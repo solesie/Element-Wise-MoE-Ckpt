@@ -1,0 +1,1072 @@
+[2026-04-20 02:56:56,207] [WARNING] [runner.py:232:fetch_hostfile] Unable to find hostfile, will proceed with training with local resources only.
+[2026-04-20 02:56:56,208] [INFO] [runner.py:630:main] cmd = /usr/bin/python3 -u -m deepspeed.launcher.launch --world_info=eyJsb2NhbGhvc3QiOiBbMF19 --master_addr=127.0.0.1 --master_port=29500 --enable_each_rank_log=None --log_level=info /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py --override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95 --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 --num-experts 4 4 8 8 8 8 --expert-interval 2 --moe-loss-coeff 0.01 --moe-train-capacity-factor 1.25 --moe-eval-capacity-factor 1.25 --moe-min-capacity 4 --topk 2 --init-method-std 0.014 --micro-batch-size 8 --global-batch-size 24 --num-layers 12 --hidden-size 768 --num-attention-heads 12 --seq-length 2048 --max-position-embeddings 2048 --train-iters 2000 --lr 1.5e-4 --min-lr 1.5e-5 --lr-decay-style cosine --lr-warmup-iters 50 --split 98,2,0 --log-interval 10 --eval-interval 100 --eval-iters 128 --save-interval 100000 --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam --seed 2024 --proposal-enable --proposal-cp-dir /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/cp/proposal_hutch_seed2024 --proposal-cp-mode differential --proposal-selection-mode gnb --proposal-h-estimator hutchinson --proposal-h-cross-check --proposal-h-cross-check-log /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.hutch_vs_gnb.jsonl --proposal-gnb-refresh-every 40 --proposal-gnb-num-samples 4 --proposal-gnb-comparison-log /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.gnb_vs_vt.jsonl --proposal-fc-stagger 0 --proposal-topk-ratio 0.01 --proposal-nonexpert-fc-W 10 --proposal-async-queue 5 --proposal-dc-retention 2000 --proposal-fault-interval 100 --proposal-fault-warmup 300 --proposal-fault-log /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.faults.jsonl --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 --proposal-score-diag-log /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.score_diag.jsonl --vocab-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json --merge-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt --data-path /home/asdf1234/data/slimpajama_6b/slimpajama_6b_train_text_document --valid-data-path /home/asdf1234/data/slimpajama_6b/slimpajama_6b_valid_text_document --data-impl mmap --deepspeed --deepspeed_config /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/ds_config_proposal_hutch_seed2024.json --pipeline-model-parallel-size 1 --no-pipeline-parallel --create-moe-param-group
+[2026-04-20 02:57:01,929] [INFO] [launch.py:162:main] WORLD INFO DICT: {'localhost': [0]}
+[2026-04-20 02:57:01,929] [INFO] [launch.py:168:main] nnodes=1, num_local_procs=1, node_rank=0
+[2026-04-20 02:57:01,929] [INFO] [launch.py:179:main] global_rank_mapping=defaultdict(<class 'list'>, {'localhost': [0]})
+[2026-04-20 02:57:01,929] [INFO] [launch.py:180:main] dist_world_size=1
+[2026-04-20 02:57:01,929] [INFO] [launch.py:184:main] Setting CUDA_VISIBLE_DEVICES=0
+[2026-04-20 02:57:01,930] [INFO] [launch.py:272:main] process 90438 spawned with command: ['/usr/bin/python3', '-u', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=0', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '4', '4', '8', '8', '8', '8', '--expert-interval', '2', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.25', '--moe-eval-capacity-factor', '1.25', '--moe-min-capacity', '4', '--topk', '2', '--init-method-std', '0.014', '--micro-batch-size', '8', '--global-batch-size', '24', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '2048', '--max-position-embeddings', '2048', '--train-iters', '2000', '--lr', '1.5e-4', '--min-lr', '1.5e-5', '--lr-decay-style', 'cosine', '--lr-warmup-iters', '50', '--split', '98,2,0', '--log-interval', '10', '--eval-interval', '100', '--eval-iters', '128', '--save-interval', '100000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '2', '--bf16', '--use-flash-attn-v2', '--ds_fused_adam', '--seed', '2024', '--proposal-enable', '--proposal-cp-dir', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/cp/proposal_hutch_seed2024', '--proposal-cp-mode', 'differential', '--proposal-selection-mode', 'gnb', '--proposal-h-estimator', 'hutchinson', '--proposal-h-cross-check', '--proposal-h-cross-check-log', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.hutch_vs_gnb.jsonl', '--proposal-gnb-refresh-every', '40', '--proposal-gnb-num-samples', '4', '--proposal-gnb-comparison-log', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.gnb_vs_vt.jsonl', '--proposal-fc-stagger', '0', '--proposal-topk-ratio', '0.01', '--proposal-nonexpert-fc-W', '10', '--proposal-async-queue', '5', '--proposal-dc-retention', '2000', '--proposal-fault-interval', '100', '--proposal-fault-warmup', '300', '--proposal-fault-log', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.faults.jsonl', '--proposal-score-diag-iters', '100', '200', '400', '600', '800', '1000', '1200', '1400', '1600', '1800', '2000', '--proposal-score-diag-log', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.score_diag.jsonl', '--vocab-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json', '--merge-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt', '--data-path', '/home/asdf1234/data/slimpajama_6b/slimpajama_6b_train_text_document', '--valid-data-path', '/home/asdf1234/data/slimpajama_6b/slimpajama_6b_valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', '/home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/ds_config_proposal_hutch_seed2024.json', '--pipeline-model-parallel-size', '1', '--no-pipeline-parallel', '--create-moe-param-group']
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:250: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:288: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  def backward(ctx, grad_output):
+--------------------------------------------------
+DeepSpeed C++/CUDA extension op report
+--------------------------------------------------
+NOTE: Ops not installed will be just-in-time (JIT) compiled at
+      runtime if needed. Op compatibility means that your system
+      meet the required dependencies to JIT install the op.
+--------------------------------------------------
+JIT compiled ops requires ninja
+ninja .................. [92m[OKAY][0m
+--------------------------------------------------
+op name ................ installed .. compatible
+--------------------------------------------------
+[93m [WARNING] [0m async_io requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m async_io: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+async_io ............... [93m[NO][0m ....... [93m[NO][0m
+fused_adam ............. [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adam ............... [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adagrad ............ [93m[NO][0m ....... [92m[OKAY][0m
+cpu_lion ............... [93m[NO][0m ....... [92m[OKAY][0m
+dc ..................... [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m Please specify CUTLASS location directory as environment variable CUTLASS_PATH
+[93m [WARNING] [0m Possible values are: a path, DS_IGNORE_CUTLASS_DETECTION and DS_USE_CUTLASS_PYTHON_BINDINGS
+evoformer_attn ......... [93m[NO][0m ....... [93m[NO][0m
+[93m [WARNING] [0m FP Quantizer is using an untested triton version (3.4.0), only 2.3.(0, 1) and 3.0.0 are known to be compatible with these kernels
+fp_quantizer ........... [93m[NO][0m ....... [93m[NO][0m
+fused_lamb ............. [93m[NO][0m ....... [92m[OKAY][0m
+fused_lion ............. [93m[NO][0m ....... [92m[OKAY][0m
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmphzy_of66/test.c -o /tmp/tmphzy_of66/test.o
+x86_64-linux-gnu-gcc /tmp/tmphzy_of66/test.o -L/usr/local/cuda -L/usr/local/cuda/lib64 -lcufile -o /tmp/tmphzy_of66/a.out
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmpdfwax2dt/test.c -o /tmp/tmpdfwax2dt/test.o
+x86_64-linux-gnu-gcc /tmp/tmpdfwax2dt/test.o -laio -o /tmp/tmpdfwax2dt/a.out
+[93m [WARNING] [0m gds requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m gds: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+gds .................... [93m[NO][0m ....... [93m[NO][0m
+transformer_inference .. [93m[NO][0m ....... [92m[OKAY][0m
+inference_core_ops ..... [93m[NO][0m ....... [92m[OKAY][0m
+cutlass_ops ............ [93m[NO][0m ....... [92m[OKAY][0m
+quantizer .............. [93m[NO][0m ....... [92m[OKAY][0m
+ragged_device_ops ...... [93m[NO][0m ....... [92m[OKAY][0m
+ragged_ops ............. [93m[NO][0m ....... [92m[OKAY][0m
+random_ltd ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m sparse_attn requires a torch version >= 1.5 and < 2.0 but detected 2.8
+[93m [WARNING] [0m using untested triton version (3.4.0), only 1.0.0 is known to be compatible
+sparse_attn ............ [93m[NO][0m ....... [93m[NO][0m
+spatial_inference ...... [93m[NO][0m ....... [92m[OKAY][0m
+transformer ............ [93m[NO][0m ....... [92m[OKAY][0m
+stochastic_transformer . [93m[NO][0m ....... [92m[OKAY][0m
+utils .................. [93m[NO][0m ....... [92m[OKAY][0m
+--------------------------------------------------
+DeepSpeed general environment info:
+torch install path ............... ['/usr/local/lib/python3.10/dist-packages/torch']
+torch version .................... 2.8.0+cu128
+deepspeed install path ........... ['/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed']
+deepspeed info ................... 0.18.9, unknown, unknown
+torch cuda version ............... 12.8
+torch hip version ................ None
+nvcc version ..................... 12.8
+deepspeed wheel compiled w. ...... torch 2.8, cuda 12.8
+shared memory (/dev/shm) size .... 45.17 GB
+**** Git info for Megatron: git_hash=aab2f31 git_branch=main ****
+using world size: 1, data-parallel-size: 1, sequence-parallel size: 1, tensor-model-parallel size: 1, pipeline-model-parallel size: 1 
+accumulate and all-reduce gradients in fp32 for bfloat16 data type.
+using torch.bfloat16 for parameters ...
+------------------------ arguments ------------------------
+  accumulate_allreduce_grads_in_fp32 .............. True
+  adam_beta1 ...................................... 0.9
+  adam_beta2 ...................................... 0.95
+  adam_eps ........................................ 1e-08
+  add_bias_linear ................................. True
+  add_position_embedding .......................... True
+  adlr_autoresume ................................. False
+  adlr_autoresume_interval ........................ 1000
+  aml_data_download_path .......................... None
+  apply_layernorm_1p .............................. False
+  apply_query_key_layer_scaling ................... True
+  apply_residual_connection_post_layernorm ........ False
+  async_tensor_model_parallel_allreduce ........... False
+  attention_dropout ............................... 0.1
+  attention_softmax_in_fp32 ....................... False
+  barrier_with_L1_time ............................ True
+  bert_binary_head ................................ True
+  bert_embedder_type .............................. megatron
+  bert_load ....................................... None
+  bf16 ............................................ True
+  bias_dropout_fusion ............................. True
+  bias_gelu_fusion ................................ True
+  biencoder_projection_dim ........................ 0
+  biencoder_shared_query_context_model ............ False
+  block_data_path ................................. None
+  checkpoint_activations .......................... False
+  checkpoint_in_cpu ............................... False
+  checkpoint_num_layers ........................... 1
+  classes_fraction ................................ 1.0
+  clip_grad ....................................... 1.0
+  compression_training ............................ False
+  consumed_train_samples .......................... 0
+  consumed_train_tokens ........................... 0
+  consumed_valid_samples .......................... 0
+  contigious_checkpointing ........................ False
+  cpu_optimizer ................................... False
+  cpu_torch_adam .................................. False
+  create_moe_param_group .......................... True
+  curriculum_learning_legacy ...................... False
+  data_cache_path ................................. None
+  data_efficiency_curriculum_learning ............. False
+  data_impl ....................................... mmap
+  data_parallel_random_init ....................... False
+  data_parallel_size .............................. 1
+  data_path ....................................... ['/home/asdf1234/data/slimpajama_6b/slimpajama_6b_train_text_document']
+  data_per_class_fraction ......................... 1.0
+  data_sharding ................................... True
+  dataloader_type ................................. single
+  DDP_impl ........................................ local
+  decoder_num_layers .............................. None
+  decoder_seq_length .............................. None
+  deepscale ....................................... False
+  deepscale_config ................................ None
+  deepspeed ....................................... True
+  deepspeed_activation_checkpointing .............. False
+  deepspeed_config ................................ /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/ds_config_proposal_hutch_seed2024.json
+  dino_bottleneck_size ............................ 256
+  dino_freeze_last_layer .......................... 1
+  dino_head_hidden_size ........................... 2048
+  dino_local_crops_number ......................... 10
+  dino_local_img_size ............................. 96
+  dino_norm_last_layer ............................ False
+  dino_teacher_temp ............................... 0.07
+  dino_warmup_teacher_temp ........................ 0.04
+  dino_warmup_teacher_temp_epochs ................. 30
+  distribute_checkpointed_activations ............. False
+  distribute_saved_activations .................... False
+  distributed_backend ............................. nccl
+  distributed_timeout_minutes ..................... 10
+  ds_fused_adam ................................... True
+  ds_inference .................................... False
+  ds_pipeline_enabled ............................. False
+  ds_sequence_parallel_fpdt ....................... False
+  ds_sequence_parallel_fpdt_chunk_size ............ 65536
+  ds_sequence_parallel_fpdt_offloading ............ False
+  ds_sequence_parallel_size ....................... 1
+  embedding_path .................................. None
+  embedding_weights_in_fp32 ....................... False
+  empty_unused_memory_level ....................... 0
+  enable_expert_tensor_parallelism ................ False
+  enable_zbh1_exact_semantics ..................... False
+  enable_zbh1_pipeline ............................ False
+  encoder_num_layers .............................. 12
+  encoder_seq_length .............................. 2048
+  end_weight_decay ................................ 0.1
+  eod_mask_loss ................................... False
+  eval_interval ................................... 100
+  eval_iters ...................................... 128
+  evidence_data_path .............................. None
+  exit_duration_in_mins ........................... None
+  exit_interval ................................... None
+  exit_on_missing_checkpoint ...................... False
+  exit_signal_handler ............................. False
+  expert_interval ................................. 2
+  ffn_hidden_size ................................. 3072
+  finetune ........................................ False
+  force_ds_sequence_parallel ...................... False
+  fp16 ............................................ False
+  fp16_lm_cross_entropy ........................... False
+  fp32_residual_connection ........................ False
+  fp8_amax_compute_algo ........................... most_recent
+  fp8_amax_history_len ............................ 1
+  fp8_e4m3 ........................................ False
+  fp8_hybrid ...................................... False
+  fp8_interval .................................... 1
+  fp8_margin ...................................... 0
+  fp8_wgrad ....................................... True
+  global_batch_size ............................... 24
+  gradient_accumulation_fusion .................... True
+  head_lr_mult .................................... 1.0
+  hidden_dropout .................................. 0.1
+  hidden_size ..................................... 768
+  hidden_size_teacher ............................. None
+  hysteresis ...................................... 2
+  ict_head_size ................................... None
+  ict_load ........................................ None
+  img_h ........................................... 224
+  img_w ........................................... 224
+  indexer_batch_size .............................. 128
+  indexer_log_interval ............................ 1000
+  inference ....................................... False
+  inference_batch_times_seqlen_threshold .......... 512
+  init_method_std ................................. 0.014
+  init_method_xavier_uniform ...................... False
+  initial_loss_scale .............................. 4294967296
+  iter_per_epoch .................................. 1250
+  kd .............................................. False
+  kd_alpha_ce ..................................... 1
+  kd_beta_ce ...................................... 1
+  kd_temp ......................................... 1.0
+  kill_switch_file ................................ None
+  kv_channels ..................................... 64
+  layernorm_epsilon ............................... 1e-05
+  lazy_mpu_init ................................... None
+  load ............................................ None
+  load_tag ........................................ None
+  load_teacher .................................... None
+  local_rank ...................................... 0
+  log_batch_size_to_tensorboard ................... False
+  log_interval .................................... 10
+  log_learning_rate_to_tensorboard ................ True
+  log_loss_scale_to_tensorboard ................... True
+  log_memory_to_tensorboard ....................... False
+  log_num_zeros_in_grad ........................... False
+  log_optimizer_states_to_tensorboard ............. False
+  log_params_norm ................................. False
+  log_timers_to_tensorboard ....................... False
+  log_validation_ppl_to_tensorboard ............... False
+  log_world_size_to_tensorboard ................... False
+  loss_scale ...................................... None
+  loss_scale_window ............................... 1000
+  lr .............................................. 0.00015
+  lr_decay_iters .................................. None
+  lr_decay_samples ................................ None
+  lr_decay_style .................................. cosine
+  lr_decay_tokens ................................. None
+  lr_warmup_fraction .............................. None
+  lr_warmup_iters ................................. 50
+  lr_warmup_samples ............................... 0
+  lr_warmup_tokens ................................ None
+  make_vocab_size_divisible_by .................... 128
+  mask_factor ..................................... 1.0
+  mask_prob ....................................... 0.15
+  mask_type ....................................... random
+  masked_softmax_fusion ........................... True
+  max_position_embeddings ......................... 2048
+  max_tokens_to_oom ............................... 12000
+  mem_efficient_ln ................................ True
+  memory_centric_tiled_linear ..................... False
+  merge_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt
+  micro_batch_size ................................ 8
+  min_loss_scale .................................. 1.0
+  min_lr .......................................... 1.5e-05
+  mlp_type ........................................ standard
+  mmap_warmup ..................................... False
+  moe_eval_capacity_factor ........................ 1.25
+  moe_expert_parallel_size ........................ 1
+  moe_loss_coeff .................................. 0.01
+  moe_min_capacity ................................ 4
+  moe_token_dropping .............................. True
+  moe_top2_2nd_expert_sampling .................... True
+  moe_train_capacity_factor ....................... 1.25
+  mos ............................................. False
+  no_load_lr_state ................................ False
+  no_load_optim ................................... None
+  no_load_rng ..................................... None
+  no_persist_layer_norm ........................... False
+  no_pipeline_parallel ............................ True
+  no_save_optim ................................... None
+  no_save_rng ..................................... None
+  normalization ................................... layernorm
+  num_attention_heads ............................. 12
+  num_attention_heads_teacher ..................... None
+  num_channels .................................... 3
+  num_classes ..................................... 1000
+  num_experts ..................................... [4, 4, 8, 8, 8, 8]
+  num_experts_switch .............................. None
+  num_experts_teacher ............................. [1]
+  num_key_value_heads ............................. 12
+  num_layers ...................................... 12
+  num_layers_per_virtual_pipeline_stage ........... None
+  num_layers_teacher .............................. None
+  num_workers ..................................... 2
+  onnx_safe ....................................... None
+  openai_gelu ..................................... False
+  optimizer ....................................... adam
+  output_bert_embeddings .......................... False
+  overlap_p2p_comm ................................ False
+  override_opt_param_scheduler .................... True
+  params_dtype .................................... torch.bfloat16
+  partition_activations ........................... False
+  patch_dim ....................................... 16
+  perform_initialization .......................... True
+  pipeline_model_parallel_size .................... 1
+  pipeline_model_parallel_split_rank .............. None
+  profile ......................................... None
+  profile_backward ................................ False
+  profile_ranks ................................... None
+  profile_steps ................................... 2,3
+  proposal_async_queue ............................ 5
+  proposal_cp_dir ................................. /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/cp/proposal_hutch_seed2024
+  proposal_cp_mode ................................ differential
+  proposal_dc_retention ........................... 2000
+  proposal_enable ................................. True
+  proposal_expert_fc_D ............................ None
+  proposal_fault_interval ......................... 100
+  proposal_fault_log .............................. /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.faults.jsonl
+  proposal_fault_warmup ........................... 300
+  proposal_fc_stagger ............................. 0
+  proposal_fisher_coverage_iters .................. None
+  proposal_gnb_comparison_log ..................... /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.gnb_vs_vt.jsonl
+  proposal_gnb_num_samples ........................ 4
+  proposal_gnb_refresh_every ...................... 40
+  proposal_h_cross_check .......................... True
+  proposal_h_cross_check_log ...................... /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.hutch_vs_gnb.jsonl
+  proposal_h_estimator ............................ hutchinson
+  proposal_hutchinson_at_end ...................... False
+  proposal_hutchinson_k_samples ................... 4
+  proposal_hutchinson_log ......................... None
+  proposal_nonexpert_fc_W ......................... 10
+  proposal_replay_at_end .......................... False
+  proposal_replay_only ............................ False
+  proposal_rolling_flush_every .................... 1
+  proposal_score_diag_every ....................... 0
+  proposal_score_diag_iters ....................... [100, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000]
+  proposal_score_diag_log ......................... /home/asdf1234/Megatron-DeepSpeed/results/exp_etc_hutch/log/proposal_hutch_seed2024.score_diag.jsonl
+  proposal_selection_mode ......................... gnb
+  proposal_topk_ratio ............................. 0.01
+  query_in_block_prob ............................. 0.1
+  rampup_batch_size ............................... None
+  random_ltd ...................................... False
+  rank ............................................ 0
+  recompute_granularity ........................... None
+  recompute_method ................................ None
+  recompute_num_layers ............................ 1
+  remote_device ................................... none
+  repeated_dataloader ............................. False
+  reset_attention_mask ............................ False
+  reset_iteration ................................. False
+  reset_position_ids .............................. False
+  retriever_report_topk_accuracies ................ []
+  retriever_score_scaling ......................... False
+  retriever_seq_length ............................ 256
+  retro_add_retriever ............................. False
+  retro_cyclic_train_iters ........................ None
+  retro_encoder_attention_dropout ................. 0.1
+  retro_encoder_hidden_dropout .................... 0.1
+  retro_encoder_layers ............................ 2
+  retro_num_neighbors ............................. 2
+  retro_num_retrieved_chunks ...................... 2
+  retro_return_doc_ids ............................ False
+  retro_workdir ................................... None
+  return_data_index ............................... False
+  rope_theta ...................................... 10000
+  rotary_percent .................................. 1.0
+  sample_rate ..................................... 1.0
+  save ............................................ None
+  save_interval ................................... 100000
+  scatter_gather_tensors_in_pipeline .............. True
+  scattered_embeddings ............................ False
+  seed ............................................ 2024
+  seq_length ...................................... 2048
+  sequence_parallel ............................... False
+  sgd_momentum .................................... 0.9
+  short_seq_prob .................................. 0.1
+  skip_train ...................................... False
+  split ........................................... 98,2,0
+  split_transformers .............................. False
+  squared_relu .................................... False
+  standalone_embedding_stage ...................... False
+  start_weight_decay .............................. 0.1
+  swiglu .......................................... False
+  swin_backbone_type .............................. tiny
+  synchronize_each_layer .......................... False
+  tensor_model_parallel_size ...................... 1
+  tensorboard_dir ................................. None
+  tensorboard_log_interval ........................ 1
+  tensorboard_queue_size .......................... 1000
+  test_data_path .................................. None
+  tile_factor ..................................... 1
+  timing_log_level ................................ 0
+  timing_log_option ............................... minmax
+  titles_data_path ................................ None
+  tokenizer_model ................................. None
+  tokenizer_type .................................. GPT2BPETokenizer
+  topk ............................................ 2
+  train_data_exact_num_epochs ..................... None
+  train_data_path ................................. None
+  train_desc_path ................................. None
+  train_doc_idx_path .............................. None
+  train_idx_path .................................. None
+  train_iters ..................................... 2000
+  train_sample_idx_path ........................... None
+  train_samples ................................... None
+  train_shuffle_idx_path .......................... None
+  train_tokens .................................... None
+  transformer_impl ................................ local
+  transformer_pipeline_model_parallel_size ........ 1
+  trust_remote_code ............................... False
+  universal_checkpoint ............................ False
+  untie_embeddings_and_output_weights ............. False
+  use_checkpoint_args ............................. False
+  use_checkpoint_opt_param_scheduler .............. False
+  use_contiguous_buffers_in_local_ddp ............. True
+  use_cpu_initialization .......................... None
+  use_dataset_only ................................ False
+  use_distributed_optimizer ....................... False
+  use_flash_attn .................................. True
+  use_flash_attn_builder .......................... False
+  use_flash_attn_triton ........................... False
+  use_flash_attn_v1 ............................... False
+  use_flash_attn_v2 ............................... True
+  use_one_sent_docs ............................... False
+  use_pin_memory .................................. False
+  use_ring_exchange_p2p ........................... False
+  use_rotary_position_embeddings .................. False
+  use_tutel ....................................... False
+  valid_data_path ................................. ['/home/asdf1234/data/slimpajama_6b/slimpajama_6b_valid_text_document']
+  variable_seq_lengths ............................ False
+  virtual_pipeline_model_parallel_size ............ None
+  vision_backbone_type ............................ vit
+  vision_pretraining .............................. False
+  vision_pretraining_type ......................... classify
+  vocab_extra_ids ................................. 0
+  vocab_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json
+  vocab_size ...................................... None
+  wandb_exp_name .................................. 
+  wandb_project ................................... 
+  wandb_save_dir .................................. 
+  weight_decay .................................... 0.1
+  weight_decay_incr_style ......................... constant
+  world_size ...................................... 1
+  zero_allgather_bucket_size ...................... 0.0
+  zero_contigious_gradients ....................... False
+  zero_reduce_bucket_size ......................... 0.0
+  zero_reduce_scatter ............................. False
+  zero_stage ...................................... 1.0
+-------------------- end of arguments ---------------------
+setting number of micro-batches to constant 3
+> building GPT2BPETokenizer tokenizer ...
+ > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+WARNING: WANDB writing requested but no legit wandb project or experiment name provided, therefore no WANDB logs will be written according to random generated project or experiment name.
+> initializing torch distributed ...
+> initialized tensor model parallel with size 1
+> initialized pipeline model parallel with size 1
+> setting random seeds to 2024 ...
+> initializing model parallel cuda seeds on global rank 0, model parallel rank 0, and data parallel rank 0 with model parallel seed: 4742 and data parallel seed: 2024
+> compiling dataset index builder ...
+make: Entering directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+>>> done with dataset index builder. Compilation time: 0.071 seconds
+> compiling and loading fused kernels ...
+[rank0]:W0420 02:57:09.319000 90438 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0420 02:57:09.319000 90438 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0420 02:57:09.369000 90438 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0420 02:57:09.369000 90438 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0420 02:57:09.420000 90438 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0420 02:57:09.420000 90438 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+>>> done with compiling and loading fused kernels. Compilation time: 0.163 seconds
+[rank0]:[W420 02:57:09.106315074 init.cpp:772] Warning: nvfuser is no longer supported in torch script, use _jit_set_nvfuser_enabled is deprecated and a no-op (function operator())
+time to initialize megatron (seconds): 1.811
+[after megatron is initialized] datetime: 2026-04-20 02:57:09 
+building GPT model ...
+Before Building Model
+MA 0.0 GB         Max_MA 1.59 GB         CA 0.0 GB         Max_CA 2 GB 
+CPU Virtual Memory:  used = 9.19 GB, percent = 10.2%
+After Building Model
+MA 0.53 GB         Max_MA 0.54 GB         CA 0.6 GB         Max_CA 1 GB 
+CPU Virtual Memory:  used = 9.2 GB, percent = 10.2%
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 285855744
+[rank0]:W0420 02:57:09.993000 90438 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0420 02:57:09.993000 90438 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+> learning rate decay style: cosine
+DeepSpeed is enabled.
+No existing process group found, creating a new group named: ep_size_1
+[after model, optimizer, and learning rate scheduler are built] datetime: 2026-04-20 02:57:10 
+[proposal] Fp32StateMapper mode=fp16_zero0  masters=0 adam_state_keys=5
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      48000
+    validation: 64512
+    test:       3072
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000279 seconds
+    number of documents: 1572137
+ > dataset split:
+    train:
+     document indices in [0, 1540694) total of 1540694 documents
+    validation:
+     document indices in [1540694, 1572137) total of 31443 documents
+    test:
+     document indices in [1572137, 1572137) total of 0 documents
+ > loading doc-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_shuffle_idx.npy
+    loaded indexed file in 0.028 seconds
+    total number of samples: 797248
+    total number of epochs: 1
+ > loading doc-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_shuffle_idx.npy
+    loaded indexed file in 0.001 seconds
+    total number of samples: 65306
+    total number of epochs: 4
+> finished creating GPT datasets ...
+[after dataloaders are built] datetime: 2026-04-20 02:57:10 
+done with setup ...
+(min, max) time across ranks (ms):
+    model-and-optimizer-setup ......................: (590.76, 590.76)
+    train/valid/test-data-iterators-setup ..........: (117.95, 117.95)
+training ...
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      48000
+    validation: 64512
+    test:       3072
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000523 seconds
+    number of documents: 1572137
+ > dataset split:
+    train:
+     document indices in [0, 1540694) total of 1540694 documents
+    validation:
+     document indices in [1540694, 1572137) total of 31443 documents
+    test:
+     document indices in [1572137, 1572137) total of 0 documents
+ > loading doc-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/9bef26c6e584bb6c926f73400bbf5967_shuffle_idx.npy
+    loaded indexed file in 0.001 seconds
+    total number of samples: 797248
+    total number of epochs: 1
+ > loading doc-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/slimpajama_6b/index-cache/d0cab74191b70bcfe089cc334666345c_shuffle_idx.npy
+    loaded indexed file in 0.001 seconds
+    total number of samples: 65306
+    total number of epochs: 4
+> finished creating GPT datasets ...
+[before the start of training step] datetime: 2026-04-20 02:57:10 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] Backend compiler exception
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             l_x_ = L_x_
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             one_hot: "i64[16384, 10240][10240, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             float_1: "f32[16384, 10240][10240, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             return (float_1,)
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     . Adding a graph break.
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]   Developer debug context: Backend: inductor
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             l_x_ = L_x_
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             one_hot: "i64[16384, 10240][10240, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             float_1: "f32[16384, 10240][10240, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]             return (float_1,)
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]     Traceback:
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0420 02:57:15.374000 90438 torch/_dynamo/exc.py:525] [2/0] 
+[proposal] scale @iter1: |H| mean=1.668e-02 max=6.709e-01  |δ| mean=0.000e+00 max=0.000e+00  (score=|H|·δ² ≈ 0.000e+00)
+[proposal] hutch-vs-gnb @iter1: bare P=+0.392 J@1%=0.129 J@10%=0.246  score P=+0.000 J@1%=0.000 J@10%=0.000
+[proposal] refresh_hutchinson @iter1 K=4 2850 ms  (188,897,280 expert elements)
+ iteration       10/    2000 | consumed samples:          240 | consumed tokens:       491520 | elapsed time per iteration (ms): 3699.5 | learning rate: 3.000E-05 | global batch size:    24 | lm loss: 1.041999E+01 | moe loss: 7.220774E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 6.487 | tokens per gpu per second (tgs): 13285.945 | TFLOPs: 17.37 |
+[Rank 0] (after 10 iterations) memory (MB) | allocated: 5110.064453125 | max allocated: 69929.3251953125 | reserved: 50588.0 | max reserved: 74668.0
+ iteration       20/    2000 | consumed samples:          480 | consumed tokens:       983040 | elapsed time per iteration (ms): 2542.4 | learning rate: 6.000E-05 | global batch size:    24 | lm loss: 9.683975E+00 | moe loss: 6.693549E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.440 | tokens per gpu per second (tgs): 19333.135 | TFLOPs: 25.28 |
+ iteration       30/    2000 | consumed samples:          720 | consumed tokens:      1474560 | elapsed time per iteration (ms): 2485.5 | learning rate: 9.000E-05 | global batch size:    24 | lm loss: 9.289892E+00 | moe loss: 6.414514E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.656 | tokens per gpu per second (tgs): 19775.827 | TFLOPs: 25.86 |
+[proposal] scale @iter40: |H| mean=1.448e-04 max=6.437e-03  |δ| mean=2.071e-04 max=1.851e-03  (score=|H|·δ² ≈ 6.208e-12)
+[proposal] hutch-vs-gnb @iter40: bare P=+0.166 J@1%=0.056 J@10%=0.160  score P=+0.162 J@1%=0.059 J@10%=0.175
+[proposal] refresh_hutchinson @iter40 K=4 2822 ms  (188,897,280 expert elements)
+ iteration       40/    2000 | consumed samples:          960 | consumed tokens:      1966080 | elapsed time per iteration (ms): 3154.6 | learning rate: 1.200E-04 | global batch size:    24 | lm loss: 8.716113E+00 | moe loss: 6.511593E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.608 | tokens per gpu per second (tgs): 15581.049 | TFLOPs: 20.37 |
+ iteration       50/    2000 | consumed samples:         1200 | consumed tokens:      2457600 | elapsed time per iteration (ms): 2539.0 | learning rate: 1.500E-04 | global batch size:    24 | lm loss: 8.123154E+00 | moe loss: 6.333278E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.452 | tokens per gpu per second (tgs): 19358.720 | TFLOPs: 25.31 |
+ iteration       60/    2000 | consumed samples:         1440 | consumed tokens:      2949120 | elapsed time per iteration (ms): 2511.4 | learning rate: 1.500E-04 | global batch size:    24 | lm loss: 7.737792E+00 | moe loss: 6.207536E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.557 | tokens per gpu per second (tgs): 19571.832 | TFLOPs: 25.59 |
+ iteration       70/    2000 | consumed samples:         1680 | consumed tokens:      3440640 | elapsed time per iteration (ms): 2535.1 | learning rate: 1.500E-04 | global batch size:    24 | lm loss: 7.502322E+00 | moe loss: 6.287329E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.467 | tokens per gpu per second (tgs): 19388.601 | TFLOPs: 25.35 |
+[proposal] scale @iter80: |H| mean=1.194e-04 max=5.775e-03  |δ| mean=2.216e-04 max=2.289e-03  (score=|H|·δ² ≈ 5.864e-12)
+[proposal] hutch-vs-gnb @iter80: bare P=+0.221 J@1%=0.074 J@10%=0.178  score P=+0.212 J@1%=0.079 J@10%=0.196
+[proposal] refresh_hutchinson @iter80 K=4 2791 ms  (188,897,280 expert elements)
+ iteration       80/    2000 | consumed samples:         1920 | consumed tokens:      3932160 | elapsed time per iteration (ms): 3024.7 | learning rate: 1.499E-04 | global batch size:    24 | lm loss: 7.482385E+00 | moe loss: 6.305412E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.935 | tokens per gpu per second (tgs): 16250.263 | TFLOPs: 21.25 |
+ iteration       90/    2000 | consumed samples:         2160 | consumed tokens:      4423680 | elapsed time per iteration (ms): 2545.6 | learning rate: 1.499E-04 | global batch size:    24 | lm loss: 7.418366E+00 | moe loss: 6.334816E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.428 | tokens per gpu per second (tgs): 19308.518 | TFLOPs: 25.25 |
+[proposal] ScoreDiag @iter 100: expert max=2.765e-18 p99.9=1.595e-20 | non-expert max=1.361e-15 p99.9=7.593e-21 | overlap: 0.434%
+          [expert diag] δ_max=2.695e-03 v̂_max=6.702e-11 |θ|_mean=6.748e-03 ΔL≈2.688e-14
+ iteration      100/    2000 | consumed samples:         2400 | consumed tokens:      4915200 | elapsed time per iteration (ms): 11537.2 | learning rate: 1.498E-04 | global batch size:    24 | lm loss: 7.235477E+00 | moe loss: 6.202740E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 2.080 | tokens per gpu per second (tgs): 4260.292 | TFLOPs: 5.57 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 100 | lm loss value: 7.166057E+00 | lm loss PPL: 1.294730E+03 | 
+-----------------------------------------------------------------------------------------------
+ iteration      110/    2000 | consumed samples:         2640 | consumed tokens:      5406720 | elapsed time per iteration (ms): 15536.3 | learning rate: 1.497E-04 | global batch size:    24 | lm loss: 7.169344E+00 | moe loss: 6.178557E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.545 | tokens per gpu per second (tgs): 3163.682 | TFLOPs: 4.14 |
+[proposal] scale @iter120: |H| mean=1.469e-04 max=4.890e-03  |δ| mean=2.359e-04 max=3.220e-03  (score=|H|·δ² ≈ 8.173e-12)
+[proposal] hutch-vs-gnb @iter120: bare P=+0.193 J@1%=0.054 J@10%=0.190  score P=+0.203 J@1%=0.075 J@10%=0.210
+[proposal] refresh_hutchinson @iter120 K=4 2826 ms  (188,897,280 expert elements)
+ iteration      120/    2000 | consumed samples:         2880 | consumed tokens:      5898240 | elapsed time per iteration (ms): 2944.2 | learning rate: 1.496E-04 | global batch size:    24 | lm loss: 7.111023E+00 | moe loss: 6.166789E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.152 | tokens per gpu per second (tgs): 16694.302 | TFLOPs: 21.83 |
+ iteration      130/    2000 | consumed samples:         3120 | consumed tokens:      6389760 | elapsed time per iteration (ms): 2741.1 | learning rate: 1.494E-04 | global batch size:    24 | lm loss: 7.025764E+00 | moe loss: 6.155352E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.756 | tokens per gpu per second (tgs): 17931.682 | TFLOPs: 23.45 |
+ iteration      140/    2000 | consumed samples:         3360 | consumed tokens:      6881280 | elapsed time per iteration (ms): 2548.7 | learning rate: 1.493E-04 | global batch size:    24 | lm loss: 6.952544E+00 | moe loss: 6.111832E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.417 | tokens per gpu per second (tgs): 19285.341 | TFLOPs: 25.22 |
+ iteration      150/    2000 | consumed samples:         3600 | consumed tokens:      7372800 | elapsed time per iteration (ms): 2494.5 | learning rate: 1.491E-04 | global batch size:    24 | lm loss: 6.889558E+00 | moe loss: 6.152614E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.621 | tokens per gpu per second (tgs): 19703.929 | TFLOPs: 25.77 |
+[proposal] scale @iter160: |H| mean=2.086e-04 max=7.496e-03  |δ| mean=2.561e-04 max=3.204e-03  (score=|H|·δ² ≈ 1.368e-11)
+[proposal] hutch-vs-gnb @iter160: bare P=+0.183 J@1%=0.047 J@10%=0.173  score P=+0.175 J@1%=0.062 J@10%=0.200
+[proposal] refresh_hutchinson @iter160 K=4 2796 ms  (188,897,280 expert elements)
+ iteration      160/    2000 | consumed samples:         3840 | consumed tokens:      7864320 | elapsed time per iteration (ms): 3058.1 | learning rate: 1.489E-04 | global batch size:    24 | lm loss: 6.869048E+00 | moe loss: 6.102410E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.848 | tokens per gpu per second (tgs): 16072.772 | TFLOPs: 21.02 |
+ iteration      170/    2000 | consumed samples:         4080 | consumed tokens:      8355840 | elapsed time per iteration (ms): 2726.6 | learning rate: 1.487E-04 | global batch size:    24 | lm loss: 6.840412E+00 | moe loss: 6.150569E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.802 | tokens per gpu per second (tgs): 18026.609 | TFLOPs: 23.57 |
+ iteration      180/    2000 | consumed samples:         4320 | consumed tokens:      8847360 | elapsed time per iteration (ms): 2627.1 | learning rate: 1.485E-04 | global batch size:    24 | lm loss: 6.735727E+00 | moe loss: 6.097630E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.136 | tokens per gpu per second (tgs): 18709.536 | TFLOPs: 24.47 |
+ iteration      190/    2000 | consumed samples:         4560 | consumed tokens:      9338880 | elapsed time per iteration (ms): 2511.9 | learning rate: 1.483E-04 | global batch size:    24 | lm loss: 6.718353E+00 | moe loss: 6.121197E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.555 | tokens per gpu per second (tgs): 19567.877 | TFLOPs: 25.59 |
+[proposal] ScoreDiag @iter 200: expert max=9.282e-19 p99.9=9.260e-21 | non-expert max=3.394e-16 p99.9=9.367e-21 | overlap: 0.098%
+          [expert diag] δ_max=4.120e-03 v̂_max=1.646e-11 |θ|_mean=6.799e-03 ΔL≈1.548e-14
+[proposal] scale @iter200: |H| mean=1.905e-04 max=6.260e-03  |δ| mean=2.685e-04 max=4.120e-03  (score=|H|·δ² ≈ 1.373e-11)
+[proposal] hutch-vs-gnb @iter200: bare P=+0.217 J@1%=0.065 J@10%=0.201  score P=+0.147 J@1%=0.069 J@10%=0.215
+[proposal] refresh_hutchinson @iter200 K=4 2755 ms  (188,897,280 expert elements)
+ iteration      200/    2000 | consumed samples:         4800 | consumed tokens:      9830400 | elapsed time per iteration (ms): 12000.6 | learning rate: 1.480E-04 | global batch size:    24 | lm loss: 6.661555E+00 | moe loss: 6.084939E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 2.000 | tokens per gpu per second (tgs): 4095.811 | TFLOPs: 5.36 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 200 | lm loss value: 6.601254E+00 | lm loss PPL: 7.360179E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      210/    2000 | consumed samples:         5040 | consumed tokens:     10321920 | elapsed time per iteration (ms): 15562.4 | learning rate: 1.478E-04 | global batch size:    24 | lm loss: 6.583867E+00 | moe loss: 6.135512E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.542 | tokens per gpu per second (tgs): 3158.385 | TFLOPs: 4.13 |
+ iteration      220/    2000 | consumed samples:         5280 | consumed tokens:     10813440 | elapsed time per iteration (ms): 2610.9 | learning rate: 1.475E-04 | global batch size:    24 | lm loss: 6.618262E+00 | moe loss: 6.067246E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.192 | tokens per gpu per second (tgs): 18826.029 | TFLOPs: 24.62 |
+ iteration      230/    2000 | consumed samples:         5520 | consumed tokens:     11304960 | elapsed time per iteration (ms): 2660.5 | learning rate: 1.472E-04 | global batch size:    24 | lm loss: 6.573425E+00 | moe loss: 6.085583E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.021 | tokens per gpu per second (tgs): 18474.949 | TFLOPs: 24.16 |
+[proposal] scale @iter240: |H| mean=1.644e-04 max=6.863e-03  |δ| mean=2.688e-04 max=4.913e-03  (score=|H|·δ² ≈ 1.188e-11)
+[proposal] hutch-vs-gnb @iter240: bare P=+0.225 J@1%=0.076 J@10%=0.189  score P=+0.127 J@1%=0.062 J@10%=0.204
+[proposal] refresh_hutchinson @iter240 K=4 2786 ms  (188,897,280 expert elements)
+ iteration      240/    2000 | consumed samples:         5760 | consumed tokens:     11796480 | elapsed time per iteration (ms): 3230.9 | learning rate: 1.469E-04 | global batch size:    24 | lm loss: 6.565668E+00 | moe loss: 6.097158E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.428 | tokens per gpu per second (tgs): 15213.062 | TFLOPs: 19.89 |
+ iteration      250/    2000 | consumed samples:         6000 | consumed tokens:     12288000 | elapsed time per iteration (ms): 2641.3 | learning rate: 1.465E-04 | global batch size:    24 | lm loss: 6.574041E+00 | moe loss: 6.087258E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.087 | tokens per gpu per second (tgs): 18609.313 | TFLOPs: 24.33 |
+ iteration      260/    2000 | consumed samples:         6240 | consumed tokens:     12779520 | elapsed time per iteration (ms): 2623.4 | learning rate: 1.462E-04 | global batch size:    24 | lm loss: 6.404024E+00 | moe loss: 6.106874E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.149 | tokens per gpu per second (tgs): 18736.202 | TFLOPs: 24.50 |
+ iteration      270/    2000 | consumed samples:         6480 | consumed tokens:     13271040 | elapsed time per iteration (ms): 2564.6 | learning rate: 1.458E-04 | global batch size:    24 | lm loss: 6.472841E+00 | moe loss: 6.087934E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.358 | tokens per gpu per second (tgs): 19165.419 | TFLOPs: 25.06 |
+[proposal] scale @iter280: |H| mean=1.670e-04 max=3.628e-03  |δ| mean=2.701e-04 max=5.188e-03  (score=|H|·δ² ≈ 1.219e-11)
+[proposal] hutch-vs-gnb @iter280: bare P=+0.233 J@1%=0.069 J@10%=0.198  score P=+0.100 J@1%=0.067 J@10%=0.217
+[proposal] refresh_hutchinson @iter280 K=4 2818 ms  (188,897,280 expert elements)
+ iteration      280/    2000 | consumed samples:         6720 | consumed tokens:     13762560 | elapsed time per iteration (ms): 3169.6 | learning rate: 1.454E-04 | global batch size:    24 | lm loss: 6.463074E+00 | moe loss: 6.073950E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.572 | tokens per gpu per second (tgs): 15507.402 | TFLOPs: 20.28 |
+ iteration      290/    2000 | consumed samples:         6960 | consumed tokens:     14254080 | elapsed time per iteration (ms): 2727.4 | learning rate: 1.450E-04 | global batch size:    24 | lm loss: 6.416543E+00 | moe loss: 6.109003E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.800 | tokens per gpu per second (tgs): 18021.687 | TFLOPs: 23.57 |
+[proposal] FAULT@300: recover_s=0.94 ne_fc=300 dc_replay=0/[-1, -1] B=0 pre_loss=6.427611827850342
+ iteration      300/    2000 | consumed samples:         7200 | consumed tokens:     14745600 | elapsed time per iteration (ms): 4407.5 | learning rate: 1.446E-04 | global batch size:    24 | lm loss: 6.490258E+00 | moe loss: 6.068529E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.445 | tokens per gpu per second (tgs): 11151.928 | TFLOPs: 14.58 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 300 | lm loss value: 6.358935E+00 | lm loss PPL: 5.776311E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      310/    2000 | consumed samples:         7440 | consumed tokens:     15237120 | elapsed time per iteration (ms): 15458.3 | learning rate: 1.442E-04 | global batch size:    24 | lm loss: 6.388339E+00 | moe loss: 6.077289E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.553 | tokens per gpu per second (tgs): 3179.652 | TFLOPs: 4.16 |
+[proposal] scale @iter320: |H| mean=2.487e-04 max=7.088e-03  |δ| mean=2.215e-04 max=1.495e-03  (score=|H|·δ² ≈ 1.221e-11)
+[proposal] hutch-vs-gnb @iter320: bare P=+0.203 J@1%=0.054 J@10%=0.179  score P=+0.221 J@1%=0.058 J@10%=0.213
+[proposal] refresh_hutchinson @iter320 K=4 2821 ms  (188,897,280 expert elements)
+ iteration      320/    2000 | consumed samples:         7680 | consumed tokens:     15728640 | elapsed time per iteration (ms): 2943.7 | learning rate: 1.437E-04 | global batch size:    24 | lm loss: 6.293713E+00 | moe loss: 6.071130E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.153 | tokens per gpu per second (tgs): 16697.229 | TFLOPs: 21.83 |
+ iteration      330/    2000 | consumed samples:         7920 | consumed tokens:     16220160 | elapsed time per iteration (ms): 2550.8 | learning rate: 1.432E-04 | global batch size:    24 | lm loss: 6.289614E+00 | moe loss: 6.089167E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.409 | tokens per gpu per second (tgs): 19268.915 | TFLOPs: 25.20 |
+ iteration      340/    2000 | consumed samples:         8160 | consumed tokens:     16711680 | elapsed time per iteration (ms): 2762.3 | learning rate: 1.428E-04 | global batch size:    24 | lm loss: 6.291172E+00 | moe loss: 6.063400E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.688 | tokens per gpu per second (tgs): 17794.029 | TFLOPs: 23.27 |
+ iteration      350/    2000 | consumed samples:         8400 | consumed tokens:     17203200 | elapsed time per iteration (ms): 2572.1 | learning rate: 1.423E-04 | global batch size:    24 | lm loss: 6.282978E+00 | moe loss: 6.086456E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.331 | tokens per gpu per second (tgs): 19109.376 | TFLOPs: 24.99 |
+[proposal] scale @iter360: |H| mean=2.296e-04 max=6.893e-03  |δ| mean=2.432e-04 max=2.224e-03  (score=|H|·δ² ≈ 1.358e-11)
+[proposal] hutch-vs-gnb @iter360: bare P=+0.184 J@1%=0.040 J@10%=0.174  score P=+0.214 J@1%=0.066 J@10%=0.225
+[proposal] refresh_hutchinson @iter360 K=4 2793 ms  (188,897,280 expert elements)
+ iteration      360/    2000 | consumed samples:         8640 | consumed tokens:     17694720 | elapsed time per iteration (ms): 3269.3 | learning rate: 1.418E-04 | global batch size:    24 | lm loss: 6.268320E+00 | moe loss: 6.087604E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.341 | tokens per gpu per second (tgs): 15034.307 | TFLOPs: 19.66 |
+ iteration      370/    2000 | consumed samples:         8880 | consumed tokens:     18186240 | elapsed time per iteration (ms): 2764.7 | learning rate: 1.412E-04 | global batch size:    24 | lm loss: 6.266224E+00 | moe loss: 6.062807E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.681 | tokens per gpu per second (tgs): 17778.522 | TFLOPs: 23.25 |
+ iteration      380/    2000 | consumed samples:         9120 | consumed tokens:     18677760 | elapsed time per iteration (ms): 2718.0 | learning rate: 1.407E-04 | global batch size:    24 | lm loss: 6.259148E+00 | moe loss: 6.078091E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.830 | tokens per gpu per second (tgs): 18084.202 | TFLOPs: 23.65 |
+ iteration      390/    2000 | consumed samples:         9360 | consumed tokens:     19169280 | elapsed time per iteration (ms): 2724.0 | learning rate: 1.401E-04 | global batch size:    24 | lm loss: 6.165077E+00 | moe loss: 6.079038E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.810 | tokens per gpu per second (tgs): 18043.849 | TFLOPs: 23.59 |
+[proposal] ScoreDiag @iter 400: expert max=9.994e-19 p99.9=6.048e-21 | non-expert max=2.646e-16 p99.9=8.466e-21 | overlap: 0.048%
+          [expert diag] δ_max=2.901e-03 v̂_max=1.340e-11 |θ|_mean=6.940e-03 ΔL≈1.457e-14
+[proposal] scale @iter400: |H| mean=2.183e-04 max=5.211e-03  |δ| mean=2.418e-04 max=2.899e-03  (score=|H|·δ² ≈ 1.277e-11)
+[proposal] hutch-vs-gnb @iter400: bare P=+0.229 J@1%=0.067 J@10%=0.192  score P=+0.223 J@1%=0.075 J@10%=0.227
+[proposal] refresh_hutchinson @iter400 K=4 2752 ms  (188,897,280 expert elements)
+[proposal] FAULT@400: recover_s=1.14 ne_fc=400 dc_replay=0/[-1, -1] B=0 pre_loss=6.1792521476745605
+ iteration      400/    2000 | consumed samples:         9600 | consumed tokens:     19660800 | elapsed time per iteration (ms): 12441.9 | learning rate: 1.396E-04 | global batch size:    24 | lm loss: 6.219091E+00 | moe loss: 6.084111E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.929 | tokens per gpu per second (tgs): 3950.519 | TFLOPs: 5.17 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 400 | lm loss value: 6.180052E+00 | lm loss PPL: 4.830170E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      410/    2000 | consumed samples:         9840 | consumed tokens:     20152320 | elapsed time per iteration (ms): 15429.2 | learning rate: 1.390E-04 | global batch size:    24 | lm loss: 6.237548E+00 | moe loss: 6.068841E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.555 | tokens per gpu per second (tgs): 3185.651 | TFLOPs: 4.17 |
+ iteration      420/    2000 | consumed samples:        10080 | consumed tokens:     20643840 | elapsed time per iteration (ms): 2615.4 | learning rate: 1.384E-04 | global batch size:    24 | lm loss: 6.133709E+00 | moe loss: 6.070094E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.177 | tokens per gpu per second (tgs): 18793.481 | TFLOPs: 24.58 |
+ iteration      430/    2000 | consumed samples:        10320 | consumed tokens:     21135360 | elapsed time per iteration (ms): 2595.6 | learning rate: 1.377E-04 | global batch size:    24 | lm loss: 6.120684E+00 | moe loss: 6.055693E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.246 | tokens per gpu per second (tgs): 18936.635 | TFLOPs: 24.76 |
+[proposal] scale @iter440: |H| mean=2.079e-04 max=4.505e-03  |δ| mean=2.195e-04 max=1.877e-03  (score=|H|·δ² ≈ 1.002e-11)
+[proposal] hutch-vs-gnb @iter440: bare P=+0.221 J@1%=0.058 J@10%=0.185  score P=+0.240 J@1%=0.068 J@10%=0.222
+[proposal] refresh_hutchinson @iter440 K=4 2806 ms  (188,897,280 expert elements)
+ iteration      440/    2000 | consumed samples:        10560 | consumed tokens:     21626880 | elapsed time per iteration (ms): 2930.6 | learning rate: 1.371E-04 | global batch size:    24 | lm loss: 6.137366E+00 | moe loss: 6.078228E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.189 | tokens per gpu per second (tgs): 16771.811 | TFLOPs: 21.93 |
+ iteration      450/    2000 | consumed samples:        10800 | consumed tokens:     22118400 | elapsed time per iteration (ms): 2724.4 | learning rate: 1.365E-04 | global batch size:    24 | lm loss: 6.198503E+00 | moe loss: 6.064955E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.809 | tokens per gpu per second (tgs): 18041.080 | TFLOPs: 23.59 |
+ iteration      460/    2000 | consumed samples:        11040 | consumed tokens:     22609920 | elapsed time per iteration (ms): 2899.4 | learning rate: 1.358E-04 | global batch size:    24 | lm loss: 6.127566E+00 | moe loss: 6.073793E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.277 | tokens per gpu per second (tgs): 16952.242 | TFLOPs: 22.17 |
+ iteration      470/    2000 | consumed samples:        11280 | consumed tokens:     23101440 | elapsed time per iteration (ms): 2599.2 | learning rate: 1.351E-04 | global batch size:    24 | lm loss: 6.023761E+00 | moe loss: 6.085047E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.234 | tokens per gpu per second (tgs): 18910.418 | TFLOPs: 24.73 |
+[proposal] scale @iter480: |H| mean=2.358e-04 max=6.485e-03  |δ| mean=2.270e-04 max=2.640e-03  (score=|H|·δ² ≈ 1.215e-11)
+[proposal] hutch-vs-gnb @iter480: bare P=+0.238 J@1%=0.073 J@10%=0.188  score P=+0.237 J@1%=0.069 J@10%=0.227
+[proposal] refresh_hutchinson @iter480 K=4 2829 ms  (188,897,280 expert elements)
+ iteration      480/    2000 | consumed samples:        11520 | consumed tokens:     23592960 | elapsed time per iteration (ms): 3023.5 | learning rate: 1.344E-04 | global batch size:    24 | lm loss: 6.154737E+00 | moe loss: 6.075821E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.938 | tokens per gpu per second (tgs): 16256.492 | TFLOPs: 21.26 |
+ iteration      490/    2000 | consumed samples:        11760 | consumed tokens:     24084480 | elapsed time per iteration (ms): 2621.8 | learning rate: 1.337E-04 | global batch size:    24 | lm loss: 6.061562E+00 | moe loss: 6.088303E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.154 | tokens per gpu per second (tgs): 18747.448 | TFLOPs: 24.51 |
+[proposal] FAULT@500: recover_s=0.95 ne_fc=500 dc_replay=0/[-1, -1] B=0 pre_loss=5.852175712585449
+ iteration      500/    2000 | consumed samples:        12000 | consumed tokens:     24576000 | elapsed time per iteration (ms): 4414.9 | learning rate: 1.330E-04 | global batch size:    24 | lm loss: 6.109961E+00 | moe loss: 6.070153E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.436 | tokens per gpu per second (tgs): 11133.275 | TFLOPs: 14.56 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 500 | lm loss value: 6.023770E+00 | lm loss PPL: 4.131333E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      510/    2000 | consumed samples:        12240 | consumed tokens:     25067520 | elapsed time per iteration (ms): 15504.2 | learning rate: 1.323E-04 | global batch size:    24 | lm loss: 6.121498E+00 | moe loss: 6.068560E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.548 | tokens per gpu per second (tgs): 3170.242 | TFLOPs: 4.15 |
+[proposal] scale @iter520: |H| mean=2.950e-04 max=1.109e-02  |δ| mean=1.977e-04 max=1.373e-03  (score=|H|·δ² ≈ 1.153e-11)
+[proposal] hutch-vs-gnb @iter520: bare P=+0.217 J@1%=0.063 J@10%=0.172  score P=+0.265 J@1%=0.066 J@10%=0.227
+[proposal] refresh_hutchinson @iter520 K=4 2818 ms  (188,897,280 expert elements)
+ iteration      520/    2000 | consumed samples:        12480 | consumed tokens:     25559040 | elapsed time per iteration (ms): 2950.2 | learning rate: 1.316E-04 | global batch size:    24 | lm loss: 6.106005E+00 | moe loss: 6.047002E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.135 | tokens per gpu per second (tgs): 16660.589 | TFLOPs: 21.79 |
+ iteration      530/    2000 | consumed samples:        12720 | consumed tokens:     26050560 | elapsed time per iteration (ms): 2653.2 | learning rate: 1.308E-04 | global batch size:    24 | lm loss: 6.103044E+00 | moe loss: 6.066310E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.046 | tokens per gpu per second (tgs): 18525.703 | TFLOPs: 24.22 |
+ iteration      540/    2000 | consumed samples:        12960 | consumed tokens:     26542080 | elapsed time per iteration (ms): 2744.6 | learning rate: 1.300E-04 | global batch size:    24 | lm loss: 6.004501E+00 | moe loss: 6.072356E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.744 | tokens per gpu per second (tgs): 17908.583 | TFLOPs: 23.42 |
+ iteration      550/    2000 | consumed samples:        13200 | consumed tokens:     27033600 | elapsed time per iteration (ms): 2551.5 | learning rate: 1.293E-04 | global batch size:    24 | lm loss: 6.013766E+00 | moe loss: 6.085595E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.406 | tokens per gpu per second (tgs): 19264.200 | TFLOPs: 25.19 |
+[proposal] scale @iter560: |H| mean=2.677e-04 max=9.430e-03  |δ| mean=2.127e-04 max=2.136e-03  (score=|H|·δ² ≈ 1.211e-11)
+[proposal] hutch-vs-gnb @iter560: bare P=+0.235 J@1%=0.071 J@10%=0.198  score P=+0.249 J@1%=0.073 J@10%=0.229
+[proposal] refresh_hutchinson @iter560 K=4 2807 ms  (188,897,280 expert elements)
+ iteration      560/    2000 | consumed samples:        13440 | consumed tokens:     27525120 | elapsed time per iteration (ms): 2998.5 | learning rate: 1.285E-04 | global batch size:    24 | lm loss: 6.033266E+00 | moe loss: 6.068406E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.004 | tokens per gpu per second (tgs): 16392.184 | TFLOPs: 21.44 |
+ iteration      570/    2000 | consumed samples:        13680 | consumed tokens:     28016640 | elapsed time per iteration (ms): 2704.5 | learning rate: 1.277E-04 | global batch size:    24 | lm loss: 5.994114E+00 | moe loss: 6.064003E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.874 | tokens per gpu per second (tgs): 18174.336 | TFLOPs: 23.77 |
+ iteration      580/    2000 | consumed samples:        13920 | consumed tokens:     28508160 | elapsed time per iteration (ms): 2653.2 | learning rate: 1.269E-04 | global batch size:    24 | lm loss: 6.085901E+00 | moe loss: 6.072894E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.046 | tokens per gpu per second (tgs): 18525.313 | TFLOPs: 24.22 |
+ iteration      590/    2000 | consumed samples:        14160 | consumed tokens:     28999680 | elapsed time per iteration (ms): 2579.0 | learning rate: 1.260E-04 | global batch size:    24 | lm loss: 5.988789E+00 | moe loss: 6.073513E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.306 | tokens per gpu per second (tgs): 19058.711 | TFLOPs: 24.92 |
+[proposal] ScoreDiag @iter 600: expert max=7.077e-19 p99.9=6.377e-21 | non-expert max=2.338e-16 p99.9=9.189e-21 | overlap: 0.044%
+          [expert diag] δ_max=2.564e-03 v̂_max=1.408e-11 |θ|_mean=7.082e-03 ΔL≈1.615e-14
+[proposal] scale @iter600: |H| mean=2.582e-04 max=1.038e-02  |δ| mean=2.140e-04 max=2.563e-03  (score=|H|·δ² ≈ 1.182e-11)
+[proposal] hutch-vs-gnb @iter600: bare P=+0.238 J@1%=0.067 J@10%=0.200  score P=+0.224 J@1%=0.081 J@10%=0.216
+[proposal] refresh_hutchinson @iter600 K=4 2764 ms  (188,897,280 expert elements)
+[proposal] FAULT@600: recover_s=1.61 ne_fc=600 dc_replay=0/[-1, -1] B=0 pre_loss=5.857394218444824
+ iteration      600/    2000 | consumed samples:        14400 | consumed tokens:     29491200 | elapsed time per iteration (ms): 12221.0 | learning rate: 1.252E-04 | global batch size:    24 | lm loss: 5.942935E+00 | moe loss: 6.086216E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.964 | tokens per gpu per second (tgs): 4021.918 | TFLOPs: 5.26 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 600 | lm loss value: 5.894236E+00 | lm loss PPL: 3.629393E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      610/    2000 | consumed samples:        14640 | consumed tokens:     29982720 | elapsed time per iteration (ms): 15389.7 | learning rate: 1.243E-04 | global batch size:    24 | lm loss: 5.928144E+00 | moe loss: 6.104562E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.559 | tokens per gpu per second (tgs): 3193.815 | TFLOPs: 4.18 |
+ iteration      620/    2000 | consumed samples:        14880 | consumed tokens:     30474240 | elapsed time per iteration (ms): 2628.6 | learning rate: 1.235E-04 | global batch size:    24 | lm loss: 5.891281E+00 | moe loss: 6.075240E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.130 | tokens per gpu per second (tgs): 18699.044 | TFLOPs: 24.45 |
+ iteration      630/    2000 | consumed samples:        15120 | consumed tokens:     30965760 | elapsed time per iteration (ms): 2770.9 | learning rate: 1.226E-04 | global batch size:    24 | lm loss: 5.963201E+00 | moe loss: 6.064370E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.661 | tokens per gpu per second (tgs): 17738.737 | TFLOPs: 23.20 |
+[proposal] scale @iter640: |H| mean=2.889e-04 max=7.977e-03  |δ| mean=2.010e-04 max=2.045e-03  (score=|H|·δ² ≈ 1.167e-11)
+[proposal] hutch-vs-gnb @iter640: bare P=+0.225 J@1%=0.066 J@10%=0.189  score P=+0.258 J@1%=0.070 J@10%=0.228
+[proposal] refresh_hutchinson @iter640 K=4 2882 ms  (188,897,280 expert elements)
+ iteration      640/    2000 | consumed samples:        15360 | consumed tokens:     31457280 | elapsed time per iteration (ms): 2982.2 | learning rate: 1.217E-04 | global batch size:    24 | lm loss: 5.995507E+00 | moe loss: 6.069219E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.048 | tokens per gpu per second (tgs): 16481.857 | TFLOPs: 21.55 |
+ iteration      650/    2000 | consumed samples:        15600 | consumed tokens:     31948800 | elapsed time per iteration (ms): 2729.8 | learning rate: 1.208E-04 | global batch size:    24 | lm loss: 5.907658E+00 | moe loss: 6.092600E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.792 | tokens per gpu per second (tgs): 18005.947 | TFLOPs: 23.55 |
+ iteration      660/    2000 | consumed samples:        15840 | consumed tokens:     32440320 | elapsed time per iteration (ms): 2657.5 | learning rate: 1.199E-04 | global batch size:    24 | lm loss: 5.963374E+00 | moe loss: 6.066162E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.031 | tokens per gpu per second (tgs): 18495.646 | TFLOPs: 24.19 |
+ iteration      670/    2000 | consumed samples:        16080 | consumed tokens:     32931840 | elapsed time per iteration (ms): 2875.1 | learning rate: 1.190E-04 | global batch size:    24 | lm loss: 5.818155E+00 | moe loss: 6.075135E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.348 | tokens per gpu per second (tgs): 17095.994 | TFLOPs: 22.36 |
+[proposal] scale @iter680: |H| mean=2.750e-04 max=5.636e-03  |δ| mean=2.017e-04 max=2.121e-03  (score=|H|·δ² ≈ 1.119e-11)
+[proposal] hutch-vs-gnb @iter680: bare P=+0.213 J@1%=0.056 J@10%=0.170  score P=+0.220 J@1%=0.055 J@10%=0.210
+[proposal] refresh_hutchinson @iter680 K=4 2812 ms  (188,897,280 expert elements)
+ iteration      680/    2000 | consumed samples:        16320 | consumed tokens:     33423360 | elapsed time per iteration (ms): 3120.0 | learning rate: 1.181E-04 | global batch size:    24 | lm loss: 5.925974E+00 | moe loss: 6.074823E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.692 | tokens per gpu per second (tgs): 15754.034 | TFLOPs: 20.60 |
+ iteration      690/    2000 | consumed samples:        16560 | consumed tokens:     33914880 | elapsed time per iteration (ms): 2852.7 | learning rate: 1.172E-04 | global batch size:    24 | lm loss: 5.852792E+00 | moe loss: 6.058037E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.413 | tokens per gpu per second (tgs): 17229.868 | TFLOPs: 22.53 |
+[proposal] FAULT@700: recover_s=1.38 ne_fc=700 dc_replay=0/[-1, -1] B=0 pre_loss=5.966949462890625
+ iteration      700/    2000 | consumed samples:        16800 | consumed tokens:     34406400 | elapsed time per iteration (ms): 4121.0 | learning rate: 1.162E-04 | global batch size:    24 | lm loss: 5.778449E+00 | moe loss: 6.091037E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.824 | tokens per gpu per second (tgs): 11927.192 | TFLOPs: 15.60 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 700 | lm loss value: 5.826591E+00 | lm loss PPL: 3.392002E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      710/    2000 | consumed samples:        17040 | consumed tokens:     34897920 | elapsed time per iteration (ms): 15468.9 | learning rate: 1.153E-04 | global batch size:    24 | lm loss: 5.884423E+00 | moe loss: 6.069370E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.551 | tokens per gpu per second (tgs): 3177.466 | TFLOPs: 4.15 |
+[proposal] scale @iter720: |H| mean=2.844e-04 max=7.225e-03  |δ| mean=1.781e-04 max=1.282e-03  (score=|H|·δ² ≈ 9.020e-12)
+[proposal] hutch-vs-gnb @iter720: bare P=+0.232 J@1%=0.054 J@10%=0.195  score P=+0.290 J@1%=0.084 J@10%=0.240
+[proposal] refresh_hutchinson @iter720 K=4 2839 ms  (188,897,280 expert elements)
+ iteration      720/    2000 | consumed samples:        17280 | consumed tokens:     35389440 | elapsed time per iteration (ms): 3027.2 | learning rate: 1.143E-04 | global batch size:    24 | lm loss: 5.918413E+00 | moe loss: 6.074106E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.928 | tokens per gpu per second (tgs): 16236.534 | TFLOPs: 21.23 |
+ iteration      730/    2000 | consumed samples:        17520 | consumed tokens:     35880960 | elapsed time per iteration (ms): 2643.9 | learning rate: 1.134E-04 | global batch size:    24 | lm loss: 5.868951E+00 | moe loss: 6.082816E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.077 | tokens per gpu per second (tgs): 18590.606 | TFLOPs: 24.31 |
+ iteration      740/    2000 | consumed samples:        17760 | consumed tokens:     36372480 | elapsed time per iteration (ms): 2660.9 | learning rate: 1.124E-04 | global batch size:    24 | lm loss: 5.771137E+00 | moe loss: 6.110013E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.019 | tokens per gpu per second (tgs): 18471.606 | TFLOPs: 24.15 |
+ iteration      750/    2000 | consumed samples:        18000 | consumed tokens:     36864000 | elapsed time per iteration (ms): 2604.4 | learning rate: 1.114E-04 | global batch size:    24 | lm loss: 5.851272E+00 | moe loss: 6.074663E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.215 | tokens per gpu per second (tgs): 18872.787 | TFLOPs: 24.68 |
+[proposal] scale @iter760: |H| mean=2.729e-04 max=7.088e-03  |δ| mean=1.899e-04 max=1.785e-03  (score=|H|·δ² ≈ 9.841e-12)
+[proposal] hutch-vs-gnb @iter760: bare P=+0.232 J@1%=0.064 J@10%=0.207  score P=+0.249 J@1%=0.067 J@10%=0.230
+[proposal] refresh_hutchinson @iter760 K=4 2879 ms  (188,897,280 expert elements)
+ iteration      760/    2000 | consumed samples:        18240 | consumed tokens:     37355520 | elapsed time per iteration (ms): 2938.7 | learning rate: 1.105E-04 | global batch size:    24 | lm loss: 5.889487E+00 | moe loss: 6.090013E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.167 | tokens per gpu per second (tgs): 16725.783 | TFLOPs: 21.87 |
+ iteration      770/    2000 | consumed samples:        18480 | consumed tokens:     37847040 | elapsed time per iteration (ms): 2719.0 | learning rate: 1.095E-04 | global batch size:    24 | lm loss: 5.817931E+00 | moe loss: 6.082639E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.827 | tokens per gpu per second (tgs): 18076.922 | TFLOPs: 23.64 |
+ iteration      780/    2000 | consumed samples:        18720 | consumed tokens:     38338560 | elapsed time per iteration (ms): 2575.1 | learning rate: 1.085E-04 | global batch size:    24 | lm loss: 5.825694E+00 | moe loss: 6.087623E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.320 | tokens per gpu per second (tgs): 19087.202 | TFLOPs: 24.96 |
+ iteration      790/    2000 | consumed samples:        18960 | consumed tokens:     38830080 | elapsed time per iteration (ms): 2571.4 | learning rate: 1.074E-04 | global batch size:    24 | lm loss: 5.830263E+00 | moe loss: 6.064475E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.333 | tokens per gpu per second (tgs): 19114.708 | TFLOPs: 25.00 |
+[proposal] ScoreDiag @iter 800: expert max=7.562e-19 p99.9=5.908e-21 | non-expert max=2.053e-16 p99.9=9.398e-21 | overlap: 0.034%
+          [expert diag] δ_max=1.983e-03 v̂_max=1.493e-11 |θ|_mean=7.202e-03 ΔL≈1.595e-14
+[proposal] scale @iter800: |H| mean=2.984e-04 max=8.568e-03  |δ| mean=1.904e-04 max=1.984e-03  (score=|H|·δ² ≈ 1.081e-11)
+[proposal] hutch-vs-gnb @iter800: bare P=+0.232 J@1%=0.068 J@10%=0.196  score P=+0.219 J@1%=0.072 J@10%=0.241
+[proposal] refresh_hutchinson @iter800 K=4 2749 ms  (188,897,280 expert elements)
+[proposal] FAULT@800: recover_s=1.60 ne_fc=800 dc_replay=0/[-1, -1] B=0 pre_loss=5.78126335144043
+ iteration      800/    2000 | consumed samples:        19200 | consumed tokens:     39321600 | elapsed time per iteration (ms): 12476.4 | learning rate: 1.064E-04 | global batch size:    24 | lm loss: 5.812370E+00 | moe loss: 6.065049E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.924 | tokens per gpu per second (tgs): 3939.596 | TFLOPs: 5.15 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 800 | lm loss value: 5.729400E+00 | lm loss PPL: 3.077844E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      810/    2000 | consumed samples:        19440 | consumed tokens:     39813120 | elapsed time per iteration (ms): 15474.1 | learning rate: 1.054E-04 | global batch size:    24 | lm loss: 5.735117E+00 | moe loss: 6.081136E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.551 | tokens per gpu per second (tgs): 3176.407 | TFLOPs: 4.15 |
+ iteration      820/    2000 | consumed samples:        19680 | consumed tokens:     40304640 | elapsed time per iteration (ms): 2569.6 | learning rate: 1.044E-04 | global batch size:    24 | lm loss: 5.765606E+00 | moe loss: 6.089060E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.340 | tokens per gpu per second (tgs): 19127.908 | TFLOPs: 25.01 |
+ iteration      830/    2000 | consumed samples:        19920 | consumed tokens:     40796160 | elapsed time per iteration (ms): 2834.2 | learning rate: 1.034E-04 | global batch size:    24 | lm loss: 5.750068E+00 | moe loss: 6.072925E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.468 | tokens per gpu per second (tgs): 17342.487 | TFLOPs: 22.68 |
+[proposal] scale @iter840: |H| mean=3.773e-04 max=1.035e-02  |δ| mean=1.821e-04 max=1.595e-03  (score=|H|·δ² ≈ 1.252e-11)
+[proposal] hutch-vs-gnb @iter840: bare P=+0.180 J@1%=0.054 J@10%=0.157  score P=+0.210 J@1%=0.054 J@10%=0.205
+[proposal] refresh_hutchinson @iter840 K=4 2828 ms  (188,897,280 expert elements)
+ iteration      840/    2000 | consumed samples:        20160 | consumed tokens:     41287680 | elapsed time per iteration (ms): 3027.1 | learning rate: 1.023E-04 | global batch size:    24 | lm loss: 5.780910E+00 | moe loss: 6.066344E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.928 | tokens per gpu per second (tgs): 16237.146 | TFLOPs: 21.23 |
+ iteration      850/    2000 | consumed samples:        20400 | consumed tokens:     41779200 | elapsed time per iteration (ms): 2874.7 | learning rate: 1.013E-04 | global batch size:    24 | lm loss: 5.754625E+00 | moe loss: 6.053112E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.349 | tokens per gpu per second (tgs): 17098.154 | TFLOPs: 22.36 |
+ iteration      860/    2000 | consumed samples:        20640 | consumed tokens:     42270720 | elapsed time per iteration (ms): 2587.8 | learning rate: 1.002E-04 | global batch size:    24 | lm loss: 5.659084E+00 | moe loss: 6.097572E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.274 | tokens per gpu per second (tgs): 18993.409 | TFLOPs: 24.84 |
+ iteration      870/    2000 | consumed samples:        20880 | consumed tokens:     42762240 | elapsed time per iteration (ms): 2882.6 | learning rate: 9.918E-05 | global batch size:    24 | lm loss: 5.656580E+00 | moe loss: 6.090261E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.326 | tokens per gpu per second (tgs): 17051.278 | TFLOPs: 22.30 |
+[proposal] scale @iter880: |H| mean=3.062e-04 max=8.316e-03  |δ| mean=1.774e-04 max=2.087e-03  (score=|H|·δ² ≈ 9.636e-12)
+[proposal] hutch-vs-gnb @iter880: bare P=+0.233 J@1%=0.070 J@10%=0.198  score P=+0.268 J@1%=0.078 J@10%=0.234
+[proposal] refresh_hutchinson @iter880 K=4 2783 ms  (188,897,280 expert elements)
+ iteration      880/    2000 | consumed samples:        21120 | consumed tokens:     43253760 | elapsed time per iteration (ms): 3137.9 | learning rate: 9.813E-05 | global batch size:    24 | lm loss: 5.723017E+00 | moe loss: 6.063862E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.648 | tokens per gpu per second (tgs): 15663.940 | TFLOPs: 20.48 |
+ iteration      890/    2000 | consumed samples:        21360 | consumed tokens:     43745280 | elapsed time per iteration (ms): 2681.0 | learning rate: 9.707E-05 | global batch size:    24 | lm loss: 5.693283E+00 | moe loss: 6.088937E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.952 | tokens per gpu per second (tgs): 18333.290 | TFLOPs: 23.97 |
+[proposal] FAULT@900: recover_s=1.37 ne_fc=900 dc_replay=0/[-1, -1] B=0 pre_loss=5.578023910522461
+ iteration      900/    2000 | consumed samples:        21600 | consumed tokens:     44236800 | elapsed time per iteration (ms): 3793.5 | learning rate: 9.600E-05 | global batch size:    24 | lm loss: 5.762857E+00 | moe loss: 6.079794E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 6.327 | tokens per gpu per second (tgs): 12956.817 | TFLOPs: 16.94 |
+-----------------------------------------------------------------------------------------------
+ validation loss at iteration 900 | lm loss value: 5.636014E+00 | lm loss PPL: 2.803430E+02 | 
+-----------------------------------------------------------------------------------------------
+ iteration      910/    2000 | consumed samples:        21840 | consumed tokens:     44728320 | elapsed time per iteration (ms): 15555.8 | learning rate: 9.493E-05 | global batch size:    24 | lm loss: 5.749173E+00 | moe loss: 6.057147E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.543 | tokens per gpu per second (tgs): 3159.726 | TFLOPs: 4.13 |
+[proposal] scale @iter920: |H| mean=2.988e-04 max=5.852e-03  |δ| mean=1.509e-04 max=1.038e-03  (score=|H|·δ² ≈ 6.806e-12)
+[proposal] hutch-vs-gnb @iter920: bare P=+0.236 J@1%=0.069 J@10%=0.194  score P=+0.275 J@1%=0.078 J@10%=0.227
+[proposal] refresh_hutchinson @iter920 K=4 2820 ms  (188,897,280 expert elements)
+ iteration      920/    2000 | consumed samples:        22080 | consumed tokens:     45219840 | elapsed time per iteration (ms): 2977.0 | learning rate: 9.386E-05 | global batch size:    24 | lm loss: 5.698136E+00 | moe loss: 6.061976E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.062 | tokens per gpu per second (tgs): 16510.665 | TFLOPs: 21.59 |
+ iteration      930/    2000 | consumed samples:        22320 | consumed tokens:     45711360 | elapsed time per iteration (ms): 2598.2 | learning rate: 9.279E-05 | global batch size:    24 | lm loss: 5.687265E+00 | moe loss: 6.080894E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.237 | tokens per gpu per second (tgs): 18917.625 | TFLOPs: 24.74 |
+ iteration      940/    2000 | consumed samples:        22560 | consumed tokens:     46202880 | elapsed time per iteration (ms): 2683.6 | learning rate: 9.171E-05 | global batch size:    24 | lm loss: 5.751114E+00 | moe loss: 6.068258E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.943 | tokens per gpu per second (tgs): 18315.977 | TFLOPs: 23.95 |
+ iteration      950/    2000 | consumed samples:        22800 | consumed tokens:     46694400 | elapsed time per iteration (ms): 2656.0 | learning rate: 9.064E-05 | global batch size:    24 | lm loss: 5.679565E+00 | moe loss: 6.075925E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.036 | tokens per gpu per second (tgs): 18505.709 | TFLOPs: 24.20 |
+[proposal] scale @iter960: |H| mean=4.119e-04 max=1.075e-02  |δ| mean=1.610e-04 max=1.681e-03  (score=|H|·δ² ≈ 1.067e-11)
+[proposal] hutch-vs-gnb @iter960: bare P=+0.194 J@1%=0.044 J@10%=0.172  score P=+0.217 J@1%=0.057 J@10%=0.226
+[proposal] refresh_hutchinson @iter960 K=4 2873 ms  (188,897,280 expert elements)
+ iteration      960/    2000 | consumed samples:        23040 | consumed tokens:     47185920 | elapsed time per iteration (ms): 2923.7 | learning rate: 8.956E-05 | global batch size:    24 | lm loss: 5.764610E+00 | moe loss: 6.049383E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.209 | tokens per gpu per second (tgs): 16811.464 | TFLOPs: 21.98 |
+ iteration      970/    2000 | consumed samples:        23280 | consumed tokens:     47677440 | elapsed time per iteration (ms): 2773.6 | learning rate: 8.847E-05 | global batch size:    24 | lm loss: 5.650474E+00 | moe loss: 6.091930E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.653 | tokens per gpu per second (tgs): 17721.364 | TFLOPs: 23.17 |
+ iteration      980/    2000 | consumed samples:        23520 | consumed tokens:     48168960 | elapsed time per iteration (ms): 2526.0 | learning rate: 8.739E-05 | global batch size:    24 | lm loss: 5.602506E+00 | moe loss: 6.069223E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.501 | tokens per gpu per second (tgs): 19458.668 | TFLOPs: 25.44 |
+ iteration      990/    2000 | consumed samples:        23760 | consumed tokens:     48660480 | elapsed time per iteration (ms): 2663.5 | learning rate: 8.630E-05 | global batch size:    24 | lm loss: 5.560546E+00 | moe loss: 6.102407E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.011 | tokens per gpu per second (tgs): 18453.905 | TFLOPs: 24.13 |
+[proposal] ScoreDiag @iter 1000: expert max=5.091e-19 p99.9=4.568e-21 | non-expert max=2.025e-16 p99.9=9.148e-21 | overlap: 0.018%
+          [expert diag] δ_max=1.638e-03 v̂_max=2.109e-11 |θ|_mean=7.294e-03 ΔL≈1.318e-14
+[proposal] scale @iter1000: |H| mean=3.457e-04 max=7.141e-03  |δ| mean=1.575e-04 max=1.640e-03  (score=|H|·δ² ≈ 8.575e-12)
+[proposal] hutch-vs-gnb @iter1000: bare P=+0.227 J@1%=0.056 J@10%=0.196  score P=+0.239 J@1%=0.074 J@10%=0.217
+[proposal] refresh_hutchinson @iter1000 K=4 2749 ms  (188,897,280 expert elements)
+[proposal] FAULT@1000: recover_s=1.01 ne_fc=1000 dc_replay=0/[-1, -1] B=0 pre_loss=5.80234432220459
+ iteration     1000/    2000 | consumed samples:        24000 | consumed tokens:     49152000 | elapsed time per iteration (ms): 12612.2 | learning rate: 8.522E-05 | global batch size:    24 | lm loss: 5.681772E+00 | moe loss: 6.079826E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.903 | tokens per gpu per second (tgs): 3897.164 | TFLOPs: 5.10 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1000 | lm loss value: 5.580291E+00 | lm loss PPL: 2.651488E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1010/    2000 | consumed samples:        24240 | consumed tokens:     49643520 | elapsed time per iteration (ms): 15465.7 | learning rate: 8.413E-05 | global batch size:    24 | lm loss: 5.601688E+00 | moe loss: 6.070114E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.552 | tokens per gpu per second (tgs): 3178.126 | TFLOPs: 4.16 |
+ iteration     1020/    2000 | consumed samples:        24480 | consumed tokens:     50135040 | elapsed time per iteration (ms): 2574.2 | learning rate: 8.304E-05 | global batch size:    24 | lm loss: 5.656537E+00 | moe loss: 6.054760E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.323 | tokens per gpu per second (tgs): 19094.066 | TFLOPs: 24.97 |
+ iteration     1030/    2000 | consumed samples:        24720 | consumed tokens:     50626560 | elapsed time per iteration (ms): 2974.1 | learning rate: 8.196E-05 | global batch size:    24 | lm loss: 5.712592E+00 | moe loss: 6.066434E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.070 | tokens per gpu per second (tgs): 16526.747 | TFLOPs: 21.61 |
+[proposal] scale @iter1040: |H| mean=4.129e-04 max=1.126e-02  |δ| mean=1.494e-04 max=1.358e-03  (score=|H|·δ² ≈ 9.212e-12)
+[proposal] hutch-vs-gnb @iter1040: bare P=+0.223 J@1%=0.057 J@10%=0.202  score P=+0.267 J@1%=0.069 J@10%=0.222
+[proposal] refresh_hutchinson @iter1040 K=4 2803 ms  (188,897,280 expert elements)
+ iteration     1040/    2000 | consumed samples:        24960 | consumed tokens:     51118080 | elapsed time per iteration (ms): 3070.8 | learning rate: 8.087E-05 | global batch size:    24 | lm loss: 5.723790E+00 | moe loss: 6.089311E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.815 | tokens per gpu per second (tgs): 16006.001 | TFLOPs: 20.93 |
+ iteration     1050/    2000 | consumed samples:        25200 | consumed tokens:     51609600 | elapsed time per iteration (ms): 2709.5 | learning rate: 7.978E-05 | global batch size:    24 | lm loss: 5.583142E+00 | moe loss: 6.070067E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.858 | tokens per gpu per second (tgs): 18140.285 | TFLOPs: 23.72 |
+ iteration     1060/    2000 | consumed samples:        25440 | consumed tokens:     52101120 | elapsed time per iteration (ms): 2716.6 | learning rate: 7.870E-05 | global batch size:    24 | lm loss: 5.600668E+00 | moe loss: 6.082184E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.835 | tokens per gpu per second (tgs): 18093.311 | TFLOPs: 23.66 |
+ iteration     1070/    2000 | consumed samples:        25680 | consumed tokens:     52592640 | elapsed time per iteration (ms): 2523.8 | learning rate: 7.761E-05 | global batch size:    24 | lm loss: 5.662583E+00 | moe loss: 6.050561E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.510 | tokens per gpu per second (tgs): 19475.725 | TFLOPs: 25.47 |
+[proposal] scale @iter1080: |H| mean=3.634e-04 max=7.620e-03  |δ| mean=1.456e-04 max=1.587e-03  (score=|H|·δ² ≈ 7.706e-12)
+[proposal] hutch-vs-gnb @iter1080: bare P=+0.244 J@1%=0.063 J@10%=0.206  score P=+0.280 J@1%=0.068 J@10%=0.238
+[proposal] refresh_hutchinson @iter1080 K=4 2818 ms  (188,897,280 expert elements)
+ iteration     1080/    2000 | consumed samples:        25920 | consumed tokens:     53084160 | elapsed time per iteration (ms): 3275.8 | learning rate: 7.653E-05 | global batch size:    24 | lm loss: 5.632761E+00 | moe loss: 6.070873E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.326 | tokens per gpu per second (tgs): 15004.370 | TFLOPs: 19.62 |
+ iteration     1090/    2000 | consumed samples:        26160 | consumed tokens:     53575680 | elapsed time per iteration (ms): 2661.4 | learning rate: 7.544E-05 | global batch size:    24 | lm loss: 5.676651E+00 | moe loss: 6.046938E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.018 | tokens per gpu per second (tgs): 18468.339 | TFLOPs: 24.15 |
+[proposal] FAULT@1100: recover_s=0.94 ne_fc=1100 dc_replay=0/[-1, -1] B=0 pre_loss=5.567922592163086
+ iteration     1100/    2000 | consumed samples:        26400 | consumed tokens:     54067200 | elapsed time per iteration (ms): 4040.0 | learning rate: 7.436E-05 | global batch size:    24 | lm loss: 5.578008E+00 | moe loss: 6.090716E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.941 | tokens per gpu per second (tgs): 12166.293 | TFLOPs: 15.91 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1100 | lm loss value: 5.531686E+00 | lm loss PPL: 2.525695E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1110/    2000 | consumed samples:        26640 | consumed tokens:     54558720 | elapsed time per iteration (ms): 15282.0 | learning rate: 7.329E-05 | global batch size:    24 | lm loss: 5.463290E+00 | moe loss: 6.082117E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.570 | tokens per gpu per second (tgs): 3216.337 | TFLOPs: 4.21 |
+[proposal] scale @iter1120: |H| mean=4.484e-04 max=1.264e-02  |δ| mean=1.202e-04 max=8.392e-04  (score=|H|·δ² ≈ 6.477e-12)
+[proposal] hutch-vs-gnb @iter1120: bare P=+0.221 J@1%=0.062 J@10%=0.204  score P=+0.276 J@1%=0.065 J@10%=0.226
+[proposal] refresh_hutchinson @iter1120 K=4 2793 ms  (188,897,280 expert elements)
+ iteration     1120/    2000 | consumed samples:        26880 | consumed tokens:     55050240 | elapsed time per iteration (ms): 3102.2 | learning rate: 7.221E-05 | global batch size:    24 | lm loss: 5.601212E+00 | moe loss: 6.055096E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.737 | tokens per gpu per second (tgs): 15844.438 | TFLOPs: 20.72 |
+ iteration     1130/    2000 | consumed samples:        27120 | consumed tokens:     55541760 | elapsed time per iteration (ms): 2650.4 | learning rate: 7.114E-05 | global batch size:    24 | lm loss: 5.626512E+00 | moe loss: 6.069546E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.055 | tokens per gpu per second (tgs): 18544.841 | TFLOPs: 24.25 |
+ iteration     1140/    2000 | consumed samples:        27360 | consumed tokens:     56033280 | elapsed time per iteration (ms): 2654.0 | learning rate: 7.007E-05 | global batch size:    24 | lm loss: 5.554557E+00 | moe loss: 6.068146E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.043 | tokens per gpu per second (tgs): 18519.709 | TFLOPs: 24.22 |
+ iteration     1150/    2000 | consumed samples:        27600 | consumed tokens:     56524800 | elapsed time per iteration (ms): 2538.2 | learning rate: 6.900E-05 | global batch size:    24 | lm loss: 5.523352E+00 | moe loss: 6.077980E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.456 | tokens per gpu per second (tgs): 19365.094 | TFLOPs: 25.32 |
+[proposal] scale @iter1160: |H| mean=4.541e-04 max=1.395e-02  |δ| mean=1.303e-04 max=1.286e-03  (score=|H|·δ² ≈ 7.706e-12)
+[proposal] hutch-vs-gnb @iter1160: bare P=+0.224 J@1%=0.062 J@10%=0.200  score P=+0.261 J@1%=0.064 J@10%=0.231
+[proposal] refresh_hutchinson @iter1160 K=4 2810 ms  (188,897,280 expert elements)
+ iteration     1160/    2000 | consumed samples:        27840 | consumed tokens:     57016320 | elapsed time per iteration (ms): 3316.3 | learning rate: 6.793E-05 | global batch size:    24 | lm loss: 5.606284E+00 | moe loss: 6.060926E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.237 | tokens per gpu per second (tgs): 14821.360 | TFLOPs: 19.38 |
+ iteration     1170/    2000 | consumed samples:        28080 | consumed tokens:     57507840 | elapsed time per iteration (ms): 2635.3 | learning rate: 6.687E-05 | global batch size:    24 | lm loss: 5.530191E+00 | moe loss: 6.071415E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.107 | tokens per gpu per second (tgs): 18651.509 | TFLOPs: 24.39 |
+ iteration     1180/    2000 | consumed samples:        28320 | consumed tokens:     57999360 | elapsed time per iteration (ms): 2462.8 | learning rate: 6.582E-05 | global batch size:    24 | lm loss: 5.534235E+00 | moe loss: 6.077249E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.745 | tokens per gpu per second (tgs): 19957.792 | TFLOPs: 26.10 |
+ iteration     1190/    2000 | consumed samples:        28560 | consumed tokens:     58490880 | elapsed time per iteration (ms): 2686.9 | learning rate: 6.477E-05 | global batch size:    24 | lm loss: 5.566590E+00 | moe loss: 6.067682E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.932 | tokens per gpu per second (tgs): 18293.253 | TFLOPs: 23.92 |
+[proposal] ScoreDiag @iter 1200: expert max=2.346e-19 p99.9=3.071e-21 | non-expert max=3.086e-16 p99.9=8.675e-21 | overlap: 0.008%
+          [expert diag] δ_max=1.432e-03 v̂_max=2.587e-11 |θ|_mean=7.355e-03 ΔL≈9.493e-15
+[proposal] scale @iter1200: |H| mean=3.627e-04 max=8.583e-03  |δ| mean=1.256e-04 max=1.434e-03  (score=|H|·δ² ≈ 5.719e-12)
+[proposal] hutch-vs-gnb @iter1200: bare P=+0.242 J@1%=0.069 J@10%=0.198  score P=+0.276 J@1%=0.082 J@10%=0.228
+[proposal] refresh_hutchinson @iter1200 K=4 2752 ms  (188,897,280 expert elements)
+[proposal] FAULT@1200: recover_s=1.57 ne_fc=1200 dc_replay=0/[-1, -1] B=0 pre_loss=5.653453826904297
+ iteration     1200/    2000 | consumed samples:        28800 | consumed tokens:     58982400 | elapsed time per iteration (ms): 12517.8 | learning rate: 6.372E-05 | global batch size:    24 | lm loss: 5.578945E+00 | moe loss: 6.057628E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.917 | tokens per gpu per second (tgs): 3926.563 | TFLOPs: 5.13 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1200 | lm loss value: 5.481352E+00 | lm loss PPL: 2.401712E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1210/    2000 | consumed samples:        29040 | consumed tokens:     59473920 | elapsed time per iteration (ms): 15524.5 | learning rate: 6.268E-05 | global batch size:    24 | lm loss: 5.598145E+00 | moe loss: 6.051151E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.546 | tokens per gpu per second (tgs): 3166.100 | TFLOPs: 4.14 |
+ iteration     1220/    2000 | consumed samples:        29280 | consumed tokens:     59965440 | elapsed time per iteration (ms): 2603.6 | learning rate: 6.164E-05 | global batch size:    24 | lm loss: 5.584004E+00 | moe loss: 6.072922E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.218 | tokens per gpu per second (tgs): 18878.561 | TFLOPs: 24.69 |
+ iteration     1230/    2000 | consumed samples:        29520 | consumed tokens:     60456960 | elapsed time per iteration (ms): 2716.5 | learning rate: 6.061E-05 | global batch size:    24 | lm loss: 5.512911E+00 | moe loss: 6.077698E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.835 | tokens per gpu per second (tgs): 18093.649 | TFLOPs: 23.66 |
+[proposal] scale @iter1240: |H| mean=4.478e-04 max=1.208e-02  |δ| mean=1.147e-04 max=1.038e-03  (score=|H|·δ² ≈ 5.892e-12)
+[proposal] hutch-vs-gnb @iter1240: bare P=+0.232 J@1%=0.063 J@10%=0.197  score P=+0.269 J@1%=0.070 J@10%=0.215
+[proposal] refresh_hutchinson @iter1240 K=4 2795 ms  (188,897,280 expert elements)
+ iteration     1240/    2000 | consumed samples:        29760 | consumed tokens:     60948480 | elapsed time per iteration (ms): 2957.6 | learning rate: 5.958E-05 | global batch size:    24 | lm loss: 5.564881E+00 | moe loss: 6.073245E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.115 | tokens per gpu per second (tgs): 16618.893 | TFLOPs: 21.73 |
+ iteration     1250/    2000 | consumed samples:        30000 | consumed tokens:     61440000 | elapsed time per iteration (ms): 2591.7 | learning rate: 5.856E-05 | global batch size:    24 | lm loss: 5.551343E+00 | moe loss: 6.068901E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.260 | tokens per gpu per second (tgs): 18965.232 | TFLOPs: 24.80 |
+ iteration     1260/    2000 | consumed samples:        30240 | consumed tokens:     61931520 | elapsed time per iteration (ms): 2810.5 | learning rate: 5.755E-05 | global batch size:    24 | lm loss: 5.558451E+00 | moe loss: 6.055487E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.539 | tokens per gpu per second (tgs): 17488.581 | TFLOPs: 22.87 |
+ iteration     1270/    2000 | consumed samples:        30480 | consumed tokens:     62423040 | elapsed time per iteration (ms): 2602.7 | learning rate: 5.654E-05 | global batch size:    24 | lm loss: 5.592078E+00 | moe loss: 6.056255E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.221 | tokens per gpu per second (tgs): 18885.147 | TFLOPs: 24.69 |
+[proposal] scale @iter1280: |H| mean=5.423e-04 max=1.741e-02  |δ| mean=1.101e-04 max=1.175e-03  (score=|H|·δ² ≈ 6.573e-12)
+[proposal] hutch-vs-gnb @iter1280: bare P=+0.214 J@1%=0.055 J@10%=0.186  score P=+0.230 J@1%=0.057 J@10%=0.217
+[proposal] refresh_hutchinson @iter1280 K=4 2801 ms  (188,897,280 expert elements)
+ iteration     1280/    2000 | consumed samples:        30720 | consumed tokens:     62914560 | elapsed time per iteration (ms): 2921.0 | learning rate: 5.554E-05 | global batch size:    24 | lm loss: 5.490802E+00 | moe loss: 6.076256E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.216 | tokens per gpu per second (tgs): 16826.846 | TFLOPs: 22.00 |
+ iteration     1290/    2000 | consumed samples:        30960 | consumed tokens:     63406080 | elapsed time per iteration (ms): 2813.4 | learning rate: 5.455E-05 | global batch size:    24 | lm loss: 5.414027E+00 | moe loss: 6.089187E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.530 | tokens per gpu per second (tgs): 17470.454 | TFLOPs: 22.85 |
+[proposal] FAULT@1300: recover_s=0.97 ne_fc=1300 dc_replay=0/[-1, -1] B=0 pre_loss=5.4016876220703125
+ iteration     1300/    2000 | consumed samples:        31200 | consumed tokens:     63897600 | elapsed time per iteration (ms): 4581.3 | learning rate: 5.356E-05 | global batch size:    24 | lm loss: 5.450453E+00 | moe loss: 6.070489E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.239 | tokens per gpu per second (tgs): 10728.720 | TFLOPs: 14.03 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1300 | lm loss value: 5.445883E+00 | lm loss PPL: 2.318018E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1310/    2000 | consumed samples:        31440 | consumed tokens:     64389120 | elapsed time per iteration (ms): 15475.4 | learning rate: 5.258E-05 | global batch size:    24 | lm loss: 5.486520E+00 | moe loss: 6.063774E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.551 | tokens per gpu per second (tgs): 3176.146 | TFLOPs: 4.15 |
+[proposal] scale @iter1320: |H| mean=4.942e-04 max=1.364e-02  |δ| mean=8.986e-05 max=6.104e-04  (score=|H|·δ² ≈ 3.990e-12)
+[proposal] hutch-vs-gnb @iter1320: bare P=+0.214 J@1%=0.065 J@10%=0.185  score P=+0.266 J@1%=0.062 J@10%=0.204
+[proposal] refresh_hutchinson @iter1320 K=4 2989 ms  (188,897,280 expert elements)
+ iteration     1320/    2000 | consumed samples:        31680 | consumed tokens:     64880640 | elapsed time per iteration (ms): 3177.1 | learning rate: 5.161E-05 | global batch size:    24 | lm loss: 5.429632E+00 | moe loss: 6.111258E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.554 | tokens per gpu per second (tgs): 15470.726 | TFLOPs: 20.23 |
+ iteration     1330/    2000 | consumed samples:        31920 | consumed tokens:     65372160 | elapsed time per iteration (ms): 2572.3 | learning rate: 5.065E-05 | global batch size:    24 | lm loss: 5.452564E+00 | moe loss: 6.088446E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.330 | tokens per gpu per second (tgs): 19107.870 | TFLOPs: 24.99 |
+ iteration     1340/    2000 | consumed samples:        32160 | consumed tokens:     65863680 | elapsed time per iteration (ms): 2659.3 | learning rate: 4.970E-05 | global batch size:    24 | lm loss: 5.485049E+00 | moe loss: 6.084669E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.025 | tokens per gpu per second (tgs): 18483.316 | TFLOPs: 24.17 |
+ iteration     1350/    2000 | consumed samples:        32400 | consumed tokens:     66355200 | elapsed time per iteration (ms): 2531.1 | learning rate: 4.875E-05 | global batch size:    24 | lm loss: 5.480450E+00 | moe loss: 6.089598E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.482 | tokens per gpu per second (tgs): 19419.355 | TFLOPs: 25.39 |
+[proposal] scale @iter1360: |H| mean=4.834e-04 max=2.498e-02  |δ| mean=9.652e-05 max=9.232e-04  (score=|H|·δ² ≈ 4.504e-12)
+[proposal] hutch-vs-gnb @iter1360: bare P=+0.231 J@1%=0.055 J@10%=0.212  score P=+0.296 J@1%=0.083 J@10%=0.227
+[proposal] refresh_hutchinson @iter1360 K=4 2795 ms  (188,897,280 expert elements)
+ iteration     1360/    2000 | consumed samples:        32640 | consumed tokens:     66846720 | elapsed time per iteration (ms): 2901.2 | learning rate: 4.781E-05 | global batch size:    24 | lm loss: 5.447484E+00 | moe loss: 6.071340E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.273 | tokens per gpu per second (tgs): 16942.167 | TFLOPs: 22.15 |
+ iteration     1370/    2000 | consumed samples:        32880 | consumed tokens:     67338240 | elapsed time per iteration (ms): 2833.5 | learning rate: 4.688E-05 | global batch size:    24 | lm loss: 5.514432E+00 | moe loss: 6.059360E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.470 | tokens per gpu per second (tgs): 17346.530 | TFLOPs: 22.68 |
+ iteration     1380/    2000 | consumed samples:        33120 | consumed tokens:     67829760 | elapsed time per iteration (ms): 2637.6 | learning rate: 4.597E-05 | global batch size:    24 | lm loss: 5.419480E+00 | moe loss: 6.079768E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.099 | tokens per gpu per second (tgs): 18635.346 | TFLOPs: 24.37 |
+ iteration     1390/    2000 | consumed samples:        33360 | consumed tokens:     68321280 | elapsed time per iteration (ms): 2513.1 | learning rate: 4.506E-05 | global batch size:    24 | lm loss: 5.501080E+00 | moe loss: 6.056259E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.550 | tokens per gpu per second (tgs): 19558.463 | TFLOPs: 25.58 |
+[proposal] ScoreDiag @iter 1400: expert max=3.361e-19 p99.9=1.978e-21 | non-expert max=2.809e-16 p99.9=8.488e-21 | overlap: 0.004%
+          [expert diag] δ_max=1.052e-03 v̂_max=3.875e-11 |θ|_mean=7.392e-03 ΔL≈6.135e-15
+[proposal] scale @iter1400: |H| mean=4.557e-04 max=1.218e-02  |δ| mean=9.201e-05 max=1.053e-03  (score=|H|·δ² ≈ 3.858e-12)
+[proposal] hutch-vs-gnb @iter1400: bare P=+0.236 J@1%=0.067 J@10%=0.211  score P=+0.259 J@1%=0.070 J@10%=0.216
+[proposal] refresh_hutchinson @iter1400 K=4 2774 ms  (188,897,280 expert elements)
+[proposal] FAULT@1400: recover_s=1.12 ne_fc=1400 dc_replay=0/[-1, -1] B=0 pre_loss=5.489091396331787
+ iteration     1400/    2000 | consumed samples:        33600 | consumed tokens:     68812800 | elapsed time per iteration (ms): 12129.0 | learning rate: 4.416E-05 | global batch size:    24 | lm loss: 5.572140E+00 | moe loss: 6.056245E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.979 | tokens per gpu per second (tgs): 4052.443 | TFLOPs: 5.30 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1400 | lm loss value: 5.369844E+00 | lm loss PPL: 2.148294E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1410/    2000 | consumed samples:        33840 | consumed tokens:     69304320 | elapsed time per iteration (ms): 15455.0 | learning rate: 4.327E-05 | global batch size:    24 | lm loss: 5.392251E+00 | moe loss: 6.085694E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.553 | tokens per gpu per second (tgs): 3180.340 | TFLOPs: 4.16 |
+ iteration     1420/    2000 | consumed samples:        34080 | consumed tokens:     69795840 | elapsed time per iteration (ms): 2556.2 | learning rate: 4.239E-05 | global batch size:    24 | lm loss: 5.494703E+00 | moe loss: 6.066052E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.389 | tokens per gpu per second (tgs): 19228.548 | TFLOPs: 25.14 |
+ iteration     1430/    2000 | consumed samples:        34320 | consumed tokens:     70287360 | elapsed time per iteration (ms): 2771.8 | learning rate: 4.152E-05 | global batch size:    24 | lm loss: 5.440030E+00 | moe loss: 6.094295E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.659 | tokens per gpu per second (tgs): 17733.145 | TFLOPs: 23.19 |
+[proposal] scale @iter1440: |H| mean=5.046e-04 max=1.013e-02  |δ| mean=8.261e-05 max=7.439e-04  (score=|H|·δ² ≈ 3.444e-12)
+[proposal] hutch-vs-gnb @iter1440: bare P=+0.239 J@1%=0.073 J@10%=0.198  score P=+0.282 J@1%=0.073 J@10%=0.223
+[proposal] refresh_hutchinson @iter1440 K=4 2812 ms  (188,897,280 expert elements)
+ iteration     1440/    2000 | consumed samples:        34560 | consumed tokens:     70778880 | elapsed time per iteration (ms): 3023.5 | learning rate: 4.066E-05 | global batch size:    24 | lm loss: 5.421044E+00 | moe loss: 6.067933E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.938 | tokens per gpu per second (tgs): 16256.812 | TFLOPs: 21.26 |
+ iteration     1450/    2000 | consumed samples:        34800 | consumed tokens:     71270400 | elapsed time per iteration (ms): 2703.0 | learning rate: 3.981E-05 | global batch size:    24 | lm loss: 5.442079E+00 | moe loss: 6.087657E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.879 | tokens per gpu per second (tgs): 18184.349 | TFLOPs: 23.78 |
+ iteration     1460/    2000 | consumed samples:        35040 | consumed tokens:     71761920 | elapsed time per iteration (ms): 2895.6 | learning rate: 3.897E-05 | global batch size:    24 | lm loss: 5.507981E+00 | moe loss: 6.055704E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.288 | tokens per gpu per second (tgs): 16974.581 | TFLOPs: 22.20 |
+ iteration     1470/    2000 | consumed samples:        35280 | consumed tokens:     72253440 | elapsed time per iteration (ms): 2661.8 | learning rate: 3.815E-05 | global batch size:    24 | lm loss: 5.494619E+00 | moe loss: 6.073238E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.016 | tokens per gpu per second (tgs): 18465.666 | TFLOPs: 24.15 |
+[proposal] scale @iter1480: |H| mean=4.577e-04 max=1.019e-02  |δ| mean=7.924e-05 max=9.537e-04  (score=|H|·δ² ≈ 2.874e-12)
+[proposal] hutch-vs-gnb @iter1480: bare P=+0.226 J@1%=0.067 J@10%=0.221  score P=+0.271 J@1%=0.080 J@10%=0.229
+[proposal] refresh_hutchinson @iter1480 K=4 2819 ms  (188,897,280 expert elements)
+ iteration     1480/    2000 | consumed samples:        35520 | consumed tokens:     72744960 | elapsed time per iteration (ms): 3122.0 | learning rate: 3.733E-05 | global batch size:    24 | lm loss: 5.504428E+00 | moe loss: 6.078556E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.687 | tokens per gpu per second (tgs): 15743.798 | TFLOPs: 20.59 |
+ iteration     1490/    2000 | consumed samples:        35760 | consumed tokens:     73236480 | elapsed time per iteration (ms): 2724.0 | learning rate: 3.653E-05 | global batch size:    24 | lm loss: 5.469128E+00 | moe loss: 6.084830E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.811 | tokens per gpu per second (tgs): 18044.204 | TFLOPs: 23.60 |
+[proposal] FAULT@1500: recover_s=1.13 ne_fc=1500 dc_replay=0/[-1, -1] B=0 pre_loss=5.5012431144714355
+ iteration     1500/    2000 | consumed samples:        36000 | consumed tokens:     73728000 | elapsed time per iteration (ms): 4016.5 | learning rate: 3.574E-05 | global batch size:    24 | lm loss: 5.479850E+00 | moe loss: 6.074881E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.975 | tokens per gpu per second (tgs): 12237.448 | TFLOPs: 16.00 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1500 | lm loss value: 5.363042E+00 | lm loss PPL: 2.133731E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1510/    2000 | consumed samples:        36240 | consumed tokens:     74219520 | elapsed time per iteration (ms): 15429.0 | learning rate: 3.496E-05 | global batch size:    24 | lm loss: 5.410086E+00 | moe loss: 6.069713E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.556 | tokens per gpu per second (tgs): 3185.687 | TFLOPs: 4.17 |
+[proposal] scale @iter1520: |H| mean=4.957e-04 max=1.518e-02  |δ| mean=6.325e-05 max=4.883e-04  (score=|H|·δ² ≈ 1.983e-12)
+[proposal] hutch-vs-gnb @iter1520: bare P=+0.249 J@1%=0.077 J@10%=0.230  score P=+0.300 J@1%=0.066 J@10%=0.242
+[proposal] refresh_hutchinson @iter1520 K=4 2826 ms  (188,897,280 expert elements)
+ iteration     1520/    2000 | consumed samples:        36480 | consumed tokens:     74711040 | elapsed time per iteration (ms): 3046.3 | learning rate: 3.420E-05 | global batch size:    24 | lm loss: 5.433078E+00 | moe loss: 6.084970E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.878 | tokens per gpu per second (tgs): 16134.912 | TFLOPs: 21.10 |
+ iteration     1530/    2000 | consumed samples:        36720 | consumed tokens:     75202560 | elapsed time per iteration (ms): 2783.5 | learning rate: 3.344E-05 | global batch size:    24 | lm loss: 5.458562E+00 | moe loss: 6.072859E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.622 | tokens per gpu per second (tgs): 17658.466 | TFLOPs: 23.09 |
+ iteration     1540/    2000 | consumed samples:        36960 | consumed tokens:     75694080 | elapsed time per iteration (ms): 2777.7 | learning rate: 3.270E-05 | global batch size:    24 | lm loss: 5.413326E+00 | moe loss: 6.086136E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.640 | tokens per gpu per second (tgs): 17695.465 | TFLOPs: 23.14 |
+ iteration     1550/    2000 | consumed samples:        37200 | consumed tokens:     76185600 | elapsed time per iteration (ms): 2664.9 | learning rate: 3.198E-05 | global batch size:    24 | lm loss: 5.407443E+00 | moe loss: 6.065739E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.006 | tokens per gpu per second (tgs): 18444.364 | TFLOPs: 24.12 |
+[proposal] scale @iter1560: |H| mean=5.097e-04 max=9.808e-03  |δ| mean=6.765e-05 max=6.714e-04  (score=|H|·δ² ≈ 2.333e-12)
+[proposal] hutch-vs-gnb @iter1560: bare P=+0.226 J@1%=0.065 J@10%=0.194  score P=+0.272 J@1%=0.058 J@10%=0.219
+[proposal] refresh_hutchinson @iter1560 K=4 2809 ms  (188,897,280 expert elements)
+ iteration     1560/    2000 | consumed samples:        37440 | consumed tokens:     76677120 | elapsed time per iteration (ms): 2955.2 | learning rate: 3.126E-05 | global batch size:    24 | lm loss: 5.393964E+00 | moe loss: 6.068754E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.121 | tokens per gpu per second (tgs): 16632.181 | TFLOPs: 21.75 |
+ iteration     1570/    2000 | consumed samples:        37680 | consumed tokens:     77168640 | elapsed time per iteration (ms): 2678.1 | learning rate: 3.056E-05 | global batch size:    24 | lm loss: 5.386703E+00 | moe loss: 6.088144E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.961 | tokens per gpu per second (tgs): 18353.080 | TFLOPs: 24.00 |
+ iteration     1580/    2000 | consumed samples:        37920 | consumed tokens:     77660160 | elapsed time per iteration (ms): 2808.8 | learning rate: 2.987E-05 | global batch size:    24 | lm loss: 5.456127E+00 | moe loss: 6.063846E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.544 | tokens per gpu per second (tgs): 17499.039 | TFLOPs: 22.88 |
+ iteration     1590/    2000 | consumed samples:        38160 | consumed tokens:     78151680 | elapsed time per iteration (ms): 2686.7 | learning rate: 2.920E-05 | global batch size:    24 | lm loss: 5.330258E+00 | moe loss: 6.072033E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.933 | tokens per gpu per second (tgs): 18294.570 | TFLOPs: 23.92 |
+[proposal] ScoreDiag @iter 1600: expert max=2.053e-19 p99.9=1.304e-21 | non-expert max=3.528e-16 p99.9=9.351e-21 | overlap: 0.001%
+          [expert diag] δ_max=7.310e-04 v̂_max=5.320e-11 |θ|_mean=7.410e-03 ΔL≈3.735e-15
+[proposal] scale @iter1600: |H| mean=4.966e-04 max=1.522e-02  |δ| mean=6.395e-05 max=7.324e-04  (score=|H|·δ² ≈ 2.031e-12)
+[proposal] hutch-vs-gnb @iter1600: bare P=+0.238 J@1%=0.067 J@10%=0.220  score P=+0.275 J@1%=0.065 J@10%=0.223
+[proposal] refresh_hutchinson @iter1600 K=4 2769 ms  (188,897,280 expert elements)
+[proposal] FAULT@1600: recover_s=1.74 ne_fc=1600 dc_replay=0/[-1, -1] B=0 pre_loss=5.39626407623291
+ iteration     1600/    2000 | consumed samples:        38400 | consumed tokens:     78643200 | elapsed time per iteration (ms): 12507.7 | learning rate: 2.854E-05 | global batch size:    24 | lm loss: 5.387003E+00 | moe loss: 6.058815E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.919 | tokens per gpu per second (tgs): 3929.729 | TFLOPs: 5.14 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1600 | lm loss value: 5.333591E+00 | lm loss PPL: 2.071807E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1610/    2000 | consumed samples:        38640 | consumed tokens:     79134720 | elapsed time per iteration (ms): 15472.4 | learning rate: 2.789E-05 | global batch size:    24 | lm loss: 5.444830E+00 | moe loss: 6.066284E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.551 | tokens per gpu per second (tgs): 3176.757 | TFLOPs: 4.15 |
+ iteration     1620/    2000 | consumed samples:        38880 | consumed tokens:     79626240 | elapsed time per iteration (ms): 2849.3 | learning rate: 2.726E-05 | global batch size:    24 | lm loss: 5.338129E+00 | moe loss: 6.091648E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.423 | tokens per gpu per second (tgs): 17250.533 | TFLOPs: 22.56 |
+ iteration     1630/    2000 | consumed samples:        39120 | consumed tokens:     80117760 | elapsed time per iteration (ms): 2732.5 | learning rate: 2.664E-05 | global batch size:    24 | lm loss: 5.375037E+00 | moe loss: 6.083730E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.783 | tokens per gpu per second (tgs): 17987.817 | TFLOPs: 23.52 |
+[proposal] scale @iter1640: |H| mean=6.517e-04 max=1.632e-02  |δ| mean=5.734e-05 max=5.035e-04  (score=|H|·δ² ≈ 2.143e-12)
+[proposal] hutch-vs-gnb @iter1640: bare P=+0.223 J@1%=0.060 J@10%=0.186  score P=+0.282 J@1%=0.072 J@10%=0.214
+[proposal] refresh_hutchinson @iter1640 K=4 2795 ms  (188,897,280 expert elements)
+ iteration     1640/    2000 | consumed samples:        39360 | consumed tokens:     80609280 | elapsed time per iteration (ms): 3300.2 | learning rate: 2.604E-05 | global batch size:    24 | lm loss: 5.447124E+00 | moe loss: 6.063542E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.272 | tokens per gpu per second (tgs): 14893.501 | TFLOPs: 19.48 |
+ iteration     1650/    2000 | consumed samples:        39600 | consumed tokens:     81100800 | elapsed time per iteration (ms): 3072.6 | learning rate: 2.545E-05 | global batch size:    24 | lm loss: 5.441256E+00 | moe loss: 6.063982E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.811 | tokens per gpu per second (tgs): 15996.755 | TFLOPs: 20.92 |
+ iteration     1660/    2000 | consumed samples:        39840 | consumed tokens:     81592320 | elapsed time per iteration (ms): 2502.1 | learning rate: 2.488E-05 | global batch size:    24 | lm loss: 5.273988E+00 | moe loss: 6.084991E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.592 | tokens per gpu per second (tgs): 19644.041 | TFLOPs: 25.69 |
+ iteration     1670/    2000 | consumed samples:        40080 | consumed tokens:     82083840 | elapsed time per iteration (ms): 2651.2 | learning rate: 2.432E-05 | global batch size:    24 | lm loss: 5.385086E+00 | moe loss: 6.076299E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.053 | tokens per gpu per second (tgs): 18539.698 | TFLOPs: 24.24 |
+[proposal] scale @iter1680: |H| mean=5.659e-04 max=1.254e-02  |δ| mean=5.572e-05 max=5.341e-04  (score=|H|·δ² ≈ 1.757e-12)
+[proposal] hutch-vs-gnb @iter1680: bare P=+0.234 J@1%=0.061 J@10%=0.198  score P=+0.288 J@1%=0.069 J@10%=0.223
+[proposal] refresh_hutchinson @iter1680 K=4 2827 ms  (188,897,280 expert elements)
+ iteration     1680/    2000 | consumed samples:        40320 | consumed tokens:     82575360 | elapsed time per iteration (ms): 3333.4 | learning rate: 2.377E-05 | global batch size:    24 | lm loss: 5.321157E+00 | moe loss: 6.082988E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.200 | tokens per gpu per second (tgs): 14745.433 | TFLOPs: 19.28 |
+ iteration     1690/    2000 | consumed samples:        40560 | consumed tokens:     83066880 | elapsed time per iteration (ms): 2611.3 | learning rate: 2.324E-05 | global batch size:    24 | lm loss: 5.337041E+00 | moe loss: 6.087626E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.191 | tokens per gpu per second (tgs): 18822.888 | TFLOPs: 24.61 |
+[proposal] FAULT@1700: recover_s=0.99 ne_fc=1700 dc_replay=0/[-1, -1] B=0 pre_loss=5.415872097015381
+ iteration     1700/    2000 | consumed samples:        40800 | consumed tokens:     83558400 | elapsed time per iteration (ms): 4430.2 | learning rate: 2.273E-05 | global batch size:    24 | lm loss: 5.330891E+00 | moe loss: 6.074757E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.417 | tokens per gpu per second (tgs): 11094.676 | TFLOPs: 14.51 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1700 | lm loss value: 5.304120E+00 | lm loss PPL: 2.011639E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1710/    2000 | consumed samples:        41040 | consumed tokens:     84049920 | elapsed time per iteration (ms): 15404.1 | learning rate: 2.223E-05 | global batch size:    24 | lm loss: 5.371375E+00 | moe loss: 6.079203E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.558 | tokens per gpu per second (tgs): 3190.847 | TFLOPs: 4.17 |
+[proposal] scale @iter1720: |H| mean=5.650e-04 max=1.139e-02  |δ| mean=4.265e-05 max=3.052e-04  (score=|H|·δ² ≈ 1.028e-12)
+[proposal] hutch-vs-gnb @iter1720: bare P=+0.210 J@1%=0.069 J@10%=0.209  score P=+0.269 J@1%=0.063 J@10%=0.230
+[proposal] refresh_hutchinson @iter1720 K=4 2799 ms  (188,897,280 expert elements)
+ iteration     1720/    2000 | consumed samples:        41280 | consumed tokens:     84541440 | elapsed time per iteration (ms): 3093.3 | learning rate: 2.175E-05 | global batch size:    24 | lm loss: 5.391915E+00 | moe loss: 6.072969E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.759 | tokens per gpu per second (tgs): 15889.672 | TFLOPs: 20.78 |
+ iteration     1730/    2000 | consumed samples:        41520 | consumed tokens:     85032960 | elapsed time per iteration (ms): 2737.5 | learning rate: 2.129E-05 | global batch size:    24 | lm loss: 5.348327E+00 | moe loss: 6.066364E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.767 | tokens per gpu per second (tgs): 17955.007 | TFLOPs: 23.48 |
+ iteration     1740/    2000 | consumed samples:        41760 | consumed tokens:     85524480 | elapsed time per iteration (ms): 2630.4 | learning rate: 2.084E-05 | global batch size:    24 | lm loss: 5.437953E+00 | moe loss: 6.090108E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.124 | tokens per gpu per second (tgs): 18686.177 | TFLOPs: 24.43 |
+ iteration     1750/    2000 | consumed samples:        42000 | consumed tokens:     86016000 | elapsed time per iteration (ms): 2650.4 | learning rate: 2.040E-05 | global batch size:    24 | lm loss: 5.382085E+00 | moe loss: 6.056703E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.055 | tokens per gpu per second (tgs): 18545.070 | TFLOPs: 24.25 |
+[proposal] scale @iter1760: |H| mean=6.163e-04 max=1.500e-02  |δ| mean=4.699e-05 max=5.493e-04  (score=|H|·δ² ≈ 1.361e-12)
+[proposal] hutch-vs-gnb @iter1760: bare P=+0.239 J@1%=0.065 J@10%=0.214  score P=+0.285 J@1%=0.073 J@10%=0.220
+[proposal] refresh_hutchinson @iter1760 K=4 2809 ms  (188,897,280 expert elements)
+ iteration     1760/    2000 | consumed samples:        42240 | consumed tokens:     86507520 | elapsed time per iteration (ms): 3005.6 | learning rate: 1.998E-05 | global batch size:    24 | lm loss: 5.350431E+00 | moe loss: 6.089959E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.985 | tokens per gpu per second (tgs): 16353.696 | TFLOPs: 21.38 |
+ iteration     1770/    2000 | consumed samples:        42480 | consumed tokens:     86999040 | elapsed time per iteration (ms): 2814.2 | learning rate: 1.958E-05 | global batch size:    24 | lm loss: 5.386398E+00 | moe loss: 6.084022E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.528 | tokens per gpu per second (tgs): 17465.859 | TFLOPs: 22.84 |
+ iteration     1780/    2000 | consumed samples:        42720 | consumed tokens:     87490560 | elapsed time per iteration (ms): 2552.9 | learning rate: 1.920E-05 | global batch size:    24 | lm loss: 5.393209E+00 | moe loss: 6.056314E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.401 | tokens per gpu per second (tgs): 19253.388 | TFLOPs: 25.18 |
+ iteration     1790/    2000 | consumed samples:        42960 | consumed tokens:     87982080 | elapsed time per iteration (ms): 2551.8 | learning rate: 1.883E-05 | global batch size:    24 | lm loss: 5.390699E+00 | moe loss: 6.080980E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.405 | tokens per gpu per second (tgs): 19262.072 | TFLOPs: 25.19 |
+[proposal] ScoreDiag @iter 1800: expert max=5.866e-20 p99.9=6.805e-22 | non-expert max=2.109e-16 p99.9=7.746e-21 | overlap: 0.000%
+          [expert diag] δ_max=4.516e-04 v̂_max=5.618e-11 |θ|_mean=7.420e-03 ΔL≈2.123e-15
+[proposal] scale @iter1800: |H| mean=6.344e-04 max=1.369e-02  |δ| mean=4.605e-05 max=4.883e-04  (score=|H|·δ² ≈ 1.345e-12)
+[proposal] hutch-vs-gnb @iter1800: bare P=+0.220 J@1%=0.058 J@10%=0.208  score P=+0.260 J@1%=0.066 J@10%=0.215
+[proposal] refresh_hutchinson @iter1800 K=4 2755 ms  (188,897,280 expert elements)
+[proposal] FAULT@1800: recover_s=1.58 ne_fc=1800 dc_replay=0/[-1, -1] B=0 pre_loss=5.194160461425781
+ iteration     1800/    2000 | consumed samples:        43200 | consumed tokens:     88473600 | elapsed time per iteration (ms): 12596.2 | learning rate: 1.847E-05 | global batch size:    24 | lm loss: 5.368008E+00 | moe loss: 6.085351E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.905 | tokens per gpu per second (tgs): 3902.139 | TFLOPs: 5.10 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1800 | lm loss value: 5.308536E+00 | lm loss PPL: 2.020541E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1810/    2000 | consumed samples:        43440 | consumed tokens:     88965120 | elapsed time per iteration (ms): 15435.8 | learning rate: 1.814E-05 | global batch size:    24 | lm loss: 5.277896E+00 | moe loss: 6.077051E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.555 | tokens per gpu per second (tgs): 3184.286 | TFLOPs: 4.16 |
+ iteration     1820/    2000 | consumed samples:        43680 | consumed tokens:     89456640 | elapsed time per iteration (ms): 2652.6 | learning rate: 1.782E-05 | global batch size:    24 | lm loss: 5.331001E+00 | moe loss: 6.063401E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.048 | tokens per gpu per second (tgs): 18530.073 | TFLOPs: 24.23 |
+ iteration     1830/    2000 | consumed samples:        43920 | consumed tokens:     89948160 | elapsed time per iteration (ms): 2571.5 | learning rate: 1.752E-05 | global batch size:    24 | lm loss: 5.382895E+00 | moe loss: 6.062169E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.333 | tokens per gpu per second (tgs): 19114.168 | TFLOPs: 24.99 |
+[proposal] scale @iter1840: |H| mean=5.969e-04 max=1.698e-02  |δ| mean=4.089e-05 max=4.883e-04  (score=|H|·δ² ≈ 9.980e-13)
+[proposal] hutch-vs-gnb @iter1840: bare P=+0.209 J@1%=0.064 J@10%=0.212  score P=+0.284 J@1%=0.067 J@10%=0.230
+[proposal] refresh_hutchinson @iter1840 K=4 2799 ms  (188,897,280 expert elements)
+ iteration     1840/    2000 | consumed samples:        44160 | consumed tokens:     90439680 | elapsed time per iteration (ms): 3206.8 | learning rate: 1.723E-05 | global batch size:    24 | lm loss: 5.331089E+00 | moe loss: 6.088538E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.484 | tokens per gpu per second (tgs): 15327.660 | TFLOPs: 20.04 |
+ iteration     1850/    2000 | consumed samples:        44400 | consumed tokens:     90931200 | elapsed time per iteration (ms): 2631.7 | learning rate: 1.696E-05 | global batch size:    24 | lm loss: 5.332550E+00 | moe loss: 6.065141E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.119 | tokens per gpu per second (tgs): 18676.667 | TFLOPs: 24.42 |
+ iteration     1860/    2000 | consumed samples:        44640 | consumed tokens:     91422720 | elapsed time per iteration (ms): 2587.7 | learning rate: 1.671E-05 | global batch size:    24 | lm loss: 5.409562E+00 | moe loss: 6.065939E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.275 | tokens per gpu per second (tgs): 18994.414 | TFLOPs: 24.84 |
+ iteration     1870/    2000 | consumed samples:        44880 | consumed tokens:     91914240 | elapsed time per iteration (ms): 2874.7 | learning rate: 1.648E-05 | global batch size:    24 | lm loss: 5.293629E+00 | moe loss: 6.049957E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.349 | tokens per gpu per second (tgs): 17098.171 | TFLOPs: 22.36 |
+[proposal] scale @iter1880: |H| mean=5.806e-04 max=1.205e-02  |δ| mean=4.192e-05 max=3.967e-04  (score=|H|·δ² ≈ 1.020e-12)
+[proposal] hutch-vs-gnb @iter1880: bare P=+0.241 J@1%=0.067 J@10%=0.207  score P=+0.277 J@1%=0.067 J@10%=0.221
+[proposal] refresh_hutchinson @iter1880 K=4 2801 ms  (188,897,280 expert elements)
+ iteration     1880/    2000 | consumed samples:        45120 | consumed tokens:     92405760 | elapsed time per iteration (ms): 2909.0 | learning rate: 1.626E-05 | global batch size:    24 | lm loss: 5.414007E+00 | moe loss: 6.086088E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.250 | tokens per gpu per second (tgs): 16896.644 | TFLOPs: 22.09 |
+ iteration     1890/    2000 | consumed samples:        45360 | consumed tokens:     92897280 | elapsed time per iteration (ms): 2807.7 | learning rate: 1.606E-05 | global batch size:    24 | lm loss: 5.419521E+00 | moe loss: 6.085384E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.548 | tokens per gpu per second (tgs): 17505.895 | TFLOPs: 22.89 |
+[proposal] FAULT@1900: recover_s=0.97 ne_fc=1900 dc_replay=0/[-1, -1] B=0 pre_loss=5.514251708984375
+ iteration     1900/    2000 | consumed samples:        45600 | consumed tokens:     93388800 | elapsed time per iteration (ms): 4409.2 | learning rate: 1.587E-05 | global batch size:    24 | lm loss: 5.399799E+00 | moe loss: 6.065705E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 5.443 | tokens per gpu per second (tgs): 11147.515 | TFLOPs: 14.58 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 1900 | lm loss value: 5.281075E+00 | lm loss PPL: 1.965812E+02 | 
+------------------------------------------------------------------------------------------------
+ iteration     1910/    2000 | consumed samples:        45840 | consumed tokens:     93880320 | elapsed time per iteration (ms): 15308.7 | learning rate: 1.571E-05 | global batch size:    24 | lm loss: 5.180890E+00 | moe loss: 6.090059E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.568 | tokens per gpu per second (tgs): 3210.726 | TFLOPs: 4.20 |
+[proposal] scale @iter1920: |H| mean=6.001e-04 max=1.659e-02  |δ| mean=3.210e-05 max=2.441e-04  (score=|H|·δ² ≈ 6.184e-13)
+[proposal] hutch-vs-gnb @iter1920: bare P=+0.201 J@1%=0.076 J@10%=0.218  score P=+0.277 J@1%=0.070 J@10%=0.250
+[proposal] refresh_hutchinson @iter1920 K=4 2852 ms  (188,897,280 expert elements)
+ iteration     1920/    2000 | consumed samples:        46080 | consumed tokens:     94371840 | elapsed time per iteration (ms): 3271.3 | learning rate: 1.556E-05 | global batch size:    24 | lm loss: 5.385669E+00 | moe loss: 6.077500E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.336 | tokens per gpu per second (tgs): 15025.012 | TFLOPs: 19.65 |
+ iteration     1930/    2000 | consumed samples:        46320 | consumed tokens:     94863360 | elapsed time per iteration (ms): 2605.3 | learning rate: 1.543E-05 | global batch size:    24 | lm loss: 5.385040E+00 | moe loss: 6.067785E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.212 | tokens per gpu per second (tgs): 18866.417 | TFLOPs: 24.67 |
+ iteration     1940/    2000 | consumed samples:        46560 | consumed tokens:     95354880 | elapsed time per iteration (ms): 2630.3 | learning rate: 1.532E-05 | global batch size:    24 | lm loss: 5.322665E+00 | moe loss: 6.051009E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.124 | tokens per gpu per second (tgs): 18686.847 | TFLOPs: 24.44 |
+ iteration     1950/    2000 | consumed samples:        46800 | consumed tokens:     95846400 | elapsed time per iteration (ms): 2539.7 | learning rate: 1.522E-05 | global batch size:    24 | lm loss: 5.328344E+00 | moe loss: 6.089892E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.450 | tokens per gpu per second (tgs): 19353.808 | TFLOPs: 25.31 |
+[proposal] scale @iter1960: |H| mean=6.436e-04 max=1.432e-02  |δ| mean=3.873e-05 max=4.883e-04  (score=|H|·δ² ≈ 9.655e-13)
+[proposal] hutch-vs-gnb @iter1960: bare P=+0.230 J@1%=0.063 J@10%=0.210  score P=+0.283 J@1%=0.064 J@10%=0.216
+[proposal] refresh_hutchinson @iter1960 K=4 2847 ms  (188,897,280 expert elements)
+ iteration     1960/    2000 | consumed samples:        47040 | consumed tokens:     96337920 | elapsed time per iteration (ms): 3055.4 | learning rate: 1.514E-05 | global batch size:    24 | lm loss: 5.394603E+00 | moe loss: 6.067286E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 7.855 | tokens per gpu per second (tgs): 16087.099 | TFLOPs: 21.04 |
+ iteration     1970/    2000 | consumed samples:        47280 | consumed tokens:     96829440 | elapsed time per iteration (ms): 2749.3 | learning rate: 1.508E-05 | global batch size:    24 | lm loss: 5.383909E+00 | moe loss: 6.058096E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 8.730 | tokens per gpu per second (tgs): 17878.218 | TFLOPs: 23.38 |
+ iteration     1980/    2000 | consumed samples:        47520 | consumed tokens:     97320960 | elapsed time per iteration (ms): 2550.6 | learning rate: 1.504E-05 | global batch size:    24 | lm loss: 5.293499E+00 | moe loss: 6.086339E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.410 | tokens per gpu per second (tgs): 19270.957 | TFLOPs: 25.20 |
+ iteration     1990/    2000 | consumed samples:        47760 | consumed tokens:     97812480 | elapsed time per iteration (ms): 2573.6 | learning rate: 1.501E-05 | global batch size:    24 | lm loss: 5.404773E+00 | moe loss: 6.071034E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 9.325 | tokens per gpu per second (tgs): 19098.202 | TFLOPs: 24.97 |
+[proposal] ScoreDiag @iter 2000: expert max=5.463e-20 p99.9=5.652e-22 | non-expert max=3.360e-16 p99.9=8.482e-21 | overlap: 0.000%
+          [expert diag] δ_max=3.733e-04 v̂_max=4.140e-11 |θ|_mean=7.424e-03 ΔL≈1.862e-15
+[proposal] scale @iter2000: |H| mean=5.906e-04 max=1.165e-02  |δ| mean=3.942e-05 max=4.883e-04  (score=|H|·δ² ≈ 9.178e-13)
+[proposal] hutch-vs-gnb @iter2000: bare P=+0.246 J@1%=0.066 J@10%=0.215  score P=+0.293 J@1%=0.063 J@10%=0.209
+[proposal] refresh_hutchinson @iter2000 K=4 2752 ms  (188,897,280 expert elements)
+ iteration     2000/    2000 | consumed samples:        48000 | consumed tokens:     98304000 | elapsed time per iteration (ms): 12450.4 | learning rate: 1.500E-05 | global batch size:    24 | lm loss: 5.365826E+00 | moe loss: 6.076765E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 1.928 | tokens per gpu per second (tgs): 3947.831 | TFLOPs: 5.16 |
+------------------------------------------------------------------------------------------------
+ validation loss at iteration 2000 | lm loss value: 5.281070E+00 | lm loss PPL: 1.965801E+02 | 
+------------------------------------------------------------------------------------------------
+[after training is done] datetime: 2026-04-20 05:31:37 
+Evaluating iter 10/128
+Evaluating iter 20/128
+Evaluating iter 30/128
+Evaluating iter 40/128
+Evaluating iter 50/128
+Evaluating iter 60/128
+Evaluating iter 70/128
+Evaluating iter 80/128
+Evaluating iter 90/128
+Evaluating iter 100/128
+Evaluating iter 110/128
+Evaluating iter 120/128
+----------------------------------------------------------------------------------------------------------------------------------------
+ validation loss at iteration 2000 on 3072-sample draw from validation set | lm loss value: 5.269449E+00 | lm loss PPL: 1.943089E+02 | 
+----------------------------------------------------------------------------------------------------------------------------------------
+[rank0]:[W420 05:33:48.976812055 ProcessGroupNCCL.cpp:1538] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[2026-04-20 05:33:59,340] [INFO] [launch.py:367:main] Process 90438 exits successfully.

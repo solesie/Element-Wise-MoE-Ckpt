@@ -21,3 +21,25 @@ logs
 
 # Data folder
 bookcorpus_data/
+
+# Experiment artifacts excluded from git (kept locally for analysis).
+# Logs (.log) and per-iter diagnostics (.faults.jsonl / .score_diag.jsonl)
+# remain tracked; only the bulky derived files and live checkpoint dirs
+# are skipped to keep the repo size manageable.
+results/**/cp/
+results/**/*.fc_write_log.json
+results/**/*.cpu_mem_samples.json
+results/**/*.proposal_shutdown_summary.json
+results/**/*.H_nonexpert_probe.jsonl
+results/**/*.hutch_vs_gnb.jsonl
+results/**/run.log
+results/smoke_hessian_vs_vt/smoke.jsonl
+results/exp_3/log/baseline_seed2024.SKIPPED.*
+results/exp_3_pilot/
+
+# Editor / OS
+.DS_Store
+.vscode/
+
+# Default checkpoint output dir (prevents accidental check-in of CP files)
+proposal_cp/

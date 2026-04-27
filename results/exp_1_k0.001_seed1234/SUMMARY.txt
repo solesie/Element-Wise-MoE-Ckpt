@@ -1,0 +1,18 @@
+[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1
+[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1
+[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1
+baseline: 50 iters, 0 vals, CP=0.0 MB (0 files)
+proposal: 0 iters, 0 vals, CP=0.0 MB (0 files)
+random: 0 iters, 0 vals, CP=0.0 MB (0 files)
+
+================================================================================
+EXPERIMENT 1 SUMMARY
+================================================================================
+| variant | live final val loss | **REPLAY val loss** | **REPLAY PPL** | gap vs baseline (replay) | total CP MB |
+|---|---|---|---|---|---|
+| baseline | nan | nan (no replay) | nan | +0.0000 | 0.0 |
+| proposal | nan | nan | nan | +nan | 0.0 |
+| random | nan | nan | nan | +nan | 0.0 |
+
+Plot: /home/asdf1234/Megatron-DeepSpeed/results/exp_1/exp1_plot.png
+[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1

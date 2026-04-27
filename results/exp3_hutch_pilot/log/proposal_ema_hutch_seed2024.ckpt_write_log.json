@@ -1,0 +1,52 @@
+[
+  {
+    "step": 1,
+    "path": "/dev/null",
+    "nonexpert_bytes": 0,
+    "payload_bytes": 0,
+    "file_bytes": 0,
+    "write_time_ms": 0.0,
+    "queue_delay_ms": 0.0,
+    "async_mode": true
+  },
+  {
+    "step": 2,
+    "path": "/home/asdf1234/Megatron-DeepSpeed/results/exp3_hutch_pilot/cp/proposal_ema_hutch_seed2024/non_expert/dc_iter00000002_dense_ne.bin",
+    "nonexpert_bytes": 683806720,
+    "payload_bytes": 683806720,
+    "file_bytes": 683819593,
+    "write_time_ms": 537.969953999891,
+    "queue_delay_ms": 1.3604050000139978,
+    "async_mode": true
+  },
+  {
+    "step": 3,
+    "path": "/home/asdf1234/Megatron-DeepSpeed/results/exp3_hutch_pilot/cp/proposal_ema_hutch_seed2024/non_expert/dc_iter00000003_dense_ne.bin",
+    "nonexpert_bytes": 683806720,
+    "payload_bytes": 683806720,
+    "file_bytes": 683819593,
+    "write_time_ms": 530.7817919999707,
+    "queue_delay_ms": 0.4383919999781938,
+    "async_mode": true
+  },
+  {
+    "step": 4,
+    "path": "/home/asdf1234/Megatron-DeepSpeed/results/exp3_hutch_pilot/cp/proposal_ema_hutch_seed2024/non_expert/dc_iter00000004_dense_ne.bin",
+    "nonexpert_bytes": 683806720,
+    "payload_bytes": 683806720,
+    "file_bytes": 683819593,
+    "write_time_ms": 528.9706209998712,
+    "queue_delay_ms": 0.7500789999994595,
+    "async_mode": true
+  },
+  {
+    "step": 5,
+    "path": "/home/asdf1234/Megatron-DeepSpeed/results/exp3_hutch_pilot/cp/proposal_ema_hutch_seed2024/non_expert/dc_iter00000005_dense_ne.bin",
+    "nonexpert_bytes": 683806720,
+    "payload_bytes": 683806720,
+    "file_bytes": 683819593,
+    "write_time_ms": 542.2814380001455,
+    "queue_delay_ms": 0.5319859999417531,
+    "async_mode": true
+  }
+]

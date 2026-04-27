@@ -51,6 +51,12 @@ from megatron.utils import report_memory, throughput_calculator, checkpoint_thro
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
+from megatron.proposal.cp_hooks import (
+    init_proposal, proposal_pre_step, proposal_post_step,
+    proposal_recover, proposal_inject_fault, proposal_record_iter_loss,
+    proposal_shutdown, proposal_hutchinson_probe,
+    proposal_refresh_hessian, set_hessian_valid_iter,
+)
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
@@ -176,6 +182,9 @@ def pretrain(train_valid_test_dataset_provider,
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
 
+    if getattr(args, 'proposal_enable', False):
+        init_proposal(model, optimizer, args, cp_root=args.proposal_cp_dir)
+
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
@@ -231,7 +240,27 @@ def pretrain(train_valid_test_dataset_provider,
             print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
-        if args.do_train and args.train_iters > 0:
+        # Replay-only mode: skip training, jump straight to recovery + validation.
+        # Used to re-evaluate an existing CP dir without re-training.
+        if getattr(args, 'proposal_replay_only', False):
+            iteration = int(getattr(args, 'train_iters', 0))
+            args.iteration = iteration
+            print_rank_0(f'[proposal] replay-only mode: skipping training, '
+                         f'will replay CP at t_fault={iteration}')
+        elif args.do_train and args.train_iters > 0:
+            # When hessian-based selection is active, build a DEDICATED
+            # valid iterator that refresh_hessian consumes — keeps the
+            # shared valid_data_iterator untouched so evaluate_and_print_results
+            # draws the same val sample across (hessian | v_hat | baseline).
+            if (
+                getattr(args, 'proposal_enable', False)
+                and int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0) > 0
+            ):
+                _, _hessian_valid_iter, _ = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider
+                )
+                set_hessian_valid_iter(_hessian_valid_iter)
+
             iteration = train(forward_step_func,
                             model, optimizer, opt_param_scheduler,
                             train_data_iterator, valid_data_iterator,
@@ -257,12 +286,48 @@ def pretrain(train_valid_test_dataset_provider,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
+    # Hutchinson H_diag vs v_t comparison on the live-trained state (option C smoke).
+    # Runs BEFORE replay so v_t is the one populated by normal Adam steps.
+    if getattr(args, 'proposal_enable', False) and getattr(args, 'proposal_hutchinson_at_end', False):
+        _, h_valid_iter, _ = build_train_valid_test_data_iterators(
+            train_valid_test_dataset_provider)
+        proposal_hutchinson_probe(
+            model, optimizer, forward_step_func, h_valid_iter, iteration,
+            k_samples=getattr(args, 'proposal_hutchinson_k_samples', 4),
+            out_path=getattr(args, 'proposal_hutchinson_log', None),
+        )
+
+    # Replay-at-end (exp 1 protocol): reconstruct model state from FC+DC
+    # bundles and re-run validation to measure CP reconstruction quality.
+    if getattr(args, 'proposal_enable', False) and (
+        getattr(args, 'proposal_replay_at_end', False)
+        or getattr(args, 'proposal_replay_only', False)
+    ):
+        print_rank_0(f'[proposal] replay at end: calling proposal_recover(t_fault={iteration})')
+        diag = proposal_recover(model, optimizer, t_fault=iteration)
+        if diag is not None:
+            print_rank_0(f'[proposal] recovery diag: {diag}')
+        if args.do_valid:
+            # Post-training eval at training.py:269 consumed the valid iterator.
+            # Rebuild so AFTER-REPLAY eval can draw fresh batches.
+            _, valid_data_iterator_replay, _ = build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
+            prefix = f'AFTER-REPLAY iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
+            evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator_replay, model,
+                                       iteration, process_non_loss_data_func, config,
+                                       verbose=True, write_to_tensorboard=False)
+
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train, test=True)
+
+    if getattr(args, 'proposal_enable', False):
+        proposal_shutdown()
+
     return model
 
 
@@ -743,7 +808,11 @@ def train_step(forward_step_func, data_iterator,
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
+        if getattr(args, 'proposal_enable', False):
+            proposal_pre_step(model)
         model[0].step(lr_kwargs={'increment': increment})
+        if getattr(args, 'proposal_enable', False):
+            proposal_post_step(model, step=args.iteration + 1)
         update_successful = model[0].was_step_applied()
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
@@ -1274,6 +1343,52 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        config)
         iteration += 1
         args.iteration = iteration
+
+        # Resolve current iter's loss (flushes post-fault loss + cpu mem samples).
+        cur_loss_value = None
+        if loss_dict and 'lm loss' in loss_dict:
+            try:
+                cur_loss_value = float(loss_dict['lm loss'].item())
+            except Exception:
+                cur_loss_value = None
+        if getattr(args, 'proposal_enable', False):
+            proposal_record_iter_loss(step=iteration, loss_value=cur_loss_value)
+
+        # H cache refresh for selection_mode='hessian'. Uses valid data so
+        # it does not consume/advance the training data iterator. The first
+        # refresh happens at iter=1 so tracker has a populated cache by post_step.
+        h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
+        if (
+            getattr(args, 'proposal_enable', False)
+            and h_refresh_every > 0
+            and (iteration == 1 or iteration % h_refresh_every == 0)
+        ):
+            _estimator = getattr(args, 'proposal_hessian_estimator', 'hutchinson')
+            proposal_refresh_hessian(
+                model, forward_step_func, valid_data_iterator, iteration,
+                estimator=_estimator,
+                k_samples=int(getattr(args, 'proposal_hessian_num_samples', 1)),
+            )
+
+        # Exp 2 fault injection: every N iter (after warmup), reconstruct state from CP and continue.
+        fault_interval = int(getattr(args, 'proposal_fault_interval', 0) or 0)
+        fault_warmup = int(getattr(args, 'proposal_fault_warmup', 0) or 0)
+        if (
+            getattr(args, 'proposal_enable', False)
+            and fault_interval > 0
+            and iteration >= fault_warmup
+            and iteration % fault_interval == 0
+            and iteration < args.train_iters
+        ):
+            rec = proposal_inject_fault(model, optimizer, step=iteration,
+                                        args=args, pre_fault_loss=cur_loss_value)
+            print_rank_0(
+                f"[proposal] FAULT@{iteration}: recover_s={rec.get('recover_time_s',0):.2f} "
+                f"ne_fc={rec.get('nonexpert_fc_iter')} dc_replay="
+                f"{rec.get('dc_bundles_replayed')}/{rec.get('replay_range')} "
+                f"B={rec.get('B_max_lost_iter')} pre_loss={cur_loss_value}"
+            )
+
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()

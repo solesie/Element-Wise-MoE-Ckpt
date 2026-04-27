@@ -1,0 +1,1265 @@
+[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1
+[exp1] === Skipping baseline (already complete) ===
+[exp1] === Running proposal ===
+[runner] VARIANT=proposal  LOG=/home/asdf1234/Megatron-DeepSpeed/results/exp_1/log/proposal.log
+[2026-04-14 21:02:58,142] [WARNING] [runner.py:232:fetch_hostfile] Unable to find hostfile, will proceed with training with local resources only.
+[2026-04-14 21:02:58,142] [INFO] [runner.py:630:main] cmd = /usr/bin/python3 -u -m deepspeed.launcher.launch --world_info=eyJsb2NhbGhvc3QiOiBbMF19 --master_addr=127.0.0.1 --master_port=29500 --enable_each_rank_log=None --log_level=info /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py --override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95 --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 --num-experts 8 --moe-loss-coeff 0.01 --moe-train-capacity-factor 1.0 --moe-eval-capacity-factor 1.0 --moe-min-capacity 4 --init-method-std 0.014 --micro-batch-size 8 --global-batch-size 64 --num-layers 12 --hidden-size 768 --num-attention-heads 12 --seq-length 2048 --max-position-embeddings 2048 --train-iters 500 --lr 1.5e-4 --min-lr 1.5e-5 --lr-decay-style cosine --lr-warmup-iters 50 --split 100,0,0 --log-interval 10 --eval-interval 50 --eval-iters 8 --save-interval 100000 --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam --seed 1234 --proposal-enable --proposal-cp-dir /home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/proposal --proposal-selection-mode importance --proposal-fc-stagger 0 --proposal-topk-ratio 0.001 --proposal-beta 0.1 --proposal-nonexpert-fc-W 10 --proposal-async-queue 5 --proposal-dc-retention 500 --proposal-replay-at-end --vocab-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json --merge-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt --data-path /home/asdf1234/data/wikitext-2/train_text_document --valid-data-path /home/asdf1234/data/wikitext-2/valid_text_document --data-impl mmap --deepspeed --deepspeed_config /home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_proposal-210250.json --pipeline-model-parallel-size 1 --no-pipeline-parallel --create-moe-param-group
+[2026-04-14 21:03:03,906] [INFO] [launch.py:162:main] WORLD INFO DICT: {'localhost': [0]}
+[2026-04-14 21:03:03,906] [INFO] [launch.py:168:main] nnodes=1, num_local_procs=1, node_rank=0
+[2026-04-14 21:03:03,906] [INFO] [launch.py:179:main] global_rank_mapping=defaultdict(<class 'list'>, {'localhost': [0]})
+[2026-04-14 21:03:03,906] [INFO] [launch.py:180:main] dist_world_size=1
+[2026-04-14 21:03:03,907] [INFO] [launch.py:184:main] Setting CUDA_VISIBLE_DEVICES=0
+[2026-04-14 21:03:03,907] [INFO] [launch.py:272:main] process 89486 spawned with command: ['/usr/bin/python3', '-u', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=0', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '8', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--micro-batch-size', '8', '--global-batch-size', '64', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '2048', '--max-position-embeddings', '2048', '--train-iters', '500', '--lr', '1.5e-4', '--min-lr', '1.5e-5', '--lr-decay-style', 'cosine', '--lr-warmup-iters', '50', '--split', '100,0,0', '--log-interval', '10', '--eval-interval', '50', '--eval-iters', '8', '--save-interval', '100000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '2', '--bf16', '--use-flash-attn-v2', '--ds_fused_adam', '--seed', '1234', '--proposal-enable', '--proposal-cp-dir', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/proposal', '--proposal-selection-mode', 'importance', '--proposal-fc-stagger', '0', '--proposal-topk-ratio', '0.001', '--proposal-beta', '0.1', '--proposal-nonexpert-fc-W', '10', '--proposal-async-queue', '5', '--proposal-dc-retention', '500', '--proposal-replay-at-end', '--vocab-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json', '--merge-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt', '--data-path', '/home/asdf1234/data/wikitext-2/train_text_document', '--valid-data-path', '/home/asdf1234/data/wikitext-2/valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_proposal-210250.json', '--pipeline-model-parallel-size', '1', '--no-pipeline-parallel', '--create-moe-param-group']
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:250: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:288: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  def backward(ctx, grad_output):
+--------------------------------------------------
+DeepSpeed C++/CUDA extension op report
+--------------------------------------------------
+NOTE: Ops not installed will be just-in-time (JIT) compiled at
+      runtime if needed. Op compatibility means that your system
+      meet the required dependencies to JIT install the op.
+--------------------------------------------------
+JIT compiled ops requires ninja
+ninja .................. [92m[OKAY][0m
+--------------------------------------------------
+op name ................ installed .. compatible
+--------------------------------------------------
+[93m [WARNING] [0m async_io requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m async_io: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+async_io ............... [93m[NO][0m ....... [93m[NO][0m
+fused_adam ............. [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adam ............... [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adagrad ............ [93m[NO][0m ....... [92m[OKAY][0m
+cpu_lion ............... [93m[NO][0m ....... [92m[OKAY][0m
+dc ..................... [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m Please specify CUTLASS location directory as environment variable CUTLASS_PATH
+[93m [WARNING] [0m Possible values are: a path, DS_IGNORE_CUTLASS_DETECTION and DS_USE_CUTLASS_PYTHON_BINDINGS
+evoformer_attn ......... [93m[NO][0m ....... [93m[NO][0m
+[93m [WARNING] [0m FP Quantizer is using an untested triton version (3.4.0), only 2.3.(0, 1) and 3.0.0 are known to be compatible with these kernels
+fp_quantizer ........... [93m[NO][0m ....... [93m[NO][0m
+fused_lamb ............. [93m[NO][0m ....... [92m[OKAY][0m
+fused_lion ............. [93m[NO][0m ....... [92m[OKAY][0m
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmpvtk1uj4r/test.c -o /tmp/tmpvtk1uj4r/test.o
+x86_64-linux-gnu-gcc /tmp/tmpvtk1uj4r/test.o -L/usr/local/cuda -L/usr/local/cuda/lib64 -lcufile -o /tmp/tmpvtk1uj4r/a.out
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmpb9r657al/test.c -o /tmp/tmpb9r657al/test.o
+x86_64-linux-gnu-gcc /tmp/tmpb9r657al/test.o -laio -o /tmp/tmpb9r657al/a.out
+[93m [WARNING] [0m gds requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m gds: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+gds .................... [93m[NO][0m ....... [93m[NO][0m
+transformer_inference .. [93m[NO][0m ....... [92m[OKAY][0m
+inference_core_ops ..... [93m[NO][0m ....... [92m[OKAY][0m
+cutlass_ops ............ [93m[NO][0m ....... [92m[OKAY][0m
+quantizer .............. [93m[NO][0m ....... [92m[OKAY][0m
+ragged_device_ops ...... [93m[NO][0m ....... [92m[OKAY][0m
+ragged_ops ............. [93m[NO][0m ....... [92m[OKAY][0m
+random_ltd ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m sparse_attn requires a torch version >= 1.5 and < 2.0 but detected 2.8
+[93m [WARNING] [0m using untested triton version (3.4.0), only 1.0.0 is known to be compatible
+sparse_attn ............ [93m[NO][0m ....... [93m[NO][0m
+spatial_inference ...... [93m[NO][0m ....... [92m[OKAY][0m
+transformer ............ [93m[NO][0m ....... [92m[OKAY][0m
+stochastic_transformer . [93m[NO][0m ....... [92m[OKAY][0m
+utils .................. [93m[NO][0m ....... [92m[OKAY][0m
+--------------------------------------------------
+DeepSpeed general environment info:
+torch install path ............... ['/usr/local/lib/python3.10/dist-packages/torch']
+torch version .................... 2.8.0+cu128
+deepspeed install path ........... ['/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed']
+deepspeed info ................... 0.18.9, unknown, unknown
+torch cuda version ............... 12.8
+torch hip version ................ None
+nvcc version ..................... 12.8
+deepspeed wheel compiled w. ...... torch 2.8, cuda 12.8
+shared memory (/dev/shm) size .... 94.35 GB
+**** Git info for Megatron: git_hash=aab2f31 git_branch=main ****
+using world size: 1, data-parallel-size: 1, sequence-parallel size: 1, tensor-model-parallel size: 1, pipeline-model-parallel size: 1 
+accumulate and all-reduce gradients in fp32 for bfloat16 data type.
+using torch.bfloat16 for parameters ...
+------------------------ arguments ------------------------
+  accumulate_allreduce_grads_in_fp32 .............. True
+  adam_beta1 ...................................... 0.9
+  adam_beta2 ...................................... 0.95
+  adam_eps ........................................ 1e-08
+  add_bias_linear ................................. True
+  add_position_embedding .......................... True
+  adlr_autoresume ................................. False
+  adlr_autoresume_interval ........................ 1000
+  aml_data_download_path .......................... None
+  apply_layernorm_1p .............................. False
+  apply_query_key_layer_scaling ................... True
+  apply_residual_connection_post_layernorm ........ False
+  async_tensor_model_parallel_allreduce ........... False
+  attention_dropout ............................... 0.1
+  attention_softmax_in_fp32 ....................... False
+  barrier_with_L1_time ............................ True
+  bert_binary_head ................................ True
+  bert_embedder_type .............................. megatron
+  bert_load ....................................... None
+  bf16 ............................................ True
+  bias_dropout_fusion ............................. True
+  bias_gelu_fusion ................................ True
+  biencoder_projection_dim ........................ 0
+  biencoder_shared_query_context_model ............ False
+  block_data_path ................................. None
+  checkpoint_activations .......................... False
+  checkpoint_in_cpu ............................... False
+  checkpoint_num_layers ........................... 1
+  classes_fraction ................................ 1.0
+  clip_grad ....................................... 1.0
+  compression_training ............................ False
+  consumed_train_samples .......................... 0
+  consumed_train_tokens ........................... 0
+  consumed_valid_samples .......................... 0
+  contigious_checkpointing ........................ False
+  cpu_optimizer ................................... False
+  cpu_torch_adam .................................. False
+  create_moe_param_group .......................... True
+  curriculum_learning_legacy ...................... False
+  data_cache_path ................................. None
+  data_efficiency_curriculum_learning ............. False
+  data_impl ....................................... mmap
+  data_parallel_random_init ....................... False
+  data_parallel_size .............................. 1
+  data_path ....................................... ['/home/asdf1234/data/wikitext-2/train_text_document']
+  data_per_class_fraction ......................... 1.0
+  data_sharding ................................... True
+  dataloader_type ................................. single
+  DDP_impl ........................................ local
+  decoder_num_layers .............................. None
+  decoder_seq_length .............................. None
+  deepscale ....................................... False
+  deepscale_config ................................ None
+  deepspeed ....................................... True
+  deepspeed_activation_checkpointing .............. False
+  deepspeed_config ................................ /home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_proposal-210250.json
+  dino_bottleneck_size ............................ 256
+  dino_freeze_last_layer .......................... 1
+  dino_head_hidden_size ........................... 2048
+  dino_local_crops_number ......................... 10
+  dino_local_img_size ............................. 96
+  dino_norm_last_layer ............................ False
+  dino_teacher_temp ............................... 0.07
+  dino_warmup_teacher_temp ........................ 0.04
+  dino_warmup_teacher_temp_epochs ................. 30
+  distribute_checkpointed_activations ............. False
+  distribute_saved_activations .................... False
+  distributed_backend ............................. nccl
+  distributed_timeout_minutes ..................... 10
+  ds_fused_adam ................................... True
+  ds_inference .................................... False
+  ds_pipeline_enabled ............................. False
+  ds_sequence_parallel_fpdt ....................... False
+  ds_sequence_parallel_fpdt_chunk_size ............ 65536
+  ds_sequence_parallel_fpdt_offloading ............ False
+  ds_sequence_parallel_size ....................... 1
+  embedding_path .................................. None
+  embedding_weights_in_fp32 ....................... False
+  empty_unused_memory_level ....................... 0
+  enable_expert_tensor_parallelism ................ False
+  enable_zbh1_exact_semantics ..................... False
+  enable_zbh1_pipeline ............................ False
+  encoder_num_layers .............................. 12
+  encoder_seq_length .............................. 2048
+  end_weight_decay ................................ 0.1
+  eod_mask_loss ................................... False
+  eval_interval ................................... 50
+  eval_iters ...................................... 8
+  evidence_data_path .............................. None
+  exit_duration_in_mins ........................... None
+  exit_interval ................................... None
+  exit_on_missing_checkpoint ...................... False
+  exit_signal_handler ............................. False
+  expert_interval ................................. 2
+  ffn_hidden_size ................................. 3072
+  finetune ........................................ False
+  force_ds_sequence_parallel ...................... False
+  fp16 ............................................ False
+  fp16_lm_cross_entropy ........................... False
+  fp32_residual_connection ........................ False
+  fp8_amax_compute_algo ........................... most_recent
+  fp8_amax_history_len ............................ 1
+  fp8_e4m3 ........................................ False
+  fp8_hybrid ...................................... False
+  fp8_interval .................................... 1
+  fp8_margin ...................................... 0
+  fp8_wgrad ....................................... True
+  global_batch_size ............................... 64
+  gradient_accumulation_fusion .................... True
+  head_lr_mult .................................... 1.0
+  hidden_dropout .................................. 0.1
+  hidden_size ..................................... 768
+  hidden_size_teacher ............................. None
+  hysteresis ...................................... 2
+  ict_head_size ................................... None
+  ict_load ........................................ None
+  img_h ........................................... 224
+  img_w ........................................... 224
+  indexer_batch_size .............................. 128
+  indexer_log_interval ............................ 1000
+  inference ....................................... False
+  inference_batch_times_seqlen_threshold .......... 512
+  init_method_std ................................. 0.014
+  init_method_xavier_uniform ...................... False
+  initial_loss_scale .............................. 4294967296
+  iter_per_epoch .................................. 1250
+  kd .............................................. False
+  kd_alpha_ce ..................................... 1
+  kd_beta_ce ...................................... 1
+  kd_temp ......................................... 1.0
+  kill_switch_file ................................ None
+  kv_channels ..................................... 64
+  layernorm_epsilon ............................... 1e-05
+  lazy_mpu_init ................................... None
+  load ............................................ None
+  load_tag ........................................ None
+  load_teacher .................................... None
+  local_rank ...................................... 0
+  log_batch_size_to_tensorboard ................... False
+  log_interval .................................... 10
+  log_learning_rate_to_tensorboard ................ True
+  log_loss_scale_to_tensorboard ................... True
+  log_memory_to_tensorboard ....................... False
+  log_num_zeros_in_grad ........................... False
+  log_optimizer_states_to_tensorboard ............. False
+  log_params_norm ................................. False
+  log_timers_to_tensorboard ....................... False
+  log_validation_ppl_to_tensorboard ............... False
+  log_world_size_to_tensorboard ................... False
+  loss_scale ...................................... None
+  loss_scale_window ............................... 1000
+  lr .............................................. 0.00015
+  lr_decay_iters .................................. None
+  lr_decay_samples ................................ None
+  lr_decay_style .................................. cosine
+  lr_decay_tokens ................................. None
+  lr_warmup_fraction .............................. None
+  lr_warmup_iters ................................. 50
+  lr_warmup_samples ............................... 0
+  lr_warmup_tokens ................................ None
+  make_vocab_size_divisible_by .................... 128
+  mask_factor ..................................... 1.0
+  mask_prob ....................................... 0.15
+  mask_type ....................................... random
+  masked_softmax_fusion ........................... True
+  max_position_embeddings ......................... 2048
+  max_tokens_to_oom ............................... 12000
+  mem_efficient_ln ................................ True
+  memory_centric_tiled_linear ..................... False
+  merge_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt
+  micro_batch_size ................................ 8
+  min_loss_scale .................................. 1.0
+  min_lr .......................................... 1.5e-05
+  mlp_type ........................................ standard
+  mmap_warmup ..................................... False
+  moe_eval_capacity_factor ........................ 1.0
+  moe_expert_parallel_size ........................ 1
+  moe_loss_coeff .................................. 0.01
+  moe_min_capacity ................................ 4
+  moe_token_dropping .............................. True
+  moe_top2_2nd_expert_sampling .................... True
+  moe_train_capacity_factor ....................... 1.0
+  mos ............................................. False
+  no_load_lr_state ................................ False
+  no_load_optim ................................... None
+  no_load_rng ..................................... None
+  no_persist_layer_norm ........................... False
+  no_pipeline_parallel ............................ True
+  no_save_optim ................................... None
+  no_save_rng ..................................... None
+  normalization ................................... layernorm
+  num_attention_heads ............................. 12
+  num_attention_heads_teacher ..................... None
+  num_channels .................................... 3
+  num_classes ..................................... 1000
+  num_experts ..................................... [8]
+  num_experts_switch .............................. None
+  num_experts_teacher ............................. [1]
+  num_key_value_heads ............................. 12
+  num_layers ...................................... 12
+  num_layers_per_virtual_pipeline_stage ........... None
+  num_layers_teacher .............................. None
+  num_workers ..................................... 2
+  onnx_safe ....................................... None
+  openai_gelu ..................................... False
+  optimizer ....................................... adam
+  output_bert_embeddings .......................... False
+  overlap_p2p_comm ................................ False
+  override_opt_param_scheduler .................... True
+  params_dtype .................................... torch.bfloat16
+  partition_activations ........................... False
+  patch_dim ....................................... 16
+  perform_initialization .......................... True
+  pipeline_model_parallel_size .................... 1
+  pipeline_model_parallel_split_rank .............. None
+  profile ......................................... None
+  profile_backward ................................ False
+  profile_ranks ................................... None
+  profile_steps ................................... 2,3
+  proposal_async_queue ............................ 5
+  proposal_beta ................................... 0.1
+  proposal_cp_dir ................................. /home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/proposal
+  proposal_cp_mode ................................ differential
+  proposal_dc_retention ........................... 500
+  proposal_enable ................................. True
+  proposal_expert_fc_D ............................ None
+  proposal_fc_stagger ............................. 0
+  proposal_nonexpert_fc_W ......................... 10
+  proposal_replay_at_end .......................... True
+  proposal_selection_mode ......................... importance
+  proposal_topk_ratio ............................. 0.001
+  query_in_block_prob ............................. 0.1
+  rampup_batch_size ............................... None
+  random_ltd ...................................... False
+  rank ............................................ 0
+  recompute_granularity ........................... None
+  recompute_method ................................ None
+  recompute_num_layers ............................ 1
+  remote_device ................................... none
+  repeated_dataloader ............................. False
+  reset_attention_mask ............................ False
+  reset_iteration ................................. False
+  reset_position_ids .............................. False
+  retriever_report_topk_accuracies ................ []
+  retriever_score_scaling ......................... False
+  retriever_seq_length ............................ 256
+  retro_add_retriever ............................. False
+  retro_cyclic_train_iters ........................ None
+  retro_encoder_attention_dropout ................. 0.1
+  retro_encoder_hidden_dropout .................... 0.1
+  retro_encoder_layers ............................ 2
+  retro_num_neighbors ............................. 2
+  retro_num_retrieved_chunks ...................... 2
+  retro_return_doc_ids ............................ False
+  retro_workdir ................................... None
+  return_data_index ............................... False
+  rope_theta ...................................... 10000
+  rotary_percent .................................. 1.0
+  sample_rate ..................................... 1.0
+  save ............................................ None
+  save_interval ................................... 100000
+  scatter_gather_tensors_in_pipeline .............. True
+  scattered_embeddings ............................ False
+  seed ............................................ 1234
+  seq_length ...................................... 2048
+  sequence_parallel ............................... False
+  sgd_momentum .................................... 0.9
+  short_seq_prob .................................. 0.1
+  skip_train ...................................... False
+  split ........................................... 100,0,0
+  split_transformers .............................. False
+  squared_relu .................................... False
+  standalone_embedding_stage ...................... False
+  start_weight_decay .............................. 0.1
+  swiglu .......................................... False
+  swin_backbone_type .............................. tiny
+  synchronize_each_layer .......................... False
+  tensor_model_parallel_size ...................... 1
+  tensorboard_dir ................................. None
+  tensorboard_log_interval ........................ 1
+  tensorboard_queue_size .......................... 1000
+  test_data_path .................................. None
+  tile_factor ..................................... 1
+  timing_log_level ................................ 0
+  timing_log_option ............................... minmax
+  titles_data_path ................................ None
+  tokenizer_model ................................. None
+  tokenizer_type .................................. GPT2BPETokenizer
+  topk ............................................ 1
+  train_data_exact_num_epochs ..................... None
+  train_data_path ................................. None
+  train_desc_path ................................. None
+  train_doc_idx_path .............................. None
+  train_idx_path .................................. None
+  train_iters ..................................... 500
+  train_sample_idx_path ........................... None
+  train_samples ................................... None
+  train_shuffle_idx_path .......................... None
+  train_tokens .................................... None
+  transformer_impl ................................ local
+  transformer_pipeline_model_parallel_size ........ 1
+  trust_remote_code ............................... False
+  universal_checkpoint ............................ False
+  untie_embeddings_and_output_weights ............. False
+  use_checkpoint_args ............................. False
+  use_checkpoint_opt_param_scheduler .............. False
+  use_contiguous_buffers_in_local_ddp ............. True
+  use_cpu_initialization .......................... None
+  use_dataset_only ................................ False
+  use_distributed_optimizer ....................... False
+  use_flash_attn .................................. True
+  use_flash_attn_builder .......................... False
+  use_flash_attn_triton ........................... False
+  use_flash_attn_v1 ............................... False
+  use_flash_attn_v2 ............................... True
+  use_one_sent_docs ............................... False
+  use_pin_memory .................................. False
+  use_ring_exchange_p2p ........................... False
+  use_rotary_position_embeddings .................. False
+  use_tutel ....................................... False
+  valid_data_path ................................. ['/home/asdf1234/data/wikitext-2/valid_text_document']
+  variable_seq_lengths ............................ False
+  virtual_pipeline_model_parallel_size ............ None
+  vision_backbone_type ............................ vit
+  vision_pretraining .............................. False
+  vision_pretraining_type ......................... classify
+  vocab_extra_ids ................................. 0
+  vocab_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json
+  vocab_size ...................................... None
+  wandb_exp_name .................................. 
+  wandb_project ................................... 
+  wandb_save_dir .................................. 
+  weight_decay .................................... 0.1
+  weight_decay_incr_style ......................... constant
+  world_size ...................................... 1
+  zero_allgather_bucket_size ...................... 0.0
+  zero_contigious_gradients ....................... False
+  zero_reduce_bucket_size ......................... 0.0
+  zero_reduce_scatter ............................. False
+  zero_stage ...................................... 1.0
+-------------------- end of arguments ---------------------
+setting number of micro-batches to constant 8
+> building GPT2BPETokenizer tokenizer ...
+ > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+WARNING: WANDB writing requested but no legit wandb project or experiment name provided, therefore no WANDB logs will be written according to random generated project or experiment name.
+> initializing torch distributed ...
+> initialized tensor model parallel with size 1
+> initialized pipeline model parallel with size 1
+> setting random seeds to 1234 ...
+> initializing model parallel cuda seeds on global rank 0, model parallel rank 0, and data parallel rank 0 with model parallel seed: 3952 and data parallel seed: 1234
+> compiling dataset index builder ...
+make: Entering directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+>>> done with dataset index builder. Compilation time: 0.069 seconds
+> compiling and loading fused kernels ...
+[rank0]:W0414 21:03:11.622000 89486 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:03:11.622000 89486 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0414 21:03:11.676000 89486 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:03:11.676000 89486 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0414 21:03:11.724000 89486 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:03:11.724000 89486 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+>>> done with compiling and loading fused kernels. Compilation time: 0.164 seconds
+[rank0]:[W414 21:03:11.602362537 init.cpp:772] Warning: nvfuser is no longer supported in torch script, use _jit_set_nvfuser_enabled is deprecated and a no-op (function operator())
+time to initialize megatron (seconds): 1.815
+[after megatron is initialized] datetime: 2026-04-14 21:03:11 
+building GPT model ...
+Before Building Model
+MA 0.0 GB         Max_MA 1.59 GB         CA 0.0 GB         Max_CA 2 GB 
+CPU Virtual Memory:  used = 13.87 GB, percent = 7.4%
+After Building Model
+MA 0.6 GB         Max_MA 0.61 GB         CA 0.68 GB         Max_CA 1 GB 
+CPU Virtual Memory:  used = 13.88 GB, percent = 7.4%
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 323641344
+[rank0]:W0414 21:03:12.332000 89486 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:03:12.332000 89486 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+> learning rate decay style: cosine
+DeepSpeed is enabled.
+No existing process group found, creating a new group named: ep_size_1
+[after model, optimizer, and learning rate scheduler are built] datetime: 2026-04-14 21:03:12 
+[proposal] Fp32StateMapper mode=fp16_zero0  masters=0 adam_state_keys=5
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      32000
+    validation: 5632
+    test:       512
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000273 seconds
+    number of documents: 23767
+ > dataset split:
+    train:
+     document indices in [0, 23767) total of 23767 documents
+    validation:
+     document indices in [23767, 23767) total of 0 documents
+    test:
+     document indices in [23767, 23767) total of 0 documents
+ > loading doc-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_shuffle_idx.npy
+    loaded indexed file in 0.028 seconds
+    total number of samples: 32504
+    total number of epochs: 28
+> finished creating GPT datasets ...
+[after dataloaders are built] datetime: 2026-04-14 21:03:12 
+done with setup ...
+(min, max) time across ranks (ms):
+    model-and-optimizer-setup ......................: (657.22, 657.22)
+    train/valid/test-data-iterators-setup ..........: (76.16, 76.16)
+training ...
+[before the start of training step] datetime: 2026-04-14 21:03:12 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] Backend compiler exception
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[16384, 8][8, 1]"):
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 8][8, 1]" = topk[1];  topk = None
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     . Adding a graph break.
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]   Developer debug context: Backend: inductor
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[16384, 8][8, 1]"):
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 8][8, 1]" = topk[1];  topk = None
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]     Traceback:
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.495000 89486 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] Backend compiler exception
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[16384, 2048][2048, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[16384, 2048][2048, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     . Adding a graph break.
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]   Developer debug context: Backend: inductor
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[16384, 2048][2048, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[16384, 2048][2048, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]     Traceback:
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:03:17.572000 89486 torch/_dynamo/exc.py:525] [3/0] 
+ iteration       10/     500 | consumed samples:          640 | consumed tokens:      1310720 | elapsed time per iteration (ms): 3666.9 | learning rate: 3.000E-05 | global batch size:    64 | lm loss: 1.033399E+01 | moe loss: 7.450057E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 17.453 | tokens per gpu per second (tgs): 35744.710 | TFLOPs: 34.60 |
+[Rank 0] (after 10 iterations) memory (MB) | allocated: 6938.40234375 | max allocated: 27572.87255859375 | reserved: 30856.0 | max reserved: 30856.0
+ iteration       20/     500 | consumed samples:         1280 | consumed tokens:      2621440 | elapsed time per iteration (ms): 2845.4 | learning rate: 6.000E-05 | global batch size:    64 | lm loss: 9.411855E+00 | moe loss: 6.692263E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 22.492 | tokens per gpu per second (tgs): 46064.139 | TFLOPs: 44.59 |
+ iteration       30/     500 | consumed samples:         1920 | consumed tokens:      3932160 | elapsed time per iteration (ms): 2773.1 | learning rate: 9.000E-05 | global batch size:    64 | lm loss: 8.702847E+00 | moe loss: 6.788761E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.079 | tokens per gpu per second (tgs): 47265.668 | TFLOPs: 45.75 |
+ iteration       40/     500 | consumed samples:         2560 | consumed tokens:      5242880 | elapsed time per iteration (ms): 2721.9 | learning rate: 1.200E-04 | global batch size:    64 | lm loss: 7.988014E+00 | moe loss: 6.684832E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.513 | tokens per gpu per second (tgs): 48153.999 | TFLOPs: 46.61 |
+ iteration       50/     500 | consumed samples:         3200 | consumed tokens:      6553600 | elapsed time per iteration (ms): 2742.3 | learning rate: 1.500E-04 | global batch size:    64 | lm loss: 7.329080E+00 | moe loss: 6.431143E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.338 | tokens per gpu per second (tgs): 47796.999 | TFLOPs: 46.26 |
+ iteration       60/     500 | consumed samples:         3840 | consumed tokens:      7864320 | elapsed time per iteration (ms): 2755.9 | learning rate: 1.498E-04 | global batch size:    64 | lm loss: 6.818284E+00 | moe loss: 6.142949E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.223 | tokens per gpu per second (tgs): 47560.384 | TFLOPs: 46.03 |
+ iteration       70/     500 | consumed samples:         4480 | consumed tokens:      9175040 | elapsed time per iteration (ms): 2718.1 | learning rate: 1.493E-04 | global batch size:    64 | lm loss: 6.570975E+00 | moe loss: 6.110554E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.546 | tokens per gpu per second (tgs): 48221.998 | TFLOPs: 46.67 |
+ iteration       80/     500 | consumed samples:         5120 | consumed tokens:     10485760 | elapsed time per iteration (ms): 2770.1 | learning rate: 1.485E-04 | global batch size:    64 | lm loss: 6.443605E+00 | moe loss: 6.098168E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.104 | tokens per gpu per second (tgs): 47317.557 | TFLOPs: 45.80 |
+ iteration       90/     500 | consumed samples:         5760 | consumed tokens:     11796480 | elapsed time per iteration (ms): 2739.2 | learning rate: 1.474E-04 | global batch size:    64 | lm loss: 6.319860E+00 | moe loss: 6.066499E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.365 | tokens per gpu per second (tgs): 47850.999 | TFLOPs: 46.32 |
+ iteration      100/     500 | consumed samples:         6400 | consumed tokens:     13107200 | elapsed time per iteration (ms): 2693.4 | learning rate: 1.459E-04 | global batch size:    64 | lm loss: 6.216240E+00 | moe loss: 6.058399E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.762 | tokens per gpu per second (tgs): 48664.074 | TFLOPs: 47.10 |
+ iteration      110/     500 | consumed samples:         7040 | consumed tokens:     14417920 | elapsed time per iteration (ms): 2708.7 | learning rate: 1.442E-04 | global batch size:    64 | lm loss: 6.124690E+00 | moe loss: 6.055195E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.627 | tokens per gpu per second (tgs): 48388.704 | TFLOPs: 46.84 |
+ iteration      120/     500 | consumed samples:         7680 | consumed tokens:     15728640 | elapsed time per iteration (ms): 2743.5 | learning rate: 1.421E-04 | global batch size:    64 | lm loss: 6.046641E+00 | moe loss: 6.165516E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.328 | tokens per gpu per second (tgs): 47775.734 | TFLOPs: 46.24 |
+ iteration      130/     500 | consumed samples:         8320 | consumed tokens:     17039360 | elapsed time per iteration (ms): 2733.8 | learning rate: 1.397E-04 | global batch size:    64 | lm loss: 5.939495E+00 | moe loss: 6.101491E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.411 | tokens per gpu per second (tgs): 47945.259 | TFLOPs: 46.41 |
+ iteration      140/     500 | consumed samples:         8960 | consumed tokens:     18350080 | elapsed time per iteration (ms): 2695.9 | learning rate: 1.371E-04 | global batch size:    64 | lm loss: 5.853856E+00 | moe loss: 6.039640E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.739 | tokens per gpu per second (tgs): 48618.123 | TFLOPs: 47.06 |
+ iteration      150/     500 | consumed samples:         9600 | consumed tokens:     19660800 | elapsed time per iteration (ms): 2741.3 | learning rate: 1.342E-04 | global batch size:    64 | lm loss: 5.789051E+00 | moe loss: 6.027660E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.347 | tokens per gpu per second (tgs): 47813.985 | TFLOPs: 46.28 |
+ iteration      160/     500 | consumed samples:        10240 | consumed tokens:     20971520 | elapsed time per iteration (ms): 2702.4 | learning rate: 1.311E-04 | global batch size:    64 | lm loss: 5.722631E+00 | moe loss: 6.029226E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.683 | tokens per gpu per second (tgs): 48501.785 | TFLOPs: 46.94 |
+ iteration      170/     500 | consumed samples:        10880 | consumed tokens:     22282240 | elapsed time per iteration (ms): 2705.2 | learning rate: 1.277E-04 | global batch size:    64 | lm loss: 5.666348E+00 | moe loss: 6.026734E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.658 | tokens per gpu per second (tgs): 48451.817 | TFLOPs: 46.90 |
+ iteration      180/     500 | consumed samples:        11520 | consumed tokens:     23592960 | elapsed time per iteration (ms): 2759.8 | learning rate: 1.241E-04 | global batch size:    64 | lm loss: 5.609516E+00 | moe loss: 6.015658E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.190 | tokens per gpu per second (tgs): 47493.534 | TFLOPs: 45.97 |
+ iteration      190/     500 | consumed samples:        12160 | consumed tokens:     24903680 | elapsed time per iteration (ms): 2713.2 | learning rate: 1.202E-04 | global batch size:    64 | lm loss: 5.569950E+00 | moe loss: 6.017736E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.588 | tokens per gpu per second (tgs): 48308.376 | TFLOPs: 46.76 |
+ iteration      200/     500 | consumed samples:        12800 | consumed tokens:     26214400 | elapsed time per iteration (ms): 2745.0 | learning rate: 1.162E-04 | global batch size:    64 | lm loss: 5.521895E+00 | moe loss: 6.014125E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.315 | tokens per gpu per second (tgs): 47748.542 | TFLOPs: 46.22 |
+ iteration      210/     500 | consumed samples:        13440 | consumed tokens:     27525120 | elapsed time per iteration (ms): 2723.3 | learning rate: 1.121E-04 | global batch size:    64 | lm loss: 5.475309E+00 | moe loss: 6.014675E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.501 | tokens per gpu per second (tgs): 48129.461 | TFLOPs: 46.58 |
+ iteration      220/     500 | consumed samples:        14080 | consumed tokens:     28835840 | elapsed time per iteration (ms): 2692.8 | learning rate: 1.078E-04 | global batch size:    64 | lm loss: 5.443509E+00 | moe loss: 6.010875E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.767 | tokens per gpu per second (tgs): 48674.362 | TFLOPs: 47.11 |
+ iteration      230/     500 | consumed samples:        14720 | consumed tokens:     30146560 | elapsed time per iteration (ms): 2701.2 | learning rate: 1.034E-04 | global batch size:    64 | lm loss: 5.406126E+00 | moe loss: 6.009305E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.693 | tokens per gpu per second (tgs): 48523.316 | TFLOPs: 46.97 |
+ iteration      240/     500 | consumed samples:        15360 | consumed tokens:     31457280 | elapsed time per iteration (ms): 2764.8 | learning rate: 9.883E-05 | global batch size:    64 | lm loss: 5.382206E+00 | moe loss: 6.009862E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.148 | tokens per gpu per second (tgs): 47406.681 | TFLOPs: 45.88 |
+ iteration      250/     500 | consumed samples:        16000 | consumed tokens:     32768000 | elapsed time per iteration (ms): 2701.9 | learning rate: 9.422E-05 | global batch size:    64 | lm loss: 5.348114E+00 | moe loss: 6.011082E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.687 | tokens per gpu per second (tgs): 48510.453 | TFLOPs: 46.95 |
+ iteration      260/     500 | consumed samples:        16640 | consumed tokens:     34078720 | elapsed time per iteration (ms): 2706.9 | learning rate: 8.956E-05 | global batch size:    64 | lm loss: 5.321956E+00 | moe loss: 6.005461E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.643 | tokens per gpu per second (tgs): 48420.832 | TFLOPs: 46.87 |
+ iteration      270/     500 | consumed samples:        17280 | consumed tokens:     35389440 | elapsed time per iteration (ms): 2728.6 | learning rate: 8.486E-05 | global batch size:    64 | lm loss: 5.292054E+00 | moe loss: 6.005427E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.455 | tokens per gpu per second (tgs): 48036.531 | TFLOPs: 46.49 |
+ iteration      280/     500 | consumed samples:        17920 | consumed tokens:     36700160 | elapsed time per iteration (ms): 2709.7 | learning rate: 8.014E-05 | global batch size:    64 | lm loss: 5.270012E+00 | moe loss: 6.000895E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.619 | tokens per gpu per second (tgs): 48371.198 | TFLOPs: 46.82 |
+ iteration      290/     500 | consumed samples:        18560 | consumed tokens:     38010880 | elapsed time per iteration (ms): 2700.5 | learning rate: 7.544E-05 | global batch size:    64 | lm loss: 5.242834E+00 | moe loss: 6.007484E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.699 | tokens per gpu per second (tgs): 48535.598 | TFLOPs: 46.98 |
+ iteration      300/     500 | consumed samples:        19200 | consumed tokens:     39321600 | elapsed time per iteration (ms): 2728.2 | learning rate: 7.078E-05 | global batch size:    64 | lm loss: 5.227093E+00 | moe loss: 6.004913E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.458 | tokens per gpu per second (tgs): 48042.783 | TFLOPs: 46.50 |
+ iteration      310/     500 | consumed samples:        19840 | consumed tokens:     40632320 | elapsed time per iteration (ms): 2699.1 | learning rate: 6.617E-05 | global batch size:    64 | lm loss: 5.209669E+00 | moe loss: 6.002632E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.712 | tokens per gpu per second (tgs): 48561.630 | TFLOPs: 47.00 |
+ iteration      320/     500 | consumed samples:        20480 | consumed tokens:     41943040 | elapsed time per iteration (ms): 2745.6 | learning rate: 6.164E-05 | global batch size:    64 | lm loss: 5.191566E+00 | moe loss: 6.005695E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.310 | tokens per gpu per second (tgs): 47738.537 | TFLOPs: 46.21 |
+ iteration      330/     500 | consumed samples:        21120 | consumed tokens:     43253760 | elapsed time per iteration (ms): 2789.2 | learning rate: 5.721E-05 | global batch size:    64 | lm loss: 5.175312E+00 | moe loss: 6.003357E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 22.945 | tokens per gpu per second (tgs): 46992.381 | TFLOPs: 45.48 |
+ iteration      340/     500 | consumed samples:        21760 | consumed tokens:     44564480 | elapsed time per iteration (ms): 2705.6 | learning rate: 5.291E-05 | global batch size:    64 | lm loss: 5.171662E+00 | moe loss: 6.002294E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.655 | tokens per gpu per second (tgs): 48444.658 | TFLOPs: 46.89 |
+ iteration      350/     500 | consumed samples:        22400 | consumed tokens:     45875200 | elapsed time per iteration (ms): 2700.6 | learning rate: 4.875E-05 | global batch size:    64 | lm loss: 5.144769E+00 | moe loss: 6.002806E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.699 | tokens per gpu per second (tgs): 48534.619 | TFLOPs: 46.98 |
+ iteration      360/     500 | consumed samples:        23040 | consumed tokens:     47185920 | elapsed time per iteration (ms): 2699.1 | learning rate: 4.475E-05 | global batch size:    64 | lm loss: 5.138008E+00 | moe loss: 6.003418E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.712 | tokens per gpu per second (tgs): 48562.231 | TFLOPs: 47.00 |
+ iteration      370/     500 | consumed samples:        23680 | consumed tokens:     48496640 | elapsed time per iteration (ms): 2735.8 | learning rate: 4.094E-05 | global batch size:    64 | lm loss: 5.133211E+00 | moe loss: 6.000387E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.393 | tokens per gpu per second (tgs): 47909.182 | TFLOPs: 46.37 |
+ iteration      380/     500 | consumed samples:        24320 | consumed tokens:     49807360 | elapsed time per iteration (ms): 2698.8 | learning rate: 3.733E-05 | global batch size:    64 | lm loss: 5.116563E+00 | moe loss: 6.004622E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.714 | tokens per gpu per second (tgs): 48566.535 | TFLOPs: 47.01 |
+ iteration      390/     500 | consumed samples:        24960 | consumed tokens:     51118080 | elapsed time per iteration (ms): 2727.7 | learning rate: 3.394E-05 | global batch size:    64 | lm loss: 5.105925E+00 | moe loss: 6.002499E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.463 | tokens per gpu per second (tgs): 48051.696 | TFLOPs: 46.51 |
+ iteration      400/     500 | consumed samples:        25600 | consumed tokens:     52428800 | elapsed time per iteration (ms): 2699.2 | learning rate: 3.079E-05 | global batch size:    64 | lm loss: 5.097826E+00 | moe loss: 6.003325E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.711 | tokens per gpu per second (tgs): 48559.269 | TFLOPs: 47.00 |
+ iteration      410/     500 | consumed samples:        26240 | consumed tokens:     53739520 | elapsed time per iteration (ms): 2719.9 | learning rate: 2.789E-05 | global batch size:    64 | lm loss: 5.084684E+00 | moe loss: 6.003474E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.530 | tokens per gpu per second (tgs): 48189.989 | TFLOPs: 46.64 |
+ iteration      420/     500 | consumed samples:        26880 | consumed tokens:     55050240 | elapsed time per iteration (ms): 2700.5 | learning rate: 2.526E-05 | global batch size:    64 | lm loss: 5.082355E+00 | moe loss: 6.001704E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.700 | tokens per gpu per second (tgs): 48536.739 | TFLOPs: 46.98 |
+ iteration      430/     500 | consumed samples:        27520 | consumed tokens:     56360960 | elapsed time per iteration (ms): 2714.4 | learning rate: 2.290E-05 | global batch size:    64 | lm loss: 5.086011E+00 | moe loss: 6.002519E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.578 | tokens per gpu per second (tgs): 48287.263 | TFLOPs: 46.74 |
+ iteration      440/     500 | consumed samples:        28160 | consumed tokens:     57671680 | elapsed time per iteration (ms): 2706.4 | learning rate: 2.084E-05 | global batch size:    64 | lm loss: 5.074632E+00 | moe loss: 6.005992E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.648 | tokens per gpu per second (tgs): 48430.861 | TFLOPs: 46.88 |
+ iteration      450/     500 | consumed samples:        28800 | consumed tokens:     58982400 | elapsed time per iteration (ms): 2700.1 | learning rate: 1.907E-05 | global batch size:    64 | lm loss: 5.069178E+00 | moe loss: 6.006107E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.703 | tokens per gpu per second (tgs): 48544.069 | TFLOPs: 46.99 |
+ iteration      460/     500 | consumed samples:        29440 | consumed tokens:     60293120 | elapsed time per iteration (ms): 2720.6 | learning rate: 1.761E-05 | global batch size:    64 | lm loss: 5.067255E+00 | moe loss: 5.999936E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.524 | tokens per gpu per second (tgs): 48177.878 | TFLOPs: 46.63 |
+ iteration      470/     500 | consumed samples:        30080 | consumed tokens:     61603840 | elapsed time per iteration (ms): 2705.2 | learning rate: 1.648E-05 | global batch size:    64 | lm loss: 5.055261E+00 | moe loss: 6.003825E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.658 | tokens per gpu per second (tgs): 48452.143 | TFLOPs: 46.90 |
+ iteration      480/     500 | consumed samples:        30720 | consumed tokens:     62914560 | elapsed time per iteration (ms): 2698.8 | learning rate: 1.566E-05 | global batch size:    64 | lm loss: 5.054254E+00 | moe loss: 6.003509E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.714 | tokens per gpu per second (tgs): 48566.499 | TFLOPs: 47.01 |
+ iteration      490/     500 | consumed samples:        31360 | consumed tokens:     64225280 | elapsed time per iteration (ms): 2727.8 | learning rate: 1.516E-05 | global batch size:    64 | lm loss: 5.047395E+00 | moe loss: 6.004500E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.462 | tokens per gpu per second (tgs): 48050.531 | TFLOPs: 46.51 |
+ iteration      500/     500 | consumed samples:        32000 | consumed tokens:     65536000 | elapsed time per iteration (ms): 2695.9 | learning rate: 1.500E-05 | global batch size:    64 | lm loss: 5.045095E+00 | moe loss: 6.003712E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.740 | tokens per gpu per second (tgs): 48619.529 | TFLOPs: 47.06 |
+[after training is done] datetime: 2026-04-14 21:26:04 
+[proposal] replay at end: calling proposal_recover(t_fault=500)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py", line 361, in <module>
+[rank0]:     pretrain(train_valid_test_datasets_provider,
+[rank0]:   File "/home/asdf1234/Megatron-DeepSpeed/megatron/training.py", line 271, in pretrain
+[rank0]:     diag = proposal_recover(model, optimizer, t_fault=iteration)
+[rank0]:   File "/home/asdf1234/Megatron-DeepSpeed/megatron/proposal/cp_hooks.py", line 297, in proposal_recover
+[rank0]:     diag = recover(
+[rank0]:   File "/home/asdf1234/Megatron-DeepSpeed/megatron/proposal/recovery.py", line 296, in recover
+[rank0]:     opt_defs = optimizer.defaults
+[rank0]: AttributeError: 'FP16_Optimizer' object has no attribute 'defaults'
+[rank0]:[W414 21:26:31.322708119 ProcessGroupNCCL.cpp:1538] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[2026-04-14 21:26:39,466] [INFO] [launch.py:335:sigkill_handler] Killing subprocess 89486
+[2026-04-14 21:26:39,467] [ERROR] [launch.py:341:sigkill_handler] ['/usr/bin/python3', '-u', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=0', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '8', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--micro-batch-size', '8', '--global-batch-size', '64', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '2048', '--max-position-embeddings', '2048', '--train-iters', '500', '--lr', '1.5e-4', '--min-lr', '1.5e-5', '--lr-decay-style', 'cosine', '--lr-warmup-iters', '50', '--split', '100,0,0', '--log-interval', '10', '--eval-interval', '50', '--eval-iters', '8', '--save-interval', '100000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '2', '--bf16', '--use-flash-attn-v2', '--ds_fused_adam', '--seed', '1234', '--proposal-enable', '--proposal-cp-dir', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/proposal', '--proposal-selection-mode', 'importance', '--proposal-fc-stagger', '0', '--proposal-topk-ratio', '0.001', '--proposal-beta', '0.1', '--proposal-nonexpert-fc-W', '10', '--proposal-async-queue', '5', '--proposal-dc-retention', '500', '--proposal-replay-at-end', '--vocab-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json', '--merge-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt', '--data-path', '/home/asdf1234/data/wikitext-2/train_text_document', '--valid-data-path', '/home/asdf1234/data/wikitext-2/valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_proposal-210250.json', '--pipeline-model-parallel-size', '1', '--no-pipeline-parallel', '--create-moe-param-group'] exits with return code = 1
+[exp1] === Finished proposal ===
+[exp1] === Running random ===
+[runner] VARIANT=random  LOG=/home/asdf1234/Megatron-DeepSpeed/results/exp_1/log/random.log
+[2026-04-14 21:26:50,516] [WARNING] [runner.py:232:fetch_hostfile] Unable to find hostfile, will proceed with training with local resources only.
+[2026-04-14 21:26:50,517] [INFO] [runner.py:630:main] cmd = /usr/bin/python3 -u -m deepspeed.launcher.launch --world_info=eyJsb2NhbGhvc3QiOiBbMF19 --master_addr=127.0.0.1 --master_port=29500 --enable_each_rank_log=None --log_level=info /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py --override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95 --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 --num-experts 8 --moe-loss-coeff 0.01 --moe-train-capacity-factor 1.0 --moe-eval-capacity-factor 1.0 --moe-min-capacity 4 --init-method-std 0.014 --micro-batch-size 8 --global-batch-size 64 --num-layers 12 --hidden-size 768 --num-attention-heads 12 --seq-length 2048 --max-position-embeddings 2048 --train-iters 500 --lr 1.5e-4 --min-lr 1.5e-5 --lr-decay-style cosine --lr-warmup-iters 50 --split 100,0,0 --log-interval 10 --eval-interval 50 --eval-iters 8 --save-interval 100000 --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam --seed 1234 --proposal-enable --proposal-cp-dir /home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/random --proposal-selection-mode random --proposal-fc-stagger 0 --proposal-topk-ratio 0.001 --proposal-nonexpert-fc-W 10 --proposal-async-queue 5 --proposal-dc-retention 500 --proposal-replay-at-end --vocab-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json --merge-file /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt --data-path /home/asdf1234/data/wikitext-2/train_text_document --valid-data-path /home/asdf1234/data/wikitext-2/valid_text_document --data-impl mmap --deepspeed --deepspeed_config /home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_random-212643.json --pipeline-model-parallel-size 1 --no-pipeline-parallel --create-moe-param-group
+[2026-04-14 21:26:56,241] [INFO] [launch.py:162:main] WORLD INFO DICT: {'localhost': [0]}
+[2026-04-14 21:26:56,241] [INFO] [launch.py:168:main] nnodes=1, num_local_procs=1, node_rank=0
+[2026-04-14 21:26:56,241] [INFO] [launch.py:179:main] global_rank_mapping=defaultdict(<class 'list'>, {'localhost': [0]})
+[2026-04-14 21:26:56,241] [INFO] [launch.py:180:main] dist_world_size=1
+[2026-04-14 21:26:56,241] [INFO] [launch.py:184:main] Setting CUDA_VISIBLE_DEVICES=0
+[2026-04-14 21:26:56,242] [INFO] [launch.py:272:main] process 91500 spawned with command: ['/usr/bin/python3', '-u', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=0', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '8', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--micro-batch-size', '8', '--global-batch-size', '64', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '2048', '--max-position-embeddings', '2048', '--train-iters', '500', '--lr', '1.5e-4', '--min-lr', '1.5e-5', '--lr-decay-style', 'cosine', '--lr-warmup-iters', '50', '--split', '100,0,0', '--log-interval', '10', '--eval-interval', '50', '--eval-iters', '8', '--save-interval', '100000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '2', '--bf16', '--use-flash-attn-v2', '--ds_fused_adam', '--seed', '1234', '--proposal-enable', '--proposal-cp-dir', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/random', '--proposal-selection-mode', 'random', '--proposal-fc-stagger', '0', '--proposal-topk-ratio', '0.001', '--proposal-nonexpert-fc-W', '10', '--proposal-async-queue', '5', '--proposal-dc-retention', '500', '--proposal-replay-at-end', '--vocab-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json', '--merge-file', '/home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt', '--data-path', '/home/asdf1234/data/wikitext-2/train_text_document', '--valid-data-path', '/home/asdf1234/data/wikitext-2/valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', '/home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_random-212643.json', '--pipeline-model-parallel-size', '1', '--no-pipeline-parallel', '--create-moe-param-group']
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:250: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
+/home/asdf1234/Megatron-DeepSpeed/megatron/core/tensor_parallel/layers.py:288: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  def backward(ctx, grad_output):
+--------------------------------------------------
+DeepSpeed C++/CUDA extension op report
+--------------------------------------------------
+NOTE: Ops not installed will be just-in-time (JIT) compiled at
+      runtime if needed. Op compatibility means that your system
+      meet the required dependencies to JIT install the op.
+--------------------------------------------------
+JIT compiled ops requires ninja
+ninja .................. [92m[OKAY][0m
+--------------------------------------------------
+op name ................ installed .. compatible
+--------------------------------------------------
+[93m [WARNING] [0m async_io requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m async_io: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+async_io ............... [93m[NO][0m ....... [93m[NO][0m
+fused_adam ............. [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adam ............... [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adagrad ............ [93m[NO][0m ....... [92m[OKAY][0m
+cpu_lion ............... [93m[NO][0m ....... [92m[OKAY][0m
+dc ..................... [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m Please specify CUTLASS location directory as environment variable CUTLASS_PATH
+[93m [WARNING] [0m Possible values are: a path, DS_IGNORE_CUTLASS_DETECTION and DS_USE_CUTLASS_PYTHON_BINDINGS
+evoformer_attn ......... [93m[NO][0m ....... [93m[NO][0m
+[93m [WARNING] [0m FP Quantizer is using an untested triton version (3.4.0), only 2.3.(0, 1) and 3.0.0 are known to be compatible with these kernels
+fp_quantizer ........... [93m[NO][0m ....... [93m[NO][0m
+fused_lamb ............. [93m[NO][0m ....... [92m[OKAY][0m
+fused_lion ............. [93m[NO][0m ....... [92m[OKAY][0m
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmp_z8lpogd/test.c -o /tmp/tmp_z8lpogd/test.o
+x86_64-linux-gnu-gcc /tmp/tmp_z8lpogd/test.o -L/usr/local/cuda -L/usr/local/cuda/lib64 -lcufile -o /tmp/tmp_z8lpogd/a.out
+x86_64-linux-gnu-gcc -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -c /tmp/tmpxw0xsxkj/test.c -o /tmp/tmpxw0xsxkj/test.o
+x86_64-linux-gnu-gcc /tmp/tmpxw0xsxkj/test.o -laio -o /tmp/tmpxw0xsxkj/a.out
+[93m [WARNING] [0m gds requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m gds: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+gds .................... [93m[NO][0m ....... [93m[NO][0m
+transformer_inference .. [93m[NO][0m ....... [92m[OKAY][0m
+inference_core_ops ..... [93m[NO][0m ....... [92m[OKAY][0m
+cutlass_ops ............ [93m[NO][0m ....... [92m[OKAY][0m
+quantizer .............. [93m[NO][0m ....... [92m[OKAY][0m
+ragged_device_ops ...... [93m[NO][0m ....... [92m[OKAY][0m
+ragged_ops ............. [93m[NO][0m ....... [92m[OKAY][0m
+random_ltd ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m sparse_attn requires a torch version >= 1.5 and < 2.0 but detected 2.8
+[93m [WARNING] [0m using untested triton version (3.4.0), only 1.0.0 is known to be compatible
+sparse_attn ............ [93m[NO][0m ....... [93m[NO][0m
+spatial_inference ...... [93m[NO][0m ....... [92m[OKAY][0m
+transformer ............ [93m[NO][0m ....... [92m[OKAY][0m
+stochastic_transformer . [93m[NO][0m ....... [92m[OKAY][0m
+utils .................. [93m[NO][0m ....... [92m[OKAY][0m
+--------------------------------------------------
+DeepSpeed general environment info:
+torch install path ............... ['/usr/local/lib/python3.10/dist-packages/torch']
+torch version .................... 2.8.0+cu128
+deepspeed install path ........... ['/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed']
+deepspeed info ................... 0.18.9, unknown, unknown
+torch cuda version ............... 12.8
+torch hip version ................ None
+nvcc version ..................... 12.8
+deepspeed wheel compiled w. ...... torch 2.8, cuda 12.8
+shared memory (/dev/shm) size .... 94.35 GB
+**** Git info for Megatron: git_hash=aab2f31 git_branch=main ****
+using world size: 1, data-parallel-size: 1, sequence-parallel size: 1, tensor-model-parallel size: 1, pipeline-model-parallel size: 1 
+accumulate and all-reduce gradients in fp32 for bfloat16 data type.
+using torch.bfloat16 for parameters ...
+------------------------ arguments ------------------------
+  accumulate_allreduce_grads_in_fp32 .............. True
+  adam_beta1 ...................................... 0.9
+  adam_beta2 ...................................... 0.95
+  adam_eps ........................................ 1e-08
+  add_bias_linear ................................. True
+  add_position_embedding .......................... True
+  adlr_autoresume ................................. False
+  adlr_autoresume_interval ........................ 1000
+  aml_data_download_path .......................... None
+  apply_layernorm_1p .............................. False
+  apply_query_key_layer_scaling ................... True
+  apply_residual_connection_post_layernorm ........ False
+  async_tensor_model_parallel_allreduce ........... False
+  attention_dropout ............................... 0.1
+  attention_softmax_in_fp32 ....................... False
+  barrier_with_L1_time ............................ True
+  bert_binary_head ................................ True
+  bert_embedder_type .............................. megatron
+  bert_load ....................................... None
+  bf16 ............................................ True
+  bias_dropout_fusion ............................. True
+  bias_gelu_fusion ................................ True
+  biencoder_projection_dim ........................ 0
+  biencoder_shared_query_context_model ............ False
+  block_data_path ................................. None
+  checkpoint_activations .......................... False
+  checkpoint_in_cpu ............................... False
+  checkpoint_num_layers ........................... 1
+  classes_fraction ................................ 1.0
+  clip_grad ....................................... 1.0
+  compression_training ............................ False
+  consumed_train_samples .......................... 0
+  consumed_train_tokens ........................... 0
+  consumed_valid_samples .......................... 0
+  contigious_checkpointing ........................ False
+  cpu_optimizer ................................... False
+  cpu_torch_adam .................................. False
+  create_moe_param_group .......................... True
+  curriculum_learning_legacy ...................... False
+  data_cache_path ................................. None
+  data_efficiency_curriculum_learning ............. False
+  data_impl ....................................... mmap
+  data_parallel_random_init ....................... False
+  data_parallel_size .............................. 1
+  data_path ....................................... ['/home/asdf1234/data/wikitext-2/train_text_document']
+  data_per_class_fraction ......................... 1.0
+  data_sharding ................................... True
+  dataloader_type ................................. single
+  DDP_impl ........................................ local
+  decoder_num_layers .............................. None
+  decoder_seq_length .............................. None
+  deepscale ....................................... False
+  deepscale_config ................................ None
+  deepspeed ....................................... True
+  deepspeed_activation_checkpointing .............. False
+  deepspeed_config ................................ /home/asdf1234/Megatron-DeepSpeed/results/exp_1/ds_config_random-212643.json
+  dino_bottleneck_size ............................ 256
+  dino_freeze_last_layer .......................... 1
+  dino_head_hidden_size ........................... 2048
+  dino_local_crops_number ......................... 10
+  dino_local_img_size ............................. 96
+  dino_norm_last_layer ............................ False
+  dino_teacher_temp ............................... 0.07
+  dino_warmup_teacher_temp ........................ 0.04
+  dino_warmup_teacher_temp_epochs ................. 30
+  distribute_checkpointed_activations ............. False
+  distribute_saved_activations .................... False
+  distributed_backend ............................. nccl
+  distributed_timeout_minutes ..................... 10
+  ds_fused_adam ................................... True
+  ds_inference .................................... False
+  ds_pipeline_enabled ............................. False
+  ds_sequence_parallel_fpdt ....................... False
+  ds_sequence_parallel_fpdt_chunk_size ............ 65536
+  ds_sequence_parallel_fpdt_offloading ............ False
+  ds_sequence_parallel_size ....................... 1
+  embedding_path .................................. None
+  embedding_weights_in_fp32 ....................... False
+  empty_unused_memory_level ....................... 0
+  enable_expert_tensor_parallelism ................ False
+  enable_zbh1_exact_semantics ..................... False
+  enable_zbh1_pipeline ............................ False
+  encoder_num_layers .............................. 12
+  encoder_seq_length .............................. 2048
+  end_weight_decay ................................ 0.1
+  eod_mask_loss ................................... False
+  eval_interval ................................... 50
+  eval_iters ...................................... 8
+  evidence_data_path .............................. None
+  exit_duration_in_mins ........................... None
+  exit_interval ................................... None
+  exit_on_missing_checkpoint ...................... False
+  exit_signal_handler ............................. False
+  expert_interval ................................. 2
+  ffn_hidden_size ................................. 3072
+  finetune ........................................ False
+  force_ds_sequence_parallel ...................... False
+  fp16 ............................................ False
+  fp16_lm_cross_entropy ........................... False
+  fp32_residual_connection ........................ False
+  fp8_amax_compute_algo ........................... most_recent
+  fp8_amax_history_len ............................ 1
+  fp8_e4m3 ........................................ False
+  fp8_hybrid ...................................... False
+  fp8_interval .................................... 1
+  fp8_margin ...................................... 0
+  fp8_wgrad ....................................... True
+  global_batch_size ............................... 64
+  gradient_accumulation_fusion .................... True
+  head_lr_mult .................................... 1.0
+  hidden_dropout .................................. 0.1
+  hidden_size ..................................... 768
+  hidden_size_teacher ............................. None
+  hysteresis ...................................... 2
+  ict_head_size ................................... None
+  ict_load ........................................ None
+  img_h ........................................... 224
+  img_w ........................................... 224
+  indexer_batch_size .............................. 128
+  indexer_log_interval ............................ 1000
+  inference ....................................... False
+  inference_batch_times_seqlen_threshold .......... 512
+  init_method_std ................................. 0.014
+  init_method_xavier_uniform ...................... False
+  initial_loss_scale .............................. 4294967296
+  iter_per_epoch .................................. 1250
+  kd .............................................. False
+  kd_alpha_ce ..................................... 1
+  kd_beta_ce ...................................... 1
+  kd_temp ......................................... 1.0
+  kill_switch_file ................................ None
+  kv_channels ..................................... 64
+  layernorm_epsilon ............................... 1e-05
+  lazy_mpu_init ................................... None
+  load ............................................ None
+  load_tag ........................................ None
+  load_teacher .................................... None
+  local_rank ...................................... 0
+  log_batch_size_to_tensorboard ................... False
+  log_interval .................................... 10
+  log_learning_rate_to_tensorboard ................ True
+  log_loss_scale_to_tensorboard ................... True
+  log_memory_to_tensorboard ....................... False
+  log_num_zeros_in_grad ........................... False
+  log_optimizer_states_to_tensorboard ............. False
+  log_params_norm ................................. False
+  log_timers_to_tensorboard ....................... False
+  log_validation_ppl_to_tensorboard ............... False
+  log_world_size_to_tensorboard ................... False
+  loss_scale ...................................... None
+  loss_scale_window ............................... 1000
+  lr .............................................. 0.00015
+  lr_decay_iters .................................. None
+  lr_decay_samples ................................ None
+  lr_decay_style .................................. cosine
+  lr_decay_tokens ................................. None
+  lr_warmup_fraction .............................. None
+  lr_warmup_iters ................................. 50
+  lr_warmup_samples ............................... 0
+  lr_warmup_tokens ................................ None
+  make_vocab_size_divisible_by .................... 128
+  mask_factor ..................................... 1.0
+  mask_prob ....................................... 0.15
+  mask_type ....................................... random
+  masked_softmax_fusion ........................... True
+  max_position_embeddings ......................... 2048
+  max_tokens_to_oom ............................... 12000
+  mem_efficient_ln ................................ True
+  memory_centric_tiled_linear ..................... False
+  merge_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-merges.txt
+  micro_batch_size ................................ 8
+  min_loss_scale .................................. 1.0
+  min_lr .......................................... 1.5e-05
+  mlp_type ........................................ standard
+  mmap_warmup ..................................... False
+  moe_eval_capacity_factor ........................ 1.0
+  moe_expert_parallel_size ........................ 1
+  moe_loss_coeff .................................. 0.01
+  moe_min_capacity ................................ 4
+  moe_token_dropping .............................. True
+  moe_top2_2nd_expert_sampling .................... True
+  moe_train_capacity_factor ....................... 1.0
+  mos ............................................. False
+  no_load_lr_state ................................ False
+  no_load_optim ................................... None
+  no_load_rng ..................................... None
+  no_persist_layer_norm ........................... False
+  no_pipeline_parallel ............................ True
+  no_save_optim ................................... None
+  no_save_rng ..................................... None
+  normalization ................................... layernorm
+  num_attention_heads ............................. 12
+  num_attention_heads_teacher ..................... None
+  num_channels .................................... 3
+  num_classes ..................................... 1000
+  num_experts ..................................... [8]
+  num_experts_switch .............................. None
+  num_experts_teacher ............................. [1]
+  num_key_value_heads ............................. 12
+  num_layers ...................................... 12
+  num_layers_per_virtual_pipeline_stage ........... None
+  num_layers_teacher .............................. None
+  num_workers ..................................... 2
+  onnx_safe ....................................... None
+  openai_gelu ..................................... False
+  optimizer ....................................... adam
+  output_bert_embeddings .......................... False
+  overlap_p2p_comm ................................ False
+  override_opt_param_scheduler .................... True
+  params_dtype .................................... torch.bfloat16
+  partition_activations ........................... False
+  patch_dim ....................................... 16
+  perform_initialization .......................... True
+  pipeline_model_parallel_size .................... 1
+  pipeline_model_parallel_split_rank .............. None
+  profile ......................................... None
+  profile_backward ................................ False
+  profile_ranks ................................... None
+  profile_steps ................................... 2,3
+  proposal_async_queue ............................ 5
+  proposal_beta ................................... 0.1
+  proposal_cp_dir ................................. /home/asdf1234/Megatron-DeepSpeed/results/exp_1/cp/random
+  proposal_cp_mode ................................ differential
+  proposal_dc_retention ........................... 500
+  proposal_enable ................................. True
+  proposal_expert_fc_D ............................ None
+  proposal_fc_stagger ............................. 0
+  proposal_nonexpert_fc_W ......................... 10
+  proposal_replay_at_end .......................... True
+  proposal_selection_mode ......................... random
+  proposal_topk_ratio ............................. 0.001
+  query_in_block_prob ............................. 0.1
+  rampup_batch_size ............................... None
+  random_ltd ...................................... False
+  rank ............................................ 0
+  recompute_granularity ........................... None
+  recompute_method ................................ None
+  recompute_num_layers ............................ 1
+  remote_device ................................... none
+  repeated_dataloader ............................. False
+  reset_attention_mask ............................ False
+  reset_iteration ................................. False
+  reset_position_ids .............................. False
+  retriever_report_topk_accuracies ................ []
+  retriever_score_scaling ......................... False
+  retriever_seq_length ............................ 256
+  retro_add_retriever ............................. False
+  retro_cyclic_train_iters ........................ None
+  retro_encoder_attention_dropout ................. 0.1
+  retro_encoder_hidden_dropout .................... 0.1
+  retro_encoder_layers ............................ 2
+  retro_num_neighbors ............................. 2
+  retro_num_retrieved_chunks ...................... 2
+  retro_return_doc_ids ............................ False
+  retro_workdir ................................... None
+  return_data_index ............................... False
+  rope_theta ...................................... 10000
+  rotary_percent .................................. 1.0
+  sample_rate ..................................... 1.0
+  save ............................................ None
+  save_interval ................................... 100000
+  scatter_gather_tensors_in_pipeline .............. True
+  scattered_embeddings ............................ False
+  seed ............................................ 1234
+  seq_length ...................................... 2048
+  sequence_parallel ............................... False
+  sgd_momentum .................................... 0.9
+  short_seq_prob .................................. 0.1
+  skip_train ...................................... False
+  split ........................................... 100,0,0
+  split_transformers .............................. False
+  squared_relu .................................... False
+  standalone_embedding_stage ...................... False
+  start_weight_decay .............................. 0.1
+  swiglu .......................................... False
+  swin_backbone_type .............................. tiny
+  synchronize_each_layer .......................... False
+  tensor_model_parallel_size ...................... 1
+  tensorboard_dir ................................. None
+  tensorboard_log_interval ........................ 1
+  tensorboard_queue_size .......................... 1000
+  test_data_path .................................. None
+  tile_factor ..................................... 1
+  timing_log_level ................................ 0
+  timing_log_option ............................... minmax
+  titles_data_path ................................ None
+  tokenizer_model ................................. None
+  tokenizer_type .................................. GPT2BPETokenizer
+  topk ............................................ 1
+  train_data_exact_num_epochs ..................... None
+  train_data_path ................................. None
+  train_desc_path ................................. None
+  train_doc_idx_path .............................. None
+  train_idx_path .................................. None
+  train_iters ..................................... 500
+  train_sample_idx_path ........................... None
+  train_samples ................................... None
+  train_shuffle_idx_path .......................... None
+  train_tokens .................................... None
+  transformer_impl ................................ local
+  transformer_pipeline_model_parallel_size ........ 1
+  trust_remote_code ............................... False
+  universal_checkpoint ............................ False
+  untie_embeddings_and_output_weights ............. False
+  use_checkpoint_args ............................. False
+  use_checkpoint_opt_param_scheduler .............. False
+  use_contiguous_buffers_in_local_ddp ............. True
+  use_cpu_initialization .......................... None
+  use_dataset_only ................................ False
+  use_distributed_optimizer ....................... False
+  use_flash_attn .................................. True
+  use_flash_attn_builder .......................... False
+  use_flash_attn_triton ........................... False
+  use_flash_attn_v1 ............................... False
+  use_flash_attn_v2 ............................... True
+  use_one_sent_docs ............................... False
+  use_pin_memory .................................. False
+  use_ring_exchange_p2p ........................... False
+  use_rotary_position_embeddings .................. False
+  use_tutel ....................................... False
+  valid_data_path ................................. ['/home/asdf1234/data/wikitext-2/valid_text_document']
+  variable_seq_lengths ............................ False
+  virtual_pipeline_model_parallel_size ............ None
+  vision_backbone_type ............................ vit
+  vision_pretraining .............................. False
+  vision_pretraining_type ......................... classify
+  vocab_extra_ids ................................. 0
+  vocab_file ...................................... /home/asdf1234/Megatron-DeepSpeed/examples_deepspeed/MoE/../rebase/gpt2-vocab.json
+  vocab_size ...................................... None
+  wandb_exp_name .................................. 
+  wandb_project ................................... 
+  wandb_save_dir .................................. 
+  weight_decay .................................... 0.1
+  weight_decay_incr_style ......................... constant
+  world_size ...................................... 1
+  zero_allgather_bucket_size ...................... 0.0
+  zero_contigious_gradients ....................... False
+  zero_reduce_bucket_size ......................... 0.0
+  zero_reduce_scatter ............................. False
+  zero_stage ...................................... 1.0
+-------------------- end of arguments ---------------------
+setting number of micro-batches to constant 8
+> building GPT2BPETokenizer tokenizer ...
+ > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+WARNING: WANDB writing requested but no legit wandb project or experiment name provided, therefore no WANDB logs will be written according to random generated project or experiment name.
+> initializing torch distributed ...
+> initialized tensor model parallel with size 1
+> initialized pipeline model parallel with size 1
+> setting random seeds to 1234 ...
+> initializing model parallel cuda seeds on global rank 0, model parallel rank 0, and data parallel rank 0 with model parallel seed: 3952 and data parallel seed: 1234
+> compiling dataset index builder ...
+make: Entering directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/home/asdf1234/Megatron-DeepSpeed/megatron/data'
+>>> done with dataset index builder. Compilation time: 0.076 seconds
+> compiling and loading fused kernels ...
+[rank0]:W0414 21:27:03.767000 91500 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:27:03.767000 91500 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0414 21:27:03.828000 91500 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:27:03.828000 91500 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0414 21:27:03.873000 91500 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:27:03.873000 91500 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+>>> done with compiling and loading fused kernels. Compilation time: 0.175 seconds
+[rank0]:[W414 21:27:03.758658730 init.cpp:772] Warning: nvfuser is no longer supported in torch script, use _jit_set_nvfuser_enabled is deprecated and a no-op (function operator())
+time to initialize megatron (seconds): 1.877
+[after megatron is initialized] datetime: 2026-04-14 21:27:04 
+building GPT model ...
+Before Building Model
+MA 0.0 GB         Max_MA 1.59 GB         CA 0.0 GB         Max_CA 2 GB 
+CPU Virtual Memory:  used = 14.33 GB, percent = 7.6%
+After Building Model
+MA 0.6 GB         Max_MA 0.61 GB         CA 0.68 GB         Max_CA 1 GB 
+CPU Virtual Memory:  used = 14.34 GB, percent = 7.6%
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 323641344
+[rank0]:W0414 21:27:04.489000 91500 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0414 21:27:04.489000 91500 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+> learning rate decay style: cosine
+DeepSpeed is enabled.
+No existing process group found, creating a new group named: ep_size_1
+[after model, optimizer, and learning rate scheduler are built] datetime: 2026-04-14 21:27:04 
+[proposal] Fp32StateMapper mode=fp16_zero0  masters=0 adam_state_keys=5
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      32000
+    validation: 5632
+    test:       512
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000285 seconds
+    number of documents: 23767
+ > dataset split:
+    train:
+     document indices in [0, 23767) total of 23767 documents
+    validation:
+     document indices in [23767, 23767) total of 0 documents
+    test:
+     document indices in [23767, 23767) total of 0 documents
+ > loading doc-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_doc_idx.npy
+ > loading sample-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_sample_idx.npy
+ > loading shuffle-idx mapping from /home/asdf1234/data/wikitext-2/index-cache/8255dbe0aea633ff468b1c55be89ffdf_shuffle_idx.npy
+    loaded indexed file in 0.014 seconds
+    total number of samples: 32504
+    total number of epochs: 28
+> finished creating GPT datasets ...
+[after dataloaders are built] datetime: 2026-04-14 21:27:04 
+done with setup ...
+(min, max) time across ranks (ms):
+    model-and-optimizer-setup ......................: (679.74, 679.74)
+    train/valid/test-data-iterators-setup ..........: (62.39, 62.39)
+training ...
+[before the start of training step] datetime: 2026-04-14 21:27:04 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] Backend compiler exception
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[16384, 8][8, 1]"):
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 8][8, 1]" = topk[1];  topk = None
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     . Adding a graph break.
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]   Developer debug context: Backend: inductor
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[16384, 8][8, 1]"):
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 8][8, 1]" = topk[1];  topk = None
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]     Traceback:
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.736000 91500 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] Backend compiler exception
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[16384, 2048][2048, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[16384, 2048][2048, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     . Adding a graph break.
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]   Developer debug context: Backend: inductor
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[16384][1]"):
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]              # File: /home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[16384, 2048][2048, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[16384, 2048][2048, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]     Traceback:
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]       File "/home/asdf1234/.local/lib/python3.10/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0414 21:27:09.814000 91500 torch/_dynamo/exc.py:525] [3/0] 
+ iteration       10/     500 | consumed samples:          640 | consumed tokens:      1310720 | elapsed time per iteration (ms): 3653.8 | learning rate: 3.000E-05 | global batch size:    64 | lm loss: 1.033399E+01 | moe loss: 7.450010E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 17.516 | tokens per gpu per second (tgs): 35873.072 | TFLOPs: 34.72 |
+[Rank 0] (after 10 iterations) memory (MB) | allocated: 6938.40234375 | max allocated: 27572.87255859375 | reserved: 30856.0 | max reserved: 30856.0
+ iteration       20/     500 | consumed samples:         1280 | consumed tokens:      2621440 | elapsed time per iteration (ms): 2815.8 | learning rate: 6.000E-05 | global batch size:    64 | lm loss: 9.411793E+00 | moe loss: 6.691840E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 22.729 | tokens per gpu per second (tgs): 46549.260 | TFLOPs: 45.06 |
+ iteration       30/     500 | consumed samples:         1920 | consumed tokens:      3932160 | elapsed time per iteration (ms): 2759.2 | learning rate: 9.000E-05 | global batch size:    64 | lm loss: 8.700921E+00 | moe loss: 6.783616E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.195 | tokens per gpu per second (tgs): 47503.221 | TFLOPs: 45.98 |
+ iteration       40/     500 | consumed samples:         2560 | consumed tokens:      5242880 | elapsed time per iteration (ms): 2698.9 | learning rate: 1.200E-04 | global batch size:    64 | lm loss: 7.986034E+00 | moe loss: 6.674884E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.713 | tokens per gpu per second (tgs): 48564.186 | TFLOPs: 47.01 |
+ iteration       50/     500 | consumed samples:         3200 | consumed tokens:      6553600 | elapsed time per iteration (ms): 2751.7 | learning rate: 1.500E-04 | global batch size:    64 | lm loss: 7.327768E+00 | moe loss: 6.418669E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.258 | tokens per gpu per second (tgs): 47633.331 | TFLOPs: 46.10 |
+ iteration       60/     500 | consumed samples:         3840 | consumed tokens:      7864320 | elapsed time per iteration (ms): 2757.9 | learning rate: 1.498E-04 | global batch size:    64 | lm loss: 6.817129E+00 | moe loss: 6.139508E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.206 | tokens per gpu per second (tgs): 47526.274 | TFLOPs: 46.00 |
+ iteration       70/     500 | consumed samples:         4480 | consumed tokens:      9175040 | elapsed time per iteration (ms): 2701.1 | learning rate: 1.493E-04 | global batch size:    64 | lm loss: 6.570220E+00 | moe loss: 6.107078E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.694 | tokens per gpu per second (tgs): 48525.209 | TFLOPs: 46.97 |
+ iteration       80/     500 | consumed samples:         5120 | consumed tokens:     10485760 | elapsed time per iteration (ms): 3340.4 | learning rate: 1.485E-04 | global batch size:    64 | lm loss: 6.443564E+00 | moe loss: 6.105657E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 19.159 | tokens per gpu per second (tgs): 39238.588 | TFLOPs: 37.98 |
+ iteration       90/     500 | consumed samples:         5760 | consumed tokens:     11796480 | elapsed time per iteration (ms): 2754.5 | learning rate: 1.474E-04 | global batch size:    64 | lm loss: 6.318673E+00 | moe loss: 6.091827E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.235 | tokens per gpu per second (tgs): 47585.156 | TFLOPs: 46.06 |
+ iteration      100/     500 | consumed samples:         6400 | consumed tokens:     13107200 | elapsed time per iteration (ms): 2678.7 | learning rate: 1.459E-04 | global batch size:    64 | lm loss: 6.216090E+00 | moe loss: 6.064955E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.892 | tokens per gpu per second (tgs): 48930.784 | TFLOPs: 47.36 |
+ iteration      110/     500 | consumed samples:         7040 | consumed tokens:     14417920 | elapsed time per iteration (ms): 2680.1 | learning rate: 1.442E-04 | global batch size:    64 | lm loss: 6.124339E+00 | moe loss: 6.054986E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.880 | tokens per gpu per second (tgs): 48906.079 | TFLOPs: 47.34 |
+ iteration      120/     500 | consumed samples:         7680 | consumed tokens:     15728640 | elapsed time per iteration (ms): 2696.5 | learning rate: 1.421E-04 | global batch size:    64 | lm loss: 6.015403E+00 | moe loss: 6.055923E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.734 | tokens per gpu per second (tgs): 48607.762 | TFLOPs: 47.05 |
+ iteration      130/     500 | consumed samples:         8320 | consumed tokens:     17039360 | elapsed time per iteration (ms): 2682.9 | learning rate: 1.397E-04 | global batch size:    64 | lm loss: 5.917656E+00 | moe loss: 6.036947E-02 | actual seqlen:  2048 | number of skipped iterations:   0 | number of nan iterations:   0 | samples per second: 23.855 | tokens per gpu per second (tgs): 48854.550 | TFLOPs: 47.29 |
+tee: /home/asdf1234/Megatron-DeepSpeed/results/exp_1/log/random.log: No space left on device
+ iteration      140/     500 | consumed samples:         8960 | consumed tokens:     18350080 | elapsed time per iteration (ms): 2682.8 | learning rate: 1.371E-04 | global batch size:    64 | lm loss: 5.835909E+00 | moe loss: 6.039318E-02 | actual seqlen:  20
