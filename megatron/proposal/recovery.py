@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -344,8 +344,17 @@ def recover(
     num_experts: int = 0,
     dc_replay: bool = True,
     load_expert_fcs: bool = True,
+    dram_expert_state: Optional[Any] = None,
 ) -> RecoveryDiagnostics:
-    """Rebuild state from CP files at ``t_fault``."""
+    """Rebuild state from CP files at ``t_fault``.
+
+    ``dram_expert_state``: when provided (proposal cp_target=dram), per-expert
+    state is read from the in-memory DramExpertState buffer instead of
+    scanning disk for ``(lossless, lossy)`` pairs. Non-expert FC and DC
+    bundles still come from disk — DRAM mode currently only optimizes the
+    expert path. Set CP_DIR_OVERRIDE / --proposal-cp-dir to /dev/shm to also
+    eliminate disk I/O for non-expert + DC.
+    """
     import time as _time
     _phase: Dict[str, float] = {}
     _t_all0 = _time.perf_counter()
@@ -385,7 +394,36 @@ def recover(
     legacy_experts: Dict[ExpertId, Dict[str, torch.nn.Parameter]] = {}
 
     _t0 = _time.perf_counter()
-    if load_expert_fcs:
+    if load_expert_fcs and dram_expert_state is not None:
+        # DRAM mode: each expert's merged dense (p, m, v) buffer lives in
+        # host RAM. No log replay needed — DramExpertState.lossy_fc_append
+        # already scattered every update into the buffer at write time.
+        # Recovery is just an O(num_experts × tensors_per_expert × full_size)
+        # CPU→GPU copy. We bypass disk scan entirely for the expert path.
+        _t_dram0 = _time.perf_counter()
+        for (L, E), target in by_expert_params.items():
+            payload = dram_expert_state.read((L, E))
+            if payload is None:
+                continue
+            log_step = _apply_payload_dict_to_model(payload, target, optimizer)
+            if log_step >= 0 and log_step <= t_fault:
+                log_loaded[(L, E)] = log_step
+                diag.expert_fc_iters[(L, E)] = log_step
+        _phase["expert_dram_apply_ms"] = (
+            _time.perf_counter() - _t_dram0
+        ) * 1000.0
+        diag.rolling_experts_loaded = len(log_loaded)
+        diag.expert_fc_count = len(log_loaded)
+        if diag.expert_fc_count == 0:
+            raise RuntimeError(
+                "DRAM expert state contained no recoverable experts; "
+                "did you call lossless_fc / lossy_fc_append before recover?"
+            )
+        # min_fc_iter / expert_load_ms / DC replay are handled by the
+        # shared code path below — no log replay window for DRAM mode
+        # (every selected element was already scattered into the dense
+        # buffer at write time), so the DC replay floor is best_ne[0].
+    elif load_expert_fcs:
         # Phase A (parallel, CPU-bound): read each expert's (lossless, lossy)
         # pair from disk via read_expert_state — pure numpy scatter, GIL-free
         # during I/O + numpy kernels. Phase B (serial, GPU) applies the

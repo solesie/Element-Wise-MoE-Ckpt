@@ -104,6 +104,7 @@ class FCManager:
         lossless_fc_fraction_pct: float = 2.0,
         expert_output_dir: Optional[Path] = None,
         fresh_expert_state: bool = True,
+        cp_target: str = "disk",
     ) -> None:
         if expert_fc_D is not None and expert_fc_D < 1:
             raise ValueError(f"expert_fc_D must be ≥1, got {expert_fc_D}")
@@ -218,8 +219,20 @@ class FCManager:
         # FC snapshot). See ``expert_state.ExpertState``. Skipped in
         # ``sequential`` mode (MoC-System baseline: only legacy FC files,
         # no element-wise lossy FC).
+        # cp_target selects between the disk-backed ExpertState (default)
+        # and the host-DRAM-backed DramExpertState. Both implement the same
+        # public surface used downstream (lossless_fc / lossy_fc_append /
+        # flush / shutdown / total_bytes / lossless_fc_step). Recovery has
+        # a separate fast path for DRAM mode — see recovery.recover().
+        # Sequential (MoC) mode does not use ExpertState at all, so the
+        # cp_target flag is a no-op for that schedule.
+        if cp_target not in ("disk", "dram"):
+            raise ValueError(
+                f"cp_target must be 'disk' or 'dram', got {cp_target!r}"
+            )
+        self.cp_target = cp_target
         if self._schedule == "sequential":
-            self._expert_state: Optional[ExpertState] = None
+            self._expert_state: Optional[Any] = None
         else:
             named_params = dict(self.model.named_parameters())
             expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]] = {}
@@ -229,10 +242,17 @@ class FCManager:
                     p = named_params[tname]
                     entries.append((tname, p.shape, int(p.numel())))
                 expert_tensor_map[eid] = entries
-            self._expert_state = ExpertState(
-                expert_tensor_map, output_dir=self.expert_output_dir,
-                fresh=fresh_expert_state, async_writer=self._async_writer,
-            )
+            if cp_target == "dram":
+                from .dram_expert_state import DramExpertState
+                self._expert_state = DramExpertState(
+                    expert_tensor_map, output_dir=self.expert_output_dir,
+                    fresh=fresh_expert_state, async_writer=self._async_writer,
+                )
+            else:
+                self._expert_state = ExpertState(
+                    expert_tensor_map, output_dir=self.expert_output_dir,
+                    fresh=fresh_expert_state, async_writer=self._async_writer,
+                )
 
     # ------------------------------------------------------------------
     def _enumerate_params(self) -> None:
@@ -489,13 +509,21 @@ class FCManager:
                                                initial_state=initial_state)
             _dp_ms = (time.perf_counter() - _t_dp0) * 1000.0
             # Record an event so callers can count FC fires for schedule
-            # diagnostics. `path` points at the expert's lossless FC file.
+            # diagnostics. `path` points at the expert's lossless FC file
+            # (disk mode) or a synthetic placeholder (DRAM mode — no path
+            # since the buffer lives in host RAM). DRAM mode reports
+            # `file_bytes=0` because the dense buffer is bounded by the
+            # expert's parameter count, not by per-FC growth.
             L, E = expert_id
-            lossless_path = self._expert_state._entries[expert_id].lossless_path \
-                if expert_id in self._expert_state._entries else Path("<expert_state>")
-            try:
-                file_bytes = int(lossless_path.stat().st_size)
-            except (OSError, FileNotFoundError):
+            entries = getattr(self._expert_state, "_entries", None)
+            if entries is not None and expert_id in entries:
+                lossless_path = entries[expert_id].lossless_path
+                try:
+                    file_bytes = int(lossless_path.stat().st_size)
+                except (OSError, FileNotFoundError):
+                    file_bytes = 0
+            else:
+                lossless_path = Path("<dram_expert_state>")
                 file_bytes = 0
             self.write_log.append(FCEventStats(
                 kind="expert",

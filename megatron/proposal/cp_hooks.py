@@ -284,6 +284,9 @@ def init_proposal(
             # read it back. Normal training starts with fresh=True so the
             # previous run's stale append-log doesn't pollute the new state.
             fresh_expert_state=not _is_replay_only,
+            # cp_target: 'disk' (default) or 'dram'. DRAM mode swaps in
+            # DramExpertState — see fc_manager.py and dram_expert_state.py.
+            cp_target=str(getattr(args, "proposal_cp_target", "disk")),
         )
         # Wire the ExpertState sink into the tracker. tracker.step() then
         # routes each expert's top-K selections into lossy_fc_append. For
@@ -634,6 +637,16 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
     inner_model = _config["_inner_model"]
     inner_opt = _config["_inner_opt"] if optimizer is None else optimizer
     num_experts = _config["num_experts"]
+    # When proposal cp_target=dram, the per-expert state was kept in a
+    # host-RAM DramExpertState rather than written to disk. Hand the
+    # in-memory state to recover() so the per-expert load short-circuits
+    # the disk scan (see recovery.recover()'s dram_expert_state branch).
+    _dram_es = None
+    if (
+        _fc is not None and _fc.expert_state is not None
+        and getattr(_fc, "cp_target", "disk") == "dram"
+    ):
+        _dram_es = _fc.expert_state
     import time as _time
     _t_rec0 = _time.perf_counter()
     diag = recover(
@@ -643,6 +656,7 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         t_fault=t_fault,
         num_experts=num_experts,
         dc_replay=True,
+        dram_expert_state=_dram_es,
     )
     _t_rec1 = _time.perf_counter()
     _restore_h_ema_from_cp(t_fault)
@@ -912,6 +926,15 @@ def proposal_inject_fault(
     inner_model = _config["_inner_model"]
     inner_opt = _config["_inner_opt"]
     num_experts = _config["num_experts"]
+    # Same DRAM-mode short-circuit as proposal_recover() (above): when
+    # cp_target=dram the per-expert state lives in DramExpertState, not on
+    # disk. Pass it through so recover() reads from the in-memory buffer.
+    _dram_es = None
+    if (
+        _fc is not None and _fc.expert_state is not None
+        and getattr(_fc, "cp_target", "disk") == "dram"
+    ):
+        _dram_es = _fc.expert_state
     diag = recover(
         model=inner_model,
         optimizer=inner_opt,
@@ -919,6 +942,7 @@ def proposal_inject_fault(
         t_fault=int(step),
         num_experts=num_experts,
         dc_replay=True,
+        dram_expert_state=_dram_es,
     )
     _restore_h_ema_from_cp(int(step))
     recover_s = time.perf_counter() - t0

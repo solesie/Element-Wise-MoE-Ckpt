@@ -119,6 +119,25 @@ def add_proposal_args(parser):
                             "expert lossless FC every D iter. "
                             "'sequential': MoC-System baseline (layer-wise "
                             "round-robin lossless FC, no element-wise lossy).")
+    group.add_argument("--proposal-cp-target", type=str, default="disk",
+                       choices=["disk", "dram"],
+                       help="Where to persist expert checkpoints. "
+                            "'disk' (default): write lossless/lossy FC files "
+                            "to --proposal-cp-dir on storage; recovery reads "
+                            "files back. SSD 4KB write granularity forces the "
+                            "log format. "
+                            "'dram': proposal mode keeps a per-expert "
+                            "sparse-dense FP32 buffer in host RAM (no log, no "
+                            "file I/O). Lossy FC scatters new (idx, p, m, v) "
+                            "directly into the buffer; recovery reads the "
+                            "buffer in O(expert_size) regardless of how many "
+                            "lossy appends accumulated. Use for fast "
+                            "validation-loss experiments where storage "
+                            "cost/recovery time is not the variable under "
+                            "study. Sequential (MoC) mode currently still "
+                            "uses disk regardless of this flag — set "
+                            "CP_DIR_OVERRIDE to a tmpfs path (e.g. /dev/shm) "
+                            "for that mode if you want RAM-speed I/O.")
     group.add_argument("--proposal-cp-dir", type=str, default="./proposal_cp",
                        help="Directory for proposal checkpoint files.")
     group.add_argument("--proposal-replay-at-end", action="store_true",
