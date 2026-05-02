@@ -321,9 +321,33 @@ def init_proposal(
     _config["_score_diag_every"] = int(getattr(args, "proposal_score_diag_every", 0) or 0)
     _config["_score_diag_done"] = set()
     _config["_hessian_comparison_log"] = getattr(args, "proposal_hessian_comparison_log", None)
-    _config["_hessian_estimator"] = getattr(args, "proposal_hessian_estimator", "hutchinson")
+    _config["_hessian_estimator"] = getattr(args, "proposal_hessian_estimator", "finite_diff")
     _config["_hessian_cross_check"] = bool(getattr(args, "proposal_hessian_cross_check", False))
     _config["_hessian_cross_check_log"] = getattr(args, "proposal_hessian_cross_check_log", None)
+    # finite_diff config (used when estimator='finite_diff').
+    _config["_finite_diff_eps"] = getattr(args, "proposal_finite_diff_eps", None)
+    # Diagnostic env override: PROPOSAL_FD_EPS=<float> bypasses autotune
+    # and forces a fixed eps. Used to test BF16-noise-floor hypothesis
+    # (autotune's iter-1 chosen eps may be below BF16 ULP at output scale,
+    # making activation perturbation rounded to zero in BF16 forward).
+    import os as _os_eps
+    _eps_env = _os_eps.environ.get("PROPOSAL_FD_EPS", "")
+    if _eps_env:
+        try:
+            _config["_finite_diff_eps"] = float(_eps_env)
+        except ValueError:
+            pass
+    _config["_finite_diff_routing_freeze"] = bool(
+        getattr(args, "proposal_finite_diff_routing_freeze", True)
+    )
+    _config["_finite_diff_cross_check"] = bool(
+        getattr(args, "proposal_finite_diff_cross_check", False)
+    )
+    _config["_finite_diff_flip_cutoff"] = float(
+        getattr(args, "proposal_finite_diff_flip_cutoff", 100.0)
+    )
+    # Diagnostic: per-refresh expert_coverage / flip_skip_ratio / eps.
+    _config["_h_diag_records"] = []
     # ANALYSIS: non-expert |H| probe — comparison of expert vs non-expert |H|
     # distribution at score_diag_iters; retained for measurement purposes.
     _config["_hessian_nonexpert_probe_log"] = getattr(args, "proposal_hessian_nonexpert_probe_log", None)
@@ -996,7 +1020,8 @@ def set_hessian_valid_iter(it: Any) -> None:
     _config["_hessian_dedicated_valid_iter"] = it
 
 
-def _fold_h(names: List[str], h_new_list: List[torch.Tensor]) -> None:
+def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
+            flip_cutoff: Optional[float] = None) -> Dict[str, Any]:
     """Update ``_tracker._H_ema`` with a fresh |H| estimate.
 
     Two modes, controlled by ``--proposal-hessian-mode``:
@@ -1009,23 +1034,63 @@ def _fold_h(names: List[str], h_new_list: List[torch.Tensor]) -> None:
     function only touches GPU state; disk persistence is orthogonal and
     handled by :func:`_persist_h_ema` when ``--proposal-hessian-persist``
     is set.
+
+    Outlier protection
+    ------------------
+    Per-tensor Hz-norm is computed (mean of ``|h_new[i]|``); the median
+    across all tensors is the reference. Tensors whose Hz-norm exceeds
+    ``flip_cutoff × median`` are SKIPPED from the EMA update. Tensors
+    with zero coverage (``|h_new[i]|.sum() == 0``) are also skipped. This
+    is a residual safety net when routing freeze isn't perfect — it
+    benefits Hutchinson too (Hutchinson can hit 2nd-order grad outliers
+    even without routing instability).
+
+    ``flip_cutoff=None`` disables protection (legacy behaviour). Returns
+    a diagnostic dict ``{expert_coverage, flip_skip_ratio, n_skipped}``.
     """
     if _tracker is None:
-        return
+        return {"expert_coverage": 0.0, "flip_skip_ratio": 0.0, "n_skipped": 0}
     mode = str(_config.get("_hessian_mode", "ema"))
-    if mode == "plain":
-        for name, h_new in zip(names, h_new_list):
+    alpha = float(_config.get("_hessian_ema_alpha", 0.9))
+
+    # Compute per-tensor Hz norms (mean abs) on GPU.
+    hz_norms = []
+    coverage_flags = []
+    for h in h_new_list:
+        s = float(h.detach().abs().mean().item()) if h.numel() > 0 else 0.0
+        hz_norms.append(s)
+        coverage_flags.append(s > 0)
+    n = len(h_new_list)
+    expert_coverage = float(sum(coverage_flags)) / max(n, 1)
+    skip_mask = [False] * n
+    if flip_cutoff is not None and n > 0:
+        # Median over POSITIVE entries to avoid being pulled to 0 by all-zero tensors.
+        positives = [v for v in hz_norms if v > 0]
+        if positives:
+            positives.sort()
+            med = positives[len(positives) // 2]
+            for i, v in enumerate(hz_norms):
+                if v > flip_cutoff * med:
+                    skip_mask[i] = True
+    n_skipped = 0
+    for i, (name, h_new) in enumerate(zip(names, h_new_list)):
+        if not coverage_flags[i] or skip_mask[i]:
+            n_skipped += 1
+            continue
+        if mode == "plain":
             _tracker._H_ema[name] = h_new.detach().clone()
-    else:  # ema
-        alpha = float(_config.get("_hessian_ema_alpha", 0.9))
-        for name, h_new in zip(names, h_new_list):
+        else:  # ema
             cur = _tracker._H_ema.get(name)
             if cur is None:
                 _tracker._H_ema[name] = h_new.detach().clone()
             else:
-                # In-place EMA to avoid a transient alloc of shape(h_new).
                 cur.mul_(alpha).add_(h_new.detach(), alpha=(1.0 - alpha))
     _tracker._H_ema_updates += 1
+    return {
+        "expert_coverage": expert_coverage,
+        "flip_skip_ratio": float(n_skipped) / max(n, 1),
+        "n_skipped": int(n_skipped),
+    }
 
 
 def _persist_h_ema(iteration: int) -> None:
@@ -1119,19 +1184,25 @@ def _persist_h_ema(iteration: int) -> None:
 
 def proposal_refresh_hessian(
     model, forward_step_func, data_iterator, iteration,
-    estimator: str = "hutchinson",
+    estimator: str = "finite_diff",
     k_samples: int = 1,
 ) -> Optional[Dict[str, Any]]:
     """Fold a fresh |H_diag| estimate into tracker._H_ema. Dispatches to
     the chosen estimator:
-        estimator='gnb'        → _refresh_gnb_impl (Sophia-G, 1 fwd + 1 bwd)
-        estimator='hutchinson' → proposal_refresh_hutchinson (K× 2nd-order bwd)
+        estimator='gnb'         → _refresh_gnb_impl (Sophia-G, 1 fwd + 1 bwd)
+        estimator='hutchinson'  → proposal_refresh_hutchinson (K× 2nd-order bwd)
+        estimator='finite_diff' → proposal_refresh_finite_diff (central-diff Hz)
     EMA result is also async-persisted to <cp>/hessian/.
     When selection_mode='hessian', the EMA H replaces v̂_t in Pass 1 of
     tracker.step.
     """
     if estimator == "hutchinson":
         return proposal_refresh_hutchinson(
+            model, forward_step_func, data_iterator, iteration,
+            k_samples=k_samples,
+        )
+    if estimator == "finite_diff":
+        return proposal_refresh_finite_diff(
             model, forward_step_func, data_iterator, iteration,
             k_samples=k_samples,
         )
@@ -1341,7 +1412,13 @@ def _refresh_gnb_impl(
 
     # Fold the fresh |H| into H_ema (see _fold_h). Since g² ≥ 0 already,
     # no abs_() needed. Disk persist is opt-in via --proposal-hessian-persist.
-    _fold_h(names, h_accum)
+    _fold_diag = _fold_h(names, h_accum,
+                         flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
+    _config["_h_diag_records"].append({
+        "iter": int(iteration), "estimator": "gnb",
+        "expert_coverage": _fold_diag["expert_coverage"],
+        "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
+    })
     _persist_h_ema(int(iteration))
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1585,7 +1662,9 @@ def _refresh_gnb_impl(
 from .hessian import (
     compute_hessian_hutchinson as _hutchinson_compute_H,
     compute_hessian_gnb as _gnb_compute_H,
+    compute_hessian_finite_diff as _finite_diff_compute_H,
     compare_hutchinson_vs_gnb as _hutchinson_vs_gnb_similarity,
+    compare_hessian_estimators as _compare_hessian_estimators,
 )
 
 
@@ -1649,7 +1728,13 @@ def proposal_refresh_hutchinson(
     t1 = _time.perf_counter()
 
     # Fold Hutchinson |H| into H_ema; disk persist is opt-in.
-    _fold_h(names, h_hutch)
+    _fold_diag = _fold_h(names, h_hutch,
+                         flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
+    _config["_h_diag_records"].append({
+        "iter": int(iteration), "estimator": "hutchinson",
+        "expert_coverage": _fold_diag["expert_coverage"],
+        "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
+    })
     _persist_h_ema(int(iteration))
 
     elapsed_ms = (t1 - t0) * 1000.0
@@ -1799,6 +1884,355 @@ def proposal_refresh_hutchinson(
         )
 
     return _finalize({"iter": iteration, "k_samples": k_samples, "ms": elapsed_ms, "numel": n_elem})
+
+
+def proposal_refresh_finite_diff(
+    model, forward_step_func, data_iterator, iteration,
+    k_samples: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """Fold a finite-difference Hessian-vector |H_diag| estimate into
+    tracker._H_ema. Plain 1st-order grads × 2 (central diff) per Rademacher
+    sample; routing freeze applied around the +/- forwards (default ON).
+
+    Falls back to Hutchinson if compute_hessian_finite_diff returns None
+    for any reason (gate-id failure, OOM during sweep, NaN, etc.). Training
+    MUST continue.
+
+    Optional cross-check: when --proposal-finite-diff-cross-check is set,
+    Hutchinson is run on the same param state and the Hutchinson-vs-finite_diff
+    Pearson/Jaccard is dumped to the cross-check log (label_a='hutch',
+    label_b='finite_diff').
+    """
+    if not _enabled or _tracker is None:
+        return None
+    dedicated = _config.get("_hessian_dedicated_valid_iter")
+    if dedicated is not None:
+        data_iterator = dedicated
+
+    import time as _time
+    inner_model = _config["_inner_model"]
+    tracked = [(n, p) for n, p in inner_model.named_parameters()
+               if p.requires_grad and getattr(p, "allreduce", True) is False]
+    if not tracked:
+        return None
+
+    _cpu_rng_state = torch.get_rng_state()
+    _cuda_rng_state = (torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
+    if hasattr(model[0], "module"):
+        net = model[0].module
+    else:
+        net = model[0]
+    was_training = net.training
+    net.train()
+    m0 = model[0] if isinstance(model, (list, tuple)) else model
+    ds_engine = m0
+    prev_flag = getattr(ds_engine, "_running_engine_backward", False)
+    try: ds_engine._running_engine_backward = True
+    except Exception: pass
+
+    def _restore_rng():
+        try:
+            torch.set_rng_state(_cpu_rng_state)
+            if _cuda_rng_state is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(_cuda_rng_state)
+        except Exception: pass
+
+    def _finalize(ret):
+        try: ds_engine._running_engine_backward = prev_flag
+        except Exception: pass
+        net.train(was_training); _restore_rng()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return ret
+
+    expert_ps = [p for _, p in tracked]
+    names = [n for n, _ in tracked]
+
+    eps = _config.get("_finite_diff_eps")
+    use_freeze = bool(_config.get("_finite_diff_routing_freeze", True))
+    cross_check_on = bool(_config.get("_finite_diff_cross_check", False))
+
+    # CRN compliance for cross-check: capture the batch ONCE at refresh
+    # entry, then feed the same batch tensor to BOTH FD and Hutchinson.
+    # Per the original spec ("±ε 양쪽이 동일 batch tensor를 사용") the
+    # CRN principle should also extend to any direct comparison between
+    # estimators — otherwise batch-to-batch Hessian variance dominates
+    # the cross-check Pearson and masks the actual estimator agreement.
+    crn_batch = None
+    crn_step_func = forward_step_func
+    crn_di = data_iterator
+    if cross_check_on:
+        try:
+            from pretrain_gpt import get_batch as _get_batch_gpt
+            di_for_capture = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
+            crn_batch = _get_batch_gpt(di_for_capture)
+            tokens, labels, loss_mask, attn_mask, position_ids = crn_batch[:5]
+
+            import torch.nn.functional as _F
+            def _crn_step(_di, m):
+                """forward_step_func wrapper that ignores the iterator and
+                uses the pre-captured CRN batch. Mirrors Megatron's LM
+                forward + cross-entropy reduction. Used for the
+                cross-check Hutchinson call so it sees the SAME batch FD
+                used."""
+                out = m(tokens, position_ids, attn_mask)
+                logits = out[0] if isinstance(out, tuple) else out
+                if logits is None or not torch.is_tensor(logits):
+                    raise RuntimeError("CRN: model returned non-tensor")
+                if logits.dim() >= 2:
+                    flat = logits.reshape(-1, logits.size(-1))
+                else:
+                    flat = logits
+                if labels is None:
+                    raise RuntimeError("CRN: labels missing")
+                lbl = labels.reshape(-1)
+                if loss_mask is not None and loss_mask.numel() == flat.size(0):
+                    per_tok = _F.cross_entropy(flat.float(), lbl, reduction="none")
+                    denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
+                    loss = (per_tok * loss_mask.view(-1).float()).sum() / denom
+                else:
+                    loss = _F.cross_entropy(flat.float(), lbl, reduction="mean")
+                return loss, {}
+            crn_step_func = _crn_step
+            # Stub iterator — _crn_step ignores it.
+            class _StubIter:
+                def __next__(self): return None
+            crn_di = _StubIter()
+        except Exception as _exc:
+            if _should_write():
+                print(f"[proposal] CRN batch capture failed: {_exc} — "
+                      f"falling back to per-estimator batch (CRN violation, "
+                      f"cross-check Pearson will reflect batch noise)", flush=True)
+            crn_batch = None
+            crn_step_func = forward_step_func
+            crn_di = data_iterator
+
+    t0 = _time.perf_counter()
+    h_fd = _finite_diff_compute_H(
+        model, crn_step_func if crn_batch is not None else forward_step_func,
+        crn_di if crn_batch is not None else data_iterator,
+        expert_ps, k_samples,
+        eps=eps, use_routing_freeze=use_freeze,
+        batch_override=crn_batch,
+    )
+    t1 = _time.perf_counter()
+
+    if h_fd is None:
+        # Graceful fallback to Hutchinson — print warning and re-run.
+        if _should_write():
+            print(f"[proposal] finite_diff failed @iter{iteration}, falling back "
+                  f"to hutchinson", flush=True)
+        h_hutch = _hutchinson_compute_H(model, forward_step_func, data_iterator,
+                                         expert_ps, k_samples)
+        if h_hutch is None:
+            return _finalize(None)
+        _fold_diag = _fold_h(names, h_hutch,
+                             flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
+        _config["_h_diag_records"].append({
+            "iter": int(iteration), "estimator": "fallback_hutch",
+            "expert_coverage": _fold_diag["expert_coverage"],
+            "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
+        })
+        _persist_h_ema(int(iteration))
+        elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+        return _finalize({"iter": iteration, "k_samples": k_samples,
+                          "ms": elapsed_ms, "fallback": True})
+
+    # Fold into H_ema with outlier protection.
+    _fold_diag = _fold_h(names, h_fd,
+                         flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
+    _persist_h_ema(int(iteration))
+
+    elapsed_ms = (t1 - t0) * 1000.0
+    n_elem = sum(p.numel() for p in expert_ps)
+
+    # Resolve eps actually used. _EPS_CACHE now stores ABSOLUTE eps (post
+    # the activation-perturb refactor; rationale in compute_hessian_finite_diff
+    # docstring), so we use it directly without multiplying by ||θ||_mean.
+    from .hessian import _EPS_CACHE as _FD_EPS_CACHE
+    cached_eps = _FD_EPS_CACHE.get(id(model[0] if isinstance(model, (list, tuple)) else model))
+    eps_actual = float(eps) if eps is not None else (
+        float(cached_eps) if cached_eps is not None else float("nan")
+    )
+
+    diag_record = {
+        "iter": int(iteration), "estimator": "finite_diff",
+        "expert_coverage": _fold_diag["expert_coverage"],
+        "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
+        "eps": eps_actual,
+        "routing_freeze": use_freeze,
+    }
+    _config["_h_diag_records"].append(diag_record)
+
+    # Magnitude log.
+    try:
+        if _should_write():
+            import statistics as _st
+            h_abs_means = [float(h.mean().item()) for h in h_fd]
+            h_abs_maxs  = [float(h.max().item())  for h in h_fd]
+            d_abs_means = []; d_abs_maxs = []
+            for (name, p) in tracked:
+                fc = _tracker.theta_cp.get(name)
+                if fc is not None:
+                    d = (p.data.to(torch.float32) - fc.to(torch.float32)).abs_()
+                    d_abs_means.append(float(d.mean().item()))
+                    d_abs_maxs.append(float(d.max().item()))
+            print(
+                f"[proposal] scale @iter{iteration} (finite_diff): "
+                f"|H| mean={_st.mean(h_abs_means):.3e} max={max(h_abs_maxs):.3e}  "
+                f"|δ| mean={_st.mean(d_abs_means):.3e} max={max(d_abs_maxs):.3e}  "
+                f"(eps={eps_actual:.3e}, coverage={_fold_diag['expert_coverage']:.3f}, "
+                f"flip_skip={_fold_diag['flip_skip_ratio']:.4f})",
+                flush=True,
+            )
+    except Exception as _exc:
+        if _should_write():
+            print(f"[proposal] scale log FAILED: {_exc}", flush=True)
+
+    # ---- Optional cross-check: ALSO run Hutchinson and dump similarity. ----
+    if cross_check_on:
+        try:
+            # CRN: pass the SAME crn_step_func (which closes over the
+            # captured batch) so Hutchinson sees the same batch as FD.
+            # ALSO wrap Hutchinson in the same RoutingFreezeContext that FD
+            # used internally — otherwise FD differentiates lm_loss (with
+            # l_aux zeroed by freeze) while Hutch differentiates
+            # lm_loss + λ·l_aux. Different losses → different |H| → low
+            # cross-Pearson. Per spec ("finite-diff는 task loss만 사용"),
+            # the fair comparison is to make Hutch see the same task loss.
+            from .hessian import _unwrap_model as _uw
+            from ._routing_freeze import (
+                RoutingFreezeContext as _RFC,
+                identify_gate_modules_safe as _id_gates,
+            )
+            gates_xc, _ = _id_gates(model)
+            hutch_step = (crn_step_func if crn_batch is not None
+                          else forward_step_func)
+            hutch_di = (crn_di if crn_batch is not None else data_iterator)
+            # Cross-check Hutchinson K is decoupled from FD's K. FD scales
+            # K to exploit its memory advantage (e.g. K=16) but Hutchinson's
+            # baseline is fixed at K=4 (per CLAUDE.md scaled-OLMoE Hutchinson
+            # spec). Comparing FD-K=16 against Hutch-K=16 would inflate Hutch
+            # cost and obscure the headline metric (FD vs the established
+            # Hutch baseline). The cross-check Pearson is upper-bounded by
+            # Hutch's K=4 noise floor; FD with higher K narrows the gap.
+            xc_hutch_k = min(4, k_samples)
+            # PROPOSAL_TRUTH_K: optional 3rd Hutch run with high K (e.g. 128)
+            # as a near-truth reference. Used by small-MoE diagnostic runs
+            # to test whether prod cross-check Pearson is FD-distance or
+            # Hutch-noise. Disabled (==0) by default. When >0 we ALSO log
+            # FD-vs-truth and HutchK4-vs-truth Pearson alongside the
+            # standard FD-vs-HutchK4 metric.
+            import os as _os_xc
+            truth_k = int(_os_xc.environ.get("PROPOSAL_TRUTH_K", "0"))
+            h_hutch_truth = None
+            if gates_xc and use_freeze:
+                with _RFC(gates_xc) as _ctx_xc:
+                    try:
+                        _ctx_xc.capture(
+                            lambda: hutch_step(hutch_di, _uw(model))
+                        )
+                    except Exception as _exc:
+                        if _should_write():
+                            print(f"[proposal] xc routing-freeze capture failed: "
+                                  f"{_exc} — Hutch will see un-frozen gate "
+                                  f"(loss-alignment violation, Pearson floor)",
+                                  flush=True)
+                    h_hutch_xc = _hutchinson_compute_H(
+                        model, hutch_step, hutch_di, expert_ps, xc_hutch_k,
+                    )
+                    if truth_k > 0 and h_hutch_xc is not None:
+                        h_hutch_truth = _hutchinson_compute_H(
+                            model, hutch_step, hutch_di, expert_ps, truth_k,
+                        )
+            else:
+                h_hutch_xc = _hutchinson_compute_H(
+                    model, hutch_step, hutch_di, expert_ps, xc_hutch_k,
+                )
+                if truth_k > 0 and h_hutch_xc is not None:
+                    h_hutch_truth = _hutchinson_compute_H(
+                        model, hutch_step, hutch_di, expert_ps, truth_k,
+                    )
+            if h_hutch_xc is not None:
+                agg = _compare_hessian_estimators(
+                    iteration, tracked, h_hutch_xc, h_fd, _tracker.theta_cp,
+                    label_a="hutch", label_b="finite_diff",
+                )
+                # Augment record with diag info.
+                agg["expert_coverage"] = _fold_diag["expert_coverage"]
+                agg["flip_skip_ratio"] = _fold_diag["flip_skip_ratio"]
+                agg["eps"] = eps_actual
+                agg["routing_freeze"] = use_freeze
+                if _should_write():
+                    p_bare = agg.get("pearson_hutch_finite_diff_bare", 0.0)
+                    p_score = agg.get("pearson_hutch_finite_diff_score", 0.0)
+                    print(
+                        f"[proposal] hutch-vs-finite_diff @iter{iteration}: "
+                        f"bare P={p_bare:+.3f} "
+                        f"J@1%={agg.get('jaccard_top1pct_bare', 0.0):.3f} "
+                        f"J@10%={agg.get('jaccard_top10pct_bare', 0.0):.3f}  "
+                        f"score P={p_score:+.3f} "
+                        f"J@1%={agg.get('jaccard_top1pct_score', 0.0):.3f} "
+                        f"J@10%={agg.get('jaccard_top10pct_score', 0.0):.3f}",
+                        flush=True,
+                    )
+                    cross_log = _config.get("_hessian_cross_check_log")
+                    if cross_log:
+                        import json as _json
+                        Path(cross_log).parent.mkdir(parents=True, exist_ok=True)
+                        with open(cross_log, "a") as _f:
+                            _f.write(_json.dumps(agg) + "\n")
+                # Optional truth-K Hutch comparison (PROPOSAL_TRUTH_K env).
+                if h_hutch_truth is not None:
+                    try:
+                        agg_fd_t = _compare_hessian_estimators(
+                            iteration, tracked, h_hutch_truth, h_fd, _tracker.theta_cp,
+                            label_a="hutchTRUTH", label_b="finite_diff",
+                        )
+                        agg_h_t = _compare_hessian_estimators(
+                            iteration, tracked, h_hutch_truth, h_hutch_xc, _tracker.theta_cp,
+                            label_a="hutchTRUTH", label_b="hutchK4",
+                        )
+                        for _agg in (agg_fd_t, agg_h_t):
+                            _agg["expert_coverage"] = _fold_diag["expert_coverage"]
+                            _agg["flip_skip_ratio"] = _fold_diag["flip_skip_ratio"]
+                            _agg["truth_k"] = int(truth_k)
+                        if _should_write():
+                            p_fd_t = agg_fd_t.get("pearson_hutchTRUTH_finite_diff_bare", 0.0)
+                            j_fd_t = agg_fd_t.get("jaccard_top1pct_bare", 0.0)
+                            p_h_t = agg_h_t.get("pearson_hutchTRUTH_hutchK4_bare", 0.0)
+                            j_h_t = agg_h_t.get("jaccard_top1pct_bare", 0.0)
+                            print(
+                                f"[proposal] vs-TRUTH(K={truth_k}) @iter{iteration}: "
+                                f"FDk{k_samples}->truth bare P={p_fd_t:+.3f} J@1%={j_fd_t:.3f}  "
+                                f"Hk{xc_hutch_k}->truth bare P={p_h_t:+.3f} J@1%={j_h_t:.3f}",
+                                flush=True,
+                            )
+                            if cross_log:
+                                with open(cross_log, "a") as _f:
+                                    _f.write(_json.dumps(agg_fd_t) + "\n")
+                                    _f.write(_json.dumps(agg_h_t) + "\n")
+                    except Exception as _texc:
+                        if _should_write():
+                            print(f"[proposal] truth-K compare FAILED @iter{iteration}: "
+                                  f"{_texc}", flush=True)
+                    del h_hutch_truth
+                del h_hutch_xc
+        except Exception as _exc:
+            if _should_write():
+                print(f"[proposal] hutch-vs-finite_diff comparison FAILED "
+                      f"@iter{iteration}: {_exc}", flush=True)
+
+    if _should_write():
+        print(
+            f"[proposal] refresh_finite_diff @iter{iteration} K={k_samples} "
+            f"{elapsed_ms:.0f} ms  ({n_elem:,} expert elements)",
+            flush=True,
+        )
+
+    return _finalize({"iter": iteration, "k_samples": k_samples,
+                      "ms": elapsed_ms, "numel": n_elem,
+                      "diag": diag_record})
 
 
 def proposal_hutchinson_probe(
@@ -2092,6 +2526,15 @@ def proposal_shutdown() -> Dict[str, Any]:
         try:
             (dump_dir / f"{dump_prefix}proposal_shutdown_summary.json").write_text(
                 json.dumps(summary, indent=2)
+            )
+        except Exception:
+            pass
+    # Dump per-refresh diagnostic record (expert_coverage, flip_skip_ratio, eps).
+    h_diag_records = _config.get("_h_diag_records") if _config else None
+    if dump_dir is not None and h_diag_records:
+        try:
+            (dump_dir / f"{dump_prefix}h_diag_records.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in h_diag_records) + "\n"
             )
         except Exception:
             pass

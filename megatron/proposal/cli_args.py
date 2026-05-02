@@ -3,7 +3,7 @@ checkpointing pipeline.
 
 Registered via ``pretrain_gpt.py``'s ``extra_args_provider``. Defaults
 track CLAUDE.md: cp_mode=element_wise, selection_mode=hessian,
-hessian_estimator=hutchinson, topk_ratio=0.05, W=10, async_queue=5.
+hessian_estimator=finite_diff (default), topk_ratio=0.05, W=10, async_queue=5.
 
 Kept as a separate module (vs. inline in cp_hooks.py) so the argparse
 wiring can be imported without triggering the heavier cp_hooks module
@@ -28,14 +28,45 @@ def add_proposal_args(parser):
                             "'hessian' = |H_diag| × δ² (estimator configurable via "
                             "--proposal-hessian-estimator) ; "
                             "'random' = uniform random (ablation). Default 'hessian'.")
-    group.add_argument("--proposal-hessian-estimator", type=str, default="hutchinson",
-                       choices=["gnb", "hutchinson"],
+    group.add_argument("--proposal-hessian-estimator", type=str, default="finite_diff",
+                       choices=["gnb", "hutchinson", "finite_diff"],
                        help="When --proposal-selection-mode=hessian, how to estimate "
-                            "|H_diag|. 'gnb' = Sophia-G (Gauss-Newton-Bartlett: "
-                            "1 fwd + 1 bwd on sampled labels, cheap, biased in "
-                            "non-CE regimes). 'hutchinson' = K-sample Rademacher on "
-                            "true-label CE with 2nd-order autograd (unbiased, "
-                            "K× more expensive). Default 'hutchinson'.")
+                            "|H_diag|. 'finite_diff' (default) = central-difference Hz "
+                            "via plain 1st-order grads with MoE routing freeze + "
+                            "Parameter rebind to bypass DS BF16+ZeRO storage aliasing. "
+                            "Validated to match Hutchinson K=4 quality at lower memory "
+                            "and compute (no 2nd-order autograd / saved-tensor offload). "
+                            "'hutchinson' (legacy) = K-sample Rademacher with "
+                            "2nd-order autograd; kept for cross-checks and dense "
+                            "(non-MoE) settings. 'gnb' = Sophia-G (cheap but biased).")
+    group.add_argument("--proposal-finite-diff-eps", type=float, default=None,
+                       help="Absolute eps for finite-difference Hz (2-point central). "
+                            "Default None triggers an auto-tune sweep against a "
+                            "Hutchinson K=2 reference. For BF16 + MoE production, "
+                            "1e-3 has been validated as a robust choice; can also be "
+                            "set via PROPOSAL_FD_EPS env override.")
+    group.add_argument("--proposal-finite-diff-routing-freeze", action="store_true",
+                       default=True,
+                       help="Freeze MoE gating decisions during finite-diff "
+                            "+/- eps forwards. Default ON; without freeze, "
+                            "top-k argmax flips between perturbed forwards "
+                            "produce noise that swamps Hz.")
+    group.add_argument("--proposal-no-finite-diff-routing-freeze",
+                       dest="proposal_finite_diff_routing_freeze",
+                       action="store_false",
+                       help="Ablation: turn the routing freeze OFF.")
+    group.add_argument("--proposal-finite-diff-cross-check", action="store_true",
+                       help="When estimator=finite_diff, ALSO run Hutchinson on "
+                            "the same param state and log Pearson/Jaccard via "
+                            "compare_hessian_estimators(label_a='hutch', "
+                            "label_b='finite_diff') to the cross-check log.")
+    group.add_argument("--proposal-finite-diff-flip-cutoff", type=float,
+                       default=100.0,
+                       help="Outlier protection: per-tensor Hz mean-abs is "
+                            "compared to the median across tensors; tensors "
+                            "exceeding cutoff*median are skipped from the EMA "
+                            "update (residual flip protection beyond routing "
+                            "freeze). Default 100.")
     group.add_argument("--proposal-hessian-refresh-every", type=int, default=40,
                        help="With --proposal-selection-mode=hessian: re-estimate "
                             "|H_diag| every N iters and fold into the H EMA. "

@@ -95,35 +95,49 @@ class DramExpertState:
         del output_dir, async_writer, fresh  # unused in DRAM mode
 
         # Per-expert: tensor_name -> {'p', 'm', 'v', 'shape', 'numel'}.
-        # 'p'/'m'/'v' are flat CPU FP32 buffers of size 'numel'. 'shape'
-        # is kept so callers that need the original tensor shape (e.g.
-        # for diagnostics) can recover it without the model handle.
+        # 'p'/'m'/'v' are flat CPU FP32 views into ONE contiguous backing
+        # buffer (``self._flat``) of size 3 × Σ numel. Single allocation
+        # avoids hundreds of small per-tensor torch.zeros() calls — the
+        # previous design fragmented the CPU allocator and inflated
+        # virtual memory bookkeeping under sustained training. With the
+        # flat layout the OS sees a single anonymous mapping and the
+        # views (.narrow + .view) are zero-cost.
         self._buffers: Dict[ExpertId, Dict[str, Dict[str, Any]]] = {}
-        # Most recent step that fired a lossless / lossy update for this
-        # expert. `lossless_step` mirrors ExpertState's `_entries[eid].
-        # lossless_step` so external code (e.g. FCManager.tick logging)
-        # sees the same field.
         self._lossless_step: Dict[ExpertId, int] = {}
         self._last_step: Dict[ExpertId, int] = {}
 
+        # Phase 1: compute total flat size (3 × Σ numel for p/m/v).
+        total_numel = 0
+        for eid, schema in expert_tensor_map.items():
+            for (_tname, _shape, numel) in schema:
+                total_numel += int(numel) * 3
+        # Phase 2: single contiguous allocation, zero-initialised.
+        self._flat = torch.zeros(int(total_numel), dtype=torch.float32)
+        # Phase 3: hand out narrow() views to each (expert, tensor, role).
+        # narrow returns a view sharing storage; scatter_/copy_ on the
+        # view writes through to self._flat.
+        offset = 0
         for eid, schema in expert_tensor_map.items():
             tensor_buffers: Dict[str, Dict[str, Any]] = {}
             for (tname, shape, numel) in schema:
-                # Pre-allocate zero buffers so lossy FC can scatter even
-                # before the first lossless FC fires for this expert. The
-                # alternative — lazy alloc on first use — would make the
-                # very first lossy_fc_append for an expert pay the full
-                # alloc cost on the training thread.
+                n = int(numel)
+                p_view = self._flat.narrow(0, offset, n); offset += n
+                m_view = self._flat.narrow(0, offset, n); offset += n
+                v_view = self._flat.narrow(0, offset, n); offset += n
                 tensor_buffers[tname] = {
-                    "p": torch.zeros(int(numel), dtype=torch.float32),
-                    "m": torch.zeros(int(numel), dtype=torch.float32),
-                    "v": torch.zeros(int(numel), dtype=torch.float32),
+                    "p": p_view,
+                    "m": m_view,
+                    "v": v_view,
                     "shape": shape,
-                    "numel": int(numel),
+                    "numel": n,
                 }
             self._buffers[eid] = tensor_buffers
             self._lossless_step[eid] = -1
             self._last_step[eid] = -1
+        assert offset == total_numel, (
+            f"flat-buffer offset accounting mismatch: "
+            f"used {offset} of {total_numel}"
+        )
 
     # ------------------------------------------------------------------
     # Introspection — mirror ExpertState's API surface.
@@ -161,6 +175,18 @@ class DramExpertState:
                                        Optional[torch.Tensor],
                                        Optional[torch.Tensor]]],
     ) -> None:
+        # Bypass for measurement-only runs (e.g. Pearson cross-check
+        # without recovery): PROPOSAL_SKIP_EXPERT_WRITES=1 makes
+        # DRAM expert state inert, eliminating the host-RAM scatter
+        # cost and the per-expert dense buffer dirtying that drives
+        # background flush traffic. The importance tracker's score
+        # signal (H × δ²) remains correct because we still update
+        # θ_CP via the on_expert_fc / on_state_snapshot paths.
+        import os as _os
+        if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
+            self._lossless_step[expert_id] = int(step)
+            self._last_step[expert_id] = int(step)
+            return
         """Replace the per-tensor dense buffer with the supplied
         (param, m, v) triples. Mirrors ``ExpertState.lossless_fc``: the
         provided tensors come from ``FCManager._collect_expert_payload``
@@ -210,6 +236,13 @@ class DramExpertState:
         Returns the total number of elements written (sum of idx sizes
         across tensors), matching ``ExpertState.lossy_fc_append``.
         """
+        # Bypass for measurement-only runs (see lossless_fc docstring).
+        import os as _os
+        if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
+            n = sum(int(idx.numel()) for (_, idx, _, _, _) in tensor_updates)
+            if n > 0:
+                self._last_step[expert_id] = int(step)
+            return n
         tensor_buffers = self._buffers.get(expert_id)
         if tensor_buffers is None:
             return 0

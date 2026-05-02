@@ -35,7 +35,7 @@ LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-50}
 INIT_STD=0.014
 MLC=0.01
 
-VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch|proposal_hutch_k4pct|proposal_hutch_k3pct|proposal_hutch_k2pct|proposal_hutch_k10pct|proposal_ema_hutch|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4}
+VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch|proposal_hutch_k4pct|proposal_hutch_k4pct_finite_diff|proposal_hutch_k1pct_finite_diff_F1|proposal_hutch_k4pct_finite_diff_nofreeze|proposal_hutch_k3pct|proposal_hutch_k2pct|proposal_hutch_k10pct|proposal_ema_hutch|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4}
 OUTPUT_BASEPATH=${OUTPUT_BASEPATH:?must set OUTPUT_BASEPATH}
 TAG="${VARIANT}_seed${SEED}"
 FAULT_INTERVAL=${FAULT_INTERVAL:-100}
@@ -261,6 +261,118 @@ case "$VARIANT" in
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG} \
             --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
+            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+        ;;
+    proposal_hutch_k4pct_finite_diff)
+        # Mirror of proposal_hutch_k4pct with estimator=finite_diff +
+        # routing freeze ON + Hutchinson cross-check. Used to validate
+        # the new finite-difference Hessian path against Hutchinson.
+        SCORE_DIAG_LOG="${OUTPUT_BASEPATH}/log/${TAG}.score_diag.jsonl"
+        H_CMP_LOG="${OUTPUT_BASEPATH}/log/${TAG}.gnb_vs_vt.jsonl"
+        HUTCH_FD_LOG="${OUTPUT_BASEPATH}/log/${TAG}.hutch_vs_finite_diff.jsonl"
+        PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
+            --proposal-cp-mode proposal \
+            --proposal-selection-mode hessian \
+            --proposal-hessian-estimator finite_diff \
+            --proposal-finite-diff-cross-check \
+            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
+            --proposal-hessian-refresh-every 40 \
+            --proposal-hessian-num-samples 4 \
+            --proposal-hessian-comparison-log ${H_CMP_LOG} \
+            --proposal-topk-ratio 0.04 \
+            --proposal-nonexpert-fc-W 10 \
+            --proposal-async-queue 5 \
+            --proposal-dc-retention ${TRAIN_ITERS} \
+            --proposal-fault-interval ${FAULT_INTERVAL} \
+            --proposal-fault-warmup ${FAULT_WARMUP} \
+            --proposal-fault-log ${FAULT_LOG} \
+            --proposal-score-diag-iters 100 200 \
+            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+        ;;
+    proposal_hutch_k1pct_finite_diff_F1)
+        # FD estimator + K=1% + F=1% (lossless-fc-fraction). Mirrors
+        # the original proposal_hutch (K=1%) Hutchinson setup but with
+        # finite-diff. cp-target=dram for fast recovery (disk mode's
+        # log-replay would dominate the wall-clock budget; DRAM read
+        # is a single CPU→GPU dense copy per expert).
+        # CRITICAL: dc-retention is 12 (= W+2 per CLAUDE.md spec), not
+        # ${TRAIN_ITERS}. Earlier value retained ALL 2000 DC bundles
+        # (388 MB each = 776 GB) → kernel page cache filled → OOM
+        # cascade → SERVER REBOOT. With retention=12 we cap at ~5 GB.
+        # K=16 (vs Hutch's K=4) — leverages FD's memory advantage:
+        # variance ∝ 1/K so K=16 cuts sample noise to ¼. Memory cost
+        # is just K extra Rademacher z tensors (per-iter transient).
+        # Refresh time scales linearly: K=4 was ~5s with cross-check,
+        # K=16 expected ~16-20s. Refresh fires every 40 iter so
+        # amortised throughput hit is ~+0.5 s/iter (~22% slower).
+        # Cross-check Hutchinson stays K=4 (clamped in cp_hooks) so we
+        # measure FD-K=16 vs the established Hutch baseline, not against
+        # an inflated Hutch-K=16.
+        # Expert lossless FC DISABLED (D=999999): in DRAM mode there's
+        # no lossy log file to purge — lossy_fc_append scatters into
+        # the same dense buffer in-place, so the lossless "checkpoint
+        # boundary" is purely cosmetic and just adds copy overhead +
+        # forces a θ_CP reset that briefly suppresses the protected
+        # expert from importance scoring.
+        SCORE_DIAG_LOG="${OUTPUT_BASEPATH}/log/${TAG}.score_diag.jsonl"
+        H_CMP_LOG="${OUTPUT_BASEPATH}/log/${TAG}.gnb_vs_vt.jsonl"
+        HUTCH_FD_LOG="${OUTPUT_BASEPATH}/log/${TAG}.hutch_vs_finite_diff.jsonl"
+        # FD_CROSS_CHECK env (default ON for diagnostic runs). Set to 0 to
+        # disable Hutchinson cross-check on the same param state — cuts
+        # refresh memory ~3× (no 2nd-order autograd graph) and lets the
+        # FD-only path run on bigger models. Used when the cross-check has
+        # already validated the FD setting and we just want to train.
+        FD_CROSS_CHECK_FLAG=""
+        if [ "${FD_CROSS_CHECK:-1}" != "0" ]; then
+            FD_CROSS_CHECK_FLAG="--proposal-finite-diff-cross-check \
+            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
+            --proposal-hessian-comparison-log ${H_CMP_LOG}"
+        fi
+        PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
+            --proposal-cp-mode proposal \
+            --proposal-cp-target dram \
+            --proposal-selection-mode hessian \
+            --proposal-hessian-estimator finite_diff \
+            ${FD_CROSS_CHECK_FLAG} \
+            --proposal-hessian-refresh-every 40 \
+            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-16} \
+            --proposal-topk-ratio 0.01 \
+            --proposal-lossless-fc-fraction 1.0 \
+            --proposal-expert-fc-D 999999 \
+            --proposal-nonexpert-fc-W 10 \
+            --proposal-async-queue 5 \
+            --proposal-dc-retention 12 \
+            --proposal-fault-interval ${FAULT_INTERVAL} \
+            --proposal-fault-warmup ${FAULT_WARMUP} \
+            --proposal-fault-log ${FAULT_LOG} \
+            --proposal-score-diag-iters 1000 2000 \
+            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+        ;;
+    proposal_hutch_k4pct_finite_diff_nofreeze)
+        # Ablation: same as proposal_hutch_k4pct_finite_diff but routing
+        # freeze OFF. Used to verify that ON yields a higher Pearson and
+        # lower flip_skip_ratio.
+        SCORE_DIAG_LOG="${OUTPUT_BASEPATH}/log/${TAG}.score_diag.jsonl"
+        H_CMP_LOG="${OUTPUT_BASEPATH}/log/${TAG}.gnb_vs_vt.jsonl"
+        HUTCH_FD_LOG="${OUTPUT_BASEPATH}/log/${TAG}.hutch_vs_finite_diff.jsonl"
+        PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
+            --proposal-cp-mode proposal \
+            --proposal-selection-mode hessian \
+            --proposal-hessian-estimator finite_diff \
+            --proposal-no-finite-diff-routing-freeze \
+            --proposal-finite-diff-cross-check \
+            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
+            --proposal-hessian-refresh-every 40 \
+            --proposal-hessian-num-samples 4 \
+            --proposal-hessian-comparison-log ${H_CMP_LOG} \
+            --proposal-topk-ratio 0.04 \
+            --proposal-nonexpert-fc-W 10 \
+            --proposal-async-queue 5 \
+            --proposal-dc-retention ${TRAIN_ITERS} \
+            --proposal-fault-interval ${FAULT_INTERVAL} \
+            --proposal-fault-warmup ${FAULT_WARMUP} \
+            --proposal-fault-log ${FAULT_LOG} \
+            --proposal-score-diag-iters 100 200 \
             --proposal-score-diag-log ${SCORE_DIAG_LOG}"
         ;;
     proposal_ema_hutch)
