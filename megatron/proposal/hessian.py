@@ -1,28 +1,25 @@
 """Diagonal Hessian estimators for the element-wise importance score.
 
-Two estimators are provided:
+Production
+----------
+* :func:`compute_hessian_finite_diff` — central-difference Hessian-vector
+  product. Wraps :func:`compute_hessian_finite_diff_core` (param-perturb)
+  inside :func:`._param_rebind.param_rebind_context` so writes to
+  ``p.data`` reach the bytes forward reads under DeepSpeed BF16+ZeRO-1.
+  Uses MoE routing freeze so ±ε forwards see the same dispatch.
+  Validated to match Hutchinson K=4 baseline within iteration noise on
+  production exp_etc (BF16, 12-layer 768d) and is faster (no 2nd-order
+  autograd, no saved-tensor offload).
 
-* :func:`compute_hessian_hutchinson` — K-sample Rademacher on true-label
-  CE via 2nd-order autograd (create_graph=True + Hz). Unbiased;
-  K× more expensive than GNB. Matches the "Hutchinson" arm of the
-  ``--proposal-hessian-estimator`` flag.
-* :func:`compute_hessian_gnb` — Sophia-G (Gauss-Newton-Bartlett): sample
-  labels from softmax, 1 forward + 1 backward, square the gradient,
-  scale by batch size. Cheap; biased in non-CE regimes.
-
-Both return per-parameter FP32 tensors with values ``|H_diag|`` (already
-absolute-valued for Hutchinson, non-negative by construction for GNB)
-ready to be consumed by ``ImportanceTracker._H_ema`` (EMA-folded in the
-refresh hook).
-
-:func:`compare_hutchinson_vs_gnb` computes Pearson / Jaccard similarity
-between the two estimators on bare |H| and on the score = |H|·δ². It is
-called from ``proposal_refresh_hutchinson`` when
-``--proposal-hessian-cross-check`` is set.
+Truth reference (opt-in)
+------------------------
+* :func:`compute_hessian_hutchinson` — K-sample Rademacher with 2nd-order
+  autograd. Used for occasional comparison runs on small models
+  (`--proposal-hessian-estimator hutchinson`). Memory-heavy due to
+  saved-tensor offload; not validated for EP > 1.
 
 These functions are state-free: all dependencies (model, data iterator,
-tracked params, θ_CP cache) are passed in explicitly. That makes them
-testable and independent of the cp_hooks singleton state.
+tracked params, θ_CP cache) are passed in explicitly.
 """
 from __future__ import annotations
 
@@ -32,7 +29,8 @@ import torch
 
 
 # ----------------------------------------------------------------------
-# Hutchinson estimator (K-sample Rademacher on true-label CE)
+# Hutchinson estimator (kept for occasional truth comparison on small
+# models — not the production default; production uses finite_diff).
 # ----------------------------------------------------------------------
 def compute_hessian_hutchinson(
     model,
@@ -50,63 +48,29 @@ def compute_hessian_hutchinson(
     :func:`~megatron.proposal.checkpoint_ctx.hutchinson_cpu_offload_ctx`
     (opt-out via ``HUTCHINSON_NO_CPU_OFFLOAD=1``). It installs
     ``saved_tensors_hooks`` that park every saved-for-backward tensor on
-    a pinned CPU buffer pool until autograd demands it. Empirically drops
-    exp2-scale refresh peak from OOM (~74 GB) to ~43 GB, at ~17 s/refresh
-    steady-state (1 in 40 iters, ~0.4 s/iter amortized).
+    a pinned CPU buffer pool until autograd demands it.
 
-    Regular training iters are unaffected — the ctx is entered only for
-    this refresh call, which fires every ``--proposal-hessian-refresh-every``
-    iterations.
+    Use case: invoked when ``--proposal-hessian-estimator hutchinson`` is
+    explicitly set — primarily for truth comparison runs on small models
+    (FD K=16 vs Hutch K=4 vs Hutch K=64 on tiny MoE / FP32 dense LM).
+    Production runs use finite_diff (default).
     """
     import os as _os
     from contextlib import nullcontext as _nullcontext
     from .checkpoint_ctx import hutchinson_cpu_offload_ctx
-    from ._functorch_probe import is_probe_enabled as _is_probe_enabled, _probe as _run_probe
 
     di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
     m0 = model[0] if isinstance(model, (list, tuple)) else model
 
-    # Diagnostic: HUTCHINSON_FUNCTORCH_TEST=1 replaces this refresh with a
-    # 3-step compatibility probe (functional_call → grad_fn → jvp) and
-    # exits. Used to empirically verify torch.func viability before any
-    # refactor claim.
-    if _is_probe_enabled():
-        _run_probe(model, forward_step_func, data_iterator, expert_ps)
-        return None  # unreachable — probe os._exit(0) s
-    # HUTCHINSON_NO_CPU_OFFLOAD=1: opt-out of the pinned-pool saved-tensor
-    # offload. Default ON; this is the load-bearing mitigation.
     _cpu_offload = _os.environ.get("HUTCHINSON_NO_CPU_OFFLOAD", "") not in ("1", "true", "True")
-    # Per-phase GPU memory instrumentation (HUTCHINSON_MEM_TRACE=1). Prints
-    # ``torch.cuda.memory_allocated()`` at each key phase so the caller can
-    # locate where peak memory is consumed inside the refresh.
-    _trace = _os.environ.get("HUTCHINSON_MEM_TRACE", "") in ("1", "true", "True")
-    import time as _time
-    _t0 = _time.perf_counter()
-    def _mem(tag: str) -> None:
-        if not _trace or not torch.cuda.is_available():
-            return
-        # Synchronize so reported elapsed reflects completed device work,
-        # not just kernel launches queued on the stream. Negligible overhead
-        # relative to the phases we're timing (≥100 ms each).
-        torch.cuda.synchronize()
-        a = torch.cuda.memory_allocated() / 1024 / 1024
-        r = torch.cuda.memory_reserved() / 1024 / 1024
-        dt = _time.perf_counter() - _t0
-        print(f"[hutch-mem] {tag}: t={dt:.2f}s alloc={a:.1f}MB reserved={r:.1f}MB",
-              flush=True)
-    if _trace and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    _mem("entry")
     _ctx = hutchinson_cpu_offload_ctx() if _cpu_offload else _nullcontext()
     try:
         with _ctx:
-            _mem("after ctx enter")
             try:
                 loss, _ = forward_step_func(di, m0)
             except Exception as exc:
                 print(f"[proposal] compute_hessian_hutchinson: forward failed: {exc}", flush=True)
                 return None
-            _mem("after forward")
             if not torch.is_tensor(loss):
                 return None
             if loss.dim() > 0:
@@ -124,24 +88,19 @@ def compute_hessian_hutchinson(
                 )
                 del loss
                 return None
-            _mem("after 1st-order grad (create_graph=True)")
             grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, expert_ps)]
             gen = torch.Generator(device=expert_ps[0].device).manual_seed(0xBADCAFE)
             h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
-            _mem("after h_accum alloc")
             for k in range(k_samples):
                 zs = [
                     (torch.randint(0, 2, p.shape, generator=gen, device=p.device, dtype=torch.float32) * 2 - 1)
                     for p in expert_ps
                 ]
-                _mem(f"k={k} after zs alloc")
                 dot = sum((g * z).sum() for g, z in zip(grads, zs))
-                _mem(f"k={k} after dot (g·z sum)")
                 try:
                     hz = torch.autograd.grad(
                         dot, expert_ps, retain_graph=(k < k_samples - 1), allow_unused=True,
                     )
-                    _mem(f"k={k} after 2nd-order grad (Hv)")
                 except Exception as exc:
                     import traceback as _tb
                     print(
@@ -154,19 +113,11 @@ def compute_hessian_hutchinson(
                 # Streaming accumulation: element-wise |z_i · (Hz)_i| folded
                 # into h_accum[i] (fp32, pre-allocated once), then drop the
                 # full hz and zs tensor lists. h_accum IS the diagonal-Hessian
-                # estimate we need for the importance score — a scalar
-                # trace-style reduction (v·Hv) would destroy the per-element
-                # signal. Memory trace confirms zs/hz are released before the
-                # next k-iter allocates: alloc stays flat across k.
+                # estimate we need for the importance score.
                 for i, (z, h) in enumerate(zip(zs, hz)):
                     h_accum[i].add_((z * h).to(torch.float32).abs_().detach().div_(k_samples))
                 del zs, hz, dot
-                _mem(f"k={k} after accumulate (end of k iter)")
             del loss, grads
-            _mem("after del loss, grads")
-            if _trace and torch.cuda.is_available():
-                peak = torch.cuda.max_memory_allocated() / 1024 / 1024
-                print(f"[hutch-mem] PEAK during refresh: {peak:.1f}MB", flush=True)
             return h_accum
     except Exception as exc:
         print(f"[proposal] compute_hessian_hutchinson: context failed: {exc}", flush=True)
@@ -174,181 +125,7 @@ def compute_hessian_hutchinson(
 
 
 # ----------------------------------------------------------------------
-# GNB (Sophia-G) estimator
-# ----------------------------------------------------------------------
-def compute_hessian_gnb(
-    model,
-    data_iterator,
-    expert_ps: List[torch.nn.Parameter],
-    k_samples: int,
-) -> Optional[List[torch.Tensor]]:
-    """Compute |H_diag| via Sophia-G (Gauss-Newton-Bartlett). Returns list of
-    FP32 non-negative tensors. Samples labels from softmax(logits), takes
-    first-order grad, squares, scales by effective batch size.
-    """
-    import torch.nn.functional as F
-    try:
-        from pretrain_gpt import get_batch as _get_batch_gpt
-    except Exception as _imp_exc:
-        print(f"[proposal] compute_hessian_gnb: cannot import get_batch: {_imp_exc}", flush=True)
-        return None
-    di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
-    m0 = model[0] if isinstance(model, (list, tuple)) else model
-    h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
-    for k in range(max(1, int(k_samples))):
-        try:
-            batch = _get_batch_gpt(di)
-        except Exception as exc:
-            print(f"[proposal] compute_hessian_gnb: get_batch failed at k={k}: {exc}", flush=True)
-            return None
-        tokens, _labels_true, loss_mask, attention_mask, position_ids = batch[:5]
-        try:
-            out = m0(tokens, position_ids, attention_mask)
-        except Exception as exc:
-            print(f"[proposal] compute_hessian_gnb: forward failed at k={k}: {exc}", flush=True)
-            return None
-        logits = out[0] if isinstance(out, tuple) else out
-        if logits is None or not torch.is_tensor(logits):
-            return None
-        V = logits.size(-1) if logits.dim() >= 2 else None
-        flat_logits = logits.reshape(-1, V) if V is not None else logits
-        with torch.no_grad():
-            probs = torch.softmax(flat_logits.detach().float(), dim=-1)
-            y_hat = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        del probs
-        if loss_mask is not None and loss_mask.numel() == flat_logits.size(0):
-            per_tok = F.cross_entropy(flat_logits.float(), y_hat, reduction="none")
-            denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
-            loss_gnb = (per_tok * loss_mask.view(-1).float()).sum() / denom
-            B_eff = float(denom.item())
-        else:
-            loss_gnb = F.cross_entropy(flat_logits.float(), y_hat, reduction="mean")
-            B_eff = float(flat_logits.size(0))
-        try:
-            grads = torch.autograd.grad(
-                loss_gnb, expert_ps,
-                retain_graph=False, create_graph=False, allow_unused=True,
-            )
-        except Exception as exc:
-            print(f"[proposal] compute_hessian_gnb: grad failed at k={k}: {exc}", flush=True)
-            return None
-        grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, expert_ps)]
-        inv_k = 1.0 / max(1, int(k_samples))
-        for i, g in enumerate(grads):
-            h_accum[i].add_(g.to(torch.float32).pow(2).mul_(B_eff * inv_k))
-        del logits, out, flat_logits, y_hat, loss_gnb, grads, tokens, batch
-    return h_accum
-
-
-# ----------------------------------------------------------------------
-# Finite-difference estimator (opt-in alternative to Hutchinson)
-# ----------------------------------------------------------------------
-# Module-level cache for the auto-tuned eps multiplier. Set on the first
-# call when eps=None, reused on all subsequent calls so we don't redo the
-# 3-point sweep every refresh. Keyed by id(model) so distinct models in
-# the same process get independent locks.
-_EPS_CACHE: Dict[int, float] = {}
-
-
-def _norm_mean_theta(params: List[torch.nn.Parameter]) -> float:
-    """Mean of per-tensor ||θ||_F. Base scale for the eps auto-tune sweep."""
-    if not params:
-        return 1.0
-    norms = []
-    for p in params:
-        try:
-            norms.append(float(p.data.detach().to(torch.float32).norm().item()))
-        except Exception:
-            norms.append(0.0)
-    n = sum(norms) / max(len(norms), 1)
-    return max(n, 1e-12)
-
-
-_HOOK_PROBE_DONE = False
-
-
-def _probe_hook_levels(
-    model: Any, forward_loss_fn: Callable,
-) -> None:
-    """One-shot diagnostic: install passive log-only forward hooks on
-    EVERY module under the "deepspeed_experts" subtree, run ONE forward,
-    print which hooks actually fired. Identifies the right module level
-    for activation perturbation when the inner Linear hooks don't fire
-    (DeepSpeed MoE may bypass module.__call__ for fused expert paths).
-    """
-    global _HOOK_PROBE_DONE
-    if _HOOK_PROBE_DONE:
-        return
-    _HOOK_PROBE_DONE = True
-
-    inner = _unwrap_model(model)
-    while hasattr(inner, "module") and not hasattr(inner, "named_parameters"):
-        inner = inner.module
-    if hasattr(inner, "module") and hasattr(inner.module, "named_parameters"):
-        inner = inner.module
-
-    fired: List[str] = []
-    handles = []
-    name_to_class: Dict[str, str] = {}
-    candidates: List[Tuple[str, torch.nn.Module]] = []
-    for name, module in inner.named_modules():
-        # MoE-relevant subtree only (avoid hooking the entire model).
-        if not any(kw in name for kw in
-                   ("deepspeed_experts", "deepspeed_moe", "experts", "MoE", "moe")):
-            continue
-        candidates.append((name, module))
-        name_to_class[name] = type(module).__name__
-
-    print(f"\n[HOOK-PROBE] candidates: {len(candidates)} modules under MoE/expert subtree",
-          flush=True)
-
-    def make_hook(name):
-        def hook(_m, _args, _output):
-            fired.append(name)
-            return None
-        return hook
-
-    for name, module in candidates:
-        try:
-            handles.append(module.register_forward_hook(make_hook(name)))
-        except Exception:
-            pass
-
-    try:
-        with torch.no_grad():
-            _ = forward_loss_fn()
-    except Exception as exc:
-        print(f"[HOOK-PROBE] forward failed during probe: {exc}", flush=True)
-    finally:
-        for h in handles:
-            try: h.remove()
-            except Exception: pass
-
-    # Group fired modules by class name for compact output.
-    fired_by_class: Dict[str, List[str]] = {}
-    for n in fired:
-        cls = name_to_class.get(n, "?")
-        fired_by_class.setdefault(cls, []).append(n)
-    print(f"[HOOK-PROBE] FIRED ({len(fired)} hook events, "
-          f"{len(set(fired))} distinct modules):", flush=True)
-    for cls, names in fired_by_class.items():
-        print(f"[HOOK-PROBE]   class={cls}  count={len(names)}  "
-              f"sample={names[0] if names else '-'}", flush=True)
-
-    # Did NOT fire (subset; avoid spam).
-    not_fired = [n for n, _ in candidates if n not in set(fired)]
-    print(f"[HOOK-PROBE] NOT-fired: {len(not_fired)} modules. Sample classes:",
-          flush=True)
-    seen_cls = set()
-    for n in not_fired:
-        cls = name_to_class.get(n, "?")
-        if cls in seen_cls: continue
-        seen_cls.add(cls)
-        print(f"[HOOK-PROBE]   class={cls}  e.g. {n}", flush=True)
-        if len(seen_cls) >= 8: break
-    print("", flush=True)
-
-
+# Finite-difference estimator (production default)
 def _make_rademacher(params: List[torch.nn.Parameter], gen: torch.Generator) -> List[torch.Tensor]:
     return [
         (torch.randint(0, 2, p.shape, generator=gen, device=p.device, dtype=torch.float32) * 2 - 1)
@@ -407,131 +184,6 @@ def _pearson_two_tensor_lists(a_list: List[torch.Tensor],
     d = (va * vb) ** 0.5
     return float(cov / d) if d > 0 else 0.0
 
-
-def compute_hessian_finite_diff_activation_core(
-    forward_loss_fn: Callable[[], Tuple[torch.Tensor, Any]],
-    expert_ps: List[torch.nn.Parameter],
-    expert_modules: List[Tuple[str, torch.nn.Module,
-                                Dict[str, torch.nn.Parameter]]],
-    k_samples: int,
-    eps: float,
-    gates_for_freeze: Optional[List[Tuple[str, torch.nn.Module]]] = None,
-    rng_seed: int = 0xFD15CAFE,
-) -> Optional[List[torch.Tensor]]:
-    """Activation-perturbation backend (PRIMARY path).
-
-    Mathematically equivalent to true param perturbation
-    ``W ← W + εz`` for affine layers — see ``_activation_perturb`` for
-    the algebra. Crucially this avoids touching ``param.data`` or any
-    DeepSpeed BF16/FP32 master buffer, so it works under the
-    BF16+ZeRO-1 setup where param perturbation silently fails (the
-    perturbation never reaches the buffer that forward actually reads).
-
-    Inputs
-    ------
-    expert_ps:
-        Same list the caller maintains for h_accum indexing. Order
-        determines the returned list.
-    expert_modules:
-        Output of :func:`._activation_perturb.identify_expert_linear_modules`.
-        Each entry is ``(qualified_name, module, {"weight": p, ...})``.
-        Hooks attach to these modules; per-(module, role) Rademacher z
-        is tied back to ``expert_ps`` indices via ``id(p)``.
-
-    Returns ``[|H_diag|_p_FP32 for p in expert_ps]`` or ``None``. Params
-    not represented in ``expert_modules`` (e.g. gate weights, embeddings
-    that slipped past the filter) get a zero ``|H_diag|`` accumulator —
-    same convention as the param-perturb backend's "untouched param"
-    behavior, so the H_ema fold's coverage check flags them.
-    """
-    if not expert_ps or eps <= 0:
-        return None
-    from contextlib import nullcontext
-    from ._routing_freeze import RoutingFreezeContext
-    from ._activation_perturb import ActivationPerturbContext
-
-    if not expert_modules:
-        print("[proposal] finite_diff: activation perturb requires "
-              "expert_modules; returning None", flush=True)
-        return None
-
-    # Index map for tying per-(module, role) z back to h_accum slots.
-    param_to_idx: Dict[int, int] = {id(p): i for i, p in enumerate(expert_ps)}
-
-    h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
-    gen = torch.Generator(device=expert_ps[0].device).manual_seed(rng_seed)
-
-    if gates_for_freeze:
-        ctx_mgr = RoutingFreezeContext(gates_for_freeze)
-    else:
-        ctx_mgr = None
-
-    perturb_ctx = ActivationPerturbContext(expert_modules, param_to_idx)
-
-    try:
-        with (ctx_mgr if ctx_mgr is not None else nullcontext()):
-            if ctx_mgr is not None:
-                try:
-                    ctx_mgr.capture(forward_loss_fn)
-                except Exception as exc:
-                    print(f"[proposal] finite_diff: routing-freeze capture failed: {exc}",
-                          flush=True)
-                    return None
-            for k in range(max(1, int(k_samples))):
-                perturb_ctx.sample_z(gen)
-                z_by_idx = perturb_ctx.z_by_param_idx()
-
-                # +ε pass
-                perturb_ctx.install(eps_signed=+eps)
-                try:
-                    grads_plus = _compute_grad_no_create(forward_loss_fn, expert_ps)
-                finally:
-                    fire_p = perturb_ctx.fire_count()
-                    perturb_ctx.remove()
-                # -ε pass with same z, opposite sign
-                perturb_ctx.install(eps_signed=-eps)
-                try:
-                    grads_minus = _compute_grad_no_create(forward_loss_fn, expert_ps)
-                finally:
-                    fire_m = perturb_ctx.fire_count()
-                    perturb_ctx.remove()
-                if k == 0:
-                    print(f"[proposal] finite_diff: hooks fired +ε:{fire_p} -ε:{fire_m} "
-                          f"(modules: {len(expert_modules)})", flush=True)
-                if grads_plus is None or grads_minus is None:
-                    return None
-
-                inv_2eps = 1.0 / (2.0 * eps)
-                inv_k = 1.0 / max(1, int(k_samples))
-                for idx in range(len(expert_ps)):
-                    z = z_by_idx.get(idx)
-                    if z is None:
-                        continue  # param outside hooked modules → zero accumulator
-                    gp = grads_plus[idx]
-                    gm = grads_minus[idx]
-                    if gp is None or gm is None:
-                        continue
-                    # Subtract in FP32: when gp ≈ gm (catastrophic cancellation
-                    # under BF16 grad noise), upcasting both operands first
-                    # preserves the result's full dynamic range. Cheap (BF16→FP32
-                    # is lossless), no extra memory beyond one extra tensor.
-                    hz = (gp.to(torch.float32) - gm.to(torch.float32)).mul_(inv_2eps)
-                    h_accum[idx].add_((z.to(torch.float32) * hz).abs_().mul_(inv_k))
-                del grads_plus, grads_minus
-    except Exception as exc:
-        import traceback as _tb
-        print(f"[proposal] finite_diff: refresh failed: {type(exc).__name__}: {exc}\n"
-              f"{_tb.format_exc()}", flush=True)
-        return None
-    finally:
-        perturb_ctx.remove()
-
-    for h in h_accum:
-        if not bool(torch.isfinite(h).all()):
-            print("[proposal] finite_diff: NaN/Inf in result", flush=True)
-            return None
-
-    return h_accum
 
 
 def compute_hessian_finite_diff_core(
@@ -773,47 +425,14 @@ def compute_hessian_finite_diff(
         else:
             gates_for_freeze = gates
 
-    # ---- One-shot diagnostic: which modules actually fire forward hooks? ----
-    _probe_hook_levels(model, _forward_loss)
-
-    # ---- Expert Linear module identification (activation perturb path) ----
-    from ._activation_perturb import identify_expert_linear_modules_safe
-    expert_modules, _expert_rules = identify_expert_linear_modules_safe(model)
-    if not expert_modules:
-        print("[proposal] finite_diff: WARN no expert Linear modules identified; "
-              "activation perturb path requires them — falling back to None "
-              "(caller will use Hutchinson)", flush=True)
-        return None
-    # One-time identifier debug.
-    if not getattr(compute_hessian_finite_diff, "_announced", False):
-        sample = [n for n, _m, _r in expert_modules[:5]]
-        print(f"[proposal] finite_diff: identified {len(expert_modules)} expert Linear modules "
-              f"(rules={_expert_rules}). Sample: {sample}", flush=True)
-        compute_hessian_finite_diff._announced = True  # type: ignore[attr-defined]
-
     # ---- eps resolution ----
-    # Cache stores the ABSOLUTE eps (not a multiplier × ||θ||_mean) for
-    # activation-perturb. Reason: ||θ||_mean from param.data is unreliable
-    # under DeepSpeed BF16 + Megatron Float16Module wrapping (stale view
-    # post-step), so multiplying it gives drifting eps values that fall
-    # below the BF16 ULP at output scale. The absolute eps from a
-    # Hutchinson-anchored auto-tune sweep at iter 1 is the right scale
-    # for activation perturbation since the perturbation magnitude
-    # ε(x @ z.T) depends on x and z, not on ||θ||.
-    cached_eps = _EPS_CACHE.get(id(_unwrap_model(model)))
-    if eps is None and cached_eps is not None:
-        eps_value = cached_eps
-    elif eps is None:
-        # Auto-tune sweep against a Hutchinson reference (returns absolute).
-        eps_value = _autotune_eps(model, forward_step_func, data_iterator,
-                                  expert_ps, batch_cached=batch,
-                                  forward_loss_fn=_forward_loss,
-                                  gates_for_freeze=gates_for_freeze,
-                                  expert_modules=expert_modules)
-        if eps_value is None:
-            return None
-    else:
-        eps_value = float(eps)
+    # Default: 1e-3, validated on tiny (4-layer 256d) and production
+    # (12-layer 768d) MoE setups under BF16+ZeRO-1 with K=16 — matches
+    # Hutchinson K=4 baseline within iteration noise. Override via
+    # `--proposal-finite-diff-eps` CLI or `PROPOSAL_FD_EPS` env if a
+    # very different scale (e.g. 100B+ params with unusual |H| range)
+    # ever proves the default unsafe.
+    eps_value = 1e-3 if eps is None else float(eps)
 
     # ---- Main K-sample finite-diff loop ----
     # rng_seed defaults to Hutchinson's hardcoded 0xBADCAFE so cross-check
@@ -830,8 +449,7 @@ def compute_hessian_finite_diff(
     # this matches the Hutchinson K=4 baseline within iteration noise on
     # production exp_etc and is faster (no 2nd-order autograd needed).
     from ._param_rebind import param_rebind_context
-    with param_rebind_context(model, expert_ps=expert_ps,
-                               expert_modules=expert_modules):
+    with param_rebind_context(model, expert_ps=expert_ps):
         return compute_hessian_finite_diff_core(
             forward_loss_fn=_forward_loss,
             expert_ps=expert_ps,
@@ -847,99 +465,6 @@ def _unwrap_model(model: Any) -> Any:
         return model[0]
     return model
 
-
-def _autotune_eps(
-    model: Any,
-    forward_step_func: Callable,
-    data_iterator: Any,
-    expert_ps: List[torch.nn.Parameter],
-    batch_cached: Any,
-    forward_loss_fn: Callable[[], Tuple[torch.Tensor, Dict[str, Any]]],
-    gates_for_freeze: Optional[List[Tuple[str, torch.nn.Module]]],
-    expert_modules: Optional[List[Tuple[str, torch.nn.Module,
-                                          Dict[str, torch.nn.Parameter]]]] = None,
-) -> Optional[float]:
-    """3-point sweep over eps ∈ {1e-2, 1e-3, 1e-4} × ||θ||_mean. Computes a
-    Hutchinson K=2 reference once, then for each eps runs a 1-sample
-    finite-diff probe (via :func:`compute_hessian_finite_diff_core`) and
-    measures Pearson against the reference. Returns the absolute eps with
-    the highest Pearson, caches the multiplier in ``_EPS_CACHE``. Returns
-    None if every probe fails.
-    """
-    base = _norm_mean_theta(expert_ps)
-    # 5-point sweep with intermediate half-decade points. Original 3-point
-    # log sweep (1e-2, 1e-3, 1e-4) misses sweet spots between adjacent
-    # decades (e.g. 5e-3 or 5e-4) where the round-off and truncation
-    # error envelopes cross. Extra cost is one-time at iter 1 only;
-    # cached thereafter via _EPS_CACHE.
-    multipliers = (1e-2, 5e-3, 1e-3, 5e-4, 1e-4)
-    ref = compute_hessian_hutchinson(model, forward_step_func, data_iterator,
-                                      expert_ps, k_samples=2)
-    if ref is None:
-        print("[proposal] finite_diff: auto-tune Hutchinson reference FAILED — "
-              "cannot pick eps", flush=True)
-        return None
-
-    best_pearson = -2.0
-    best_mult = None
-    pearsons: Dict[float, Optional[float]] = {}
-    for mult in multipliers:
-        eps_try = mult * base
-        try:
-            # Activation-perturb path requires expert_modules; fall back to
-            # the legacy param-perturb core only when the caller didn't
-            # provide them (e.g. unit tests on FP32 toy models).
-            if expert_modules is not None:
-                probe = compute_hessian_finite_diff_activation_core(
-                    forward_loss_fn=forward_loss_fn,
-                    expert_ps=expert_ps,
-                    expert_modules=expert_modules,
-                    k_samples=1,
-                    eps=eps_try,
-                    gates_for_freeze=gates_for_freeze,
-                    rng_seed=0xEC0EC0EC + int(mult * 1e6),
-                )
-            else:
-                probe = compute_hessian_finite_diff_core(
-                    forward_loss_fn=forward_loss_fn,
-                    expert_ps=expert_ps,
-                    k_samples=1,
-                    eps=eps_try,
-                    gates_for_freeze=gates_for_freeze,
-                    rng_seed=0xEC0EC0EC + int(mult * 1e6),
-                )
-            if probe is None:
-                pearsons[mult] = None
-                continue
-            r = _pearson_two_tensor_lists(probe, ref)
-            pearsons[mult] = r
-            if r > best_pearson:
-                best_pearson = r
-                best_mult = mult
-        except torch.cuda.OutOfMemoryError as exc:
-            print(f"[proposal] finite_diff: eps={eps_try:.3e} OOM, skipping ({exc})", flush=True)
-            torch.cuda.empty_cache()
-            pearsons[mult] = None
-            continue
-        except Exception as exc:
-            print(f"[proposal] finite_diff: eps={eps_try:.3e} probe failed: {exc}", flush=True)
-            pearsons[mult] = None
-            continue
-    if best_mult is None:
-        print("[proposal] finite_diff: auto-tune found no viable eps", flush=True)
-        return None
-    best_eps = best_mult * base
-    print(f"[proposal] finite_diff: auto-tune Pearson = {pearsons} "
-          f"→ chose mult={best_mult:.0e} eps={best_eps:.3e}", flush=True)
-    # Cache ABSOLUTE eps (not multiplier) — see compute_hessian_finite_diff
-    # for the rationale. ||θ||_mean from param.data is unreliable under
-    # DeepSpeed BF16 + Megatron Float16Module wrapping, so multiplying it
-    # gives drifting eps. Storing the absolute value picked at iter 1
-    # keeps the perturbation magnitude stable across all subsequent
-    # refreshes (which is what activation perturb needs — the eps is a
-    # function of x and z magnitudes, not θ magnitudes).
-    _EPS_CACHE[id(_unwrap_model(model))] = best_eps
-    return best_eps
 
 
 # ----------------------------------------------------------------------
@@ -1103,19 +628,3 @@ def compare_hessian_estimators(
     return out
 
 
-def compare_hutchinson_vs_gnb(
-    iteration: int,
-    tracked: List[Tuple[str, torch.nn.Parameter]],
-    h_hutch: List[torch.Tensor],
-    h_gnb: List[torch.Tensor],
-    theta_cp: Dict[str, torch.Tensor],
-) -> Dict[str, Any]:
-    """Backwards-compat wrapper around :func:`compare_hessian_estimators`
-    with ``label_a='hutch'`` / ``label_b='gnb'``. Preserved so existing
-    cp_hooks call sites and analysis scripts that consume the
-    ``pearson_hutch_gnb_*`` keys continue to work.
-    """
-    return compare_hessian_estimators(
-        iteration, tracked, h_hutch, h_gnb, theta_cp,
-        label_a="hutch", label_b="gnb",
-    )

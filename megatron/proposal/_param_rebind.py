@@ -11,32 +11,72 @@ that flat buffer, not from `p.data` of the user-visible Parameter.
 
 The fix
 -------
-For the duration of one FD refresh, walk every module that holds BF16
-parameters and replace each `module._parameters[name]` with a freshly-
-allocated Parameter object — same dtype (BF16), same values (cloned), but
-with NEW backing storage that is no longer aliased to DS's flat buffer.
-Forward then reads `_parameters[name]` (via `nn.Module.__getattr__`) and
-finds our new Parameter, so writes via `p.data.copy_(...).add_(...)` do
-reach the bytes that forward consumes.
+For the duration of one FD refresh, replace each
+``module._parameters[name]`` for the params we will perturb with a
+freshly-allocated Parameter object — same dtype (BF16), same values
+(cloned), but with NEW backing storage independent of DS's flat buffer.
+Forward then reads ``_parameters[name]`` (via ``nn.Module.__getattr__``)
+and finds our new Parameter, so writes via ``p.data.copy_(...).add_(...)``
+do reach the bytes that forward consumes.
 
-Caller-supplied `expert_ps` and `expert_modules` lists hold references to
-the OLD Parameter objects. We REMAP both in place so the caller's list
-items now point to the new Parameters — `torch.autograd.grad(loss, expert_ps)`
+The caller-supplied ``expert_ps`` list is REMAPPED in place so each entry
+points to the new Parameter — ``torch.autograd.grad(loss, expert_ps)``
 then operates on the same nodes that forward computed against.
 
+Scope
+-----
+Only params in ``expert_ps`` are rebinded. All other model params keep
+their DS flat-buffer aliasing untouched. This keeps the transient memory
+cost ~|expert_params| (e.g. ~1B BF16 = 2 GB on a 1T total-param model)
+instead of cloning the entire model. Forward correctness is preserved
+because we only WRITE to expert_ps; everything else flows through DS's
+normal storage.
+
 On context exit (success or exception) we restore everything bit-exactly:
-- `_parameters` and `_buffers` dicts get the original objects back
-- expert_ps and expert_modules lists get the original Parameter refs back
+- ``_parameters`` dicts get the original Parameter objects back
+- ``expert_ps`` list gets the original Parameter refs back
 - DS bf16_optimizer.bf16_groups is untouched throughout (we never wrote
   to old Parameters), so the model weights forward sees AFTER the refresh
   are identical to the values BEFORE.
 
-Empirical validation (tiny MoE, 2000 iter, eps=1e-3, K=16):
-- val loss matches the Hutchinson K=4 baseline within iteration noise
-- recovery from injected faults works (DRAM expert state intact)
+Empirical validation (tiny MoE 200 iter + production exp_etc 1000 iter,
+eps=1e-3, K=16): val loss matches the Hutchinson K=4 baseline within
+iteration noise; recovery from injected faults works (DRAM expert state
+intact).
 
-Cost: clones one BF16 copy of every replaced parameter — ~1% of model
-memory for typical MoE sizes; freed on context exit.
+EP > 1 caveats
+--------------
+The actual EP-specific risks are NOT cross-rank gradient noise (see
+"non-issue" note below) but:
+
+1. **Routing freeze across ranks** (single-rank tested only). All-to-all
+   dispatch must produce the SAME routing on +ε and -ε forwards.
+   ``RoutingFreezeContext`` captures gate output once at θ and replays
+   on the perturbed forwards — verify it works under cross-rank dispatch
+   before declaring the EP path safe.
+
+2. **DS expert grad reduce hooks**. DeepSpeed registers grad
+   accumulation hooks on the original Parameter objects; verify these
+   don't fire on our ``torch.autograd.grad`` call (which they shouldn't,
+   since we don't trigger ``loss.backward()``, but worth confirming).
+
+3. **All-to-all latency**. Each refresh costs 2K extra all-to-alls
+   (one per ±ε forward). Multiplies refresh time by EP communication
+   overhead — usually small but worth measuring.
+
+Non-issue: cross-rank gradient variance
+---------------------------------------
+A naive concern is that under EP=N every rank perturbs its local
+expert independently, and rank 0's gradient ``g_+ - g_-`` picks up the
+other ranks' perturbations as noise. Closer analysis: under
+``RoutingFreezeContext`` each token is dispatched to a fixed expert,
+so within a single MoE layer the cross-expert Hessian
+``H_{i,j} = ∂²L/∂W_i ∂W_j = 0`` for i ≠ j (different token sets, no
+interaction). Across MoE layers cross-Hessians are non-zero (a token
+visits experts at multiple layers), but that variance source is intrinsic
+to multi-layer MoE and exists at EP=1 too — EP just redistributes the
+computation, not the noise. So the per-element FD variance is the same
+function of (#layers × #experts-per-layer), independent of EP topology.
 """
 from __future__ import annotations
 
@@ -46,97 +86,56 @@ from typing import Any, List, Tuple
 import torch
 
 
-def _iter_modules(model: Any):
-    """Yield every nn.Module in the (possibly DS-wrapped) model tree."""
-    if isinstance(model, (list, tuple)):
-        model = model[0]
-    if hasattr(model, "modules"):
-        yield from model.modules()
-        return
-    cur = model
-    visited = 0
-    while cur is not None and visited < 8:
-        if hasattr(cur, "modules"):
-            yield from cur.modules()
-            return
-        cur = getattr(cur, "module", None)
-        visited += 1
-
-
 @contextlib.contextmanager
-def param_rebind_context(model: Any, expert_ps=None, expert_modules=None):
-    """Replace every BF16 Parameter in `model` with a fresh Parameter
-    (same dtype, cloned data, new storage), remap `expert_ps` and the
-    role-dicts inside `expert_modules` to point to the new Parameters,
-    then restore everything on exit.
+def param_rebind_context(model: Any, expert_ps: List[torch.nn.Parameter]):
+    """Replace the Parameter objects in ``expert_ps`` (and their host
+    modules) with fresh Parameters that have independent storage. On
+    exit, restore the originals bit-exactly.
 
     Use as::
 
-        with param_rebind_context(model, expert_ps, expert_modules):
+        with param_rebind_context(model, expert_ps):
             # FD param-perturb runs here — p.data writes reach forward
             ...
     """
-    if isinstance(model, (list, tuple)):
-        model = model[0]
+    if not expert_ps:
+        yield
+        return
 
-    # Step 1: replace BF16 (and FP16) Parameters and buffers with fresh
-    # objects whose storage is independent of DS's flat-tensor aliasing.
-    saved_params: List[Tuple[Any, str, Any]] = []
-    old_to_new: dict = {}
-    for sub in _iter_modules(model):
+    # Locate (host_module, attr_name) for each expert Parameter via id() match.
+    targets: List[Tuple[Any, str, torch.nn.Parameter]] = []
+    expert_ids = {id(p) for p in expert_ps}
+    inner = model[0] if isinstance(model, (list, tuple)) else model
+    for sub in inner.modules():
         for name, p in list(sub._parameters.items()):
-            if p is None or p.dtype == torch.float32:
-                continue
-            saved_params.append((sub, name, p))
-            new_p = torch.nn.Parameter(
-                p.data.clone(), requires_grad=p.requires_grad,
-            )
-            sub._parameters[name] = new_p
-            old_to_new[id(p)] = new_p
-        for name, b in list(sub._buffers.items()):
-            if b is None or not torch.is_floating_point(b) or b.dtype == torch.float32:
-                continue
-            saved_params.append((sub, name, b))
-            sub._buffers[name] = b.clone()
+            if p is not None and id(p) in expert_ids:
+                targets.append((sub, name, p))
 
-    # Step 2: remap expert_ps in place — autograd.grad(loss, expert_ps)
-    # must land on the new Parameters that forward actually used.
-    saved_expert_ps_originals: List[Any] = []
-    if expert_ps is not None:
-        for i, p in enumerate(expert_ps):
-            saved_expert_ps_originals.append(p)
-            new_p = old_to_new.get(id(p))
-            if new_p is not None:
-                expert_ps[i] = new_p
+    # Step 1: replace each target with a fresh Parameter (independent storage).
+    saved: List[Tuple[Any, str, torch.nn.Parameter]] = []
+    old_to_new: dict = {}
+    for sub, name, old_p in targets:
+        new_p = torch.nn.Parameter(
+            old_p.data.clone(), requires_grad=old_p.requires_grad,
+        )
+        sub._parameters[name] = new_p
+        old_to_new[id(old_p)] = new_p
+        saved.append((sub, name, old_p))
 
-    saved_expert_modules_originals: List[Tuple[dict, str, Any]] = []
-    if expert_modules is not None:
-        for entry in expert_modules:
-            try:
-                _qname, _mod, role_dict = entry
-            except Exception:
-                continue
-            if not isinstance(role_dict, dict):
-                continue
-            for role, p in list(role_dict.items()):
-                saved_expert_modules_originals.append((role_dict, role, p))
-                new_p = old_to_new.get(id(p))
-                if new_p is not None:
-                    role_dict[role] = new_p
+    # Step 2: remap expert_ps in place → autograd.grad lands on the new graph nodes.
+    saved_expert_ps: List[torch.nn.Parameter] = list(expert_ps)
+    for i, p in enumerate(expert_ps):
+        new_p = old_to_new.get(id(p))
+        if new_p is not None:
+            expert_ps[i] = new_p
 
     try:
         yield
     finally:
-        # Restore in reverse order. Each step is bit-exact: we put back
-        # the saved object (not a clone or cast).
-        if expert_ps is not None:
-            for i, original in enumerate(saved_expert_ps_originals):
-                if i < len(expert_ps):
-                    expert_ps[i] = original
-        for role_dict, role, original in saved_expert_modules_originals:
-            role_dict[role] = original
-        for sub, name, original in saved_params:
-            if name in sub._parameters:
-                sub._parameters[name] = original
-            elif name in sub._buffers:
-                sub._buffers[name] = original
+        # Restore expert_ps list contents.
+        for i, original in enumerate(saved_expert_ps):
+            if i < len(expert_ps):
+                expert_ps[i] = original
+        # Restore module._parameters entries (bit-exact: same Parameter object).
+        for sub, name, original in saved:
+            sub._parameters[name] = original

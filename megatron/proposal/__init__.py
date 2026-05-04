@@ -15,10 +15,8 @@ from .recovery import (  # noqa: F401
 )
 from .hessian import (  # noqa: F401
     compute_hessian_hutchinson,
-    compute_hessian_gnb,
     compute_hessian_finite_diff,
     compute_hessian_finite_diff_core,
-    compare_hutchinson_vs_gnb,
     compare_hessian_estimators,
 )
 from .expert_state import (  # noqa: F401
@@ -33,9 +31,9 @@ __all__ = [
     "CheckpointManager", "DCBundleStats",
     "FCManager", "FCEventStats",
     "recover", "compare_states", "summarize_errors", "RecoveryDiagnostics",
-    "compute_hessian_hutchinson", "compute_hessian_gnb",
+    "compute_hessian_hutchinson",
     "compute_hessian_finite_diff",
-    "compare_hutchinson_vs_gnb", "compare_hessian_estimators",
+    "compare_hessian_estimators",
     "ExpertState", "read_expert_state",
     "add_proposal_args",
 ]

@@ -29,22 +29,21 @@ def add_proposal_args(parser):
                             "--proposal-hessian-estimator) ; "
                             "'random' = uniform random (ablation). Default 'hessian'.")
     group.add_argument("--proposal-hessian-estimator", type=str, default="finite_diff",
-                       choices=["gnb", "hutchinson", "finite_diff"],
-                       help="When --proposal-selection-mode=hessian, how to estimate "
-                            "|H_diag|. 'finite_diff' (default) = central-difference Hz "
-                            "via plain 1st-order grads with MoE routing freeze + "
-                            "Parameter rebind to bypass DS BF16+ZeRO storage aliasing. "
-                            "Validated to match Hutchinson K=4 quality at lower memory "
-                            "and compute (no 2nd-order autograd / saved-tensor offload). "
-                            "'hutchinson' (legacy) = K-sample Rademacher with "
-                            "2nd-order autograd; kept for cross-checks and dense "
-                            "(non-MoE) settings. 'gnb' = Sophia-G (cheap but biased).")
+                       choices=["finite_diff", "hutchinson"],
+                       help="Estimator for |H_diag|. 'finite_diff' (default, "
+                            "production) = central-difference Hz via 1st-order "
+                            "grads with MoE routing freeze + Parameter rebind to "
+                            "bypass DS BF16+ZeRO storage aliasing. 'hutchinson' "
+                            "(opt-in) = K-sample Rademacher with 2nd-order autograd; "
+                            "kept as a truth reference for occasional comparison runs "
+                            "on small models — heavier (saved-tensor offload) and not "
+                            "validated for EP > 1, so don't use for production.")
     group.add_argument("--proposal-finite-diff-eps", type=float, default=None,
                        help="Absolute eps for finite-difference Hz (2-point central). "
-                            "Default None triggers an auto-tune sweep against a "
-                            "Hutchinson K=2 reference. For BF16 + MoE production, "
-                            "1e-3 has been validated as a robust choice; can also be "
-                            "set via PROPOSAL_FD_EPS env override.")
+                            "Default None → 1e-3 (validated on production exp_etc, "
+                            "BF16 + MoE). Override via this flag or PROPOSAL_FD_EPS "
+                            "env if a very different scale (e.g. 100B+ params with "
+                            "unusual |H| range) ever proves the default unsafe.")
     group.add_argument("--proposal-finite-diff-routing-freeze", action="store_true",
                        default=True,
                        help="Freeze MoE gating decisions during finite-diff "

@@ -8,7 +8,6 @@ distributed init, or the Megatron training stack:
   * exact param restore after the +/- eps perturbations
   * routing freeze hook captures and replays gate outputs
   * graceful None-return when forward fails
-  * compare_hessian_estimators ↔ compare_hutchinson_vs_gnb back-compat
 """
 from __future__ import annotations
 
@@ -20,13 +19,8 @@ import torch
 
 from megatron.proposal.hessian import (
     compute_hessian_finite_diff_core,
-    compute_hessian_hutchinson,
     compare_hessian_estimators,
-    compare_hutchinson_vs_gnb,
-    _autotune_eps,
-    _norm_mean_theta,
     _pearson_two_tensor_lists,
-    _EPS_CACHE,
 )
 from megatron.proposal._routing_freeze import (
     RoutingFreezeContext,
@@ -99,67 +93,6 @@ def test_quadratic_recovers_diag():
     pb = h64 - h64.mean()
     pearson = (pa * pb).sum() / (pa.norm() * pb.norm() + 1e-12)
     assert pearson.item() > 0.85, f"low pearson on quadratic test: {pearson.item():.3f}"
-
-
-def test_eps_autotune_picks_best_pearson():
-    """Synthetic problem where one eps in {1e-2,1e-3,1e-4} clearly maximises
-    correlation against the Hutchinson reference. _autotune_eps must pick
-    that eps.
-    """
-    # Use the synthetic quadratic; we substitute a "Hutchinson reference"
-    # that is just `a` (the true diagonal). _autotune_eps takes a model
-    # arg only as a key for the EPS_CACHE — we pass a dummy.
-    torch.manual_seed(0)
-    n = 64
-    theta, a = _make_quadratic(n=n, seed=7)
-
-    def _forward():
-        loss = 0.5 * (a * theta * theta).sum()
-        return loss, {}
-
-    # Build a closure-shaped fake "compute_hessian_hutchinson" that returns
-    # the truth `a`. We monkey-patch _autotune_eps's reference call by
-    # patching the symbol in the hessian module (it's looked up at call
-    # time so monkey-patching works).
-    import megatron.proposal.hessian as _h
-    orig = _h.compute_hessian_hutchinson
-    _h.compute_hessian_hutchinson = (
-        lambda model, fsf, di, ps, k_samples: [a.clone().to(torch.float32)]
-    )
-    try:
-        # Clear cache so the test sees a fresh sweep.
-        _EPS_CACHE.clear()
-        eps_val = _autotune_eps(
-            model=theta,  # used only as cache key
-            forward_step_func=None,
-            data_iterator=None,
-            expert_ps=[theta],
-            batch_cached=None,
-            forward_loss_fn=_forward,
-            gates_for_freeze=None,
-        )
-        assert eps_val is not None
-        # Cache stores the ABSOLUTE eps (chosen_mult × ||θ||_mean base).
-        # See compute_hessian_finite_diff docstring for rationale: under
-        # DeepSpeed BF16 + Megatron Float16Module, ||θ||_mean from
-        # param.data is unreliable across refreshes, so we cache the
-        # absolute value picked at iter 1 and reuse it verbatim.
-        cached = _EPS_CACHE[id(theta)]
-        assert cached == eps_val, (
-            f"cache should hold absolute eps, got {cached} vs eps_val={eps_val}"
-        )
-        from megatron.proposal.hessian import _norm_mean_theta
-        base = _norm_mean_theta([theta])
-        ratio = cached / max(base, 1e-30)
-        assert ratio in (1e-2, 1e-3, 1e-4) or any(
-            abs(ratio - m) / m < 1e-6 for m in (1e-2, 1e-3, 1e-4)
-        ), (
-            f"absolute eps {cached} doesn't decompose into "
-            f"mult × ||θ||_mean ({base:.4e}); ratio={ratio}"
-        )
-    finally:
-        _h.compute_hessian_hutchinson = orig
-        _EPS_CACHE.clear()
 
 
 def test_graceful_none_on_forward_failure():
@@ -273,33 +206,6 @@ def test_identify_gate_modules_safe_force_empty():
         _set_force_empty(False)
 
 
-# ---------------------------------------------------------------------------
-# compare_hessian_estimators back-compat wrapper
-# ---------------------------------------------------------------------------
-def test_compare_hessian_estimators_back_compat():
-    """The old compare_hutchinson_vs_gnb wrapper must produce the same
-    Pearson/Jaccard numbers as compare_hessian_estimators, AND preserve
-    the legacy 'pearson_hutch_gnb_*' keys for downstream analysis scripts.
-    """
-    torch.manual_seed(0)
-    n = 64
-    p = torch.nn.Parameter(torch.randn(n))
-    h_a = torch.randn(n).abs().to(torch.float32)
-    h_b = (h_a + 0.1 * torch.randn(n)).abs().to(torch.float32)
-    tracked = [("toy.weight", p)]
-    theta_cp = {"toy.weight": p.data.clone()}
-
-    a_legacy = compare_hutchinson_vs_gnb(0, tracked, [h_a], [h_b], theta_cp)
-    a_new = compare_hessian_estimators(0, tracked, [h_a], [h_b], theta_cp,
-                                        label_a="hutch", label_b="gnb")
-    # Same numeric content.
-    assert a_legacy["pearson_hutch_gnb_bare"] == a_new["pearson_hutch_gnb_bare"]
-    assert a_legacy["jaccard_top1pct_bare"] == a_new["jaccard_top1pct_bare"]
-    # New keys present in both via the alias path.
-    assert "pearson_hutch_gnb_bare" in a_new
-    # New label-keyed alternative also present.
-    assert "pearson_hutch_gnb_score" in a_new
-
 
 def test_compare_hessian_estimators_label_propagation():
     """When called with custom labels, the output keys reflect them."""
@@ -315,16 +221,6 @@ def test_compare_hessian_estimators_label_propagation():
     assert res["label_a"] == "hutch"
     assert res["label_b"] == "finite_diff"
 
-
-# ---------------------------------------------------------------------------
-# Norm helper sanity
-# ---------------------------------------------------------------------------
-def test_norm_mean_theta_nonzero():
-    p1 = torch.nn.Parameter(torch.ones(4))
-    p2 = torch.nn.Parameter(torch.full((9,), 3.0))
-    n = _norm_mean_theta([p1, p2])
-    # ||p1|| = 2, ||p2|| = 9. mean = 5.5.
-    assert math.isclose(n, 5.5, abs_tol=1e-4)
 
 
 def test_pearson_two_tensor_lists_constant():

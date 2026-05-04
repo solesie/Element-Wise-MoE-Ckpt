@@ -1656,14 +1656,9 @@ def _refresh_gnb_impl(
     return {"iter": iteration, "k_samples": k_samples, "ms": elapsed_ms, "numel": n_elem}
 
 
-# _hutchinson_compute_H, _gnb_compute_H, _hutchinson_vs_gnb_similarity
-# moved to hessian.py (state-free helpers). Imported below for use by
-# proposal_refresh_hutchinson.
 from .hessian import (
     compute_hessian_hutchinson as _hutchinson_compute_H,
-    compute_hessian_gnb as _gnb_compute_H,
     compute_hessian_finite_diff as _finite_diff_compute_H,
-    compare_hutchinson_vs_gnb as _hutchinson_vs_gnb_similarity,
     compare_hessian_estimators as _compare_hessian_estimators,
 )
 
@@ -2046,14 +2041,9 @@ def proposal_refresh_finite_diff(
     elapsed_ms = (t1 - t0) * 1000.0
     n_elem = sum(p.numel() for p in expert_ps)
 
-    # Resolve eps actually used. _EPS_CACHE now stores ABSOLUTE eps (post
-    # the activation-perturb refactor; rationale in compute_hessian_finite_diff
-    # docstring), so we use it directly without multiplying by ||θ||_mean.
-    from .hessian import _EPS_CACHE as _FD_EPS_CACHE
-    cached_eps = _FD_EPS_CACHE.get(id(model[0] if isinstance(model, (list, tuple)) else model))
-    eps_actual = float(eps) if eps is not None else (
-        float(cached_eps) if cached_eps is not None else float("nan")
-    )
+    # Resolve eps actually used: explicit override > default 1e-3.
+    # (Autotune was removed when finite_diff became the only estimator.)
+    eps_actual = float(eps) if eps is not None else 1e-3
 
     diag_record = {
         "iter": int(iteration), "estimator": "finite_diff",
