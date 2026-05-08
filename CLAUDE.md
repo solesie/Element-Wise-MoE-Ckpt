@@ -21,6 +21,47 @@ Checkpointing은 모델 훈련 과정에서 예상치못한 상황에서 훈련 
 
 ---
 
+# Hard Implementation Constraints (절대 어겨선 안 됨)
+
+이 두 제약은 본 시스템의 모든 구현 결정을 지배한다. 새 코드 / 리팩터 / 최적화 시 **반드시** 준수.
+
+## 1. VRAM 추가 사용량 제약
+
+| 종류 | 한도 | 측정 방식 |
+|---|---|---|
+| **Persistent VRAM 추가** | **0 MB** (절대 0) | `torch.cuda.memory_allocated()` 의 baseline (학습 시작 직후) 대비 영구 증가량 |
+| **Transient VRAM 추가 (whole-iter peak)** | **≤ 80 MB** | `torch.cuda.max_memory_allocated()` − baseline. 매 iter 마다 `reset_peak_memory_stats()` 직후 측정 |
+
+- baseline = "outlier promotion / proposal CP 비활성화" 시점의 alloc/peak.
+- 새 GPU buffer 를 추가할 때는 **반드시** view (zero-copy) 를 우선 시도. 새 storage 를 생성해야 한다면 init log 와 `gpu_memory_breakdown()` 에 추가하여 가시화.
+- pinned host memory 는 VRAM 이 아니므로 이 제약 밖. 단 200 MB 이상 사용 시 host RAM 영향 검토.
+- 측정 의무: 의심스러운 변경 후 `PROPOSAL_OUTLIER_DBG_DSP_PEAK=1` 또는 cp_hooks 의 `peak/Δpeak` 로그로 확인.
+
+## 2. main_stream blocking 제약
+
+| 항목 | 한도 |
+|---|---|
+| **main_stream 위 blocking 추가** | **0 ms** (절대 0) |
+| **training thread 의 추가 sync 호출** | **0** (절대 0) |
+
+- main_stream = Megatron/DeepSpeed 의 forward/backward/optimizer 가 launch 되는 stream. 학습 critical path.
+- proposal 의 어떤 작업도 main_stream 위에 enqueue 되어선 안 됨. tracker_stream / d2h_stream 위에 launch.
+- training thread 가 `torch.cuda.synchronize()`, `tensor.item()`, `tensor.cpu()` 등으로 GPU 를 기다리는 호출은 **금지**. 필요한 sync 는 writer thread (background) 로 위임 — `cuda.Event` 를 writer 에 전달하여 writer 가 `event.synchronize()` 호출.
+- 예외: dispatch 의 `ev.synchronize()` (1-iter pipelining 의 일부) — 이 시점엔 prev iter 의 tracker_stream work 가 main_stream 의 forward+backward+optimizer (~2000 ms) 보다 훨씬 일찍 완료되므로 host wait time = 0.
+- SM contention 은 "soft" blocking 으로 간주 — 큰 batched kernel 이 작은 launch 들보다 SM 점유시간 짧아 contention 줄임. 1280 small launch → 30 batched launch 식의 변경은 SM 측면에서도 이득.
+
+## 3. 검증 의무
+
+새 변경마다 다음 측정값을 비교:
+- **iter time gap** (vs baseline outlier-OFF) ≤ 10 ms
+- **persistent VRAM gap** = 0 MB
+- **transient VRAM peak gap** ≤ 80 MB
+- **algorithm 정합성**: val loss 가 baseline 과 4-자리 이상 일치
+
+위 4 개 중 하나라도 실패하면 변경 폐기 또는 재설계.
+
+---
+
 # 용어 정리
 
 - loseless FC(Full Checkpointing):
@@ -29,7 +70,7 @@ expert는 특정 간격(D)마다 실행함.
 Adam Optimizer, model weight 등을 선별 없이 100% 저장하는 가장 일반적인 checkpointing 방법.
 - lossy FC:
 expert에만 적용됨. 
-Adam Optimizer, model weight 등을 전체 experts의 원소 중 Importance score 기반 상위 K%만 선별 저장하는 checkpointing 방법. 매 iteration 마다 중요한 expert의 elements를 선별하여 저장하는데에 사용됨.
+매 iteration 마다 element-level score (single iter `H × Δθ²`) 와 group-level score (time-window `H × δ[g]`) 가 **단일 K-budget (= topk_ratio × N_total_elements) 에서 경쟁** 하여 두 pool 의 통합 top 을 선별. 선택된 element / group 의 (idx, p, m, v) 가 expert 의 lossy FC 파일에 append.
 - DC(Differential Checkpointing):
 non-expert에만 적용됨. 
 매 iteration 마다 non-expert의 전체 gradient만을 저장함. 복구 시, non-expert loseless FC 와 W간격동안의 DC를 통해 모델을 lossless하게 복구함.
@@ -51,7 +92,13 @@ non-expert에만 적용됨.
 
 Lossy FC(append-only) + Round-robin expert lossless FC 방식을 사용한다.
 
-매 iteration마다, 전체 expert 원소 중 importance score 상위 K%를 선별하여 각 expert의 lossy FC 파일에 append한다. 특정 간격(D)마다, 전체 expert 중 F% expert 를 round-robin으로 선택하여 해당 expert의 전체 파라미터를 새 파일에 sequential write한다 (expert lossless FC). Expert lossless FC가 완료된 expert는 기존의 expert lossless FC 파일과 lossy FC 파일을 삭제한다.
+매 iteration 마다 단일 K-budget = `topk_ratio × N_total_elements` 안에서 두 pool 이 경쟁:
+1. **Element pool**: single-iter score `H × Δθ_i²` 의 top — outlier promotion (한 iter 에 spike 한 원소).
+2. **Group pool**: time-window score `H × δ[g]` 의 top — rotation (지속적으로 변동 누적된 그룹).
+
+선택된 element 와 group 은 각 expert 의 lossy FC 파일에 append (element 는 element entry, group 은 g 개 element entries). 자세한 선택 메커니즘은 [Method: Importance Score](#method-importance-score-expert-parameters) 참조.
+
+특정 간격(D) 마다 전체 expert 중 F% 를 round-robin 선택하여 expert lossless FC 수행 (해당 expert 의 전체 parameter 를 새 파일에 sequential write). LFC 완료된 expert 는 기존 LFC 파일과 lossy FC 파일을 삭제하고 새 lossy FC 파일을 fresh 생성.
 
 ## 파일 구조
 
@@ -103,10 +150,12 @@ Lossy FC(append-only) + Round-robin expert lossless FC 방식을 사용한다.
 
 ## Importance Score와의 상호작용
 
-δ는 매 iteration마다 group 단위로 누적되는 Σ Δθ_i² (accum_sq) 로 추정한다. theta_cp/element-level δ legacy path 는 제거됨.
+δ[g] = (1/g) × Σ_step Σ_{i ∈ g, not selected} Δθ_i² 는 group 단위 self-correcting accumulator. 매 iter 의 element-level Δθ² 도 single-iter score 로 직접 평가되어 같은 K-budget 에서 group 과 경쟁. 자세한 알고리즘은 [Method: Importance Score](#method-importance-score-expert-parameters) 참조.
 
-- Expert lossless FC 수행 시: 해당 expert 의 모든 group δ_g 가 0 으로 초기화 → score = 0. 이후 학습 진행으로 자연스럽게 δ_g 가 증가 → score 복구. rotation 효과로 최근 lossless 한 expert 보다 오래 된 expert 의 원소가 lossy FC 에서 우선 선별됨.
-- Lossy FC 수행 시: 선별된 group 의 δ_g 만 0 으로 초기화 → 다음 iteration 에서 다른 group 이 선별됨.
+- **Element 가 선택된 경우** (single iter outlier promotion): 그 element 의 Δθ² 는 δ[g] 에 더해지지 않음 (Intent E selective fold). 이미 lossy log 에 element entry 로 저장됨 → 다음 iter 에 다시 score = 0 (Δθ² 새로 시작).
+- **Group 이 선택된 경우** (group-level rotation): 그 group 의 모든 g 개 element 가 lossy log 에 entry 로 저장. 그 group 의 δ[g] 0 으로 초기화 → 다음 iter score = 0.
+- **Expert lossless FC 수행 시**: 해당 expert 의 모든 group δ[g] 0 → 그 expert 의 모든 score 0. 이후 학습 진행으로 δ[g] 자연 증가, element Δθ² 새로 측정 → 회복.
+- **Rotation**: 최근 보호된 항목은 score 0 으로 떨어지고, 미보호 항목이 우선. element pool / group pool 양쪽에서 자동 회전.
 
 ## 복구 성능 주의사항
 
@@ -130,73 +179,166 @@ Lossy FC(append-only) + Round-robin expert lossless FC 방식을 사용한다.
 
 ## Score Definition
 
-```
-score[j] = H × δ_j²
-```
-
-Expert FFN 파라미터의 각 원소에 대해서 계산.
-Non-expert parameter는 매 FC마다 전부 저장하므로 score 불필요.
-
-## Components
-
-### H(Hessian)
-
-- Finite-Difference 기반 (production). Hutchinson 은 FD 와의 비교 검증용 cross-check 에서만 사용.
-
-### δ_g — Recovery error proxy (group-level)
-
-block_quant_g 크기의 contiguous group 단위로 누적:
+매 iteration 마다 두 종류의 score 가 동일한 **per-element score axis** 위에서 동시에 계산되어 단일 K-budget 을 두고 경쟁한다.
 
 ```
-δ_g²  = Σ_{step ∈ window} Σ_{i ∈ group} Δθ_i²    (= "accum_sq")
+element score:  s_elem(i)   = H[group(i)] × Δθ_i²                    # single iter, per-element
+group   score:  s_group(g)  = H[group=g]  × δ[g]
+                where δ[g]  = (1/g) × Σ_{step ∈ window} Σ_{i ∈ g, not selected} Δθ_i²
 ```
 
-- 매 step: optimizer 의 m, v 로부터 Δθ_i 를 유도하여 group 별로 제곱합 누적
-- expert lossy FC 시: 선택된 group 의 δ_g 만 0 으로 초기화
-- expert lossless FC 시: 해당 expert 의 모든 group δ_g 0 으로 초기화
+- `Δθ_i²` = optimizer 의 m, v 로부터 유도한 이번 step 의 update² (single iter).
+- `δ[g]` = 시간창에 걸친 그룹 평균 per-element δ². "선택 안 된" 원소들의 (Δθ²/g) 가 누적되어 자연 회복.
+- `H[group]` = Finite-Difference 기반 group-level diagonal Hessian (production). Hutchinson 은 FD vs Hutch cross-check 에서만 사용.
+- 두 score 모두 per-element 단위 (group 측이 1/g 정규화) → 같은 axis 에서 직접 비교 가능.
 
-**메모리 비용 (group-level)**: H_g, δ_g 모두 1/g (BF16) 으로 줄어 element-level 대비 ~수십~수백배 절감. 기본 g=256.
+Non-expert parameter 는 매 W iter 전부 저장하므로 score 불필요.
 
-## 이론적 근거
+## Two-pool Unified Top-K (단일 K-budget 경쟁)
+
+### 알고리즘
+
+매 iter 다음을 수행:
+
+1. **Score 계산**:
+   - element pool: 각 expert element 의 `H × Δθ²` (단일 iter scale)
+   - group pool: 각 group 의 `H × δ[g]` (시간창 mean scale, 같은 per-element axis)
+
+2. **두 histogram 으로 단일 top-K**:
+   - `histc(element_scores, ...)` → 4096 bin
+   - `histc(group_scores, ...)` → 10000 bin
+   - 두 histogram 의 bin 을 **per-element score** 축에 정렬, weighted cumsum 생성:
+     - element bin: `weight = 1` (선택 시 K-budget 1 unit 소비)
+     - group   bin: `weight = g` (group 1개 선택 = g element 보호 = g unit 소비)
+   - cumsum 이 K_total = `topk_ratio × N_total_elements` 에 도달하는 score 가 **단일 임계값**.
+   - 이 임계값 이상의 element 는 element pool 에서 선택됨, 이상의 group 은 group pool 에서 선택됨. **합계 K-budget = K_total**.
+
+3. **선택된 항목 → checkpointing**:
+   - 선택된 element: lossy log 에 element entry (idx, p, m, v)
+   - 선택된 group: lossy log 에 g 개 element entries (group 의 모든 element)
+
+4. **탈락된 element 의 self-correcting 누적**:
+   - 선택 안 된 (탈락된) element 의 Δθ²/g 가 그 element 가 속한 group 의 δ[g] 에 가산
+   - 즉 **선택된 element 는 δ[g] 에 기여하지 않음** (= Intent E, 선택적 fold)
+   - 시간이 지나며 탈락된 element 가 많은 group 의 δ[g] 가 자연스레 커짐 → group score 증가 → 다음 iter 에서 group pool 우위 → group 단위로 회수 가능
+
+### 이론적 근거
 
 Taylor 2차 근사:
 
 ```
-ΔL ≈ (1/2) × Σ_j H × δ_j²
+ΔL ≈ (1/2) × Σ_j (H × δ_j²)
 ```
 
-- 1차 항 (∇L·δ): 기댓값 ≈ 0 (gradient 부호가 recovery error와 독립)
-- 2차 항 (H × δ²): 항상 양수, recovery loss의 실제 기여량
-- 각 원소의 score = 해당 원소의 recovery loss 기여량 그 자체
-- Top-K 선택은 ranking만 필요하므로 정규화 불필요
-- Score 연산은 FP32 (optimizer 내부 precision). Underflow 우려 없음
+- 1차 항: 기댓값 ≈ 0
+- 2차 항: 항상 양수, recovery loss 의 실제 기여량
+- 각 element 의 회수 가치 = `H × Δθ_j²`
+- 각 group 의 회수 가치 (per element) = `H × δ[g]` = `H × mean Δθ²` over time window
+- **K-budget 의 최적 분배**: 가장 회수 가치 높은 element 와 group 을 단일 ranking 으로 선택 (greedy by score-per-cost ratio; cost 를 normalize 하면 단일 score axis 의 top-K).
+
+### 두 pool 의 비대칭성 (역할 분담)
+
+- **Element pool (single iter, sharp)**: 한 iter 에 갑자기 큰 Δθ² 를 보인 outlier. 즉시 보호하지 않으면 회수 손실 큼.
+- **Group pool (time window, smooth)**: 여러 iter 에 걸쳐 누적되는 moderate δ². 단발성 spike 는 평균에 묻혀 우위에 안 옴; 지속적 변동은 결국 group threshold 통과.
+- 두 pool 이 같은 axis 에서 경쟁 → 분포에 따라 비율이 동적으로 조정됨 (고정 비율 분할이 아님).
 
 ### Starvation 방지
 
-- Snapshot된 원소: θ\_CP\[j\] = θ\_current\[j\]로 갱신 → δ = 0 → score = 0 → 선택 안 됨
-- FC된 expert: θ\_FC 전체 갱신 → 해당 expert 전체 δ = 0 → score = 0
-- 이후 학습이 진행되면 θ\_current가 θ\_CP에서 벗어나며 δ 자연 증가 → score 복구
-- 자연스러운 rotation: 이미 보호된 원소 대신 아직 보호되지 않은 원소가 선택됨
+- Snapshot 된 element / group: δ[g] 부분 0 → score = 0 → 다음 iter 선택 안 됨.
+- LFC 된 expert: 해당 expert 의 모든 group δ[g] = 0 → score = 0.
+- 이후 학습 진행 → 탈락된 element 의 Δθ²/g 가 δ[g] 에 누적 → score 자연 회복.
+- **자연 rotation**: 보호된 항목 대신 미보호 항목이 다음 iter 선택.
 
 ## 구현 요구사항
 
-- **Top-K 선택**: `torch.histc` 기반
+- **Top-K**: `torch.histc` 기반 두 histogram + dispatch 의 host-side merged walk (numpy `argsort` + `searchsorted`, ~14k entry 처리, < 0.1 ms).
+- **두 임계값 산출**:
+  - `elem_th` = walk 결과 score → kernel `prev_th` (element 선택 임계)
+  - `group_th` = `elem_th × g` → pass2 chunk-loop `prev_threshold_t` (group 선택 임계)
+- **Floor pruning**: walk 를 `K_total × FLOOR_MULT` (= 5 × K_total) 까지 연장하여 atomic histogram 의 floor 도출. floor 이하 element 는 kernel 의 `tl.atomic_add(..., mask=above_floor)` 로 atomic 자체를 skip.
+- **Bin 정밀도**: element 4096 bins, group 10000 bins. Bin width 는 `prev_smax × 1.5` 로 자동 스케일.
+- **prev_smax 갱신**: histogram 의 최상위 non-empty bin 으로 추정 (kernel 의 atomic_max 제거 — 단일-스칼라 contention 방지).
 
 ---
 
 # Checkpointing Strategy
 
-## 비동기 파이프라인 아키텍처
+## 4-stream / writer-thread 아키텍처 (Hard Contract)
 
-Training Process와 Checkpointing Process는 비동기로 분리되어 **학습이 중단되지 않는다.**
+학습은 **절대로** checkpointing 작업에 의해 중단되지 않는다. 이를 위해 4 계층의 책임 분리를 강제한다.
 
 ```
-GPU: Training Process (계속 학습, 멈추지 않음)
-     ↓ zero-copy snapshot (수 ms, 유일한 동기 지점)
-CPU: Checkpointing Process (비동기 + 저장)
-     ↓ write (비동기)
-Storage: persist
+┌─────────────────┬──────────────────────────────────────────────────────────┐
+│ Stream / Thread │ 책임                                                      │
+├─────────────────┼──────────────────────────────────────────────────────────┤
+│ main_stream     │ 학습 — Megatron/DeepSpeed 의 forward / backward /         │
+│                 │ optimizer 가 launch. 이 stream 위에는 proposal 의 어떤   │
+│                 │ 작업도 enqueue 되어선 안 됨 (critical path).              │
+├─────────────────┼──────────────────────────────────────────────────────────┤
+│ tracker_stream  │ Proposal 의 expert 관련 GPU compute — Triton outlier      │
+│                 │ kernel, group score chunk-loop, index_select, dg index_   │
+│                 │ fill 등. tracker.step 이 진입 시 main_stream 의 grad-     │
+│                 │ ready event 만 wait_event 하고 자체적으로 진행.           │
+├─────────────────┼──────────────────────────────────────────────────────────┤
+│ d2h_stream      │ **모든** GPU → pinned host memory 데이터 이동 (non-       │
+│                 │ expert DC + expert lossy dispatch + LFCL payload). H2D    │
+│                 │ destination 은 반드시 pinned (pageable 은 ~1.2 GB/s,     │
+│                 │ pinned 는 ~16 GB/s + non_blocking 가능). tracker_stream  │
+│                 │ 의 결과를 cuda.Event 로 받아 wait_event 후 copy.          │
+├─────────────────┼──────────────────────────────────────────────────────────┤
+│ writer thread   │ Host DRAM 의 데이터를 DRAM buffer (DRAM mode) /          │
+│ (host CPU)      │ disk file (disk mode) 에 저장. 모든 numpy 조립 / scatter │
+│                 │ / file write 는 여기서. d2h_stream 의 cuda.Event 를      │
+│                 │ writer 가 직접 `event.synchronize()` 호출하여 H2D 완료   │
+│                 │ 후 read. training thread 는 stream sync 호출 안 함.      │
+└─────────────────┴──────────────────────────────────────────────────────────┘
 ```
+
+### 데이터 흐름 (per iter)
+
+```
+forward ─backward─ optimizer.step()                  [main_stream]
+   │                       ↑
+   │                       │ wait_event(grad_ready)
+   ▼                  ┌────┴─────┐
+   (next iter)        │  tracker  │  Triton kernel (atomic histogram +
+                      │  _stream  │  selection + selective fold), pass2
+                      │           │  histc + chunk-loop selection,
+                      │           │  index_select per BF16-group
+                      └────┬──────┘
+                           │ event_compute
+                           ▼
+                      ┌──────────┐
+                      │d2h_stream│  pinned_host.copy_(gpu_tensor,
+                      │          │  non_blocking=True)
+                      └────┬─────┘
+                           │ event_h2d
+                           ▼
+                      ┌──────────┐
+                      │  writer  │  event_h2d.synchronize()
+                      │  thread  │  → numpy assembly / scatter
+                      │          │  → binary_io.write_lossless_payload
+                      │          │    or binary_io.append_lossy_log
+                      └──────────┘
+```
+
+### File I/O 위치 강제 규칙
+
+**모든 실제 file write 호출은 `megatron/proposal/binary_io.py` 안에만 위치한다.** 다른 모듈에서 `os.write*`, `os.fsync`, `os.replace`, `f.write(`, `tofile(` 를 직접 호출하지 않는다 — `binary_io` 의 헬퍼 (`save_binary`, `write_lossless_payload_atomic`, `open_lossy_log_for_append`, `append_lossy_log`, `fsync_fd`, `close_fd`) 를 사용한다. 위반 사항은 `grep -rEn 'os\.writev|os\.write\(|os\.fsync' megatron/proposal/ | grep -v binary_io.py | grep -v "test\|docstring"` 로 0 건이 나와야 한다.
+
+binary_io 의 헬퍼 함수들은 모두 **CPU 전용** (torch / cuda dependency 0): bytes / memoryview / numpy array 만 받음. → GPU stream 위에 잘못 호출될 가능성 0.
+
+### Stream sync 의무
+
+- tracker_stream → d2h_stream: `cuda.Event.record(tracker_stream)` + `d2h_stream.wait_event(...)`. 단일 event 가 phase 전체를 커버 (per-name event 금지 — overhead).
+- d2h_stream → writer thread: `cuda.Event.record(d2h_stream)` 을 writer 호출에 전달. writer 가 `event.synchronize()` 호출 (background thread 라 main_thread blocking 0).
+- main_stream / tracker_stream / d2h_stream 사이의 host-blocking sync (`stream.synchronize()`, `event.synchronize()` on training thread) 는 dispatch 진입 시점의 `ev.synchronize()` (1-iter pipelining) **단 1 회만** 허용. 이는 prev iter 의 tracker work 가 main_stream forward (~2000 ms) 보다 일찍 끝나므로 host wait time = 0.
+
+### 1-iter pipelining
+
+- iter T 의 tracker_stream 작업 결과는 iter T+1 의 dispatch 에서 사용 (1-iter 지연).
+- iter T 의 stash 시점에 GPU intermediate (sel_idx, sel_count, etc.) 를 `.clone()` 하여 ref 보관. iter T+1 dispatch 가 `ev.synchronize()` 후 `.item()` 으로 host scalar 추출 (sync 비용 0 — 이미 GPU 작업 완료).
+- 이 방식으로 stash 단계의 어떤 host sync 도 main_thread 를 block 하지 않음.
 
 ## Checkpoint 이벤트 — 매 iteration
 

@@ -62,6 +62,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from .binary_io import (
+    append_lossy_log,
+    close_fd,
+    fsync_fd,
+    open_lossy_log_for_append,
+    write_lossless_payload_atomic,
+)
+
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
 
@@ -366,28 +374,16 @@ class ExpertState:
 
         # 2) Close the current lossy fd (we own fd lifecycle here).
         if ent.lossy_fd is not None:
-            try:
-                os.close(ent.lossy_fd)
-            except OSError:
-                pass
+            close_fd(ent.lossy_fd)
             ent.lossy_fd = None
 
-        # 3) Serialise new lossless FC to <path>.tmp → atomic rename.
-        tmp_path = ent.lossless_path.with_suffix(ent.lossless_path.suffix + ".tmp")
-        fd = os.open(str(tmp_path),
-                     os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
-        try:
-            os.write(fd, header)
-            for (_tname, p_bytes, m_bytes, v_bytes) in tensor_bytes:
-                os.write(fd, p_bytes)
-                os.write(fd, m_bytes)
-                os.write(fd, v_bytes)
-            # fsync + rename runs on the AsyncWriter raw worker, so
-            # blocking here does NOT stall the training thread.
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(str(tmp_path), str(ent.lossless_path))
+        # 3) Serialise new lossless FC to <path>.tmp → atomic rename via
+        # the centralised binary_io helper (single home for write syscalls).
+        write_lossless_payload_atomic(
+            ent.lossless_path,
+            header_bytes=header,
+            tensor_bytes=tensor_bytes,
+        )
         ent.lossless_step = int(step)
         ent.step = int(step)
 
@@ -420,15 +416,20 @@ class ExpertState:
         array from already-CPU input tensors. Zero-copy for fp32/int32
         contiguous inputs.
 
-        **Background-thread work** (in ``_do_lossy_fc_append``):
-        ``os.writev`` the (count, step) prefix + record array into the
-        per-expert lossy FC log, lazily opening the fd if needed.
+        **Background-thread work** (in ``_do_lossy_fc_assemble_and_write``):
+        build the structured-dtype record array and ``os.writev`` it
+        with a (count, step) prefix into the per-expert lossy FC log,
+        lazily opening the fd if needed.
         """
         ent = self._entries.get(expert_id)
         if ent is None:
             return 0
         # Tally filtered total (skip unknown tensor names / empty
-        # selections).
+        # selections). All filtering work here is fast; the heavy
+        # numpy structured-array assembly is moved to the writer
+        # thread (see _do_lossy_fc_assemble_and_write) so the
+        # training thread doesn't pay ~100-200 ms of CPU memcpy
+        # per iter for ~9 M selected elements.
         total_n = 0
         filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for (tname, idx_local, p, m, v) in tensor_updates:
@@ -443,8 +444,28 @@ class ExpertState:
             ent.step = int(step)
             return 0
 
-        # Build structured-dtype array on training thread (data is CPU
-        # already; conversions are zero-copy for the common fp32/i32 path).
+        ent.step = int(step)
+        # The CPU tensors in ``filtered`` were freshly produced by the
+        # tracker dispatch (not aliased to any ongoing GPU buffer), so
+        # ownership transfer to the writer thread is safe.
+        L, E = ent.expert_id
+        self._dispatch(
+            self._do_lossy_fc_assemble_and_write,
+            ent, int(step), filtered, int(total_n),
+            tag=f"lossy_L{L:02d}_E{E:02d}",
+        )
+        return total_n
+
+    def _do_lossy_fc_assemble_and_write(
+        self,
+        ent: "_ExpertEntry",
+        step: int,
+        filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        total_n: int,
+    ) -> None:
+        """Writer-thread assembly + writev. Builds the structured-dtype
+        record array (interleaved idx/p/m/v fields) here so the training
+        thread never pays the per-iter numpy memcpy cost."""
         arr = np.empty(total_n, dtype=_RECORD_DTYPE)
         cursor = 0
         for (offset, idx_local, p, m, v) in filtered:
@@ -455,43 +476,107 @@ class ExpertState:
             arr["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
             arr["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
             cursor += n_i
-        assert cursor == total_n
-
-        ent.step = int(step)
-        # Dispatch raw writev to AsyncWriter raw worker (or sync if no
-        # writer). Takes ownership of ``arr``; training thread must not
-        # mutate it after this point (arr was just freshly allocated by
-        # np.empty above, so no aliasing risk).
-        L, E = ent.expert_id
-        self._dispatch(
-            self._do_lossy_fc_append, ent, int(step), arr,
-            tag=f"lossy_L{L:02d}_E{E:02d}",
-        )
-        return total_n
-
-    # ------------------------------------------------------------------
-    # Background lossy FC handler
-    # ------------------------------------------------------------------
-    def _do_lossy_fc_append(
-        self,
-        ent: "_ExpertEntry",
-        step: int,
-        arr: "np.ndarray",
-    ) -> None:
         if ent.lossy_fd is None:
             self._open_fresh_lossy(ent, step=int(step))
-        prefix = struct.pack("<II", int(arr.shape[0]), int(step))
-        os.writev(ent.lossy_fd, [prefix, memoryview(arr)])
+        append_lossy_log(ent.lossy_fd, int(arr.shape[0]), int(step), memoryview(arr))
+
+    def lossy_fc_append_batch(
+        self,
+        step: int,
+        per_expert_updates: Dict[ExpertId, List[Tuple[str, torch.Tensor,
+                                                       torch.Tensor, torch.Tensor,
+                                                       torch.Tensor]]],
+        h2d_event: Optional[Any] = None,
+    ) -> int:
+        """Batch variant of ``lossy_fc_append``: takes ALL per-expert
+        updates for one iter and submits a SINGLE writer-thread job that
+        handles every expert in sequence. Avoids ~80 per-iter
+        submit_raw calls (each costs ~1-2 ms training-thread time
+        from queue lock + counter increment), so the training-thread
+        overhead drops to one submission. Heavy numpy assembly + writev
+        still runs on the writer thread.
+
+        ``h2d_event``: optional cuda.Event recorded after the d2h_stream
+        copies that populate the pinned tensor data. The writer thread
+        synchronises on this event before reading the pinned tensors —
+        keeps the H2D off the training thread's critical path while
+        guaranteeing the writer sees consistent data."""
+        # Build a list of (entry, total_n, filtered) on training thread.
+        # All work here is fast (filtering numel checks + dict lookups);
+        # the heavy numpy memcpy is deferred to the writer thread.
+        prepared: List[Tuple[_ExpertEntry, int, List[Tuple[int, torch.Tensor,
+                                                            torch.Tensor, torch.Tensor,
+                                                            torch.Tensor]]]] = []
+        grand_total = 0
+        for eid, tensor_updates in per_expert_updates.items():
+            ent = self._entries.get(eid)
+            if ent is None:
+                continue
+            total_n = 0
+            filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor,
+                                 torch.Tensor]] = []
+            for (tname, idx_local, p, m, v) in tensor_updates:
+                if tname not in ent.global_offsets:
+                    continue
+                n_i = int(idx_local.numel())
+                if n_i == 0:
+                    continue
+                filtered.append((ent.global_offsets[tname], idx_local, p, m, v))
+                total_n += n_i
+            ent.step = int(step)
+            if total_n == 0:
+                continue
+            prepared.append((ent, total_n, filtered))
+            grand_total += total_n
+        if not prepared:
+            return 0
+        self._dispatch(
+            self._do_lossy_fc_batch_write,
+            int(step), prepared, h2d_event,
+            tag=f"lossy_batch_iter{int(step)}",
+        )
+        return grand_total
+
+    def _do_lossy_fc_batch_write(
+        self,
+        step: int,
+        prepared: List[Tuple["_ExpertEntry", int, List[Tuple[int, torch.Tensor,
+                                                              torch.Tensor, torch.Tensor,
+                                                              torch.Tensor]]]],
+        h2d_event: Optional[Any] = None,
+    ) -> None:
+        """Writer-thread handler for the batched variant — performs the
+        per-expert numpy assembly + writev sequentially.
+
+        Synchronises on ``h2d_event`` first (when present) so we read
+        the pinned tensors only after the d2h_stream copies that filled
+        them have completed."""
+        if h2d_event is not None:
+            try:
+                h2d_event.synchronize()
+            except Exception:
+                pass
+        for (ent, total_n, filtered) in prepared:
+            arr = np.empty(total_n, dtype=_RECORD_DTYPE)
+            cursor = 0
+            for (offset, idx_local, p, m, v) in filtered:
+                n_i = int(idx_local.numel())
+                idx_np = _to_i32_numpy(idx_local, n_i)
+                arr["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
+                arr["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
+                arr["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
+                arr["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
+                cursor += n_i
+            if ent.lossy_fd is None:
+                self._open_fresh_lossy(ent, step=int(step))
+            append_lossy_log(ent.lossy_fd, int(arr.shape[0]), int(step), memoryview(arr))
 
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
     def _do_fsync_lossy(self, ent: "_ExpertEntry") -> None:
         if ent.lossy_fd is not None:
-            try:
-                os.fsync(ent.lossy_fd)
-            except OSError:
-                pass
+            fsync_fd(ent.lossy_fd)
 
     def flush(self, only_eids: Optional[List[ExpertId]] = None) -> None:
         """Drain pending async jobs, then fsync every open lossy FC fd.
@@ -537,10 +622,7 @@ class ExpertState:
         # Close remaining fds. Safe only after flush() drained all jobs.
         for ent in self._entries.values():
             if ent.lossy_fd is not None:
-                try:
-                    os.close(ent.lossy_fd)
-                except OSError:
-                    pass
+                close_fd(ent.lossy_fd)
                 ent.lossy_fd = None
 
     # ------------------------------------------------------------------
@@ -559,14 +641,7 @@ class ExpertState:
             "record_bytes": RECORD_BYTES,
         }
         header = _pack_header(MAGIC_LFSY, header_meta)
-        fd = os.open(str(ent.lossy_path),
-                     os.O_CREAT | os.O_RDWR | os.O_TRUNC | os.O_APPEND, 0o644)
-        try:
-            os.write(fd, header)
-        except Exception:
-            os.close(fd)
-            raise
-        ent.lossy_fd = fd
+        ent.lossy_fd = open_lossy_log_for_append(ent.lossy_path, header)
         ent.lossy_start_step = int(step)
 
 

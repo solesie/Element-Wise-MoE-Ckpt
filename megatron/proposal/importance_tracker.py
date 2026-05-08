@@ -89,6 +89,89 @@ try:
         gid_mask = gid_off < n_groups
         prev = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
         tl.store(accum_ptr + gid_off, prev + block_sums, mask=gid_mask)
+
+    @triton.jit
+    def _accum_with_outlier_kernel(
+        m_ptr, v_ptr, accum_ptr, h_g_ptr,
+        elem_hist_ptr, sel_idx_ptr, sel_count_ptr,
+        prev_th_ptr, floor_ptr,
+        n_groups, score_max, sel_max,
+        lr_over_bc1, sqrt_bc2_inv, eps,
+        G: tl.constexpr,
+        GROUPS_PER_BLOCK: tl.constexpr,
+        N_BINS: tl.constexpr,
+    ):
+        """accum_sq + outlier-promotion fused kernel with bin-floor pruning.
+
+        Per element i in group g, computes Δθ²_i, element score
+        H_g·Δθ²_i, then:
+          1. if score ≥ floor: atomically increments
+             elem_hist[bin(score)]. Below-floor elements skip the
+             histogram entirely — they cannot be selected (floor ≤
+             prev_th by construction) and aren't needed for the
+             K-th rank determination as long as |above-floor| > K.
+             This collapses the atomic_add count from N_total down
+             to ~5-15 % under heavy-tail δ² distributions.
+          2. if score ≥ prev_th: stream-compact via cumsum + 1
+             scalar atomic per program block; emit global idx to
+             sel_idx (capacity sel_max).
+          3. accumulates the group sum of Δθ²_i EXCLUDING elements
+             that hit (2) — Intent E (self-correcting accumulator).
+        """
+        BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
+        pid = tl.program_id(axis=0)
+        gid_start = pid * GROUPS_PER_BLOCK
+        elem_off = gid_start * G + tl.arange(0, BLOCK_SIZE)
+        elem_mask = elem_off < n_groups * G
+
+        m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
+        v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
+        denom = tl.sqrt(v) * sqrt_bc2_inv + eps
+        delta = lr_over_bc1 * m / denom
+        delta_sq = delta * delta  # [BLOCK_SIZE]
+        delta_sq_2d = tl.reshape(delta_sq, (GROUPS_PER_BLOCK, G))
+
+        gid_off = gid_start + tl.arange(0, GROUPS_PER_BLOCK)
+        gid_mask = gid_off < n_groups
+        h_g_per_g = tl.load(h_g_ptr + gid_off, mask=gid_mask, other=0.0)
+        h_g_2d = tl.broadcast_to(h_g_per_g[:, None], (GROUPS_PER_BLOCK, G))
+        elem_score_2d = h_g_2d.to(tl.float32) * delta_sq_2d  # [GPB, G]
+        elem_score = tl.reshape(elem_score_2d, (BLOCK_SIZE,))
+
+        # 1) Histogram (floor-pruned): only bin scores ≥ floor.
+        # Using ``mask=above_floor`` skips the atomic for ~95 % of
+        # elements (those below the percentile floor), which dominates
+        # this kernel's runtime — going from 188 M atomics → ~9 M.
+        # observed_max is no longer atomic-tracked; it's recovered
+        # from the histogram (highest non-empty bin) in the dispatch
+        # walk, so the per-block atomic_max — 737 K contentious
+        # atomics on a single scalar — is gone entirely.
+        floor = tl.load(floor_ptr)
+        above_floor = (elem_score >= floor) & elem_mask
+        bin_idx = (elem_score / score_max * N_BINS).to(tl.int32)
+        bin_idx = tl.minimum(bin_idx, N_BINS - 1)
+        bin_idx = tl.maximum(bin_idx, 0)
+        tl.atomic_add(elem_hist_ptr + bin_idx, 1, mask=above_floor)
+
+        # 2) Selection: emit idx if score >= prev_th. Stream-compact via
+        # block-local cumsum + 1 global atomic_add per program (returns
+        # this block's starting slot).
+        prev_th = tl.load(prev_th_ptr)
+        selected = (elem_score >= prev_th) & elem_mask
+        sel_int = selected.to(tl.int32)
+        within_block_pos = tl.cumsum(sel_int, axis=0) - sel_int  # 0..block_n-1
+        block_n = tl.sum(sel_int, axis=0)
+        block_start = tl.atomic_add(sel_count_ptr, block_n)
+        write_pos = block_start + within_block_pos
+        write_ok = selected & (write_pos < sel_max)
+        tl.store(sel_idx_ptr + write_pos, elem_off, mask=write_ok)
+
+        # 3) Selective fold: zero out selected elements before group sum.
+        selected_2d = tl.reshape(selected, (GROUPS_PER_BLOCK, G))
+        delta_sq_kept = tl.where(selected_2d, 0.0, delta_sq_2d)
+        block_sums = tl.sum(delta_sq_kept, axis=1)
+        prev = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
+        tl.store(accum_ptr + gid_off, prev + block_sums, mask=gid_mask)
 except Exception:
     _HAS_TRITON = False
 
@@ -123,6 +206,51 @@ def _accum_delta_sq_triton(flat_m, flat_v, flat_accum, total_a, g, lr_over_bc1, 
         flat_m, flat_v, flat_accum,
         n_groups, lr_over_bc1, sqrt_bc2_inv, eps,
         G=g, GROUPS_PER_BLOCK=gpb,
+    )
+
+
+def _accum_with_outlier(
+    flat_m, flat_v, flat_accum, h_g_flat,
+    elem_hist, sel_idx, sel_count,
+    total_a, g,
+    prev_th, prev_floor,
+    score_max, sel_max,
+    lr_over_bc1, sqrt_bc2_inv, eps,
+):
+    """Outlier-promotion path: same group sum as ``_accum_delta_sq_triton``
+    plus element histogram + selection emission + selective fold (Intent E).
+    Falls back to ``_accum_delta_sq_triton`` (group sum only, no outlier
+    emission) when Triton is unavailable — outlier promotion requires the
+    fused kernel."""
+    n_groups = total_a // g
+    if n_groups == 0:
+        return
+    if not _HAS_TRITON:
+        # Non-Triton fallback: do the plain group sum so training stays
+        # correct; outlier emission is silently disabled. Caller checks
+        # sel_count for "did anything emit" semantics.
+        flat = (flat_m[:total_a].to(torch.float32) /
+                ((flat_v[:total_a].to(torch.float32).sqrt() * sqrt_bc2_inv) + eps)
+                ) * lr_over_bc1
+        flat = flat * flat
+        flat_accum.add_(flat.view(-1, g).sum(dim=1))
+        return
+    target_block = 256
+    gpb = max(1, target_block // max(1, g))
+    p = 1
+    while p < gpb:
+        p *= 2
+    gpb = p
+    n_progs = (n_groups + gpb - 1) // gpb
+    grid = (n_progs,)
+    n_bins = int(elem_hist.numel())
+    _accum_with_outlier_kernel[grid](
+        flat_m, flat_v, flat_accum, h_g_flat,
+        elem_hist, sel_idx, sel_count,
+        prev_th, prev_floor,
+        n_groups, score_max, sel_max,
+        lr_over_bc1, sqrt_bc2_inv, eps,
+        G=g, GROUPS_PER_BLOCK=gpb, N_BINS=n_bins,
     )
 
 
@@ -245,6 +373,47 @@ class ImportanceTracker:
         self._H: Dict[str, torch.Tensor] = {}
         # Number of EMA updates applied. Used for diagnostics / bias correction.
         self._H_updates: int = 0  # bumped every refresh
+
+        # Outlier-promotion (Intent A–E). Off by default; enabled by
+        # PROPOSAL_OUTLIER_PROMOTE=1. When ON, the accum_sq Triton kernel
+        # additionally (a) bins H_g·Δθ²_i into _outlier_elem_hist for next
+        # iter's element threshold, (b) tags elements whose score ≥
+        # _outlier_prev_th into _outlier_sel_idx (atomic FIFO), and (c)
+        # excludes those elements' Δθ²_i from the dg group sum (Intent E).
+        # All buffers are persistent and small (< 100 KB GPU); the per-
+        # iter selection idx buffer is sized once at first use.
+        import os as _os_op
+        self._outlier_promote = _os_op.environ.get(
+            "PROPOSAL_OUTLIER_PROMOTE", ""
+        ) in ("1", "true", "TRUE")
+        self._outlier_n_bins = int(_os_op.environ.get(
+            "PROPOSAL_OUTLIER_N_BINS", "4096"
+        ))
+        # Lazy: alloc on first kernel call (need device + total numel).
+        self._outlier_elem_hist: Optional[torch.Tensor] = None  # (n_bins,) i32
+        self._outlier_prev_th: Optional[torch.Tensor] = None    # () fp32
+        # Floor for histogram pruning: only scores ≥ floor enter the
+        # atomic histogram. Cold start = 0 (no pruning); after walk,
+        # set to prev_th × 0.5 — captures top ~5-15 % under heavy-tail
+        # δ², 6-20× atomic_add reduction, K-th rank still computable.
+        self._outlier_prev_floor: Optional[torch.Tensor] = None  # () fp32
+        # observed element-score max: recovered from the histogram
+        # itself (highest non-empty bin) in the dispatch walk. Element
+        # scores are narrowly distributed (Adam normalises δ) and
+        # ~40× smaller than group scores, so we can't reuse the
+        # group s_max — it would squeeze the histogram into the
+        # bottom bins. Per-iter atomic_max in the kernel was the
+        # original design but cost ~30 ms in single-scalar contention
+        # across 737 K blocks; the bin-quantised estimate is adequate
+        # because we only need it to size the next iter's bin range.
+        self._outlier_prev_smax: float = 1e-6                    # host
+        self._outlier_sel_idx: Optional[torch.Tensor] = None    # (K_max,) i32
+        self._outlier_sel_count: Optional[torch.Tensor] = None  # (1,) i32
+        # Per-iter pending: list of selected element idx (CPU long).
+        # 1-iter pipelined like group selection — dispatched at next
+        # tracker.step's _dispatch_pending_payload.
+        self._outlier_pending_idx_cpu: Optional[torch.Tensor] = None
+
         self.num_experts = int(num_experts) if num_experts is not None else None
 
         self._tracked_names: List[str] = []
@@ -571,11 +740,17 @@ class ImportanceTracker:
                     g_idx = coord[0]
             b = buckets.setdefault(g_idx, {
                 "names": [], "sizes": [], "m_refs": [], "v_refs": [],
+                "p_refs": [],
             })
             b["names"].append(n)
             b["sizes"].append(int(p.numel()))
             b["m_refs"].append(m.detach().reshape(-1))
             b["v_refs"].append(v.detach().reshape(-1))
+            # FP32 master view for batched p index_select. Same FP32
+            # master buffer as ``master_flat = mapper._fp32_flat[g_idx]``,
+            # so all p_refs in this bucket share storage and form a
+            # zero-copy flat view over the BF16-Opt group's params.
+            b["p_refs"].append(_fp32_param(p).detach().reshape(-1))
 
         if not buckets:
             return
@@ -698,9 +873,19 @@ class ImportanceTracker:
             names = b["names"]
             m_refs = b["m_refs"]
             v_refs = b["v_refs"]
+            p_refs = b["p_refs"]
             group_total = sum(sizes)
             group_groups = group_total // g
+            master_off = cur_off  # start of this group's region in flat
             master_dg = self._g_fast_dg_flat.narrow(0, cur_off, group_groups)
+            master_h_g = self._g_fast_h_g_bf16_flat.narrow(
+                0, cur_off, group_groups,
+            )
+
+            # Track this BF16 group's name range in the global name_list
+            # — used by the Option-B dispatch path to slice top_idx_sorted
+            # / outlier_sorted_global per BF16 group.
+            start_name_in_grp = len(self._g_fast_name_list)
 
             # Per-name views (in this master's region).
             for n, sz in zip(names, sizes):
@@ -720,8 +905,11 @@ class ImportanceTracker:
                 cur_off += n_g
                 self._g_fast_offsets_cpu.append(cur_off)
 
+            end_name_in_grp = len(self._g_fast_name_list)
+
             m_flat, m_why = _try_flat_view(m_refs)
             v_flat, v_why = _try_flat_view(v_refs)
+            p_flat, p_why = _try_flat_view(p_refs)
             zc = (m_flat is not None and v_flat is not None
                   and m_flat.numel() == group_total
                   and v_flat.numel() == group_total)
@@ -730,15 +918,26 @@ class ImportanceTracker:
                 zc_reasons.append(
                     f"g_idx={g_idx} m_why={m_why} v_why={v_why}"
                 )
+            # p_flat is required for Option-B batched dispatch but its
+            # absence does not invalidate zero_copy (m/v fallback path
+            # still works). Track the reason for diagnostic logging.
+            if p_flat is None or p_flat.numel() != group_total:
+                p_flat = None  # signals dispatch to fall back per-name
             self._groups.append({
                 "g_idx": g_idx,
                 "names": names,
                 "sizes": sizes,
                 "m_refs": m_refs,
                 "v_refs": v_refs,
+                "p_refs": p_refs,
                 "m_flat": m_flat,
                 "v_flat": v_flat,
+                "p_flat": p_flat,
                 "dg_buf": master_dg,  # master-region view into dg_flat
+                "h_g_buf": master_h_g,  # master-region view into h_g_bf16_flat
+                "master_off": master_off,  # global flat offset (= dg/h_g start)
+                "start_name_in_grp": start_name_in_grp,
+                "end_name_in_grp": end_name_in_grp,
                 "zero_copy": zc,
                 "total": group_total,
                 "total_aligned": (group_total // g) * g,
@@ -867,10 +1066,62 @@ class ImportanceTracker:
         _budget_mb = int(_os_b.environ.get("PROPOSAL_DG_SCRATCH_MB", "50"))
         CHUNK_BUDGET = max(1, _budget_mb) * 1024 * 1024 // 4  # FP32 elems
 
+        # Outlier-promotion path: lazy-alloc per-iter buffers (prev_th,
+        # elem_hist, sel_idx, sel_count) on first call. Atomic counter
+        # and histogram are reset to 0 each iter so the kernel can
+        # accumulate fresh distribution.
+        outlier_on = (
+            self._outlier_promote
+            and all(grp["zero_copy"] for grp in self._groups)
+            and _HAS_TRITON
+        )
+        if outlier_on:
+            device = self._g_fast_dg_flat.device
+            n_bins = self._outlier_n_bins
+            if self._outlier_elem_hist is None:
+                self._outlier_elem_hist = torch.zeros(
+                    n_bins, dtype=torch.int32, device=device,
+                )
+                self._outlier_prev_th = torch.full(
+                    (), float("inf"), dtype=torch.float32, device=device,
+                )
+                self._outlier_prev_floor = torch.zeros(
+                    (), dtype=torch.float32, device=device,
+                )
+                self._outlier_sel_count = torch.zeros(
+                    1, dtype=torch.int32, device=device,
+                )
+            # K_max sized to topk_ratio × N_total (element-equiv budget),
+            # plus headroom for early-iter promotion ratio spikes (Intent D).
+            K_max = max(1, int(self.topk_ratio * total * 1.5))
+            if (self._outlier_sel_idx is None
+                    or self._outlier_sel_idx.numel() < K_max):
+                self._outlier_sel_idx = torch.empty(
+                    K_max, dtype=torch.int32, device=device,
+                )
+            self._outlier_elem_hist.zero_()
+            self._outlier_sel_count.zero_()
+            # score_max for THIS iter's bin range = prev iter's actual
+            # max + 50 % headroom. Cold start uses small default so
+            # iter 1's hist is mostly clamped (acceptable — adapts in
+            # 1 iter once observed max is recovered from the histogram).
+            score_max = max(self._outlier_prev_smax * 1.5, 1e-30)
+            sel_max = int(self._outlier_sel_idx.numel())
+
         for grp in self._groups:
             dg_buf = grp["dg_buf"]
             total_a = grp["total_aligned"]
-            if grp["zero_copy"]:
+            if outlier_on and grp["zero_copy"]:
+                _accum_with_outlier(
+                    grp["m_flat"], grp["v_flat"], dg_buf, grp["h_g_buf"],
+                    self._outlier_elem_hist, self._outlier_sel_idx,
+                    self._outlier_sel_count,
+                    total_a, g,
+                    self._outlier_prev_th, self._outlier_prev_floor,
+                    score_max, sel_max,
+                    lr_over_bc1, sqrt_bc2_inv, eps_adam,
+                )
+            elif grp["zero_copy"]:
                 _accum_delta_sq_triton(
                     grp["m_flat"], grp["v_flat"], dg_buf,
                     total_a, g, lr_over_bc1, sqrt_bc2_inv, eps_adam,
@@ -981,6 +1232,20 @@ class ImportanceTracker:
         values *on top of* the just-written T LFCL — a recovery
         regression. Skipping them here keeps T's LFCL authoritative.
         """
+        import time as _time_dsp
+        import os as _os_dsp
+        _dsp_dbg = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP", "") in ("1",)
+        # Narrow peak-memory window for dispatch only — set
+        # PROPOSAL_OUTLIER_DBG_DSP_PEAK=1 to log dispatch's GPU
+        # transient contribution (in addition to the iter-level peak
+        # in cp_hooks). Reset at entry, read at exit; isolates dispatch
+        # from forward/backward/optimizer's own transient peaks.
+        _dsp_peak = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP_PEAK", "") in ("1",)
+        _t_dsp_entry = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+        if _dsp_peak and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _dsp_alloc_at_entry = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
         pending = self._pending_dispatch
         if pending is None:
             return
@@ -991,6 +1256,7 @@ class ImportanceTracker:
             except Exception:
                 pass
             self._pending_tracker_event = None
+        _t_after_evsync = _time_dsp.perf_counter() if _dsp_dbg else 0.0
 
         seg_bounds = pending["seg_bounds"]
         top_idx_sorted = pending["top_idx_sorted"]
@@ -1006,108 +1272,625 @@ class ImportanceTracker:
         prev_step = pending["step"]
 
         seg_bounds_cpu = seg_bounds.cpu()
+        _t_after_segcpu = _time_dsp.perf_counter() if _dsp_dbg else 0.0
         device = next(self.model.parameters()).device
         g_blk = max(1, int(self.block_quant_g))
         arange_g = self._g_fast_arange_g
         mapper = get_mapper()
         stream = self._tracker_stream
 
+        # === Form 1: Merged walk on TWO histograms — single K-budget. ==
+        # CLAUDE.md spec: "production 그룹 score 와 동일 K-budget 에서
+        # single-iter element score H_g·Δθ²_i 가 경쟁."
+        #
+        # Both histograms (element-level + group-level) are populated at
+        # PREV iter — element by the outlier kernel's atomic_add, group
+        # by pass2's chunk-loop ``histc``. After ev.synchronize above
+        # both are valid on host. We:
+        #   1. Read both hists to host (4096 + 10000 entries — ~56 KB).
+        #   2. Convert each bin to a per-element-score axis:
+        #        element bin i:  score = (i + 0.5) × elem_bin_width
+        #        group   bin i:  score = (i + 0.5) × group_bin_width / g_blk
+        #      (group bin's per-element score = its mean element score.)
+        #   3. Each entry's K-budget cost: element = 1, group = g_blk.
+        #   4. Walk merged-sorted (descending score) with weighted cumsum
+        #      until ≥ K_total = topk_ratio × N_total_elements.
+        #   5. The score at K_total → unified threshold:
+        #        elem_th  = threshold (used by kernel for outlier emit)
+        #        group_th = threshold × g_blk (used by pass2 chunk-loop)
+        #   6. Floor analogously at K_total × FLOOR_MULT (kernel atomic
+        #      pruning).
+        # Effect: elements with high individual contribution displace
+        # groups whose mean element contribution is lower — true unified
+        # top-K under K-budget. Total selected ≤ K_total elements.
+        if (self._outlier_promote
+                and self._outlier_elem_hist is not None
+                and getattr(self, "_flat_layout_done", False)):
+            import numpy as _np_form1
+            elem_hist = self._outlier_elem_hist
+            total_groups_outlier = self._g_fast_dg_flat.numel()
+            total_elems_outlier = total_groups_outlier * g_blk
+            K_total = max(1, int(self.topk_ratio * total_elems_outlier))
+            FLOOR_MULT = 5
+
+            # --- score-axis parameters (host scalars) ---
+            elem_score_max_used = max(self._outlier_prev_smax * 1.5, 1e-30)
+            elem_n_bins = elem_hist.numel()
+            elem_bin_width = elem_score_max_used / elem_n_bins
+
+            group_hist = self._g_fast_global_hist
+            group_smax = getattr(self, "_prev_s_max_g", None)
+            if group_smax is None or group_smax <= 0.0:
+                group_smax = 1e-6
+            group_score_max_used = max(group_smax * 1.5, 1e-30)
+            group_n_bins = group_hist.numel()
+            group_bin_width = group_score_max_used / group_n_bins
+
+            # --- pull both hists to host (small, ~56 KB total) ---
+            elem_np = elem_hist.cpu().numpy().astype(_np_form1.int64)
+            # group_hist is fp32 (histc accumulator); cast to int64 for
+            # weighted cumsum arithmetic.
+            group_np = group_hist.cpu().numpy().astype(_np_form1.int64)
+
+            # Per-element score for each bin's midpoint, axis: descending.
+            elem_bin_idx = _np_form1.arange(elem_n_bins)
+            elem_scores = (elem_bin_idx + 0.5) * elem_bin_width
+            group_bin_idx = _np_form1.arange(group_n_bins)
+            group_scores_per_elem = (
+                (group_bin_idx + 0.5) * group_bin_width / g_blk
+            )
+
+            # Concatenate the two pools, then sort by score descending.
+            # ``weight``: 1 for element bins, g_blk for group bins.
+            all_scores = _np_form1.concatenate([elem_scores, group_scores_per_elem])
+            all_counts = _np_form1.concatenate([elem_np, group_np])
+            all_weights = _np_form1.concatenate([
+                _np_form1.full(elem_n_bins, 1, dtype=_np_form1.int64),
+                _np_form1.full(group_n_bins, g_blk, dtype=_np_form1.int64),
+            ])
+            order = _np_form1.argsort(-all_scores, kind="stable")
+            sorted_scores = all_scores[order]
+            sorted_weighted = (all_counts[order] * all_weights[order])
+            cum = _np_form1.cumsum(sorted_weighted)
+            total_weighted = int(cum[-1]) if cum.size > 0 else 0
+
+            # --- threshold at K_total (selection boundary) ---
+            if total_weighted < K_total:
+                # Cold / under-populated: open both gates — every element
+                # / group eligible next iter.
+                elem_th_val = 0.0
+            else:
+                idx_th = int(_np_form1.searchsorted(cum, K_total, side="left"))
+                idx_th = min(idx_th, sorted_scores.size - 1)
+                # Lower edge of the bin where cumsum reached K_total.
+                # Using the bin score (midpoint) is good enough — bin
+                # quantisation is the inherent noise floor anyway.
+                elem_th_val = float(sorted_scores[idx_th])
+
+            # --- floor at K_total × FLOOR_MULT (kernel atomic prune) ---
+            if total_weighted < K_total * FLOOR_MULT:
+                # Soft fallback when long tail too short: pull floor in
+                # to half of next_th — avoids the all-bin scan oscillation.
+                elem_floor_val = elem_th_val * 0.5
+            else:
+                idx_floor = int(_np_form1.searchsorted(
+                    cum, K_total * FLOOR_MULT, side="left",
+                ))
+                idx_floor = min(idx_floor, sorted_scores.size - 1)
+                elem_floor_val = float(sorted_scores[idx_floor])
+
+            # --- write thresholds back (used by THIS iter's compute) ---
+            zero_t = torch.zeros(
+                (), dtype=torch.float32, device=elem_hist.device,
+            )
+            self._outlier_prev_th.fill_(elem_th_val)
+            self._outlier_prev_floor.fill_(elem_floor_val)
+            # Group threshold = elem_th × g_blk (since group score is
+            # the SUM over g_blk elements; mean ≥ elem_th ⇔ sum ≥
+            # elem_th × g_blk). pass2 reads this directly.
+            group_th_val = elem_th_val * g_blk
+            self._g_fast_prev_threshold_t.fill_(group_th_val)
+
+            # --- update prev_smax (element & group) for next iter's
+            # bin range. Element side: highest non-empty element bin.
+            # Group side: highest non-empty group bin (in group score).
+            elem_nonempty = _np_form1.nonzero(elem_np)[0]
+            if elem_nonempty.size > 0:
+                top_elem_bin = int(elem_nonempty[-1])
+                self._outlier_prev_smax = max(
+                    (top_elem_bin + 1) * elem_bin_width, 1e-30,
+                )
+            group_nonempty = _np_form1.nonzero(group_np)[0]
+            if group_nonempty.size > 0:
+                top_group_bin = int(group_nonempty[-1])
+                self._prev_s_max_g = max(
+                    (top_group_bin + 1) * group_bin_width, 1e-30,
+                )
+
+            import os as _os_od
+            if (_os_od.environ.get("PROPOSAL_OUTLIER_DEBUG", "")
+                    in ("1", "true", "TRUE")
+                    and prev_step % 5 == 0):
+                elem_total_unweighted = int(elem_np.sum())
+                group_total_unweighted = int(group_np.sum())
+                sel_count_val = (
+                    int(pending.get("outlier_sel_count_snap").item())
+                    if pending.get("outlier_sel_count_snap") is not None
+                    else 0
+                )
+                # Predict K-budget split for next iter from current
+                # walk's threshold: bins above elem_th in each pool.
+                # Element budget = sum of element bin counts above th.
+                elem_above = int(elem_np[
+                    _np_form1.where(elem_scores >= elem_th_val)[0]
+                ].sum())
+                # Group budget (in elements) = g_blk × sum of group bin
+                # counts whose per-elem score ≥ elem_th.
+                group_above_groups = int(group_np[
+                    _np_form1.where(group_scores_per_elem >= elem_th_val)[0]
+                ].sum())
+                group_above_elem_units = group_above_groups * g_blk
+                print(
+                    f"[proposal] outlier @iter{prev_step}: "
+                    f"prev_n_sel={sel_count_val} K_total={K_total} "
+                    f"elem_hist_total={elem_total_unweighted} "
+                    f"group_hist_total={group_total_unweighted} "
+                    f"elem_smax={elem_score_max_used:.3e} "
+                    f"group_smax={group_score_max_used:.3e} "
+                    f"elem_th={elem_th_val:.3e} "
+                    f"group_th={group_th_val:.3e} "
+                    f"floor={elem_floor_val:.3e} "
+                    f"predict_next: elem={elem_above} "
+                    f"group_grps={group_above_groups} "
+                    f"(group_in_elem_units={group_above_elem_units}) "
+                    f"sum={elem_above + group_above_elem_units}/{K_total}",
+                    flush=True,
+                )
+
+        # Outlier-promotion: derive elem_idx from the GPU snapshot
+        # stashed at prev iter's tracker.step. ev.synchronize() above
+        # already waited for the snapshot clones to complete, so the
+        # .item() here is essentially free (data already resident).
+        sel_idx_snap = pending.get("outlier_sel_idx_snap", None)
+        sel_count_snap = pending.get("outlier_sel_count_snap", None)
+        outlier_elem_idx: Optional[torch.Tensor] = None
+        if sel_idx_snap is not None and sel_count_snap is not None:
+            n_sel = int(sel_count_snap.item())
+            n_sel = min(n_sel, sel_idx_snap.numel())
+            if n_sel > 0:
+                outlier_elem_idx = sel_idx_snap[:n_sel].to(torch.long)
+        # Pre-sort by tensor name_idx so each tensor's outliers are a
+        # contiguous slice — the per-name dispatch loop can use plain
+        # integer slicing instead of bool-masking (which would trigger
+        # a host sync per name from variable-size output). One CPU sync
+        # total here, zero per-name syncs.
+        outlier_sorted_global: Optional[torch.Tensor] = None
+        outlier_name_bounds_cpu: Optional[List[int]] = None
+        # Skip Phase-4 outlier dispatch when env flag set — used to
+        # quantify the cost contribution of outlier element dispatch.
+        _phase4_skip = _os_dsp.environ.get(
+            "PROPOSAL_OUTLIER_SKIP_PHASE4", ""
+        ) in ("1",)
+        if _phase4_skip:
+            outlier_elem_idx = None
+        if outlier_elem_idx is not None and outlier_elem_idx.numel() > 0:
+            group_idx_per_o = outlier_elem_idx // g_blk
+            offsets_t = self._g_fast_offsets_t
+            name_idx_per_o = torch.searchsorted(
+                offsets_t[1:], group_idx_per_o, right=True
+            )
+            name_idx_per_o.clamp_(min=0, max=len(name_list) - 1)
+            # Sort by name_idx so per-name outlier slice is contiguous.
+            sort_idx = name_idx_per_o.argsort()
+            outlier_sorted_global = outlier_elem_idx[sort_idx]
+            sorted_name_idx = name_idx_per_o[sort_idx]
+            # Boundaries: for each name i, slice is [bnd[i]:bnd[i+1]).
+            bnd = torch.searchsorted(
+                sorted_name_idx,
+                torch.arange(len(name_list) + 1, device=device),
+            )
+            outlier_name_bounds_cpu = bnd.cpu().tolist()  # ONE sync
+        _t_after_olsort = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+
         from contextlib import nullcontext as _nullcontext
-        sm = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        from .async_writer import get_d2h_stream
+        d2h_stream = get_d2h_stream() if torch.cuda.is_available() else None
+        sm_tracker = (torch.cuda.stream(stream) if stream is not None
+                      else _nullcontext())
+        sm_d2h = (torch.cuda.stream(d2h_stream) if d2h_stream is not None
+                  else _nullcontext())
 
-        selected_payload: Dict[str, Tuple[torch.Tensor, torch.Tensor,
-                                          torch.Tensor, torch.Tensor]] = {}
+        # === Option B: per-BF16-group batched index_select ============
+        # Pinned layout (per BF16 group g, sequential):
+        #   pinned_field[g_off : g_off + grp_total_groups_elem]    ← all groups
+        #   pinned_field[+grp_total_groups_elem : + grp_total]     ← all outliers
+        # Order within each region: name iteration order (same as
+        # ``name_list`` slice for that BF16 group).
+        # Per-name extraction uses two narrows (group_part, outlier_part)
+        # → selected_payload[name] = list of sub-entries; writer flattens
+        # them into the lossy log naturally.
+        # Per BF16 group: 3 batched index_select (m, v, p) on the
+        # group's flat views + 1 cat for elem_idx. Total launches /
+        # iter ≈ 3 BF16 groups × (1 cat + 3 index_select + 1 cast +
+        # 4 d2h) = ~27, vs ~1280 per-name. dg reset is ALSO batched
+        # (one global index_fill on _g_fast_dg_flat).
+        # Peak transient VRAM: per BF16 group, sequential drain →
+        # ~max_grp_total × 4 fields × 4 B (~48 MB at this scale).
+        # Per-name fallback path activates if any group's p_flat is
+        # None (i.e. _try_flat_view declined to build it for this
+        # bucket). In that case the older per-name code path runs.
+        # ==============================================================
+
+        # Pre-compute per-name layout (host-side only). Counts are
+        # derived directly from seg_bounds / outlier_name_bounds — i.e.
+        # whatever pass2 actually produced. Excluded experts ARE
+        # included in these counts when their groups/outliers slipped
+        # through pass2's exclusion (e.g. lossless FC fired at T but
+        # pass2 was stashed at T-1 so it didn't know). Including them
+        # here keeps elem_idx_groups / elem_idx_outliers size in sync
+        # with name_cnt_g / name_cnt_o (a previous force-to-0 caused
+        # repeat_interleave shape mismatch). The writer filters
+        # excluded eids when building per_expert_batch, so any wasted
+        # bytes for excluded names never make it to disk / DRAM.
+        name_cnts: List[int] = []     # full per-name (group_elems + outlier)
+        name_cnt_g: List[int] = []    # per-name group element count (cnt_g × g_blk)
+        name_cnt_o: List[int] = []    # per-name outlier count
+        name_offs: List[int] = [0]
+        for i, name in enumerate(name_list):
+            s_b_pre = int(seg_bounds_cpu[i].item())
+            e_b_pre = int(seg_bounds_cpu[i + 1].item())
+            cnt_g_pre = e_b_pre - s_b_pre
+            if outlier_name_bounds_cpu is not None:
+                cnt_o_pre = max(
+                    0,
+                    outlier_name_bounds_cpu[i + 1] - outlier_name_bounds_cpu[i],
+                )
+            else:
+                cnt_o_pre = 0
+            cnt_g_elem = cnt_g_pre * g_blk
+            name_cnt_g.append(cnt_g_elem)
+            name_cnt_o.append(cnt_o_pre)
+            cnt_e_pre = cnt_g_elem + cnt_o_pre
+            name_cnts.append(cnt_e_pre)
+            name_offs.append(name_offs[-1] + cnt_e_pre)
+        total_pinned = name_offs[-1]
+
+        # Per-BF16-group layout in the global pinned buffer.
+        # grp_pinned_off[g] = absolute offset where group g's segment starts
+        # grp_groups_size[g] = bytes/elements occupied by groups concat
+        # grp_total[g] = groups_concat + outliers_concat for group g
+        grp_pinned_off: List[int] = []
+        grp_groups_size: List[int] = []
+        grp_outliers_size: List[int] = []
+        cur_pinned_off = 0
+        for grp in self._groups:
+            sn = grp["start_name_in_grp"]
+            en = grp["end_name_in_grp"]
+            g_size = sum(name_cnt_g[sn:en])
+            o_size = sum(name_cnt_o[sn:en])
+            grp_pinned_off.append(cur_pinned_off)
+            grp_groups_size.append(g_size)
+            grp_outliers_size.append(o_size)
+            cur_pinned_off += g_size + o_size
+
+        pinned_idx: Optional[torch.Tensor] = None
+        pinned_p: Optional[torch.Tensor] = None
+        pinned_m: Optional[torch.Tensor] = None
+        pinned_v: Optional[torch.Tensor] = None
+        if total_pinned > 0:
+            pinned_idx = torch.empty(total_pinned, dtype=torch.int32, pin_memory=True)
+            pinned_p = torch.empty(total_pinned, dtype=torch.float32, pin_memory=True)
+            pinned_m = torch.empty(total_pinned, dtype=torch.float32, pin_memory=True)
+            pinned_v = torch.empty(total_pinned, dtype=torch.float32, pin_memory=True)
+
+        # selected_payload[name] = list of (idx, p, m, v) sub-entries
+        # (groups + outliers, separate). Writer iterates sub-entries
+        # and appends them sequentially to the lossy log / DRAM scatter.
+        selected_payload: Dict[str, List[Tuple[torch.Tensor, torch.Tensor,
+                                                torch.Tensor, torch.Tensor]]] = {}
         per_param_selected: Dict[str, int] = {}
+        event_h2d: Optional["torch.cuda.Event"] = None
 
-        with sm:
-            for i, name in enumerate(name_list):
-                s_b = int(seg_bounds_cpu[i].item())
-                e_b = int(seg_bounds_cpu[i + 1].item())
-                cnt_g = e_b - s_b
-                # Early-skip: if this expert is in the effective exclusion
-                # (T-1 fired ∪ T fired), don't bother with index_select +
-                # D2H. The lossy_fc_append below would skip it anyway, but
-                # this saves the wasted GPU work + pinned host transfer.
-                eid_skip = self._tname_to_eid.get(name)
-                if cnt_g == 0 or (
-                    eid_skip is not None and eid_skip in excluded_eids
-                ):
-                    selected_payload[name] = (
-                        torch.empty(0, dtype=torch.int32),
-                        torch.empty(0, dtype=torch.float32),
-                        torch.empty(0, dtype=torch.float32),
-                        torch.empty(0, dtype=torch.float32),
-                    )
-                    per_param_selected[name] = 0
-                    # NB: dg index_fill_ for T-1 selected groups under a
-                    # T-fired expert is also skipped. That's fine — the
-                    # whole-expert dg zero is already done by
-                    # ExpertLosslessFC._fire_one (and tracker.step's
-                    # defensive backup) for fired_T experts, so the dg
-                    # state for these experts is uniformly 0 regardless.
+        # Phase A: tracker_stream — batched dg fill + per-BF16-group
+        # batched index_select. GPU intermediates per group are kept in
+        # a small list across A/B; sequential-per-group drain limits
+        # transient peak to one BF16 group's worth.
+        per_grp_gpu: List[Optional[Tuple[torch.Tensor, torch.Tensor,
+                                          torch.Tensor, torch.Tensor]]] = [None] * len(self._groups)
+
+        with sm_tracker:
+            last_valid = int(seg_bounds_cpu[-1].item())
+            if last_valid > 0:
+                self._g_fast_dg_flat.index_fill_(
+                    0, top_idx_sorted[:last_valid].to(torch.long), 0.0,
+                )
+
+            for gi, grp in enumerate(self._groups):
+                sn = grp["start_name_in_grp"]
+                en = grp["end_name_in_grp"]
+                if sn == en:
                     continue
-                local_g = top_idx_sorted[s_b:e_b].sub(offsets_cpu[i])
-                elem_idx = (
-                    local_g.unsqueeze(1) * g_blk + arange_g.unsqueeze(0)
-                ).flatten()
-                cnt_e = elem_idx.numel()
+                g_size = grp_groups_size[gi]
+                o_size = grp_outliers_size[gi]
+                if g_size == 0 and o_size == 0:
+                    continue
+                master_off_g = grp["master_off"]            # in groups
+                master_off_g_elem = master_off_g * g_blk    # in elements
+                m_flat_g = grp["m_flat"]
+                v_flat_g = grp["v_flat"]
+                p_flat_g = grp["p_flat"]
 
-                p = self._name_to_param[name]
-                p_flat = _fp32_param(p).detach().reshape(-1)
-                p_sel = p_flat.index_select(0, elem_idx).to(torch.float32)
-                m_src = (mapper.get_state(p, "exp_avg") if mapper is not None
-                         else optimizer.state.get(p, {}).get("exp_avg"))
-                if m_src is None:
-                    m_sel = torch.zeros(cnt_e, dtype=torch.float32,
-                                        device=device)
+                # Group part: top_idx_sorted slice for names [sn:en).
+                # Excluded names' groups are already absent (pass2 zeroed
+                # their score). top_idx_grp is in dg_flat coords.
+                s_b_lo = int(seg_bounds_cpu[sn].item())
+                s_b_hi = int(seg_bounds_cpu[en].item())
+                if s_b_hi > s_b_lo:
+                    top_idx_grp = top_idx_sorted[s_b_lo:s_b_hi]
+                    # BF16-group-flat coords (used for index_select).
+                    local_g_in_grp = top_idx_grp.sub(master_off_g)
+                    elem_idx_groups_bf16 = (
+                        local_g_in_grp.unsqueeze(1) * g_blk
+                        + arange_g.unsqueeze(0)
+                    ).flatten()
                 else:
-                    m_sel = m_src.detach().reshape(-1).to(torch.float32) \
-                                  .index_select(0, elem_idx)
-                v_src = _fp32_v_t(optimizer, p)
-                if v_src is None:
-                    v_sel = torch.zeros(cnt_e, dtype=torch.float32,
-                                        device=device)
+                    elem_idx_groups_bf16 = torch.empty(
+                        0, dtype=torch.long, device=device,
+                    )
+
+                # Outlier part — same idea (BF16-group-flat coords).
+                if (outlier_sorted_global is not None
+                        and outlier_name_bounds_cpu is not None):
+                    o_lo = outlier_name_bounds_cpu[sn]
+                    o_hi = outlier_name_bounds_cpu[en]
+                    if o_hi > o_lo:
+                        outlier_grp = outlier_sorted_global[o_lo:o_hi]
+                        elem_idx_outliers_bf16 = outlier_grp.sub(master_off_g_elem)
+                    else:
+                        elem_idx_outliers_bf16 = torch.empty(
+                            0, dtype=torch.long, device=device,
+                        )
                 else:
-                    v_sel = v_src.detach().reshape(-1).to(torch.float32) \
-                                  .index_select(0, elem_idx)
+                    elem_idx_outliers_bf16 = torch.empty(
+                        0, dtype=torch.long, device=device,
+                    )
 
-                d_g_buf = self._delta_g_accum.get(name)
-                if d_g_buf is not None and d_g_buf.numel() > 0:
-                    d_g_buf.index_fill_(0, local_g, 0.0)
+                # Concat: [groups_concat, outliers_concat] — matches the
+                # pinned layout.
+                if (elem_idx_groups_bf16.numel() > 0
+                        and elem_idx_outliers_bf16.numel() > 0):
+                    elem_idx_grp_bf16 = torch.cat([elem_idx_groups_bf16, elem_idx_outliers_bf16])
+                elif elem_idx_groups_bf16.numel() > 0:
+                    elem_idx_grp_bf16 = elem_idx_groups_bf16
+                else:
+                    elem_idx_grp_bf16 = elem_idx_outliers_bf16
 
-                idx_cpu = elem_idx.to(torch.int32).to("cpu", non_blocking=True)
-                p_cpu = p_sel.to("cpu", non_blocking=True)
-                m_cpu = m_sel.to("cpu", non_blocking=True)
-                v_cpu = v_sel.to("cpu", non_blocking=True)
-                selected_payload[name] = (idx_cpu, p_cpu, m_cpu, v_cpu)
-                per_param_selected[name] = cnt_e
+                if elem_idx_grp_bf16.numel() == 0:
+                    continue
 
-        # Ensure all H2D non_blocking copies in tracker_stream are done
-        # before the writer thread reads the CPU tensors.
-        if stream is not None:
-            stream.synchronize()
+                # Three batched index_select on BF16-group-flat coords.
+                if (m_flat_g is not None and v_flat_g is not None
+                        and p_flat_g is not None):
+                    m_sel_grp = m_flat_g.index_select(0, elem_idx_grp_bf16)
+                    v_sel_grp = v_flat_g.index_select(0, elem_idx_grp_bf16)
+                    p_sel_grp = p_flat_g.index_select(0, elem_idx_grp_bf16)
+                    if m_sel_grp.dtype != torch.float32:
+                        m_sel_grp = m_sel_grp.to(torch.float32)
+                    if v_sel_grp.dtype != torch.float32:
+                        v_sel_grp = v_sel_grp.to(torch.float32)
+                    if p_sel_grp.dtype != torch.float32:
+                        p_sel_grp = p_sel_grp.to(torch.float32)
+                else:
+                    n_grp_elem = elem_idx_grp_bf16.numel()
+                    m_sel_grp = torch.zeros(
+                        n_grp_elem, dtype=torch.float32, device=device,
+                    )
+                    v_sel_grp = torch.zeros_like(m_sel_grp)
+                    p_sel_grp = torch.zeros_like(m_sel_grp)
 
-        if self._expert_state is not None:
+                # Convert IDX from BF16-group-flat → tensor-local (the
+                # writer / DRAM scatter expect tensor-local indices).
+                # Build per-element within-BF16-group offset via two
+                # ``repeat_interleave`` (one per region: groups, outliers).
+                # within_off_per_name[k] = (offsets_cpu[sn+k] - master_off_g) × g_blk
+                #                                    (in BF16-group ELEMENT coords).
+                within_off_per_name = torch.tensor(
+                    [(offsets_cpu[sn + k] - master_off_g) * g_blk
+                     for k in range(en - sn)],
+                    dtype=torch.long, device=device,
+                )
+                groups_off_per_elem: Optional[torch.Tensor] = None
+                outliers_off_per_elem: Optional[torch.Tensor] = None
+                if elem_idx_groups_bf16.numel() > 0:
+                    cnt_g_per_name_t = torch.tensor(
+                        name_cnt_g[sn:en], dtype=torch.long, device=device,
+                    )
+                    groups_off_per_elem = within_off_per_name.repeat_interleave(
+                        cnt_g_per_name_t,
+                    )
+                if elem_idx_outliers_bf16.numel() > 0:
+                    cnt_o_per_name_t = torch.tensor(
+                        name_cnt_o[sn:en], dtype=torch.long, device=device,
+                    )
+                    outliers_off_per_elem = within_off_per_name.repeat_interleave(
+                        cnt_o_per_name_t,
+                    )
+                if (groups_off_per_elem is not None
+                        and outliers_off_per_elem is not None):
+                    off_per_elem = torch.cat([groups_off_per_elem, outliers_off_per_elem])
+                elif groups_off_per_elem is not None:
+                    off_per_elem = groups_off_per_elem
+                else:
+                    off_per_elem = outliers_off_per_elem
+                elem_idx_grp_tl_i32 = (
+                    (elem_idx_grp_bf16 - off_per_elem).to(torch.int32)
+                )
+                per_grp_gpu[gi] = (elem_idx_grp_tl_i32, p_sel_grp, m_sel_grp, v_sel_grp)
+
+        event_compute: Optional["torch.cuda.Event"] = None
+        if stream is not None and total_pinned > 0:
+            event_compute = torch.cuda.Event()
+            event_compute.record(stream)
+
+        # Phase B: d2h_stream — ONE big copy per field per BF16 group
+        # (4 d2h × N_BF16_groups = 12 d2h total; vs 640 per-name).
+        if d2h_stream is not None and event_compute is not None:
+            d2h_stream.wait_event(event_compute)
+        with sm_d2h:
+            for gi, grp in enumerate(self._groups):
+                gpu = per_grp_gpu[gi]
+                if gpu is None:
+                    continue
+                elem_idx_grp_i32, p_sel_grp, m_sel_grp, v_sel_grp = gpu
+                grp_pinned_start = grp_pinned_off[gi]
+                grp_total = grp_groups_size[gi] + grp_outliers_size[gi]
+                pinned_idx.narrow(0, grp_pinned_start, grp_total).copy_(
+                    elem_idx_grp_i32, non_blocking=True,
+                )
+                pinned_p.narrow(0, grp_pinned_start, grp_total).copy_(
+                    p_sel_grp, non_blocking=True,
+                )
+                pinned_m.narrow(0, grp_pinned_start, grp_total).copy_(
+                    m_sel_grp, non_blocking=True,
+                )
+                pinned_v.narrow(0, grp_pinned_start, grp_total).copy_(
+                    v_sel_grp, non_blocking=True,
+                )
+        per_grp_gpu = []  # type: ignore[assignment]
+
+        # Build per-name selected_payload as a list of sub-entries.
+        # For each name in BF16 group g: groups sub-entry (if cnt_g_i > 0)
+        # then outliers sub-entry (if cnt_o_i > 0).
+        for gi, grp in enumerate(self._groups):
+            sn = grp["start_name_in_grp"]
+            en = grp["end_name_in_grp"]
+            grp_pinned_start = grp_pinned_off[gi]
+            grp_g_seg_start = grp_pinned_start
+            grp_o_seg_start = grp_pinned_start + grp_groups_size[gi]
+            # Cumulative offsets within this BF16 group's groups / outliers
+            # regions — populated as we walk names.
+            cum_g = 0
+            cum_o = 0
+            for i in range(sn, en):
+                name = name_list[i]
+                cg = name_cnt_g[i]
+                co = name_cnt_o[i]
+                sub_entries: List[Tuple[torch.Tensor, torch.Tensor,
+                                         torch.Tensor, torch.Tensor]] = []
+                if cg > 0 and pinned_idx is not None:
+                    abs_g = grp_g_seg_start + cum_g
+                    sub_entries.append((
+                        pinned_idx.narrow(0, abs_g, cg),
+                        pinned_p.narrow(0, abs_g, cg),
+                        pinned_m.narrow(0, abs_g, cg),
+                        pinned_v.narrow(0, abs_g, cg),
+                    ))
+                if co > 0 and pinned_idx is not None:
+                    abs_o = grp_o_seg_start + cum_o
+                    sub_entries.append((
+                        pinned_idx.narrow(0, abs_o, co),
+                        pinned_p.narrow(0, abs_o, co),
+                        pinned_m.narrow(0, abs_o, co),
+                        pinned_v.narrow(0, abs_o, co),
+                    ))
+                # NOTE: pinned tensors store IDX in the BF16-group's
+                # m_flat coordinates (we subtracted master_off_g_elem
+                # in Phase A). The writer's lossy_fc_append_batch
+                # subtracts the per-tensor ``offset`` (from the entry's
+                # ``ent.global_offsets[tname]``) before writing; that
+                # matches local-in-tensor convention. We need to
+                # convert from BF16-group-flat → tensor-local. Those
+                # two coord systems differ by the tensor's offset
+                # within the BF16 group's m_flat (= offsets_cpu[i] -
+                # master_off_g, in groups, × g_blk). The writer's
+                # ``ent.global_offsets[tname]`` is the offset within
+                # the EXPERT's concatenated address space (defined by
+                # _ExpertEntry), unrelated to BF16-group offsets.
+                # → the writer applies a +offset bias; the IDX in
+                # pinned should be in TENSOR-LOCAL coords (same as
+                # before). To keep that contract, we store:
+                #   pinned IDX = elem_idx_in_tensor (= elem_idx in
+                #   BF16-group coords - tensor's within-group offset).
+                # Easiest fix: store BF16-group-flat coords here and
+                # have writer's filter subtract (offsets_cpu[i] -
+                # master_off_g) × g_blk (a precomputed bias).
+                selected_payload[name] = sub_entries
+                per_param_selected[name] = cg + co
+                cum_g += cg
+                cum_o += co
+
+        if d2h_stream is not None and total_pinned > 0:
+            event_h2d = torch.cuda.Event()
+            event_h2d.record(d2h_stream)
+        _t_after_loop = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+        _t_after_streamsync = _t_after_loop
+
+        _t_lossy_skip = _os_dsp.environ.get(
+            "PROPOSAL_OUTLIER_SKIP_LOSSY", ""
+        ) in ("1",) if _dsp_dbg else False
+        _t_after_batchbuild = _t_after_streamsync
+        if self._expert_state is not None and not _t_lossy_skip:
             per_expert_batch: Dict[Tuple[int, int],
                                    List[Tuple[str, torch.Tensor,
                                               torch.Tensor, torch.Tensor,
                                               torch.Tensor]]] = {}
-            for name, entry in selected_payload.items():
-                idx_cpu, p_cpu, m_cpu, v_cpu = entry
+            # selected_payload[name] is a list of sub-entries (groups
+            # part + outliers part). Flatten into the per-expert batch
+            # — writer treats each sub-entry as a separate scatter /
+            # log append for the same tensor (last-write-wins on
+            # duplicate idx is naturally handled).
+            for name, sub_entries in selected_payload.items():
                 eid = self._tname_to_eid.get(name)
                 if eid is None or eid in excluded_eids:
                     continue
-                per_expert_batch.setdefault(eid, []).append(
-                    (name, idx_cpu, p_cpu, m_cpu, v_cpu)
-                )
-            for eid, updates in per_expert_batch.items():
-                self._expert_state.lossy_fc_append(
-                    expert_id=eid, step=int(prev_step),
-                    tensor_updates=updates,
-                )
+                if not sub_entries:
+                    continue
+                bucket = per_expert_batch.setdefault(eid, [])
+                for (idx_cpu, p_cpu, m_cpu, v_cpu) in sub_entries:
+                    bucket.append((name, idx_cpu, p_cpu, m_cpu, v_cpu))
+            _t_after_batchbuild = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+            # Single writer submission instead of one per expert — saves
+            # ~100 ms training-thread time at ~80 experts × 1-2 ms per
+            # submit_raw call (queue lock + counter increment).
+            # Writer thread waits on event_h2d (records after the d2h
+            # copies complete) before reading pinned host data, so the
+            # training thread NEVER blocks on the H2D — main_thread
+            # returns from dispatch as soon as the copies are queued.
+            self._expert_state.lossy_fc_append_batch(
+                step=int(prev_step),
+                per_expert_updates=per_expert_batch,
+                h2d_event=event_h2d,
+            )
 
         self._pending_dispatch = None
         self._last_dispatch_per_param_selected = per_param_selected
+        if _dsp_dbg and prev_step % 10 == 0:
+            _t_dsp_end = _time_dsp.perf_counter()
+            _ms = lambda a, b: (b - a) * 1000.0
+            _peak_str = ""
+            if _dsp_peak and torch.cuda.is_available():
+                # Synchronize all streams so the peak captures
+                # tracker_stream + d2h_stream's transient allocations.
+                torch.cuda.synchronize()
+                _dsp_peak_mb = (
+                    torch.cuda.max_memory_allocated() - _dsp_alloc_at_entry
+                ) / 1e6
+                _peak_str = f" dsp_peak_delta=+{_dsp_peak_mb:.1f}MB"
+            print(
+                f"[proposal] dispatch_dbg @prev_iter{prev_step}: "
+                f"total={_ms(_t_dsp_entry, _t_dsp_end):.1f}ms "
+                f"evsync={_ms(_t_dsp_entry, _t_after_evsync):.1f} "
+                f"+walk_segcpu={_ms(_t_after_evsync, _t_after_segcpu):.1f} "
+                f"+olsort={_ms(_t_after_segcpu, _t_after_olsort):.1f} "
+                f"+loop={_ms(_t_after_olsort, _t_after_loop):.1f} "
+                f"+streamsync={_ms(_t_after_loop, _t_after_streamsync):.1f} "
+                f"+batchbuild={_ms(_t_after_streamsync, _t_after_batchbuild):.1f} "
+                f"+lossy_submit={_ms(_t_after_batchbuild, _t_dsp_end):.1f} "
+                f"phase4={'OFF' if _phase4_skip else 'ON'} "
+                f"lossy={'OFF' if _t_lossy_skip else 'ON'}"
+                f"{_peak_str}",
+                flush=True,
+            )
 
     @torch.no_grad()
     def step(
@@ -1377,13 +2160,25 @@ class ImportanceTracker:
             # mask.sum(dtype=long) skips the explicit .long() cast.
             true_cum = true_cum + mask_chunk.sum(dtype=torch.long)
 
-        # Update threshold for NEXT iter (GPU scalar; no host sync).
-        cumsum_rev = global_hist.flip(0).cumsum(0)
-        ge_k = cumsum_rev >= K_groups
-        bin_idx_t = ge_k.to(torch.int8).argmax(dim=0)
-        next_threshold = s_max - bin_idx_t.to(torch.float32) * bin_width
-        self._g_fast_prev_threshold_t = next_threshold
-        self._prev_s_max_g = float(s_max)  # host-side carry
+        # NOTE (Form 1): the per-pool threshold computation is GONE
+        # from pass2. The merged walk in dispatch (next iter) reads
+        # this iter's ``global_hist`` AND ``_outlier_elem_hist`` and
+        # produces a UNIFIED elem_th + group_th (= elem_th × g_blk)
+        # under a single K-budget. ``self._prev_s_max_g`` is still
+        # carried (used by Form 1 walk to pick group score range), but
+        # the merge walk now updates it from the histogram itself —
+        # so the cold-start ``s_max`` probe above is the only place
+        # the host-side carry is set, and only on iter 1 (when the
+        # merge walk's prev_s_max_g is None).
+        if getattr(self, "_prev_s_max_g", None) is None:
+            self._prev_s_max_g = float(s_max)
+
+        # Outlier-promotion: histogram walk MOVED to dispatch (after
+        # ev.synchronize()) — there the two host syncs (hist_total,
+        # observed_max) are free because GPU work has already finished.
+        # Keeping them here would block tracker.step from returning
+        # for ~80-120 ms (pass2 atomic_max latency), defeating the
+        # 1-iter pipelining and idling main_stream.
 
         # Replace -1 padding with total_groups so sort puts them at end.
         n_groups_full = torch.full(
@@ -1408,8 +2203,28 @@ class ImportanceTracker:
         if prev_stream is not None:
             torch.cuda.set_stream(prev_stream)
 
-        # Record tracker work completion event (so next iter dispatch can
-        # synchronize and main stream race guard can wait_event).
+        # Outlier-promotion: stash selected element indices/count via
+        # GPU clone on tracker_stream — NO host sync here. The next
+        # iter's update_delta_accum will overwrite the live buffers,
+        # so we snapshot now. Clones run on tracker_stream so the
+        # event recorded below covers them; dispatch's ev.synchronize()
+        # then makes the .item() call essentially free.
+        sel_idx_snap = None
+        sel_count_snap = None
+        if (self._outlier_promote
+                and self._outlier_sel_idx is not None
+                and self._outlier_sel_count is not None):
+            from contextlib import nullcontext as _nullctx_stash
+            sm_stash = (
+                torch.cuda.stream(stream) if stream is not None
+                else _nullctx_stash()
+            )
+            with sm_stash:
+                sel_idx_snap = self._outlier_sel_idx.clone()
+                sel_count_snap = self._outlier_sel_count.clone()
+
+        # Record tracker work completion event AFTER stash clones so
+        # ev.synchronize() at next iter dispatch covers them too.
         event_tracker = None
         if stream is not None:
             event_tracker = torch.cuda.Event()
@@ -1422,6 +2237,8 @@ class ImportanceTracker:
             "name_list": list(name_list),
             "offsets_cpu": list(offsets_cpu),
             "excluded_eids": set(excluded_eids),
+            "outlier_sel_idx_snap": sel_idx_snap,
+            "outlier_sel_count_snap": sel_count_snap,
         }
 
         _t0_end = _time.perf_counter()

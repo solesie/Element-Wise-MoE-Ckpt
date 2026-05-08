@@ -1,4 +1,21 @@
-"""Raw binary serialization for proposal CP payloads (non-expert FC, H_ema).
+"""Raw binary serialization for proposal CP payloads (non-expert FC, H_ema)
+and for ExpertState's per-expert lossless / lossy FC files.
+
+This is the single home for **all** direct file ``write()`` calls in the
+proposal package. The 4-stream architecture pins each kind of work to its
+own owner:
+
+  main_stream    — training (forward / backward / optimizer)
+  tracker_stream — proposal expert score / index_select / dg reset
+  d2h_stream     — every GPU → pinned-host copy
+  writer thread  — pinned host → DRAM buf or disk file (this module)
+
+Keeping ``open / write / writev / fsync`` confined to this module makes the
+contract observable: searching for ``os.write`` etc. across ``proposal/``
+should hit only this file (plus reads in expert_state.py). Each helper
+below is intended to run on a CPU writer thread; they take ``bytes`` /
+``memoryview`` / numpy arrays (no torch tensors, no CUDA dependency) so
+they cannot accidentally touch a GPU stream.
 
 Replaces ``torch.save`` / ``torch.load`` for flat ``{str: Tensor}`` payloads.
 Eliminates Python pickle decode (~300-500 MB/s CPU-bound) — the bytes on
@@ -51,9 +68,10 @@ This module is intentionally minimal (~100 LoC) and self-contained.
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -221,3 +239,111 @@ def load_binary(
                 t = t.to(device)
             out[e["name"]] = t
     return out, scalars
+
+
+# ---------------------------------------------------------------------------
+# ExpertState LFCL (lossless full-checkpoint) writer.
+#
+# The LFCL format is independent of the PRPTENS dict format above — it's a
+# header + per-tensor [p, m, v] byte-stream chosen by ExpertState. Centralising
+# the actual ``os.open / os.write / os.fsync`` here keeps every write syscall
+# in this module while leaving ExpertState in charge of the format details
+# (header packing, tensor schema, atomic-rename policy).
+# ---------------------------------------------------------------------------
+
+LFCL_PMV = Tuple[bytes, bytes, bytes]  # (param_bytes, m_bytes, v_bytes)
+
+
+def write_lossless_payload_atomic(
+    final_path: Path,
+    header_bytes: bytes,
+    tensor_bytes: Iterable[Tuple[str, bytes, bytes, bytes]],
+    *,
+    mode: int = 0o644,
+) -> int:
+    """Atomically write a lossless FC file: ``header || (p|m|v)*`` for each
+    tensor in order. Writes to ``<final_path>.tmp`` first, ``fsync`` the fd,
+    then ``os.replace`` to ``final_path``.
+
+    Returns the total number of bytes written (header + every p/m/v byte
+    string). Designed to be called from a writer-thread callback so the
+    fsync round-trip does not stall the training thread.
+    """
+    final_path = Path(final_path)
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    total = len(header_bytes)
+    fd = os.open(str(tmp_path), os.O_CREAT | os.O_RDWR | os.O_TRUNC, mode)
+    try:
+        os.write(fd, header_bytes)
+        for (_tname, p_bytes, m_bytes, v_bytes) in tensor_bytes:
+            os.write(fd, p_bytes)
+            os.write(fd, m_bytes)
+            os.write(fd, v_bytes)
+            total += len(p_bytes) + len(m_bytes) + len(v_bytes)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp_path), str(final_path))
+    return total
+
+
+# ---------------------------------------------------------------------------
+# ExpertState LFSY (lossy log) writer.
+#
+# Lossy log layout (one file per expert):
+#   header:  ``_pack_header(MAGIC_LFSY, meta)``  (caller supplies bytes)
+#   appends: [ <count: u32> <step: u32> <records: count × RECORD_BYTES> ]*
+# Each append is a single ``writev`` of (prefix, record_view). Writer-thread
+# only — the lossy fd lifecycle is owned by the writer worker so two
+# threads never race on the same descriptor.
+# ---------------------------------------------------------------------------
+
+
+def open_lossy_log_for_append(
+    path: Path,
+    header_bytes: bytes,
+    *,
+    mode: int = 0o644,
+) -> int:
+    """Create+truncate the lossy file at ``path``, write the header, and
+    return the open fd. Caller (writer thread) holds the fd until close.
+    The ``O_APPEND`` flag guarantees that every subsequent ``writev`` is
+    atomic at the kernel level even under signal interruption."""
+    flags = os.O_CREAT | os.O_RDWR | os.O_TRUNC | os.O_APPEND
+    fd = os.open(str(path), flags, mode)
+    try:
+        os.write(fd, header_bytes)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def append_lossy_log(
+    fd: int, count: int, step: int, record_view: memoryview,
+) -> int:
+    """Append one ``(count, step, records)`` block to the lossy log fd via
+    a single ``writev`` syscall. Returns total bytes written.
+    ``record_view`` should be a contiguous memoryview over the structured
+    record buffer (idx/p/m/v interleaved)."""
+    prefix = struct.pack("<II", int(count), int(step))
+    nbytes = os.writev(fd, [prefix, record_view])
+    return int(nbytes)
+
+
+def fsync_fd(fd: int) -> None:
+    """``os.fsync`` wrapper that swallows ``OSError`` (e.g. EBADF on
+    already-closed fd) so callers do not need a try/except at every site."""
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
+def close_fd(fd: int) -> None:
+    """``os.close`` wrapper that swallows ``OSError`` for idempotent
+    teardown paths."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass

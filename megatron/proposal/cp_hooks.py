@@ -587,26 +587,34 @@ def proposal_post_step(
                 h_list_pi = []
                 theta_now_pi = []
                 names_pi = []
+                # Production stores group-level H (_H_g, BF16, 1 entry per
+                # production group). Probe needs element-level H to compare
+                # different probe g values against the element-level baseline.
+                # Broadcast _H_g back to element resolution — H locality is
+                # high (CV_H ≪ CV_|δ|) so this is a faithful proxy for the
+                # purposes of cap_g vs cap_e ratio measurement.
+                prod_g = max(1, int(getattr(_tracker, "block_quant_g", 1)))
                 for nm in tracked_pi:
                     p_pi = _tracker._name_to_param.get(nm)
                     if p_pi is None:
                         continue
-                    h = _tracker._H.get(nm)
-                    if h is None:
+                    h_g_view = _tracker._H_g.get(nm)
+                    if h_g_view is None:
                         continue
+                    h_elem = h_g_view.detach().to(torch.float32).repeat_interleave(prod_g)
                     max_g = max(_gs_pi)
-                    n_t = (h.numel() // max_g) * max_g
+                    n_t = (h_elem.numel() // max_g) * max_g
                     if n_t == 0:
                         continue
-                    h_list_pi.append(h.detach().reshape(-1)[:n_t].to(torch.float32))
+                    h_list_pi.append(h_elem[:n_t])
                     fp32_now = (_mp_pi.get_param(p_pi)
                                 if _mp_pi is not None
                                 else p_pi.data.to(torch.float32))
                     theta_now_pi.append((nm, fp32_now.detach().clone(), n_t))
                     names_pi.append(nm)
                 if not h_list_pi:
-                    # H_EMA not yet populated (first refresh hasn't fired);
-                    # silently skip until refresh sets H values.
+                    # _H_g not yet populated (first refresh hasn't fired);
+                    # silently skip until refresh runs.
                     return None
                 H_all_pi = torch.cat(h_list_pi)
                 prev_pi = _config.get("_peritr_theta_snap")
@@ -644,9 +652,16 @@ def proposal_post_step(
                             cap_d2_elem = float(delta_sq[d2_elem_mask].sum().item()) / max(d2_total, 1e-30)
                             for g in _gs_pi:
                                 ng = n_total // g
+                                # Match production (rank-fair):
+                                #   H_g     = mean_{i∈group}(|H_i|)
+                                #   δ_g     = (1/g) · Σ_{i∈group} Δθ_i²
+                                #   score_g = H_g × δ_g
+                                # Production storage uses bare Σ Δθ_i² (no
+                                # /g) but g is uniform across groups so the
+                                # 1/g constant is rank-invariant. Use mean
+                                # form here for unit consistency with H_g.
                                 H_g = H_all_pi.view(ng, g).mean(dim=1)
-                                d_g_signed = delta_signed.view(ng, g).mean(dim=1).abs_()
-                                d_g_sq = d_g_signed ** 2
+                                d_g_sq = delta_sq.view(ng, g).mean(dim=1)
                                 score_g = H_g * d_g_sq
                                 k_g = max(1, int(_kpct_pi * ng))
                                 g_th = float(torch.kthvalue(
@@ -660,7 +675,8 @@ def proposal_post_step(
                                 Hg_mask = H_g >= Hg_th
                                 elem_from_Hg = Hg_mask.repeat_interleave(g)
                                 cap_h_g = float(H_all_pi[elem_from_Hg].sum().item()) / max(H_total, 1e-30)
-                                # δ²-only group quantization: pick top groups by d_g²
+                                # δ²-only group quantization: pick top groups
+                                # by Σ_{i∈g} δ_i² (matches production).
                                 d2g_th = float(torch.kthvalue(
                                     d_g_sq, ng - k_g + 1).values.item())
                                 d2g_mask = d_g_sq >= d2g_th
@@ -679,11 +695,37 @@ def proposal_post_step(
                                 cv_d = (d_abs_g.std(dim=1) /
                                         d_abs_g.mean(dim=1).clamp_min(1e-30))
                                 cv_d_med = float(cv_d.median().item())
+
+                                # Outlier-promotion variant: union pool of
+                                #   element entry  (score=H_g·Δθ²_i, weight=1)
+                                #   group   entry  (score=H_g·δ_g,  weight=g)
+                                # Greedy by score with element-equivalent
+                                # budget K_total = k_elem.
+                                H_g_be = H_g.repeat_interleave(g)
+                                elem_pool = H_g_be * delta_sq
+                                combined = torch.cat([elem_pool, score_g])
+                                weights = torch.cat([
+                                    torch.ones(elem_pool.numel(), device=combined.device),
+                                    torch.full((ng,), float(g), device=combined.device),
+                                ])
+                                order = torch.argsort(combined, descending=True)
+                                cum_w = torch.cumsum(weights[order], dim=0)
+                                sel_n = int((cum_w < float(k_elem)).sum().item()) + 1
+                                sel = torch.zeros_like(combined, dtype=torch.bool)
+                                sel[order[:sel_n]] = True
+                                e_sel = sel[:elem_pool.numel()]
+                                g_sel = sel[elem_pool.numel():]
+                                saved = e_sel | g_sel.repeat_interleave(g)
+                                cap_promote = float(score_elem[saved].sum().item()) / total
+                                alpha_e = float(e_sel.sum().item()) / max(int(k_elem), 1)
+
                                 if _should_write():
                                     print(
                                         f"[proposal] peritr_probe g={g:>2d} "
                                         f"@iter{step}: cap_g={cap_g:.3f} "
+                                        f"cap_promote={cap_promote:.3f} "
                                         f"(elem={cap_e:.3f}) "
+                                        f"alpha_e={alpha_e:.2f} "
                                         f"cap_H={cap_h_g:.3f}/{cap_h_elem:.3f} "
                                         f"cap_d2={cap_d2_g:.3f}/{cap_d2_elem:.3f} "
                                         f"pearson={pearson_sg:.3f} "
@@ -785,9 +827,18 @@ def proposal_post_step(
                 added = cuda_alloc - _baseline_mb
                 tracked_total = tracker_total + fc_total
                 untracked = added - tracked_total
+                # Peak (max) memory tracking — captures TRANSIENT spikes
+                # caused by dispatch's per-iter GPU intermediates that
+                # ``alloc`` (steady-state allocated) misses. Reset after
+                # each log so each report's peak reflects the iters
+                # since the previous log only.
+                cuda_peak = torch.cuda.max_memory_allocated() / 1e6
+                peak_added = cuda_peak - _baseline_mb
+                torch.cuda.reset_peak_memory_stats()
                 print(
                     f"[proposal] GPU mem @iter{step}: "
                     f"alloc={cuda_alloc:.1f}MB Δfrom_baseline={added:+.1f}MB "
+                    f"peak={cuda_peak:.1f}MB Δpeak={peak_added:+.1f}MB "
                     f"proposal_buffers={tracked_total:.1f}MB "
                     f"untracked={untracked:+.1f}MB | {items_str}",
                     flush=True,
@@ -1961,13 +2012,21 @@ def proposal_refresh_finite_diff(
                         for g in GROUP_SIZES:
                             n_groups = n_total // g
                             H_g = H_all.view(n_groups, g).mean(dim=1)
-                            # Two group score variants:
-                            #   _abs:    mean(|δ|)        — no sign cancellation
-                            #   _signed: |mean(δ_signed)| — production group-reset
+                            # Three group score variants:
+                            #   _abs:  mean(|δ|)²        — no sign cancellation, /g² scaling
+                            #   _sgn:  |mean(δ_signed)|² — sign cancellation, /g² scaling
+                            #   _prod: Σ_{i∈g} δ_i²      — PRODUCTION (matches
+                            #          _accum_delta_sq_triton kernel + _fold_h
+                            #          mean-H rule). This is the only variant
+                            #          that fairly mirrors what production
+                            #          ranks groups by.
                             d_g_abs = delta_abs_all.view(n_groups, g).mean(dim=1)
                             d_g_signed = delta_signed_all.view(n_groups, g).mean(dim=1).abs_()
+                            # _prod: production-fair δ_g = (1/g)·Σ Δθ_i²
+                            d_g_prod = delta_sq_all.view(n_groups, g).mean(dim=1)
                             score_g_abs = H_g * (d_g_abs ** 2)
                             score_g_signed = H_g * (d_g_signed ** 2)
+                            score_g_prod = H_g * d_g_prod
                             k_g = max(1, int(K_PCT * n_groups))
                             # Capture rate for ABS variant
                             g_thr_abs = float(torch.kthvalue(
@@ -1975,12 +2034,18 @@ def proposal_refresh_finite_diff(
                             g_mask_abs = score_g_abs >= g_thr_abs
                             elem_from_abs = g_mask_abs.repeat_interleave(g)
                             cap_abs = float(score_elem[elem_from_abs].sum().item()) / total_score
-                            # Capture rate for SIGNED variant (production)
+                            # Capture rate for SIGNED variant
                             g_thr_signed = float(torch.kthvalue(
                                 score_g_signed, n_groups - k_g + 1).values.item())
                             g_mask_signed = score_g_signed >= g_thr_signed
                             elem_from_signed = g_mask_signed.repeat_interleave(g)
                             cap_signed = float(score_elem[elem_from_signed].sum().item()) / total_score
+                            # Capture rate for PRODUCTION variant
+                            g_thr_prod = float(torch.kthvalue(
+                                score_g_prod, n_groups - k_g + 1).values.item())
+                            g_mask_prod = score_g_prod >= g_thr_prod
+                            elem_from_prod = g_mask_prod.repeat_interleave(g)
+                            cap_prod = float(score_elem[elem_from_prod].sum().item()) / total_score
                             # CVs (use abs for CV_δ as ranking is on magnitude)
                             H_grp = H_all.view(n_groups, g)
                             d_abs_grp = delta_abs_all.view(n_groups, g)
@@ -2009,7 +2074,8 @@ def proposal_refresh_finite_diff(
                                 print(
                                     f"[proposal] group_probe[{delta_label}] g={g:>2d} "
                                     f"@iter{iteration}: "
-                                    f"cap_abs={cap_abs:.3f} cap_signed={cap_signed:.3f} "
+                                    f"cap_prod={cap_prod:.3f} cap_abs={cap_abs:.3f} "
+                                    f"cap_sgn={cap_signed:.3f} "
                                     f"(elem={capture_rate_elem:.3f}) "
                                     f"CV_H={cv_h_med:.2f} CV_|δ|={cv_d_med:.2f} "
                                     f"CV_δ²={cv_d_sq_med:.2f} CV_score={cv_score_med:.2f} "

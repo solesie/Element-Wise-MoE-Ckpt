@@ -282,13 +282,110 @@ class DramExpertState:
             self._last_step[expert_id] = int(step)
         return total_n
 
+    @torch.no_grad()
+    def lossy_fc_append_batch(
+        self,
+        step: int,
+        per_expert_updates: Dict[ExpertId, List[Tuple[str, torch.Tensor,
+                                                       torch.Tensor, torch.Tensor,
+                                                       torch.Tensor]]],
+        h2d_event: Optional[Any] = None,
+    ) -> int:
+        """Batch variant: package all per-expert scatter ops and submit
+        ONE writer-thread job. Avoids ~80 per-iter ``submit_raw`` lock
+        round-trips that the training thread paid in the per-call form,
+        and moves the actual scatter compute off the training thread.
+
+        ``h2d_event``: optional cuda.Event recorded after the d2h_stream
+        copies that populated the pinned-host tensors in
+        ``per_expert_updates``. Writer thread synchronises on it before
+        running the scatter — keeps the H2D off the training-thread
+        critical path while guaranteeing read-after-write ordering."""
+        import os as _os
+        if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
+            grand = 0
+            for eid, tensor_updates in per_expert_updates.items():
+                n = sum(int(idx.numel()) for (_, idx, _, _, _) in tensor_updates)
+                if n > 0:
+                    self._last_step[eid] = int(step)
+                grand += n
+            return grand
+
+        # Training-thread: light validation + package. The actual
+        # scatter (CPU memcpy with random indices) happens in the
+        # writer thread.
+        prepared: List[Tuple[ExpertId,
+                             List[Tuple[Dict[str, Any], torch.Tensor,
+                                        torch.Tensor, torch.Tensor,
+                                        torch.Tensor]]]] = []
+        grand_total = 0
+        for eid, tensor_updates in per_expert_updates.items():
+            tensor_buffers = self._buffers.get(eid)
+            if tensor_buffers is None:
+                continue
+            per_expert: List[Tuple[Dict[str, Any], torch.Tensor,
+                                    torch.Tensor, torch.Tensor,
+                                    torch.Tensor]] = []
+            n_eid = 0
+            for (tname, idx_local, p, m, v) in tensor_updates:
+                buf = tensor_buffers.get(tname)
+                if buf is None:
+                    continue
+                n_i = int(idx_local.numel())
+                if n_i == 0:
+                    continue
+                per_expert.append((buf, idx_local, p, m, v))
+                n_eid += n_i
+            if n_eid > 0:
+                self._last_step[eid] = int(step)
+                prepared.append((eid, per_expert))
+                grand_total += n_eid
+        if not prepared:
+            return 0
+        if self._async_writer is not None:
+            self._async_writer.submit_raw(
+                self._do_dram_lossy_batch, prepared, h2d_event,
+                tag=f"dram_lossy_batch_iter{int(step)}",
+            )
+        else:
+            self._do_dram_lossy_batch(prepared, h2d_event)
+        return grand_total
+
+    @torch.no_grad()
+    def _do_dram_lossy_batch(
+        self,
+        prepared: List[Tuple[ExpertId,
+                             List[Tuple[Dict[str, Any], torch.Tensor,
+                                        torch.Tensor, torch.Tensor,
+                                        torch.Tensor]]]],
+        h2d_event: Optional[Any] = None,
+    ) -> None:
+        """Writer-thread handler — synchronises on ``h2d_event`` (if any)
+        then runs the scatter ops sequentially."""
+        if h2d_event is not None:
+            try:
+                h2d_event.synchronize()
+            except Exception:
+                pass
+        for (eid, per_expert) in prepared:
+            for (buf, idx_local, p, m, v) in per_expert:
+                idx_long = idx_local.to(torch.long, copy=False)
+                buf["p"].scatter_(0, idx_long, p.to(torch.float32))
+                buf["m"].scatter_(0, idx_long, m.to(torch.float32))
+                buf["v"].scatter_(0, idx_long, v.to(torch.float32))
+
     # ------------------------------------------------------------------
     # Bookkeeping no-ops (kept for API compatibility with ExpertState).
     # ------------------------------------------------------------------
     def flush(self, only_eids: Optional[List[ExpertId]] = None) -> None:
-        """No-op: there are no fds or async jobs to drain. Provided so
-        callers (FCManager, cp_hooks) can call ``flush()`` uniformly."""
+        """Drain pending writer-thread scatter jobs (if any). Required
+        before recovery reads the dense buffer."""
         del only_eids
+        if self._async_writer is not None:
+            try:
+                self._async_writer.drain()
+            except Exception:
+                pass
 
     def shutdown(self) -> None:
         """No-op for symmetry with ExpertState. The buffers are released

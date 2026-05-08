@@ -295,12 +295,12 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-cp-target dram \
-            --proposal-block-quant-g 256 \
+            --proposal-block-quant-g ${BLOCK_QUANT_G:-256} \
             --proposal-selection-mode hessian \
             ${FD_CROSS_CHECK_FLAG} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-16} \
-            --proposal-topk-ratio ${PROPOSAL_TOPK:-0.01} \
+            --proposal-topk-ratio ${PROPOSAL_TOPK:-0.04} \
             --proposal-lossless-fc-fraction ${LOSSLESS_FC_FRACTION:-1.0} \
             --proposal-expert-fc-D ${EXPERT_FC_D:-999999} \
             --proposal-nonexpert-fc-W 10 \
