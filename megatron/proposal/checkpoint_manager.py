@@ -59,6 +59,7 @@ class CheckpointManager:
         step: int,
         nonexpert_payload: Dict[str, torch.Tensor],
         nonexpert_did_fc: bool = False,
+        cuda_event: Optional["torch.cuda.Event"] = None,
     ) -> DCBundleStats:
         """Write non-expert dense DC bundle for this iter.
 
@@ -133,6 +134,7 @@ class CheckpointManager:
                 nonexpert_payload, dense_path, tag="dc-dense",
                 on_complete=[_unlink_many] if to_unlink else None,
                 save_fn=_save_dc,
+                cuda_event=cuda_event,
             )
             self._live_dense_ne[-1] = (dense_path, rec)
 

@@ -240,14 +240,7 @@ def pretrain(train_valid_test_dataset_provider,
             print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
-        # Replay-only mode: skip training, jump straight to recovery + validation.
-        # Used to re-evaluate an existing CP dir without re-training.
-        if getattr(args, 'proposal_replay_only', False):
-            iteration = int(getattr(args, 'train_iters', 0))
-            args.iteration = iteration
-            print_rank_0(f'[proposal] replay-only mode: skipping training, '
-                         f'will replay CP at t_fault={iteration}')
-        elif args.do_train and args.train_iters > 0:
+        if args.do_train and args.train_iters > 0:
             # When hessian-based selection is active, build a DEDICATED
             # valid iterator that refresh_hessian consumes — keeps the
             # shared valid_data_iterator untouched so evaluate_and_print_results
@@ -296,27 +289,6 @@ def pretrain(train_valid_test_dataset_provider,
             k_samples=getattr(args, 'proposal_hutchinson_k_samples', 4),
             out_path=getattr(args, 'proposal_hutchinson_log', None),
         )
-
-    # Replay-at-end (exp 1 protocol): reconstruct model state from FC+DC
-    # bundles and re-run validation to measure CP reconstruction quality.
-    if getattr(args, 'proposal_enable', False) and (
-        getattr(args, 'proposal_replay_at_end', False)
-        or getattr(args, 'proposal_replay_only', False)
-    ):
-        print_rank_0(f'[proposal] replay at end: calling proposal_recover(t_fault={iteration})')
-        diag = proposal_recover(model, optimizer, t_fault=iteration)
-        if diag is not None:
-            print_rank_0(f'[proposal] recovery diag: {diag}')
-        if args.do_valid:
-            # Post-training eval at training.py:269 consumed the valid iterator.
-            # Rebuild so AFTER-REPLAY eval can draw fresh batches.
-            _, valid_data_iterator_replay, _ = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-            prefix = f'AFTER-REPLAY iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
-            evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator_replay, model,
-                                       iteration, process_non_loss_data_func, config,
-                                       verbose=True, write_to_tensorboard=False)
 
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
@@ -1363,10 +1335,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             and h_refresh_every > 0
             and (iteration == 1 or iteration % h_refresh_every == 0)
         ):
-            _estimator = getattr(args, 'proposal_hessian_estimator', 'hutchinson')
             proposal_refresh_hessian(
                 model, forward_step_func, valid_data_iterator, iteration,
-                estimator=_estimator,
                 k_samples=int(getattr(args, 'proposal_hessian_num_samples', 1)),
             )
 

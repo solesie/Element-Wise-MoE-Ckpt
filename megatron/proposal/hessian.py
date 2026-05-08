@@ -38,6 +38,7 @@ def compute_hessian_hutchinson(
     data_iterator,
     expert_ps: List[torch.nn.Parameter],
     k_samples: int,
+    rng_seed: int = 0xBADCAFE,
 ) -> Optional[List[torch.Tensor]]:
     """Compute |H_diag| via K-sample Hutchinson estimator (Rademacher).
     Returns list of FP32 tensors matching ``expert_ps``, already pre-abs'd.
@@ -89,7 +90,7 @@ def compute_hessian_hutchinson(
                 del loss
                 return None
             grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, expert_ps)]
-            gen = torch.Generator(device=expert_ps[0].device).manual_seed(0xBADCAFE)
+            gen = torch.Generator(device=expert_ps[0].device).manual_seed(int(rng_seed))
             h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
             for k in range(k_samples):
                 zs = [
@@ -193,8 +194,10 @@ def compute_hessian_finite_diff_core(
     eps: float,
     gates_for_freeze: Optional[List[Tuple[str, torch.nn.Module]]] = None,
     rng_seed: int = 0xFD15CAFE,
-) -> Optional[List[torch.Tensor]]:
-    """Backend that runs the central-difference loop on a caller-supplied
+    one_sided: bool = False,
+    track_k_values: Optional[List[int]] = None,
+) -> Optional[Any]:
+    """Backend that runs the finite-difference loop on a caller-supplied
     forward closure. Used by both :func:`compute_hessian_finite_diff` (via
     pretrain_gpt batch capture) and the unit tests (via a synthetic
     forward closure that needs no Megatron import).
@@ -204,6 +207,14 @@ def compute_hessian_finite_diff_core(
     ``gates_for_freeze`` is the list returned by
     :func:`identify_gate_modules`; when None, no routing freeze is
     applied. ``eps`` must be > 0.
+
+    ``one_sided`` (default False, central diff) toggles forward-difference
+    mode: ``Hz ≈ [g(θ+εz) - g(θ)] / ε``. The baseline g(θ) is computed
+    ONCE before the K-sample loop and reused, so total fwd+bwd cost drops
+    from ``2K`` (central) to ``K + 1`` (forward). Truncation error
+    increases from O(ε²) to O(ε); validated empirically — see
+    PROPOSAL_FD_ONE_SIDED env in cp_hooks. Memory cost: 1 extra grad list
+    held for the whole refresh (~|expert_ps| BF16 bytes).
 
     Returns list of |H_diag| tensors (FP32, same shape as ``expert_ps``)
     or ``None`` on failure. Param mutation is restored exactly via
@@ -235,6 +246,14 @@ def compute_hessian_finite_diff_core(
 
     h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
     gen = torch.Generator(device=expert_ps[0].device).manual_seed(rng_seed)
+    # Multi-K snapshot tracking: when track_k_values is provided, we
+    # accumulate raw sums (no inv_k division during loop) and snapshot
+    # h_sum / k_done at each K boundary. Returns dict {k: list[Tensor]}.
+    _track_set: set = set()
+    _snapshots: Dict[int, List[torch.Tensor]] = {}
+    if track_k_values:
+        _track_set = set(int(k) for k in track_k_values
+                         if 1 <= int(k) <= int(k_samples))
     try:
         with (ctx_mgr if ctx_mgr is not None else nullcontext()):
             if ctx_mgr is not None:
@@ -244,6 +263,21 @@ def compute_hessian_finite_diff_core(
                     print(f"[proposal] finite_diff: routing-freeze capture failed: {exc}",
                           flush=True)
                     return None
+            # One-sided mode: compute baseline g(θ) once, reuse across K.
+            # Saves K backward passes vs central diff.
+            grads_baseline: Optional[List[torch.Tensor]] = None
+            if one_sided:
+                with torch.no_grad():
+                    for p, snap in zip(expert_ps, theta_snapshots):
+                        p.data.copy_(snap)
+                grads_baseline = _compute_grad_no_create(forward_loss_fn, expert_ps)
+                if grads_baseline is None:
+                    return None
+            inv_step = 1.0 / eps if one_sided else 1.0 / (2.0 * eps)
+            # When tracking, accumulate raw sum (inv_k=1.0) and divide at
+            # snapshot time. Otherwise pre-divide for the existing single-K
+            # return path.
+            inv_k = 1.0 if _track_set else 1.0 / max(1, int(k_samples))
             for k in range(max(1, int(k_samples))):
                 zs = _make_rademacher(expert_ps, gen)
                 # +ε pass: copy snapshot → add eps*z (one BF16 round)
@@ -251,19 +285,32 @@ def compute_hessian_finite_diff_core(
                     for p, snap, z in zip(expert_ps, theta_snapshots, zs):
                         p.data.copy_(snap).add_(z, alpha=eps)
                 grads_plus = _compute_grad_no_create(forward_loss_fn, expert_ps)
-                # -ε pass: copy snapshot → add -eps*z (independent of +ε)
-                with torch.no_grad():
-                    for p, snap, z in zip(expert_ps, theta_snapshots, zs):
-                        p.data.copy_(snap).add_(z, alpha=-eps)
-                grads_minus = _compute_grad_no_create(forward_loss_fn, expert_ps)
-                if grads_plus is None or grads_minus is None:
+                if grads_plus is None:
                     return None
-                inv_2eps = 1.0 / (2.0 * eps)
-                inv_k = 1.0 / max(1, int(k_samples))
+                if one_sided:
+                    grads_minus = grads_baseline  # alias: read-only here
+                else:
+                    # -ε pass: copy snapshot → add -eps*z (independent of +ε)
+                    with torch.no_grad():
+                        for p, snap, z in zip(expert_ps, theta_snapshots, zs):
+                            p.data.copy_(snap).add_(z, alpha=-eps)
+                    grads_minus = _compute_grad_no_create(forward_loss_fn, expert_ps)
+                    if grads_minus is None:
+                        return None
                 for i, (gp, gm, z) in enumerate(zip(grads_plus, grads_minus, zs)):
-                    hz = (gp - gm).mul_(inv_2eps).to(torch.float32)
+                    hz = (gp - gm).mul(inv_step).to(torch.float32)
                     h_accum[i].add_((z.to(torch.float32) * hz).abs_().mul_(inv_k))
-                del grads_plus, grads_minus, zs
+                k_done = k + 1
+                if k_done in _track_set:
+                    _snapshots[k_done] = [
+                        h.detach().clone().div_(float(k_done))
+                        for h in h_accum
+                    ]
+                # one-sided: don't free grads_baseline — it's needed every k.
+                if one_sided:
+                    del grads_plus, zs
+                else:
+                    del grads_plus, grads_minus, zs
     except Exception as exc:
         import traceback as _tb
         print(f"[proposal] finite_diff: refresh failed: {type(exc).__name__}: {exc}\n"
@@ -290,6 +337,15 @@ def compute_hessian_finite_diff_core(
             print("[proposal] finite_diff: NaN/Inf in result", flush=True)
             return None
 
+    if _track_set:
+        for k_d, snap in _snapshots.items():
+            for h in snap:
+                if not bool(torch.isfinite(h).all()):
+                    print(f"[proposal] finite_diff: NaN/Inf in K={k_d} snapshot",
+                          flush=True)
+                    return None
+        return _snapshots
+
     return h_accum
 
 
@@ -303,7 +359,9 @@ def compute_hessian_finite_diff(
     use_routing_freeze: bool = True,
     batch_override: Optional[Any] = None,
     rng_seed: int = 0xBADCAFE,
-) -> Optional[List[torch.Tensor]]:
+    one_sided: bool = False,
+    track_k_values: Optional[List[int]] = None,
+) -> Optional[Any]:
     """Diagonal Hessian via central finite-difference Hessian-vector products.
 
     Estimator (Rademacher-z central diff):
@@ -457,6 +515,8 @@ def compute_hessian_finite_diff(
             eps=eps_value,
             gates_for_freeze=gates_for_freeze,
             rng_seed=rng_seed,
+            one_sided=one_sided,
+            track_k_values=track_k_values,
         )
 
 
@@ -566,7 +626,7 @@ def compare_hessian_estimators(
         bin_width = (LOG_HI - LOG_LO) / BINS
         return 10.0 ** (LOG_LO + last_idx * bin_width)
 
-    ratios = (0.001, 0.01, 0.1)
+    ratios = (0.0001, 0.001, 0.01, 0.05, 0.1)
     N_total = int(pears["n"])
     thresholds = {}
     for r in ratios:
@@ -613,12 +673,16 @@ def compare_hessian_estimators(
         "label_b": label_b,
         "total_expert_numel": N_total,
         f"pearson_{pair_key}_bare": pearson_bare,
+        "jaccard_top0.01pct_bare":_j(jacc[0.0001]["inter_hg"],jacc[0.0001]["A_h"],jacc[0.0001]["A_g"]),
         "jaccard_top0.1pct_bare": _j(jacc[0.001]["inter_hg"], jacc[0.001]["A_h"], jacc[0.001]["A_g"]),
         "jaccard_top1pct_bare":   _j(jacc[0.01]["inter_hg"],  jacc[0.01]["A_h"],  jacc[0.01]["A_g"]),
+        "jaccard_top5pct_bare":   _j(jacc[0.05]["inter_hg"],  jacc[0.05]["A_h"],  jacc[0.05]["A_g"]),
         "jaccard_top10pct_bare":  _j(jacc[0.1]["inter_hg"],   jacc[0.1]["A_h"],   jacc[0.1]["A_g"]),
         f"pearson_{pair_key}_score": pearson_score,
+        "jaccard_top0.01pct_score":_j(jacc[0.0001]["inter_shsg"],jacc[0.0001]["A_sh"],jacc[0.0001]["A_sg"]),
         "jaccard_top0.1pct_score": _j(jacc[0.001]["inter_shsg"], jacc[0.001]["A_sh"], jacc[0.001]["A_sg"]),
         "jaccard_top1pct_score":   _j(jacc[0.01]["inter_shsg"],  jacc[0.01]["A_sh"],  jacc[0.01]["A_sg"]),
+        "jaccard_top5pct_score":   _j(jacc[0.05]["inter_shsg"],  jacc[0.05]["A_sh"],  jacc[0.05]["A_sg"]),
         "jaccard_top10pct_score":  _j(jacc[0.1]["inter_shsg"],   jacc[0.1]["A_sh"],   jacc[0.1]["A_sg"]),
     }
     # Backwards-compat alias keys for the original hutch_vs_gnb call site.

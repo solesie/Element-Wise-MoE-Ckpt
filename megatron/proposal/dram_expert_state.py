@@ -89,10 +89,13 @@ class DramExpertState:
                 writes to host memory, not disk.
             fresh: accepted for compatibility; DRAM buffers are always fresh
                 because they live in process memory.
-            async_writer: accepted for compatibility but unused; all updates
-                are synchronous CPU scatters.
+            async_writer: optional AsyncWriter. When provided, ``lossless_fc``
+                dispatches its (cuda_event.synchronize() + ~50 ms host copy)
+                onto the writer's raw worker thread so the main training
+                thread isn't blocked at iter boundaries with expert FC.
         """
-        del output_dir, async_writer, fresh  # unused in DRAM mode
+        del output_dir, fresh  # unused in DRAM mode
+        self._async_writer = async_writer
 
         # Per-expert: tensor_name -> {'p', 'm', 'v', 'shape', 'numel'}.
         # 'p'/'m'/'v' are flat CPU FP32 views into ONE contiguous backing
@@ -174,49 +177,64 @@ class DramExpertState:
         initial_state: Dict[str, Tuple[torch.Tensor,
                                        Optional[torch.Tensor],
                                        Optional[torch.Tensor]]],
+        cuda_event: Optional["torch.cuda.Event"] = None,
     ) -> None:
-        # Bypass for measurement-only runs (e.g. Pearson cross-check
-        # without recovery): PROPOSAL_SKIP_EXPERT_WRITES=1 makes
-        # DRAM expert state inert, eliminating the host-RAM scatter
-        # cost and the per-expert dense buffer dirtying that drives
-        # background flush traffic. The importance tracker's score
-        # signal (H × δ²) remains correct because we still update
-        # θ_CP via the on_expert_fc / on_state_snapshot paths.
+        """Replace dense (param, m, v) buffer with the supplied triples.
+
+        Async path: dispatch the (cuda_event.synchronize() + host copy)
+        to the AsyncWriter's raw worker queue so the main training
+        thread isn't blocked on the D2H wait + ~50 ms host copy.
+        lossy_fc_append uses the same queue → automatic FIFO ordering on
+        the dense buffer, no race.
+        """
+        # Bypass for measurement-only runs.
         import os as _os
         if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
             self._lossless_step[expert_id] = int(step)
             self._last_step[expert_id] = int(step)
             return
-        """Replace the per-tensor dense buffer with the supplied
-        (param, m, v) triples. Mirrors ``ExpertState.lossless_fc``: the
-        provided tensors come from ``FCManager._collect_expert_payload``
-        already on CPU; we only have to copy them into our buffer.
-
-        Any sparse drift accumulated since the last lossless FC is
-        implicitly discarded (overwritten by the new dense snapshot),
-        which matches the disk semantics where the prior lossy FC log is
-        unlinked at this point.
-        """
         tensor_buffers = self._buffers.get(expert_id)
         if tensor_buffers is None:
             return
-        for tname, triple in initial_state.items():
-            buf = tensor_buffers.get(tname)
-            if buf is None:
-                continue
-            p, m, v = triple
-            # FP32 flatten; .copy_ keeps the buffer's identity (no realloc).
-            buf["p"].copy_(p.detach().to(torch.float32).reshape(-1))
-            if m is not None:
-                buf["m"].copy_(m.detach().to(torch.float32).reshape(-1))
-            else:
-                buf["m"].zero_()
-            if v is not None:
-                buf["v"].copy_(v.detach().to(torch.float32).reshape(-1))
-            else:
-                buf["v"].zero_()
+
+        # Update step markers immediately (used by recovery — must be
+        # consistent with the dispatched buffer write since FIFO worker
+        # processes items in order).
         self._lossless_step[expert_id] = int(step)
         self._last_step[expert_id] = int(step)
+
+        def _do_lossless_fc(
+            triples=dict(initial_state),
+            buffers=tensor_buffers,
+            ev=cuda_event,
+        ):
+            if ev is not None:
+                try:
+                    ev.synchronize()
+                except Exception:
+                    pass
+            for tname, triple in triples.items():
+                buf = buffers.get(tname)
+                if buf is None:
+                    continue
+                p, m, v = triple
+                buf["p"].copy_(p.detach().to(torch.float32).reshape(-1))
+                if m is not None:
+                    buf["m"].copy_(m.detach().to(torch.float32).reshape(-1))
+                else:
+                    buf["m"].zero_()
+                if v is not None:
+                    buf["v"].copy_(v.detach().to(torch.float32).reshape(-1))
+                else:
+                    buf["v"].zero_()
+
+        if self._async_writer is not None:
+            self._async_writer.submit_raw(
+                _do_lossless_fc,
+                tag=f"dram_lossless_L{expert_id[0]:02d}_E{expert_id[1]:02d}",
+            )
+        else:
+            _do_lossless_fc()
 
     # ------------------------------------------------------------------
     # Lossy FC (per-iter sparse updates → scatter into dense buffer)

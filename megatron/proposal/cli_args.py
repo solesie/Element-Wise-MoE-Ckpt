@@ -21,107 +21,70 @@ def add_proposal_args(parser):
     group.add_argument("--proposal-topk-ratio", type=float, default=0.05,
                        help="Fraction of expert elements to snapshot per lossy-FC "
                             "(score-based top-K). Default 5%%.")
+    group.add_argument("--proposal-block-quant-g", type=int, default=1,
+                       help="Block quantization group size for selection. Default 1 "
+                            "(no block quant). When g>1, contiguous g-element groups "
+                            "share a group score (sum of element scores) and are "
+                            "selected as a unit. Saves use element-level values "
+                            "(Option B): K-element budget preserved.")
+    # FD multi-K diagnostic (per-refresh K_x vs K_max comparison).
+    group.add_argument("--proposal-fd-multi-k-track", action="store_true",
+                       help="Track FD H estimates at multiple K values (per refresh). "
+                            "Snapshots accumulated h_sum / k_done at each requested K "
+                            "boundary; pearson(K_x, K_max) and pearson(prev_K_max, "
+                            "current_K_max) logged.")
+    group.add_argument("--proposal-fd-multi-k-values", type=int, nargs="+",
+                       default=[1, 2, 4, 8, 16, 32],
+                       help="K boundary values for multi-K tracking. Last value used "
+                            "as truth for cross-K pearson. Refresh runs k_samples = "
+                            "max(values).")
+    group.add_argument("--proposal-fd-multi-k-log", type=str, default=None,
+                       help="JSONL output path for multi-K pearson records.")
     group.add_argument("--proposal-selection-mode", type=str, default="hessian",
                        choices=["v_hat", "random", "hessian"],
                        help="Score metric for element selection: "
                             "'v_hat' = Adam bias-corrected v̂_t × δ² ; "
-                            "'hessian' = |H_diag| × δ² (estimator configurable via "
-                            "--proposal-hessian-estimator) ; "
+                            "'hessian' = |H_diag| × δ² (Finite-Difference) ; "
                             "'random' = uniform random (ablation). Default 'hessian'.")
-    group.add_argument("--proposal-hessian-estimator", type=str, default="finite_diff",
-                       choices=["finite_diff", "hutchinson"],
-                       help="Estimator for |H_diag|. 'finite_diff' (default, "
-                            "production) = central-difference Hz via 1st-order "
-                            "grads with MoE routing freeze + Parameter rebind to "
-                            "bypass DS BF16+ZeRO storage aliasing. 'hutchinson' "
-                            "(opt-in) = K-sample Rademacher with 2nd-order autograd; "
-                            "kept as a truth reference for occasional comparison runs "
-                            "on small models — heavier (saved-tensor offload) and not "
-                            "validated for EP > 1, so don't use for production.")
     group.add_argument("--proposal-finite-diff-eps", type=float, default=None,
                        help="Absolute eps for finite-difference Hz (2-point central). "
                             "Default None → 1e-3 (validated on production exp_etc, "
                             "BF16 + MoE). Override via this flag or PROPOSAL_FD_EPS "
-                            "env if a very different scale (e.g. 100B+ params with "
-                            "unusual |H| range) ever proves the default unsafe.")
-    group.add_argument("--proposal-finite-diff-routing-freeze", action="store_true",
-                       default=True,
-                       help="Freeze MoE gating decisions during finite-diff "
-                            "+/- eps forwards. Default ON; without freeze, "
-                            "top-k argmax flips between perturbed forwards "
-                            "produce noise that swamps Hz.")
-    group.add_argument("--proposal-no-finite-diff-routing-freeze",
-                       dest="proposal_finite_diff_routing_freeze",
-                       action="store_false",
-                       help="Ablation: turn the routing freeze OFF.")
+                            "env if a very different scale ever proves the default unsafe.")
     group.add_argument("--proposal-finite-diff-cross-check", action="store_true",
-                       help="When estimator=finite_diff, ALSO run Hutchinson on "
-                            "the same param state and log Pearson/Jaccard via "
-                            "compare_hessian_estimators(label_a='hutch', "
-                            "label_b='finite_diff') to the cross-check log.")
+                       help="ALSO run Hutchinson on the same param state (CRN batch) "
+                            "at refresh and log Pearson/Jaccard via "
+                            "compare_hessian_estimators. Production refresh is "
+                            "FD-only; this flag is the ONLY surviving Hutchinson "
+                            "path, kept for FD-vs-Hutch validation runs.")
+    group.add_argument("--proposal-finite-diff-cross-check-log", type=str, default=None,
+                       help="JSONL output path for the FD-vs-Hutch cross-check "
+                            "(populated when --proposal-finite-diff-cross-check is "
+                            "set). When None, results print to stdout only.")
     group.add_argument("--proposal-finite-diff-flip-cutoff", type=float,
                        default=100.0,
                        help="Outlier protection: per-tensor Hz mean-abs is "
                             "compared to the median across tensors; tensors "
-                            "exceeding cutoff*median are skipped from the EMA "
+                            "exceeding cutoff*median are skipped from the H "
                             "update (residual flip protection beyond routing "
                             "freeze). Default 100.")
     group.add_argument("--proposal-hessian-refresh-every", type=int, default=40,
                        help="With --proposal-selection-mode=hessian: re-estimate "
-                            "|H_diag| every N iters and fold into the H EMA. "
+                            "|H_diag| every N iters and overwrite the cached H. "
                             "Default 40. Set 0 to disable.")
     group.add_argument("--proposal-hessian-num-samples", type=int, default=4,
-                       help="Label draws averaged per Hessian refresh. Default 4 "
-                            "(matches the current exp_etc_new baseline). K=1 + "
-                            "aggressive EMA is a viable low-memory alternative "
-                            "but degrades recovery quality slightly.")
-    group.add_argument("--proposal-hessian-mode", type=str, default="ema",
-                       choices=["ema", "plain"],
-                       help="|H_diag| accumulation across refreshes. "
-                            "'ema' (default): H_ema = α·H_ema + (1-α)·H_new per "
-                            "refresh, smooths K-sample variance across the EMA "
-                            "window. 'plain': H_ema is overwritten with H_new "
-                            "each refresh — no temporal smoothing, use when "
-                            "K_samples is large enough on its own or when "
-                            "comparing against a fresh snapshot baseline.")
-    group.add_argument("--proposal-hessian-ema-alpha", type=float, default=0.9,
-                       help="EMA decay for |H_diag| when --proposal-hessian-mode=ema. "
-                            "H_ema = α·H_ema + (1-α)·H_new per refresh. α=0.9 "
-                            "gives effective sample count 1/(1-α)=10, which "
-                            "dominates the K=1 per-refresh variance. "
-                            "Ignored when mode=plain. Default 0.9.")
+                       help="Label draws averaged per Hessian refresh. Default 4.")
     group.add_argument("--proposal-hessian-persist", action="store_true",
-                       help="Persist |H_diag| (EMA or plain) to "
-                            "<cp-dir>/hessian/h_ema_iter*.bin after every refresh. "
-                            "Default OFF — the refresh path stays in GPU only, "
-                            "no async-writer pressure, no retention bookkeeping. "
-                            "Turn ON when recovery needs to resume H state across "
-                            "faults (--proposal-fault-interval with EMA continuity), "
-                            "or for post-hoc analysis of |H| trajectory.")
-    group.add_argument("--proposal-hessian-comparison-log", type=str, default=None,
-                       help="JSONL path for periodic v̂_t vs |H_diag| comparison "
-                            "(Pearson / Jaccard over bare and score=X·δ²). "
-                            "Populated on each refresh_hessian call.")
-    group.add_argument("--proposal-hessian-cross-check", action="store_true",
-                       help="When estimator=hutchinson, also run GNB on the same "
-                            "param state and log Hutchinson-vs-GNB ranking "
-                            "similarity (Pearson + Jaccard).")
-    group.add_argument("--proposal-hessian-cross-check-log", type=str, default=None,
-                       help="JSONL path for Hutchinson-vs-GNB cross-check dump "
-                            "(populated each refresh when "
-                            "--proposal-hessian-cross-check is set).")
+                       help="Persist |H_diag| to <cp-dir>/hessian/h_iter*.bin after "
+                            "every refresh. Default OFF — the refresh path stays in "
+                            "GPU only, no async-writer pressure. Turn ON when recovery "
+                            "needs to resume H state across faults.")
     group.add_argument("--proposal-hutchinson-at-end", action="store_true",
-                       help="At end of training, run one Hutchinson probe to compare "
-                            "v̂_t vs |H_diag| as importance proxy. Writes JSONL.")
+                       help="At end of training, run one Hutchinson probe and write "
+                            "a JSONL log (post-hoc cross-check; production refresh is "
+                            "always FD).")
     group.add_argument("--proposal-hutchinson-k-samples", type=int, default=4)
     group.add_argument("--proposal-hutchinson-log", type=str, default=None)
-    # ANALYSIS: non-expert |H| probe — retained for expert-vs-non-expert score
-    # distribution measurement (see CLAUDE.md overlap measurement plan).
-    group.add_argument("--proposal-hessian-nonexpert-probe-log", type=str, default=None,
-                       help="JSONL path for non-expert |H| probe. When set, "
-                            "refresh_hessian also computes |H| for non-expert "
-                            "params on score_diag_iters and dumps percentile "
-                            "comparison with expert |H|.")
     # DEBUG: disable the ExpertState lossy FC writer (skip both lossy-FC
     # and lossless-FC of experts). Used to isolate expert-side write cost
     # when profiling. Legacy flag name preserved for compat.
@@ -170,13 +133,6 @@ def add_proposal_args(parser):
                             "for that mode if you want RAM-speed I/O.")
     group.add_argument("--proposal-cp-dir", type=str, default="./proposal_cp",
                        help="Directory for proposal checkpoint files.")
-    group.add_argument("--proposal-replay-at-end", action="store_true",
-                       help="After training completes, call proposal_recover() and re-run "
-                            "validation. Used for exp 1 (CP reconstruction quality measurement).")
-    group.add_argument("--proposal-replay-only", action="store_true",
-                       help="Skip training entirely; load existing CP files via "
-                            "proposal_recover() then run validation. Use to re-evaluate "
-                            "an existing CP dir without re-training.")
     group.add_argument("--proposal-fault-interval", type=int, default=0,
                        help="Exp 2 fault injection: every N iters, call "
                             "proposal_recover() in the middle of training and continue "
@@ -194,14 +150,4 @@ def add_proposal_args(parser):
                             "these iters (using current Adam v_t over expert "
                             "params only — ZeRO-aware via Fp32StateMapper). "
                             "Dumps JSON list next to fault log.")
-    group.add_argument("--proposal-score-diag-iters", type=int, nargs="+",
-                       default=None,
-                       help="Measure expert vs non-expert score distribution "
-                            "(v̂_t × δ²) at each of these iters, plus per-layer "
-                            "sum + avg per expert. Dumps JSONL to --proposal-score-diag-log.")
-    group.add_argument("--proposal-score-diag-log", type=str, default=None,
-                       help="Path to JSONL file for score distribution diagnostic records.")
-    group.add_argument("--proposal-score-diag-every", type=int, default=0,
-                       help="If >0, measure score distribution every N iter "
-                            "(dense periodic sampling; use with --proposal-score-diag-log).")
     return parser

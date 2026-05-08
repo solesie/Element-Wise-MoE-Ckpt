@@ -1,1 +1,0 @@
-[exp1] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_1_seed2024  SEED=2024

@@ -103,8 +103,10 @@ Lossy FC(append-only) + Round-robin expert lossless FC 방식을 사용한다.
 
 ## Importance Score와의 상호작용
 
-- Expert lossless FC 수행 시: 해당 expert 전체의 θ_CP가 θ_current로 갱신 → δ = 0 → score = 0. 이후 학습이 진행되면 θ_current가 θ_CP에서 벗어나며 δ 자연 증가 → score 복구. 자연스러운 rotation이 발생하여, 최근 lossless FC된 expert보다 오래 전에 lossless FC된 expert의 원소가 lossy FC에서 우선 선별된다.
-- Lossy FC 수행 시: 선별된 원소만 θ_CP 갱신 → 해당 원소 δ = 0 → 다음 iteration에서 다른 원소가 선별됨.
+δ는 매 iteration마다 group 단위로 누적되는 Σ Δθ_i² (accum_sq) 로 추정한다. theta_cp/element-level δ legacy path 는 제거됨.
+
+- Expert lossless FC 수행 시: 해당 expert 의 모든 group δ_g 가 0 으로 초기화 → score = 0. 이후 학습 진행으로 자연스럽게 δ_g 가 증가 → score 복구. rotation 효과로 최근 lossless 한 expert 보다 오래 된 expert 의 원소가 lossy FC 에서 우선 선별됨.
+- Lossy FC 수행 시: 선별된 group 의 δ_g 만 0 으로 초기화 → 다음 iteration 에서 다른 group 이 선별됨.
 
 ## 복구 성능 주의사항
 
@@ -139,23 +141,21 @@ Non-expert parameter는 매 FC마다 전부 저장하므로 score 불필요.
 
 ### H(Hessian)
 
-- Hutchinson 기반 방법(기본), GNB 기반의 방법 두가지 존재.
+- Finite-Difference 기반 (production). Hutchinson 은 FD 와의 비교 검증용 cross-check 에서만 사용.
 
-### δ\_j — Recovery error
+### δ_g — Recovery error proxy (group-level)
 
-```
-δ_j = |θ_current[j] - θ_CP[j]|
-```
-
-- θ\_CP: 해당 원소의 마지막 lossy FC 시점의 param 값 (GPU에 캐시)
-- 매 iter: `δ_j = |θ_current[j] - θ_CP[j]|` 로 정확한 값을 계산
-- expert lossy FC 시: 선택된 원소의 θ\_CP\[j\]를 θ\_current\[j\]로 갱신 → 해당 원소 δ = 0
-
-**메모리 비용:**
+block_quant_g 크기의 contiguous group 단위로 누적:
 
 ```
-θ_CP = expert param의 BF16 사본
+δ_g²  = Σ_{step ∈ window} Σ_{i ∈ group} Δθ_i²    (= "accum_sq")
 ```
+
+- 매 step: optimizer 의 m, v 로부터 Δθ_i 를 유도하여 group 별로 제곱합 누적
+- expert lossy FC 시: 선택된 group 의 δ_g 만 0 으로 초기화
+- expert lossless FC 시: 해당 expert 의 모든 group δ_g 0 으로 초기화
+
+**메모리 비용 (group-level)**: H_g, δ_g 모두 1/g (BF16) 으로 줄어 element-level 대비 ~수십~수백배 절감. 기본 g=256.
 
 ## 이론적 근거
 

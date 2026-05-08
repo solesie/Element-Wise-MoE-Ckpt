@@ -106,9 +106,7 @@ case "$VARIANT" in
             --proposal-dc-retention ${DC_RETENTION} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     element_wise)
         SCORE_DIAG_LOG="${OUTPUT_BASEPATH}/log/${TAG}.score_diag.jsonl"
@@ -121,9 +119,7 @@ case "$VARIANT" in
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_gnb)
         # Same as element_wise but score uses |H| (Sophia-G
@@ -136,16 +132,13 @@ case "$VARIANT" in
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every 10 \
             --proposal-hessian-num-samples 1 \
-            --proposal-hessian-comparison-log ${H_CMP_LOG} \
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch)
         # Same data path as proposal_gnb but score uses |H| from K-sample Hutchinson
@@ -157,21 +150,15 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
-            --proposal-hessian-cross-check \
-            --proposal-hessian-cross-check-log ${HUTCH_GNB_LOG} \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
-            --proposal-hessian-comparison-log ${H_CMP_LOG} \
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k2pct)
         # Same as proposal_hutch but topk-ratio 2% (vs 1%). Split CP layout
@@ -184,7 +171,6 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
             --proposal-topk-ratio 0.02 \
@@ -193,9 +179,7 @@ case "$VARIANT" in
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k3pct)
         # Same as proposal_hutch_k2pct but topk-ratio 3% (vs 2%).
@@ -203,7 +187,6 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
             --proposal-topk-ratio 0.03 \
@@ -212,9 +195,7 @@ case "$VARIANT" in
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k10pct)
         # K=10% + per-iter rolling fsync (TEMP durability test per user).
@@ -222,7 +203,6 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
             --proposal-topk-ratio 0.10 \
@@ -231,9 +211,7 @@ case "$VARIANT" in
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k4pct)
         # Same as proposal_hutch but topk-ratio 4% (vs 1%). Includes temp
@@ -246,22 +224,15 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
-            --proposal-hessian-cross-check \
-            --proposal-hessian-cross-check-log ${HUTCH_GNB_LOG} \
-            --proposal-hessian-nonexpert-probe-log ${H_NE_PROBE_LOG} \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
-            --proposal-hessian-comparison-log ${H_CMP_LOG} \
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k4pct_finite_diff)
         # Mirror of proposal_hutch_k4pct with estimator=finite_diff +
@@ -273,21 +244,16 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator finite_diff \
             --proposal-finite-diff-cross-check \
-            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
-            --proposal-hessian-comparison-log ${H_CMP_LOG} \
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k1pct_finite_diff_F1)
         # FD estimator + K=1% + F=1% (lossless-fc-fraction). Mirrors
@@ -324,29 +290,25 @@ case "$VARIANT" in
         # already validated the FD setting and we just want to train.
         FD_CROSS_CHECK_FLAG=""
         if [ "${FD_CROSS_CHECK:-1}" != "0" ]; then
-            FD_CROSS_CHECK_FLAG="--proposal-finite-diff-cross-check \
-            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
-            --proposal-hessian-comparison-log ${H_CMP_LOG}"
+            FD_CROSS_CHECK_FLAG="--proposal-finite-diff-cross-check"
         fi
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-cp-target dram \
+            --proposal-block-quant-g 256 \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator finite_diff \
             ${FD_CROSS_CHECK_FLAG} \
-            --proposal-hessian-refresh-every 40 \
+            --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-16} \
-            --proposal-topk-ratio 0.01 \
-            --proposal-lossless-fc-fraction 1.0 \
-            --proposal-expert-fc-D 999999 \
+            --proposal-topk-ratio ${PROPOSAL_TOPK:-0.01} \
+            --proposal-lossless-fc-fraction ${LOSSLESS_FC_FRACTION:-1.0} \
+            --proposal-expert-fc-D ${EXPERT_FC_D:-999999} \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention 12 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 1000 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_hutch_k4pct_finite_diff_nofreeze)
         # Ablation: same as proposal_hutch_k4pct_finite_diff but routing
@@ -358,22 +320,16 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator finite_diff \
-            --proposal-no-finite-diff-routing-freeze \
             --proposal-finite-diff-cross-check \
-            --proposal-hessian-cross-check-log ${HUTCH_FD_LOG} \
             --proposal-hessian-refresh-every 40 \
             --proposal-hessian-num-samples 4 \
-            --proposal-hessian-comparison-log ${H_CMP_LOG} \
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_ema_hutch)
         # Lossy FC (append-only) + round-robin expert lossless FC with
@@ -388,11 +344,8 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            --proposal-hessian-mode ${HESSIAN_MODE:-ema} \
-            --proposal-hessian-ema-alpha ${HESSIAN_EMA_ALPHA:-0.9} \
             ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.03 \
             --proposal-expert-fc-D 2 \
@@ -401,9 +354,7 @@ case "$VARIANT" in
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_exp2_k2)
         # Exp2 run 1: proposal_ema_hutch-style (Hutchinson K=4 refresh=40,
@@ -416,11 +367,8 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            --proposal-hessian-mode ${HESSIAN_MODE:-ema} \
-            --proposal-hessian-ema-alpha ${HESSIAN_EMA_ALPHA:-0.9} \
             ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.02 \
             --proposal-expert-fc-D 1 \
@@ -429,9 +377,7 @@ case "$VARIANT" in
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400 2600 2800 3000 3200 3400 3600 3800 4000 4200 4400 4600 4800 5000 5200 5400 5600 5800 6000 6200 6400 6600 6800 7000 7200 7400 7600 7800 8000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_exp2_k4)
         # Exp2 run 2: same as proposal_exp2_k2 but K_top=4%.
@@ -439,11 +385,8 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            --proposal-hessian-mode ${HESSIAN_MODE:-ema} \
-            --proposal-hessian-ema-alpha ${HESSIAN_EMA_ALPHA:-0.9} \
             ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.04 \
             --proposal-expert-fc-D 1 \
@@ -452,9 +395,7 @@ case "$VARIANT" in
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 100 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400 2600 2800 3000 3200 3400 3600 3800 4000 4200 4400 4600 4800 5000 5200 5400 5600 5800 6000 6200 6400 6600 6800 7000 7200 7400 7600 7800 8000 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     proposal_nofc)
         # ETC-1: stagger=0 → iter-1 full burst + DC-only (no ongoing FC),
@@ -466,8 +407,7 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.0015 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
-            --proposal-replay-at-end"
+            --proposal-dc-retention ${TRAIN_ITERS}"
         ;;
     exp3_run1)
         # Exp3 Run 1 — proposed system, K_top=1%, D=1, F=0.5%
@@ -478,11 +418,8 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
-            --proposal-hessian-mode ${HESSIAN_MODE:-ema} \
-            --proposal-hessian-ema-alpha ${HESSIAN_EMA_ALPHA:-0.9} \
             ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.01 \
             --proposal-expert-fc-D 1 \
@@ -491,10 +428,7 @@ case "$VARIANT" in
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400 2600 2800 3000 3200 3400 3600 3800 4000 4200 4400 4600 4800 5000 5200 5400 5600 5800 6000 6200 6400 6600 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG} \
-            --proposal-hessian-comparison-log ${HCOMP_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     exp3_run2)
         # Exp3 Run 2 — proposed system, K_top=4%, D=1, F=1%
@@ -504,11 +438,8 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
-            --proposal-hessian-estimator hutchinson \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
-            --proposal-hessian-mode ${HESSIAN_MODE:-ema} \
-            --proposal-hessian-ema-alpha ${HESSIAN_EMA_ALPHA:-0.9} \
             ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.04 \
             --proposal-expert-fc-D 1 \
@@ -517,10 +448,7 @@ case "$VARIANT" in
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
-            --proposal-fault-log ${FAULT_LOG} \
-            --proposal-score-diag-iters 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400 2600 2800 3000 3200 3400 3600 3800 4000 4200 4400 4600 4800 5000 5200 5400 5600 5800 6000 6200 6400 6600 \
-            --proposal-score-diag-log ${SCORE_DIAG_LOG} \
-            --proposal-hessian-comparison-log ${HCOMP_LOG}"
+            --proposal-fault-log ${FAULT_LOG}"
         ;;
     exp3_run3_moc_d4)
         # Exp3 Run 3 — MoC PEC: D=4, layer-wise round-robin (each event FCs all
@@ -573,7 +501,7 @@ megatron_options=" \
     --train-iters ${TRAIN_ITERS} \
     --lr ${LR} --min-lr ${MIN_LR} --lr-decay-style cosine --lr-warmup-iters ${LR_WARMUP_ITERS} \
     --split 98,2,0 \
-    --log-interval 10 --eval-interval 100 --eval-iters 128 \
+    --log-interval 10 --eval-interval ${EVAL_INTERVAL:-100} --eval-iters ${EVAL_ITERS:-128} \
     --save-interval 100000 \
     --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 \
     --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam \

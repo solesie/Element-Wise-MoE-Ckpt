@@ -20,18 +20,21 @@ _tracker: Optional[ImportanceTracker] = None
 _ckpt: Optional[CheckpointManager] = None
 _fc: Optional[FCManager] = None
 _writer: Optional[AsyncWriter] = None
+_expert_lossless_fc: Optional[Any] = None  # ExpertLosslessFC, lazy import
 _ne_payload: Optional[Dict[str, torch.Tensor]] = None
+_ne_payload_cuda_event: Optional["torch.cuda.Event"] = None
 _enabled: bool = False
 _cp_dir: Optional[Path] = None
 
-# Module-level staging buffers for _persist_h_ema. H_ema lives on
+
+# Module-level staging buffers for _persist_h. The H cache lives on
 # GPU (per-expert |H|, ~900 MB on 300M-MoE). Naively ``.to("cpu")`` per tensor
 # repeats the pageable-D2H slow path we just removed from FC/DC: pinned batch
 # collapses N syncs to one pinned transfer. Allocated lazily on first refresh;
 # pinned buffer is reused across refreshes (drain_torch() before overwrite
 # ensures the previous torch.save has finished reading it).
-_h_ema_stage_gpu: Optional[torch.Tensor] = None
-_h_ema_pinned_cpu: Optional[torch.Tensor] = None
+_h_stage_gpu: Optional[torch.Tensor] = None
+_h_pinned_cpu: Optional[torch.Tensor] = None
 _config: Dict[str, Any] = {}
 
 # Exp 2 metric plumbing.
@@ -89,6 +92,7 @@ def init_proposal(
 ) -> None:
     """Build singletons. Short-circuits if args.proposal_enable is False."""
     global _tracker, _ckpt, _fc, _writer, _enabled, _cp_dir, _config
+    global _expert_lossless_fc
 
     _enabled = bool(getattr(args, "proposal_enable", False))
     if not _enabled:
@@ -131,6 +135,17 @@ def init_proposal(
     inner_model = _unwrap_ds_engine(model)
     inner_opt = _get_ds_optimizer(model) if optimizer is None else optimizer
     engine_opt = _get_ds_engine_optimizer(model)
+    # Baseline VRAM snapshot before any proposal-side allocation.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        _baseline_alloc = torch.cuda.memory_allocated()
+        _baseline_reserved = torch.cuda.memory_reserved()
+        print(f"[proposal] BASELINE VRAM (before proposal init): "
+              f"alloc={_baseline_alloc/1e6:.1f} MB, "
+              f"reserved={_baseline_reserved/1e6:.1f} MB", flush=True)
+        _config.setdefault("_baseline_alloc", _baseline_alloc) if False else None
+        # Stash on module so we can compare after init.
+        globals()["_baseline_alloc_mb"] = _baseline_alloc / 1e6
     # Build the FP32 master / Adam state mapper. This handles ZeRO-0+FP16
     # (FP16_Optimizer), ZeRO-0+BF16 (BF16_Optimizer), and ZeRO-1/2
     # (DeepSpeedZeroOptimizer with _hp_mapping) in one interface so the rest
@@ -227,6 +242,7 @@ def init_proposal(
         num_experts=num_experts_scalar,
         random_seed=int(getattr(args, "seed", 0) or 0),
         async_writer=_writer,
+        block_quant_g=int(getattr(args, "proposal_block_quant_g", 1)),
     )
 
     # Non-expert DC retention: W+2 is sufficient (each non-expert FC
@@ -247,10 +263,8 @@ def init_proposal(
     if _should_write() and bool(getattr(args, "proposal_hessian_persist", False)):
         _hessian_cp_dir.mkdir(parents=True, exist_ok=True)
     _config["_hessian_cp_dir"] = _hessian_cp_dir
-    _config["_hessian_mode"] = str(getattr(args, "proposal_hessian_mode", "ema"))
-    _config["_hessian_ema_alpha"] = float(getattr(args, "proposal_hessian_ema_alpha", 0.9))
     _config["_hessian_persist"] = bool(getattr(args, "proposal_hessian_persist", False))
-    _config["_hessian_ema_history"] = []  # [(path, rec)] for retention
+    _config["_hessian_history"] = []  # [(path, rec)] for retention
 
     if _should_write():
         _ckpt = CheckpointManager(
@@ -265,7 +279,6 @@ def init_proposal(
     fc_schedule = (
         "sequential" if _config["cp_mode"] == "sequential" else "proposal"
     )
-    _is_replay_only = bool(getattr(args, "proposal_replay_only", False))
     if _should_write():
         _fc = FCManager(
             model=inner_model,
@@ -276,14 +289,9 @@ def init_proposal(
             expert_fc_D=_config["expert_fc_D"],
             nonexpert_fc_W=_config["nonexpert_fc_W"],
             async_writer=_writer,
-            on_expert_fc_fn=_tracker.on_expert_fc,
-            on_nonexpert_fc_fn=_tracker.on_nonexpert_fc,
             schedule=fc_schedule,
             lossless_fc_fraction_pct=_config["lossless_fc_fraction_pct"],
-            # Replay-only: preserve on-disk expert state so recover() can
-            # read it back. Normal training starts with fresh=True so the
-            # previous run's stale append-log doesn't pollute the new state.
-            fresh_expert_state=not _is_replay_only,
+            fresh_expert_state=True,
             # cp_target: 'disk' (default) or 'dram'. DRAM mode swaps in
             # DramExpertState — see fc_manager.py and dram_expert_state.py.
             cp_target=str(getattr(args, "proposal_cp_target", "disk")),
@@ -298,8 +306,46 @@ def init_proposal(
         if _disable_expert_state:
             print("[proposal] expert state DISABLED (debug flag); expert "
                   "lossy-FC skipped entirely.", flush=True)
+
+        # B2 separation: expert lossless FC is now its own module driven by
+        # tracker_stream (not main stream). It shares fc_manager's collect
+        # helper for DRY but is otherwise independent. fc_manager.tick()
+        # only handles non-expert FC after this split.
+        from .expert_lossless_fc import ExpertLosslessFC
+        # Bind the collect helper as a callable that returns
+        # (payload, total_bytes); ExpertLosslessFC pulls cuda_event from
+        # fc._last_collect_cuda_event after the call.
+        def _collect_helper(tnames):
+            # private=True: each fired expert gets its OWN pinned buffer
+            # so the AsyncWriter raw worker can consume payloads at its
+            # own pace without the next _fire_one overwriting in-flight
+            # data. Steady-state alloc cost is small (pinned caching
+            # allocator recycles freed buffers).
+            named_params = dict(inner_model.named_parameters())
+            return _fc._collect_param_payload(
+                tnames, named_params, private=True,
+            )
+        _expert_lossless_fc = ExpertLosslessFC(
+            model=inner_model,
+            all_expert_ids=_fc._all_expert_ids,
+            separated_tensors_by_slot=_fc._separated_tensors_by_slot,
+            sorted_layers=_fc._sorted_layers,
+            expert_state=_fc.expert_state,
+            async_writer=_writer,
+            expert_output_dir=_expert_cp_dir,
+            keep_last_per_expert=_fc.keep_last_per_expert,
+            D=_fc.D,
+            schedule=fc_schedule,
+            lossless_fc_fraction_pct=_config["lossless_fc_fraction_pct"],
+            tracker=_tracker,
+            tracker_stream=None,  # filled lazily on first fire (tracker
+                                  # creates its stream on first step)
+            collect_payload_fn=_collect_helper,
+            event_owner=_fc,  # for retrieving _last_collect_cuda_event
+        )
     else:
         _fc = None
+        _expert_lossless_fc = None
 
     _config["_inner_model"] = inner_model
     _config["_inner_opt"] = inner_opt
@@ -313,23 +359,11 @@ def init_proposal(
     _config["_fisher_coverage_done_set"] = set()
     _config["_fisher_coverage_records"] = []
 
-    # Score distribution diagnostic: measure expert vs non-expert score
-    # distribution at specific iterations and dump per-layer stats.
-    _sd_iters = getattr(args, "proposal_score_diag_iters", None) or []
-    _config["_score_diag_iters"] = set(int(x) for x in _sd_iters)
-    _config["_score_diag_log"] = getattr(args, "proposal_score_diag_log", None)
-    _config["_score_diag_every"] = int(getattr(args, "proposal_score_diag_every", 0) or 0)
-    _config["_score_diag_done"] = set()
-    _config["_hessian_comparison_log"] = getattr(args, "proposal_hessian_comparison_log", None)
-    _config["_hessian_estimator"] = getattr(args, "proposal_hessian_estimator", "finite_diff")
-    _config["_hessian_cross_check"] = bool(getattr(args, "proposal_hessian_cross_check", False))
-    _config["_hessian_cross_check_log"] = getattr(args, "proposal_hessian_cross_check_log", None)
-    # finite_diff config (used when estimator='finite_diff').
+    # finite_diff config.
     _config["_finite_diff_eps"] = getattr(args, "proposal_finite_diff_eps", None)
     # Diagnostic env override: PROPOSAL_FD_EPS=<float> bypasses autotune
-    # and forces a fixed eps. Used to test BF16-noise-floor hypothesis
-    # (autotune's iter-1 chosen eps may be below BF16 ULP at output scale,
-    # making activation perturbation rounded to zero in BF16 forward).
+    # and forces a fixed eps. Used to test BF16 noise-floor hypotheses
+    # (autotune's iter-1 chosen eps may be below BF16 ULP at output scale).
     import os as _os_eps
     _eps_env = _os_eps.environ.get("PROPOSAL_FD_EPS", "")
     if _eps_env:
@@ -337,11 +371,19 @@ def init_proposal(
             _config["_finite_diff_eps"] = float(_eps_env)
         except ValueError:
             pass
-    _config["_finite_diff_routing_freeze"] = bool(
-        getattr(args, "proposal_finite_diff_routing_freeze", True)
+    _config["_fd_multi_k_track"] = bool(
+        getattr(args, "proposal_fd_multi_k_track", False)
     )
+    _config["_fd_multi_k_values"] = list(
+        getattr(args, "proposal_fd_multi_k_values", [1, 2, 4, 8, 16, 32])
+        or [1, 2, 4, 8, 16, 32]
+    )
+    _config["_fd_multi_k_log"] = getattr(args, "proposal_fd_multi_k_log", None)
     _config["_finite_diff_cross_check"] = bool(
         getattr(args, "proposal_finite_diff_cross_check", False)
+    )
+    _config["_finite_diff_cross_check_log"] = getattr(
+        args, "proposal_finite_diff_cross_check_log", None,
     )
     _config["_finite_diff_flip_cutoff"] = float(
         getattr(args, "proposal_finite_diff_flip_cutoff", 100.0)
@@ -350,7 +392,19 @@ def init_proposal(
     _config["_h_diag_records"] = []
     # ANALYSIS: non-expert |H| probe — comparison of expert vs non-expert |H|
     # distribution at score_diag_iters; retained for measurement purposes.
-    _config["_hessian_nonexpert_probe_log"] = getattr(args, "proposal_hessian_nonexpert_probe_log", None)
+
+    # POST-INIT VRAM diff vs baseline (run before _init_accum_sq_flat fires
+    # at first step; this only measures init-time alloc — chunk_buf, dg_flat,
+    # h_g_bf16, exc_bool, sel_buf are lazy-built on first tracker.step,
+    # so the bigger jump appears after iter 1).
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        _post_init_alloc = torch.cuda.memory_allocated()
+        _baseline = globals().get("_baseline_alloc_mb", 0.0) * 1e6
+        delta = (_post_init_alloc - _baseline) / 1e6
+        print(f"[proposal] POST-INIT VRAM: alloc={_post_init_alloc/1e6:.1f} MB "
+              f"(Δ from baseline = {delta:+.1f} MB; lazy buffers add at iter 1)",
+              flush=True)
 
 
 def proposal_pre_step(model) -> None:
@@ -359,7 +413,7 @@ def proposal_pre_step(model) -> None:
     Expert payload is built post-step from Adam state (p, m, v) via tracker.step,
     so no expert grad snapshot is needed here.
     """
-    global _ne_payload
+    global _ne_payload, _ne_payload_cuda_event
     if not _enabled or _tracker is None:
         return
 
@@ -368,10 +422,35 @@ def proposal_pre_step(model) -> None:
     if not seq_mode:
         import time as _time
         _t0 = _time.perf_counter()
-        _ne_payload, _ = _tracker.snapshot_nonexpert_dc(global_step=0)
+        _ne_payload, _ne_stats = _tracker.snapshot_nonexpert_dc(global_step=0)
+        _ne_payload_cuda_event = getattr(_ne_stats, "cuda_event", None)
         _config["_phase_ms_pre_step"] = (_time.perf_counter() - _t0) * 1000.0
     else:
         _ne_payload = None
+        _ne_payload_cuda_event = None
+
+    # accum_sq mode: snapshot expert θ before optimizer.step so update_delta_accum
+    # can compute Δθ = θ_after - θ_before in post_step (way cheaper than re-
+    # deriving from Adam m/v).
+    try:
+        _tracker.pre_step_snap()
+    except Exception as _ps_exc:
+        if _should_write():
+            print(f"[proposal] pre_step_snap FAILED: {_ps_exc}", flush=True)
+
+    # B2 race guard: main stream waits for the previous iter's tracker
+    # work to finish reading m, v BEFORE this iter's optimizer.step
+    # writes them. The wait is on a cuda Event (stream-level dependency,
+    # not host-blocking) — typically a no-op because forward+backward
+    # GPU work (~hundreds of ms) >> tracker work (~ms), but we add it
+    # for safety. Without this, fast forward+backward could race with
+    # tracker_stream's m/v read.
+    prev_ev = getattr(_tracker, "_pending_tracker_event", None)
+    if prev_ev is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.current_stream().wait_event(prev_ev)
+        except Exception:
+            pass
 
 
 def proposal_record_iter_loss(step: int, loss_value: Optional[float]) -> None:
@@ -403,7 +482,7 @@ def proposal_post_step(
     model, step: int,
 ) -> Optional[Tuple[List[Tuple[int, int]], bool]]:
     """Run tracker.step + FC tick + DC record after optimizer.step."""
-    global _ne_payload
+    global _ne_payload, _ne_payload_cuda_event
     if not _enabled or _tracker is None:
         return None
 
@@ -429,11 +508,26 @@ def proposal_post_step(
         #   3) CheckpointManager records non-expert dense DC for iters
         #      that did NOT fire a non-expert FC.
         _t_tick0 = _time.perf_counter()
+        # Expert lossless FC dispatched on tracker_stream (post-B2 split).
+        # Uses tracker's persistent stream — created lazily inside
+        # tracker.step on first call. We patch it onto _expert_lossless_fc
+        # if it's not yet bound.
+        if _expert_lossless_fc is not None:
+            if _expert_lossless_fc._tracker_stream is None:
+                _expert_lossless_fc._tracker_stream = getattr(
+                    _tracker, "_tracker_stream", None,
+                )
+            fired_experts = _expert_lossless_fc.fire_if_due(step)
+        # Non-expert FC stays on main stream via fc_manager (only piece left).
         if _fc is not None:
-            fired_experts, nonexpert_fired = _fc.tick(step=step)
+            _fired_unused, nonexpert_fired = _fc.tick(step=step)
         _phase_tick = (_time.perf_counter() - _t_tick0) * 1000.0
 
         _t_trk0 = _time.perf_counter()
+        # B2: tracker.step internally invokes update_delta_accum (so all
+        # GPU work is launched on the same tracker_stream — eliminates
+        # main-stream serialization that previously absorbed forward GPU
+        # work wait into tracker_step phase).
         _tracker.step(
             inner_opt, global_step=step,
             lossless_fc_eids=fired_experts,
@@ -446,13 +540,165 @@ def proposal_post_step(
                 step=step,
                 nonexpert_payload=_ne_payload or {},
                 nonexpert_did_fc=nonexpert_fired,
+                cuda_event=_ne_payload_cuda_event,
             )
         _phase_ckpt = (_time.perf_counter() - _t_ckpt0) * 1000.0
         _ne_payload = None
+        _ne_payload_cuda_event = None
 
         _config["_phase_ms_tick"] = _phase_tick
         _config["_phase_ms_tracker_step"] = _phase_tracker
         _config["_phase_ms_ckpt_record"] = _phase_ckpt
+
+    # Per-iter group probe (env-flagged): measures whether group score tracks
+    # element score on PER-ITER δ (1 step accumulation). Captures the
+    # production semantics where δ varies every iter.
+    # Env (single window mode):
+    #   PROPOSAL_PERITER_GROUP_PROBE_START=N PROPOSAL_PERITER_GROUP_PROBE_LEN=M
+    #   → probe fires at iter [N, N+M)
+    # Env (periodic mode):
+    #   PROPOSAL_PERITER_GROUP_PROBE_PERIOD=P PROPOSAL_PERITER_GROUP_PROBE_LEN=M
+    #   → probe fires at iter [0, M), [P, P+M), [2P, 2P+M), ...
+    import os as _os_pi
+    _pi_start = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_START", "0"))
+    _pi_len = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_LEN", "0"))
+    _pi_period = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_PERIOD", "0"))
+    if _pi_period > 0 and _pi_len > 0:
+        _pi_in_window = (step % _pi_period) < _pi_len
+        # Reset snapshot at start of each new window so δ is 1-step within window
+        if step % _pi_period == 0:
+            _config.pop("_peritr_theta_snap", None)
+    elif _pi_len > 0:
+        _pi_in_window = (_pi_start <= step < _pi_start + _pi_len)
+    else:
+        _pi_in_window = False
+    if _pi_in_window:
+        try:
+            from ._ds_state import get_mapper as _gm_pi
+            _mp_pi = _gm_pi()
+            _gs_pi = [int(g) for g in _os_pi.environ.get(
+                "PROPOSAL_PERITER_GROUP_SIZES", "2,4,8,16,32").split(",")]
+            _kpct_pi = float(_os_pi.environ.get(
+                "PROPOSAL_PERITER_GROUP_K_PCT", "0.01"))
+            tracked_pi = _tracker._tracked_names if hasattr(
+                _tracker, "_tracked_names") else None
+            if tracked_pi is not None:
+                # Build flat H, θ_now (FP32 master)
+                h_list_pi = []
+                theta_now_pi = []
+                names_pi = []
+                for nm in tracked_pi:
+                    p_pi = _tracker._name_to_param.get(nm)
+                    if p_pi is None:
+                        continue
+                    h = _tracker._H.get(nm)
+                    if h is None:
+                        continue
+                    max_g = max(_gs_pi)
+                    n_t = (h.numel() // max_g) * max_g
+                    if n_t == 0:
+                        continue
+                    h_list_pi.append(h.detach().reshape(-1)[:n_t].to(torch.float32))
+                    fp32_now = (_mp_pi.get_param(p_pi)
+                                if _mp_pi is not None
+                                else p_pi.data.to(torch.float32))
+                    theta_now_pi.append((nm, fp32_now.detach().clone(), n_t))
+                    names_pi.append(nm)
+                if not h_list_pi:
+                    # H_EMA not yet populated (first refresh hasn't fired);
+                    # silently skip until refresh sets H values.
+                    return None
+                H_all_pi = torch.cat(h_list_pi)
+                prev_pi = _config.get("_peritr_theta_snap")
+                if prev_pi is not None:
+                    delta_list = []
+                    for nm, t_now, n_t in theta_now_pi:
+                        if nm in prev_pi:
+                            d = (t_now - prev_pi[nm]).reshape(-1)[:n_t]
+                            delta_list.append(d)
+                    if len(delta_list) == len(theta_now_pi):
+                        delta_signed = torch.cat(delta_list)
+                        delta_abs = delta_signed.abs()
+                        delta_sq = delta_signed ** 2
+                        score_elem = H_all_pi * delta_sq
+                        total = float(score_elem.sum().item())
+                        n_total = score_elem.numel()
+                        k_elem = max(1, int(_kpct_pi * n_total))
+                        if total > 0:
+                            elem_th = float(torch.kthvalue(
+                                score_elem, n_total - k_elem + 1).values.item())
+                            elem_mask = score_elem >= elem_th
+                            cap_e = float(score_elem[elem_mask].sum().item()) / total
+                            # H-only top-K (δ²=1 가정): isolates impact of H block
+                            # quantization on selection
+                            H_total = float(H_all_pi.sum().item())
+                            H_elem_th = float(torch.kthvalue(
+                                H_all_pi, n_total - k_elem + 1).values.item())
+                            H_elem_mask = H_all_pi >= H_elem_th
+                            cap_h_elem = float(H_all_pi[H_elem_mask].sum().item()) / max(H_total, 1e-30)
+                            # δ²-only top-K (H=1 가정): isolates δ² block quant
+                            d2_total = float(delta_sq.sum().item())
+                            d2_elem_th = float(torch.kthvalue(
+                                delta_sq, n_total - k_elem + 1).values.item())
+                            d2_elem_mask = delta_sq >= d2_elem_th
+                            cap_d2_elem = float(delta_sq[d2_elem_mask].sum().item()) / max(d2_total, 1e-30)
+                            for g in _gs_pi:
+                                ng = n_total // g
+                                H_g = H_all_pi.view(ng, g).mean(dim=1)
+                                d_g_signed = delta_signed.view(ng, g).mean(dim=1).abs_()
+                                d_g_sq = d_g_signed ** 2
+                                score_g = H_g * d_g_sq
+                                k_g = max(1, int(_kpct_pi * ng))
+                                g_th = float(torch.kthvalue(
+                                    score_g, ng - k_g + 1).values.item())
+                                g_mask = score_g >= g_th
+                                elem_from_g = g_mask.repeat_interleave(g)
+                                cap_g = float(score_elem[elem_from_g].sum().item()) / total
+                                # H-only group quantization: pick top groups by H_g
+                                Hg_th = float(torch.kthvalue(
+                                    H_g, ng - k_g + 1).values.item())
+                                Hg_mask = H_g >= Hg_th
+                                elem_from_Hg = Hg_mask.repeat_interleave(g)
+                                cap_h_g = float(H_all_pi[elem_from_Hg].sum().item()) / max(H_total, 1e-30)
+                                # δ²-only group quantization: pick top groups by d_g²
+                                d2g_th = float(torch.kthvalue(
+                                    d_g_sq, ng - k_g + 1).values.item())
+                                d2g_mask = d_g_sq >= d2g_th
+                                elem_from_d2g = d2g_mask.repeat_interleave(g)
+                                cap_d2_g = float(delta_sq[elem_from_d2g].sum().item()) / max(d2_total, 1e-30)
+                                # Pearson(score_elem, score_g_broadcast)
+                                score_g_bcast = score_g.repeat_interleave(g)
+                                se_mean = score_elem.mean()
+                                sg_mean = score_g_bcast.mean()
+                                se_d = score_elem - se_mean
+                                sg_d = score_g_bcast - sg_mean
+                                num = float((se_d * sg_d).sum().item())
+                                den = float((se_d.norm() * sg_d.norm()).item())
+                                pearson_sg = num / max(den, 1e-30)
+                                d_abs_g = delta_abs.view(ng, g)
+                                cv_d = (d_abs_g.std(dim=1) /
+                                        d_abs_g.mean(dim=1).clamp_min(1e-30))
+                                cv_d_med = float(cv_d.median().item())
+                                if _should_write():
+                                    print(
+                                        f"[proposal] peritr_probe g={g:>2d} "
+                                        f"@iter{step}: cap_g={cap_g:.3f} "
+                                        f"(elem={cap_e:.3f}) "
+                                        f"cap_H={cap_h_g:.3f}/{cap_h_elem:.3f} "
+                                        f"cap_d2={cap_d2_g:.3f}/{cap_d2_elem:.3f} "
+                                        f"pearson={pearson_sg:.3f} "
+                                        f"CV_|δ|={cv_d_med:.2f}",
+                                        flush=True,
+                                    )
+                # Save snapshot for next iter
+                _config["_peritr_theta_snap"] = {
+                    nm: t for nm, t, _ in theta_now_pi
+                }
+        except Exception as _piexc:
+            if _should_write():
+                import traceback as _tb_pi
+                print(f"[proposal] peritr_probe FAILED @iter{step}: "
+                      f"{_piexc}\n{_tb_pi.format_exc()}", flush=True)
 
     # Diagnostic: every 10 iters, report AsyncWriter (torch + raw) queue
     # state + proposal phase breakdown. Identifies which bucket the
@@ -477,6 +723,10 @@ def proposal_post_step(
         tp1 = trk_phases.get("pass1", 0.0)
         tp2 = trk_phases.get("pass2", 0.0)
         tp3 = trk_phases.get("pass3", 0.0)
+        t_setup = trk_phases.get("setup", 0.0)
+        t_post = trk_phases.get("post", 0.0)
+        t_dispatch = trk_phases.get("dispatch", 0.0)
+        t_launch = trk_phases.get("launch", 0.0)
         tick_sub = getattr(_fc, "last_tick_phase_ms", None) or {} if _fc is not None else {}
         t_col = tick_sub.get("collect_expert_ms", 0.0)
         t_cb = tick_sub.get("on_expert_fc_ms", 0.0)
@@ -510,10 +760,40 @@ def proposal_post_step(
             f"dispatch={t_dp:.1f}+ne={t_ne:.1f}"
             f"[col={ne_col:.1f}:enum={ne_enum:.1f}+copy={ne_copy:.1f}+"
             f"wait={ne_wait:.1f}+xfer={ne_xfer:.1f} N={ne_n}]) "
-            f"tracker_step={phase_trk:.1f}(p1={tp1:.1f}+p2={tp2:.1f}+"
-            f"p3={tp3:.1f}) ckpt_record={phase_ckpt:.1f}]",
+            f"tracker_step={phase_trk:.1f}(dispatch={t_dispatch:.1f}+launch={t_launch:.1f}"
+            f": setup={t_setup:.1f}+p1={tp1:.1f}+p2={tp2:.1f}+p3={tp3:.1f}"
+            f"+post={t_post:.1f}) ckpt_record={phase_ckpt:.1f}]",
             flush=True,
         )
+        # GPU memory breakdown vs cuda.memory_allocated.
+        try:
+            if torch.cuda.is_available() and hasattr(_tracker, "gpu_memory_breakdown"):
+                torch.cuda.synchronize()
+                cuda_alloc = torch.cuda.memory_allocated() / 1e6
+                tracker_total, items = _tracker.gpu_memory_breakdown()
+                # Add fc_manager's GPU buffers.
+                fc_total = 0.0
+                if _fc is not None:
+                    for attr in ["_collect_stage_gpu"]:
+                        t = getattr(_fc, attr, None)
+                        if isinstance(t, torch.Tensor) and t.is_cuda:
+                            sz = t.element_size() * t.numel() / 1e6
+                            fc_total += sz
+                            items.append((f"fc.{attr}", sz))
+                items_str = " ".join(f"{n}={v:.1f}" for n, v in items)
+                _baseline_mb = globals().get("_baseline_alloc_mb", 0.0)
+                added = cuda_alloc - _baseline_mb
+                tracked_total = tracker_total + fc_total
+                untracked = added - tracked_total
+                print(
+                    f"[proposal] GPU mem @iter{step}: "
+                    f"alloc={cuda_alloc:.1f}MB Δfrom_baseline={added:+.1f}MB "
+                    f"proposal_buffers={tracked_total:.1f}MB "
+                    f"untracked={untracked:+.1f}MB | {items_str}",
+                    flush=True,
+                )
+        except Exception:
+            pass
 
     # Fisher mass concentration measurement.
     # - differential mode (proposal/random): element-wise C(K) over all expert v_t
@@ -568,64 +848,14 @@ def proposal_post_step(
             pass
         fc_done.add(step)
 
-    # Score distribution diagnostic (expert vs non-expert scores + per-layer).
-    sd_iters = _config.get("_score_diag_iters", set())
-    sd_done = _config.get("_score_diag_done", set())
-    sd_log = _config.get("_score_diag_log")
-    sd_every = _config.get("_score_diag_every", 0) or 0
-    # `--proposal-score-diag-every N`: trigger measurement every N iters
-    # (overrides `_score_diag_iters` list-based trigger). Used for dense
-    # diagnostic sampling during smoke/analysis.
-    should_fire_sd = (
-        (step in sd_iters and step not in sd_done)
-        or (sd_every > 0 and step > 0 and step % sd_every == 0)
-    )
-    if should_fire_sd and _tracker is not None and sd_log:
-        try:
-            rec = _tracker.measure_score_distribution(inner_opt, step)
-            if (
-                not torch.distributed.is_available()
-                or not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0
-            ):
-                import json as _json
-                with open(sd_log, "a") as f:
-                    f.write(_json.dumps(rec) + "\n")
-                exp_max = rec["expert"]["max"]
-                exp_p999 = rec["expert"]["p99.9"]
-                ne_max = rec["nonexpert"]["max"]
-                ne_p999 = rec["nonexpert"]["p99.9"]
-                overlap_pct = rec["overlap"]["expert_elements_above_ne_p999_pct"]
-                exp_diag = rec["expert"].get("diag", {})
-                d_max = exp_diag.get("delta_max", 0.0)
-                v_max = exp_diag.get("vhat_max", 0.0)
-                dL = exp_diag.get("delta_L_proxy", 0.0)
-                p_abs_mean = exp_diag.get("param_abs_mean", 0.0)
-                print(
-                    f"[proposal] ScoreDiag @iter {step}: "
-                    f"expert max={exp_max:.3e} p99.9={exp_p999:.3e} | "
-                    f"non-expert max={ne_max:.3e} p99.9={ne_p999:.3e} | "
-                    f"overlap: {overlap_pct:.3f}%\n"
-                    f"          [expert diag] δ_max={d_max:.3e} v̂_max={v_max:.3e} "
-                    f"|θ|_mean={p_abs_mean:.3e} ΔL≈{dL:.3e}",
-                    flush=True,
-                )
-        except Exception as e:
-            print(f"[proposal] ScoreDiag @iter {step} FAILED: {e}", flush=True)
-        sd_done.add(step)
-
     return fired_experts, nonexpert_fired
 
 
-def _restore_h_ema_from_cp(t_fault: int) -> None:
-    """Populate ``_tracker._H_ema`` from the most-recent ``h_ema_iter*.bin``
-    at or before ``t_fault``. Called after ``recover()`` so the tracker
-    resumes scoring with the same |H| state rather than restarting.
-
-    No-op when ``--proposal-hessian-persist`` is off (default) — the
-    tracker's in-memory H state is used as-is, and the next scheduled
-    refresh rebuilds it (for EMA mode: warm-start from H_new since
-    H_ema was empty; for plain mode: always fresh H_new).
+def _restore_h_from_cp(t_fault: int) -> None:
+    """Populate ``_tracker._H`` from the most-recent ``h_iter*.bin`` at
+    or before ``t_fault``. Called after ``recover()`` so the tracker
+    resumes scoring with the same |H| rather than waiting for the next
+    refresh. No-op when ``--proposal-hessian-persist`` is off (default).
     """
     if _tracker is None:
         return
@@ -638,8 +868,9 @@ def _restore_h_ema_from_cp(t_fault: int) -> None:
     obj = load_h_ema(Path(hessian_dir), int(t_fault), device=device)
     if obj is None:
         return
-    _tracker._H_ema = dict(obj.get("h_ema", {}))
-    _tracker._H_ema_updates = int(obj.get("updates", 0))
+    # Backwards-compat: legacy persist files used the key "h_ema".
+    h_dict = obj.get("h", obj.get("h_ema", {}))
+    _tracker._H = dict(h_dict)
 
 
 def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]:
@@ -683,12 +914,12 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         dram_expert_state=_dram_es,
     )
     _t_rec1 = _time.perf_counter()
-    _restore_h_ema_from_cp(t_fault)
+    _restore_h_from_cp(t_fault)
     _t_rec2 = _time.perf_counter()
     recover_s = _t_rec2 - _t_rec0
     print(
         f"[proposal] proposal_recover: recover_s={recover_s:.3f}  "
-        f"(recover={_t_rec1 - _t_rec0:.3f}s h_ema_load={_t_rec2 - _t_rec1:.3f}s)  "
+        f"(recover={_t_rec1 - _t_rec0:.3f}s h_load={_t_rec2 - _t_rec1:.3f}s)  "
         f"ne_fc={diag.nonexpert_fc_iter} expert_fc_count={diag.expert_fc_count} "
         f"dc_replayed={diag.dc_bundles_replayed}/{list(diag.replay_range)}",
         flush=True,
@@ -696,7 +927,7 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
     return {
         "recover_time_s": float(recover_s),
         "recover_time_main_s": float(_t_rec1 - _t_rec0),
-        "recover_time_h_ema_s": float(_t_rec2 - _t_rec1),
+        "recover_time_h_s": float(_t_rec2 - _t_rec1),
         "nonexpert_fc_iter": diag.nonexpert_fc_iter,
         "expert_fc_count": diag.expert_fc_count,
         "dc_bundles_replayed": diag.dc_bundles_replayed,
@@ -968,14 +1199,8 @@ def proposal_inject_fault(
         dc_replay=True,
         dram_expert_state=_dram_es,
     )
-    _restore_h_ema_from_cp(int(step))
+    _restore_h_from_cp(int(step))
     recover_s = time.perf_counter() - t0
-    # θ_CP cache: after recovery, param values have been overwritten to
-    # reconstruct state. We refresh θ_CP for every tracked tensor so δ = 0
-    # at the post-recovery iter (consistent with a "fresh FC" view).
-    if _tracker is not None:
-        for name in _tracker.tracked_names():
-            _tracker.on_expert_fc(name)
 
     # Maximum lost iteration window "B" = step - min(expert_fc_iter, ne_fc_iter).
     # For MoC (sequential, no DC), B is max iters since last FC for any expert.
@@ -1022,36 +1247,21 @@ def set_hessian_valid_iter(it: Any) -> None:
 
 def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
             flip_cutoff: Optional[float] = None) -> Dict[str, Any]:
-    """Update ``_tracker._H_ema`` with a fresh |H| estimate.
+    """Overwrite ``_tracker._H_g`` (group-level |H|) with a fresh estimate.
 
-    Two modes, controlled by ``--proposal-hessian-mode``:
-      * ``ema`` (default): H_ema ← α·H_ema + (1-α)·H_new per refresh,
-        α from ``--proposal-hessian-ema-alpha``. Smooths K-sample variance
-        across the EMA window. First refresh initialises H_ema = H_new.
-      * ``plain``: H_ema ← H_new each refresh — no temporal smoothing.
+    Plain assignment per refresh (no temporal smoothing). Group H lives
+    in BF16 in ``_g_fast_h_g_bf16_flat`` per-name views; the dict
+    ``_tracker._H_g`` holds the same views (storage shared).
 
-    Bumps ``_H_ema_updates`` so recovery can check continuity. This
-    function only touches GPU state; disk persistence is orthogonal and
-    handled by :func:`_persist_h_ema` when ``--proposal-hessian-persist``
-    is set.
+    Outlier protection: per-tensor Hz-norm is compared to the median
+    across tensors; tensors exceeding ``flip_cutoff × median`` are
+    skipped (residual safety net beyond routing freeze). Tensors with
+    zero coverage are also skipped. ``flip_cutoff=None`` disables.
 
-    Outlier protection
-    ------------------
-    Per-tensor Hz-norm is computed (mean of ``|h_new[i]|``); the median
-    across all tensors is the reference. Tensors whose Hz-norm exceeds
-    ``flip_cutoff × median`` are SKIPPED from the EMA update. Tensors
-    with zero coverage (``|h_new[i]|.sum() == 0``) are also skipped. This
-    is a residual safety net when routing freeze isn't perfect — it
-    benefits Hutchinson too (Hutchinson can hit 2nd-order grad outliers
-    even without routing instability).
-
-    ``flip_cutoff=None`` disables protection (legacy behaviour). Returns
-    a diagnostic dict ``{expert_coverage, flip_skip_ratio, n_skipped}``.
+    Returns ``{expert_coverage, flip_skip_ratio, n_skipped}``.
     """
     if _tracker is None:
         return {"expert_coverage": 0.0, "flip_skip_ratio": 0.0, "n_skipped": 0}
-    mode = str(_config.get("_hessian_mode", "ema"))
-    alpha = float(_config.get("_hessian_ema_alpha", 0.9))
 
     # Compute per-tensor Hz norms (mean abs) on GPU.
     hz_norms = []
@@ -1064,7 +1274,6 @@ def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
     expert_coverage = float(sum(coverage_flags)) / max(n, 1)
     skip_mask = [False] * n
     if flip_cutoff is not None and n > 0:
-        # Median over POSITIVE entries to avoid being pulled to 0 by all-zero tensors.
         positives = [v for v in hz_norms if v > 0]
         if positives:
             positives.sort()
@@ -1072,20 +1281,34 @@ def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
             for i, v in enumerate(hz_norms):
                 if v > flip_cutoff * med:
                     skip_mask[i] = True
+    g_blk = max(1, int(getattr(_tracker, "block_quant_g", 1)))
     n_skipped = 0
     for i, (name, h_new) in enumerate(zip(names, h_new_list)):
         if not coverage_flags[i] or skip_mask[i]:
             n_skipped += 1
             continue
-        if mode == "plain":
-            _tracker._H_ema[name] = h_new.detach().clone()
-        else:  # ema
-            cur = _tracker._H_ema.get(name)
-            if cur is None:
-                _tracker._H_ema[name] = h_new.detach().clone()
-            else:
-                cur.mul_(alpha).add_(h_new.detach(), alpha=(1.0 - alpha))
-    _tracker._H_ema_updates += 1
+        # Reduce h_new to per-group mean (BF16) — drop element-level.
+        # Write IN-PLACE into _g_fast_h_g_bf16_flat's per-name view; the
+        # dict ``_tracker._H_g`` holds that same view (storage shared,
+        # no extra alloc).
+        view_idx_map = getattr(_tracker, "_g_fast_name_to_idx", None)
+        if view_idx_map is None and hasattr(_tracker, "_g_fast_name_list"):
+            view_idx_map = {nm: idx for idx, nm
+                            in enumerate(_tracker._g_fast_name_list)}
+            _tracker._g_fast_name_to_idx = view_idx_map
+        if view_idx_map is None or name not in view_idx_map:
+            continue
+        view = _tracker._g_fast_h_g_views[view_idx_map[name]]
+        h_flat = h_new.detach().reshape(-1).to(torch.float32)
+        nt = h_flat.numel()
+        nt_a = (nt // g_blk) * g_blk
+        if nt_a == 0:
+            continue
+        h_g_new = h_flat[:nt_a].reshape(-1, g_blk).mean(dim=1)
+        del h_flat
+        view.copy_(h_g_new.to(torch.bfloat16))
+        _tracker._H_g[name] = view
+        del h_g_new
     return {
         "expert_coverage": expert_coverage,
         "flip_skip_ratio": float(n_skipped) / max(n, 1),
@@ -1093,9 +1316,9 @@ def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
     }
 
 
-def _persist_h_ema(iteration: int) -> None:
-    """Async-save the current ``_tracker._H_ema`` to
-    ``<cp>/hessian/h_ema_iter{N}.bin``. No-op when:
+def _persist_h(iteration: int) -> None:
+    """Async-save the current ``_tracker._H`` to
+    ``<cp>/hessian/h_iter{N}.bin``. No-op when:
       - ``--proposal-hessian-persist`` is off (default), OR
       - this rank is not the writing rank, OR
       - no async writer / hessian_cp_dir is configured.
@@ -1114,8 +1337,8 @@ def _persist_h_ema(iteration: int) -> None:
     if not _should_write() or _writer is None or hessian_dir is None:
         return
 
-    names_ord = list(_tracker._H_ema.keys())
-    srcs = [_tracker._H_ema[n] for n in names_ord]
+    names_ord = list(_tracker._H_g.keys())
+    srcs = [_tracker._H_g[n] for n in names_ord]
     plan: List[Tuple[str, int, int, torch.Size]] = []
     off = 0
     for name, src in zip(names_ord, srcs):
@@ -1127,39 +1350,32 @@ def _persist_h_ema(iteration: int) -> None:
     if device is None:
         return
 
-    global _h_ema_stage_gpu, _h_ema_pinned_cpu
-    if (_h_ema_stage_gpu is None
-            or _h_ema_stage_gpu.numel() < total_numel
-            or _h_ema_stage_gpu.device != device):
-        _h_ema_stage_gpu = torch.empty(total_numel, dtype=torch.float32, device=device)
-    stage = _h_ema_stage_gpu
+    global _h_stage_gpu, _h_pinned_cpu
+    if (_h_stage_gpu is None
+            or _h_stage_gpu.numel() < total_numel
+            or _h_stage_gpu.device != device):
+        _h_stage_gpu = torch.empty(total_numel, dtype=torch.float32, device=device)
+    stage = _h_stage_gpu
     for (_n, off_i, n_i, _s), src in zip(plan, srcs):
         stage.narrow(0, off_i, n_i).copy_(src.reshape(-1))
 
-    if _h_ema_pinned_cpu is not None:
+    if _h_pinned_cpu is not None:
         _writer.drain_torch()
-    if _h_ema_pinned_cpu is None or _h_ema_pinned_cpu.numel() < total_numel:
-        _h_ema_pinned_cpu = torch.empty(total_numel, dtype=torch.float32, pin_memory=True)
-    flat_cpu = _h_ema_pinned_cpu.narrow(0, 0, total_numel)
+    if _h_pinned_cpu is None or _h_pinned_cpu.numel() < total_numel:
+        _h_pinned_cpu = torch.empty(total_numel, dtype=torch.float32, pin_memory=True)
+    flat_cpu = _h_pinned_cpu.narrow(0, 0, total_numel)
     flat_cpu.copy_(stage.narrow(0, 0, total_numel), non_blocking=False)
 
-    h_ema_cpu = {name: flat_cpu.narrow(0, off_i, n_i).view(shape)
-                 for name, off_i, n_i, shape in plan}
+    h_cpu = {name: flat_cpu.narrow(0, off_i, n_i).view(shape)
+             for name, off_i, n_i, shape in plan}
     # Raw-binary payload (PRPTENS). ``save_binary`` takes a flat
-    # {name: tensor} dict + separate scalar metadata; on load, recovery
-    # reconstructs the same structure as the legacy pickle dict.
+    # {name: tensor} dict + separate scalar metadata.
     from .binary_io import save_binary as _save_binary
-    scalars = {
-        "iter": int(iteration),
-        "updates": int(_tracker._H_ema_updates),
-        "mode": str(_config.get("_hessian_mode", "ema")),
-        "alpha": float(_config.get("_hessian_ema_alpha", 0.9)),
-    }
-    path = Path(hessian_dir) / f"h_ema_iter{int(iteration):08d}.bin"
+    scalars = {"iter": int(iteration)}
+    path = Path(hessian_dir) / f"h_iter{int(iteration):08d}.bin"
 
     # Retention: keep last 2 (one being overwritten + one for rollback safety).
-    # Older files unlinked from the writer thread once the new one is durable.
-    history: List[Tuple[Path, Any]] = _config.setdefault("_hessian_ema_history", [])
+    history: List[Tuple[Path, Any]] = _config.setdefault("_hessian_history", [])
     to_unlink: List[Path] = []
     history.append((path, None))
     while len(history) > 2:
@@ -1171,13 +1387,13 @@ def _persist_h_ema(iteration: int) -> None:
             try: p.unlink()
             except FileNotFoundError: pass
 
-    def _save_h_ema(tensor_dict, p):
+    def _save_h(tensor_dict, p):
         _save_binary(p, tensor_dict, scalars=scalars)
 
     rec = _writer.submit(
-        h_ema_cpu, path, tag="h_ema",
+        h_cpu, path, tag="h",
         on_complete=[_unlink] if to_unlink else None,
-        save_fn=_save_h_ema,
+        save_fn=_save_h,
     )
     history[-1] = (path, rec)
 
@@ -1187,717 +1403,36 @@ def proposal_refresh_hessian(
     estimator: str = "finite_diff",
     k_samples: int = 1,
 ) -> Optional[Dict[str, Any]]:
-    """Fold a fresh |H_diag| estimate into tracker._H_ema. Dispatches to
-    the chosen estimator:
-        estimator='gnb'         → _refresh_gnb_impl (Sophia-G, 1 fwd + 1 bwd)
-        estimator='hutchinson'  → proposal_refresh_hutchinson (K× 2nd-order bwd)
-        estimator='finite_diff' → proposal_refresh_finite_diff (central-diff Hz)
-    EMA result is also async-persisted to <cp>/hessian/.
-    When selection_mode='hessian', the EMA H replaces v̂_t in Pass 1 of
-    tracker.step.
+    """Refresh ``tracker._H`` with a fresh Finite-Difference |H_diag|
+    estimate. Production refresh path is FD-only; ``estimator`` is kept
+    for backward-compatible call sites but ignored. ``proposal_refresh_
+    finite_diff`` overwrites the cached H (no temporal smoothing).
     """
-    if estimator == "hutchinson":
-        return proposal_refresh_hutchinson(
-            model, forward_step_func, data_iterator, iteration,
-            k_samples=k_samples,
-        )
-    if estimator == "finite_diff":
-        return proposal_refresh_finite_diff(
-            model, forward_step_func, data_iterator, iteration,
-            k_samples=k_samples,
-        )
-    return _refresh_gnb_impl(
-        model, forward_step_func, data_iterator, iteration, k_samples=k_samples,
+    del estimator  # FD-only now
+    return proposal_refresh_finite_diff(
+        model, forward_step_func, data_iterator, iteration,
+        k_samples=k_samples,
     )
-
-
-def _refresh_gnb_impl(
-    model, forward_step_func, data_iterator, iteration,
-    k_samples: int = 1,
-) -> Optional[Dict[str, Any]]:
-    """GNB (Sophia-G) estimator for diag(H). See proposal_refresh_hessian.
-
-    Algorithm (Liu et al. 2023, "Sophia"):
-      1. Forward pass, obtain per-token logits ℓ.
-      2. Sample ŷ_t ~ Categorical(softmax(ℓ_t)) for each token t.
-      3. Compute L̂ = CE(ℓ, ŷ).
-      4. Single backward → g = ∇_θ L̂.
-      5. |H_diag| ≈ B · g²  (Bartlett identity on diagonal GN).
-
-    Advantages vs Hutchinson:
-      - 1 forward + 1 backward (no create_graph, no 2nd-order autograd)
-      - No Rademacher allocation, no Hz vectors
-      - Peak refresh memory drops from ~7-12 GB to ~1-2 GB (189M expert params)
-
-    The `k_samples` argument now controls how many label draws are averaged
-    (variance reduction). Default 1 matches Sophia-G spec; ≥2 runs one extra
-    forward+backward per sample.
-    """
-    if not _enabled or _tracker is None:
-        return None
-
-    # Prefer dedicated iterator if set, so the shared valid iterator isn't
-    # consumed by refresh (avoids val-sample shift across variants).
-    dedicated = _config.get("_hessian_dedicated_valid_iter")
-    if dedicated is not None:
-        data_iterator = dedicated
-
-    import time as _time
-    import torch.nn.functional as F
-
-    # Lazy import get_batch to avoid circular import at module load.
-    try:
-        from pretrain_gpt import get_batch as _get_batch_gpt
-    except Exception as _imp_exc:
-        print(f"[proposal] refresh_hessian(gnb): cannot import get_batch from pretrain_gpt: {_imp_exc}", flush=True)
-        return None
-
-    inner_model = _config["_inner_model"]
-
-    tracked = []
-    for name, p in inner_model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if getattr(p, "allreduce", True) is False:
-            tracked.append((name, p))
-    if not tracked:
-        return None
-
-    # Snapshot RNG state (CPU + CUDA) so dropout masks, MoE routing, and
-    # label-sampling multinomial draws consumed by the refresh forward+backward
-    # don't shift the training RNG stream.
-    _cpu_rng_state = torch.get_rng_state()
-    _cuda_rng_state = (
-        torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    )
-
-    if hasattr(model[0], "module"):
-        net = model[0].module
-    else:
-        net = model[0]
-    was_training = net.training
-    net.train()
-
-    di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
-    m0 = model[0] if isinstance(model, (list, tuple)) else model
-
-    def _restore_rng() -> None:
-        try:
-            torch.set_rng_state(_cpu_rng_state)
-            if _cuda_rng_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(_cuda_rng_state)
-        except Exception:
-            pass
-
-    expert_ps = [p for _, p in tracked]
-    names = [n for n, _ in tracked]
-
-    # DS engine prologue bypass (same as legacy Hutchinson path).
-    ds_engine = m0
-    prev_flag = getattr(ds_engine, "_running_engine_backward", False)
-    try:
-        ds_engine._running_engine_backward = True
-    except Exception:
-        pass
-
-    h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
-    t0 = _time.perf_counter()
-
-    for k in range(max(1, int(k_samples))):
-        # ---- Get a fresh batch (advances data_iterator). ----
-        try:
-            batch = _get_batch_gpt(di)
-        except Exception as exc:
-            print(f"[proposal] refresh_gnb: get_batch failed at k={k}: {exc}", flush=True)
-            try: ds_engine._running_engine_backward = prev_flag
-            except Exception: pass
-            net.train(was_training); _restore_rng()
-            return None
-        # pretrain_gpt.get_batch returns (tokens, labels, loss_mask, attn_mask, pos_ids)
-        tokens, _labels_true, loss_mask, attention_mask, position_ids = batch[:5]
-
-        # ---- Forward WITHOUT labels → logits (post_language_model_processing
-        # returns logits shape [b, s, v] when labels is None). ----
-        try:
-            out = m0(tokens, position_ids, attention_mask)
-        except Exception as exc:
-            print(f"[proposal] refresh_gnb: forward failed at k={k}: {exc}", flush=True)
-            try: ds_engine._running_engine_backward = prev_flag
-            except Exception: pass
-            net.train(was_training); _restore_rng()
-            return None
-        logits = out[0] if isinstance(out, tuple) else out
-        if logits is None or not torch.is_tensor(logits):
-            print(f"[proposal] refresh_gnb: unexpected forward output at k={k}", flush=True)
-            try: ds_engine._running_engine_backward = prev_flag
-            except Exception: pass
-            net.train(was_training); _restore_rng()
-            return None
-
-        # Flatten to [N, V] for CE.
-        if logits.dim() >= 2:
-            V = logits.size(-1)
-            flat_logits = logits.reshape(-1, V)
-        else:
-            flat_logits = logits
-
-        # ---- Sample labels from model's predictive distribution. ----
-        with torch.no_grad():
-            probs = torch.softmax(flat_logits.detach().float(), dim=-1)
-            y_hat = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        del probs
-
-        # ---- Compute CE with sampled labels. ----
-        # Use loss_mask if provided to match training's effective batch
-        # (drops padding tokens from the estimator).
-        try:
-            if loss_mask is not None and loss_mask.numel() == flat_logits.size(0):
-                per_tok = F.cross_entropy(
-                    flat_logits.float(), y_hat, reduction="none",
-                )
-                denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
-                loss_gnb = (per_tok * loss_mask.view(-1).float()).sum() / denom
-                B_eff = float(denom.item())
-            else:
-                loss_gnb = F.cross_entropy(
-                    flat_logits.float(), y_hat, reduction="mean",
-                )
-                B_eff = float(flat_logits.size(0))
-        except Exception as exc:
-            print(f"[proposal] refresh_gnb: CE failed at k={k}: {exc}", flush=True)
-            try: ds_engine._running_engine_backward = prev_flag
-            except Exception: pass
-            net.train(was_training); _restore_rng()
-            return None
-
-        # ---- Single backward (no create_graph → activations freed). ----
-        try:
-            grads = torch.autograd.grad(
-                loss_gnb, expert_ps,
-                retain_graph=False, create_graph=False, allow_unused=True,
-            )
-        except Exception as exc:
-            print(f"[proposal] refresh_gnb: grad failed at k={k}: {exc}", flush=True)
-            try: ds_engine._running_engine_backward = prev_flag
-            except Exception: pass
-            net.train(was_training); _restore_rng()
-            return None
-        grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, expert_ps)]
-
-        # ---- GNB diagonal accumulator: H_diag_k = B_eff · g² ----
-        # The Bartlett identity gives E[g g^T] = H (when label is sampled from
-        # the model). The diagonal estimator under the chosen CE reduction is
-        # B_eff · g² (undoing the 1/B mean). Top-K is scale-invariant, so the
-        # factor only matters for the magnitude log — it keeps |H| in the same
-        # physical scale as a per-token Fisher.
-        inv_k = 1.0 / max(1, int(k_samples))
-        for i, g in enumerate(grads):
-            h_accum[i].add_(g.to(torch.float32).pow(2).mul_(B_eff * inv_k))
-
-        # Explicit cleanup to release the forward graph. Avoid per-loop
-        # empty_cache(): the allocator will reclaim freed blocks on demand,
-        # and repeated cache invalidation can perturb torch.compile graphs
-        # and slow down the next training step. Single empty_cache after
-        # the loop is enough.
-        del logits, out, flat_logits, y_hat, loss_gnb, grads, tokens, batch
-
-    t1 = _time.perf_counter()
-
-    # Restore DS engine flag.
-    try:
-        ds_engine._running_engine_backward = prev_flag
-    except Exception:
-        pass
-    net.train(was_training)
-
-    # Fold the fresh |H| into H_ema (see _fold_h). Since g² ≥ 0 already,
-    # no abs_() needed. Disk persist is opt-in via --proposal-hessian-persist.
-    _fold_diag = _fold_h(names, h_accum,
-                         flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
-    _config["_h_diag_records"].append({
-        "iter": int(iteration), "estimator": "gnb",
-        "expert_coverage": _fold_diag["expert_coverage"],
-        "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
-    })
-    _persist_h_ema(int(iteration))
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    elapsed_ms = (t1 - t0) * 1000.0
-    n_elem = sum(p.numel() for p in expert_ps)
-
-    # ---------- Magnitude log: |H| and |δ| scale ----------
-    # Helps calibrate score = |H| × δ² — e.g., if |H| ~ 1e-6 and |δ| ~ 1e-3,
-    # score scale ~ 1e-12 which is meaningful for Top-K thresholding.
-    try:
-        if (not torch.distributed.is_available()
-                or not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0):
-            import torch as _t
-            h_abs_means = []; h_abs_maxs = []
-            d_abs_means = []; d_abs_maxs = []
-            for (name, p) in tracked:
-                h_cache = _tracker._H_ema.get(name)
-                if h_cache is not None:
-                    h_abs_means.append(float(h_cache.mean().item()))
-                    h_abs_maxs.append(float(h_cache.max().item()))
-                fc = _tracker.theta_cp.get(name)
-                if fc is not None:
-                    delta = (p.data.to(_t.float32) - fc.to(_t.float32)).abs_()
-                    d_abs_means.append(float(delta.mean().item()))
-                    d_abs_maxs.append(float(delta.max().item()))
-            if h_abs_means:
-                import statistics as _st
-                print(
-                    f"[proposal] scale @iter{iteration}: "
-                    f"|H| mean={_st.mean(h_abs_means):.3e} max={max(h_abs_maxs):.3e}  "
-                    f"|\u03b4| mean={_st.mean(d_abs_means):.3e} max={max(d_abs_maxs):.3e}  "
-                    f"(score=|H|\u00b7\u03b4\u00b2 \u2248 {_st.mean(h_abs_means) * _st.mean(d_abs_means)**2:.3e})",
-                    flush=True,
-                )
-    except Exception as _exc:
-        if (not torch.distributed.is_available()
-                or not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0):
-            print(f"[proposal] scale log FAILED: {_exc}", flush=True)
-
-    # ---------- Periodic v_t vs |H| comparison dump ----------
-    # Per-tensor, GPU-resident Pearson + histc-based Jaccard for 0.1%/1%/10%
-    # top-K thresholds. No concat, no CPU fallback, no Python sets. 2-pass:
-    #   pass 1: Pearson sums + log-bin histograms (global per quantity)
-    #   → compute thresholds τ_v, τ_h, τ_sv, τ_sh from cumulative histograms
-    #   pass 2: per-tensor masks + intersection/union counts
-    # Total cost ≲ 300 ms/refresh for 189M expert params (vs ~75s CPU version).
-    try:
-        from ._ds_state import get_mapper as _get_mapper
-        _mapper = _get_mapper()
-        beta2 = 0.999
-        for g in (_config.get("_inner_opt") or []).param_groups if isinstance(_config.get("_inner_opt"), torch.optim.Optimizer) else []:
-            if "betas" in g: beta2 = float(g["betas"][1]); break
-        inner_opt_for_v = _config.get("_inner_opt")
-        bias_corr2 = max(1.0 - beta2 ** int(iteration), 1e-12)
-
-        device = expert_ps[0].device
-        # Log-scale histogram covering [1e-40, 1e+20] with 0.1-decade bins.
-        # Works across any value scale without a pre-computed max.
-        LOG_LO, LOG_HI, BINS = -40.0, 20.0, 600
-        def _quant_pair_tensors(name, p, h):
-            # Returns (v_flat, h_flat, delta_sq_flat) as GPU fp32 views.
-            v_raw = _mapper.get_state(p, "exp_avg_sq") if _mapper is not None else None
-            if v_raw is None and inner_opt_for_v is not None:
-                v_raw = inner_opt_for_v.state.get(p, {}).get("exp_avg_sq")
-            if v_raw is None:
-                v_f = torch.zeros_like(p, dtype=torch.float32).flatten()
-            else:
-                v_f = (v_raw / bias_corr2).to(torch.float32).detach().flatten()
-            h_f = h.detach().flatten()  # already fp32, non-negative
-            fc = _tracker.theta_cp.get(name)
-            if fc is not None:
-                d_sq = (p.data.to(torch.float32) - fc.to(torch.float32)).pow_(2).flatten()
-            else:
-                d_sq = torch.zeros_like(v_f)
-            return v_f, h_f, d_sq
-
-        def _log_hist_add(vals_flat, hist):
-            # Accumulate log-scale histogram in-place.
-            log_v = torch.log10(vals_flat.clamp_min(1e-40))
-            idx = ((log_v - LOG_LO) * (BINS / (LOG_HI - LOG_LO))).clamp_(0, BINS - 1).long()
-            hist += torch.bincount(idx, minlength=BINS)
-
-        # Pass 1: Pearson sums + histograms.
-        pears = {k: 0.0 for k in ("n", "sa_v", "sb_h", "sab_vh", "sa2_v", "sb2_h",
-                                   "sa_sv", "sb_sh", "sab_svsh", "sa2_sv", "sb2_sh")}
-        hist_v = torch.zeros(BINS, dtype=torch.int64, device=device)
-        hist_h = torch.zeros(BINS, dtype=torch.int64, device=device)
-        hist_sv = torch.zeros(BINS, dtype=torch.int64, device=device)
-        hist_sh = torch.zeros(BINS, dtype=torch.int64, device=device)
-        for (name, p), h in zip(tracked, h_accum):
-            v_f, h_f, d_sq = _quant_pair_tensors(name, p, h)
-            sv_f = v_f * d_sq
-            sh_f = h_f * d_sq
-            pears["n"] += float(v_f.numel())
-            pears["sa_v"] += float(v_f.sum().item())
-            pears["sb_h"] += float(h_f.sum().item())
-            pears["sab_vh"] += float((v_f * h_f).sum().item())
-            pears["sa2_v"] += float((v_f * v_f).sum().item())
-            pears["sb2_h"] += float((h_f * h_f).sum().item())
-            pears["sa_sv"] += float(sv_f.sum().item())
-            pears["sb_sh"] += float(sh_f.sum().item())
-            pears["sab_svsh"] += float((sv_f * sh_f).sum().item())
-            pears["sa2_sv"] += float((sv_f * sv_f).sum().item())
-            pears["sb2_sh"] += float((sh_f * sh_f).sum().item())
-            _log_hist_add(v_f, hist_v)
-            _log_hist_add(h_f, hist_h)
-            _log_hist_add(sv_f, hist_sv)
-            _log_hist_add(sh_f, hist_sh)
-            del v_f, h_f, d_sq, sv_f, sh_f
-
-        def _pearson_from_sums(n, sa, sb, sab, sa2, sb2):
-            if n <= 0:
-                return 0.0
-            mean_a = sa / n; mean_b = sb / n
-            cov = sab / n - mean_a * mean_b
-            va = max(sa2 / n - mean_a * mean_a, 0.0)
-            vb = max(sb2 / n - mean_b * mean_b, 0.0)
-            d = (va * vb) ** 0.5
-            return float(cov / d) if d > 0 else 0.0
-
-        pearson_vh = _pearson_from_sums(
-            pears["n"], pears["sa_v"], pears["sb_h"], pears["sab_vh"],
-            pears["sa2_v"], pears["sb2_h"],
-        )
-        pearson_svh = _pearson_from_sums(
-            pears["n"], pears["sa_sv"], pears["sb_sh"], pears["sab_svsh"],
-            pears["sa2_sv"], pears["sb2_sh"],
-        )
-
-        def _threshold_from_hist(hist, k_target):
-            # Find smallest bin index b such that sum(hist[b:]) >= k_target.
-            # Returns log10 value at the lower edge of that bin (τ in linear scale via 10**).
-            if k_target <= 0:
-                return float("inf")
-            # Reverse cumulative sum.
-            rev_cum = torch.flip(torch.cumsum(torch.flip(hist, [0]), 0), [0])
-            # Indices where rev_cum >= k_target; pick the largest (lowest threshold satisfying count).
-            mask = rev_cum >= k_target
-            if not bool(mask.any()):
-                return 0.0  # below everything → keep all
-            last_idx = int(mask.nonzero(as_tuple=True)[0][-1].item())
-            bin_width = (LOG_HI - LOG_LO) / BINS
-            log_edge = LOG_LO + last_idx * bin_width
-            return 10.0 ** log_edge
-
-        ratios = (0.001, 0.01, 0.1)
-        N_total = int(pears["n"])
-        thresholds = {}  # {ratio: (τ_v, τ_h, τ_sv, τ_sh)}
-        for r in ratios:
-            k_target = r * N_total
-            thresholds[r] = (
-                _threshold_from_hist(hist_v, k_target),
-                _threshold_from_hist(hist_h, k_target),
-                _threshold_from_hist(hist_sv, k_target),
-                _threshold_from_hist(hist_sh, k_target),
-            )
-
-        # Pass 2: masks + intersection/union counts per ratio.
-        jacc = {r: {"inter_vh": 0, "A_v": 0, "A_h": 0,
-                    "inter_svh": 0, "A_sv": 0, "A_sh": 0} for r in ratios}
-        for (name, p), h in zip(tracked, h_accum):
-            v_f, h_f, d_sq = _quant_pair_tensors(name, p, h)
-            sv_f = v_f * d_sq
-            sh_f = h_f * d_sq
-            for r in ratios:
-                tv, th_, tsv, tsh = thresholds[r]
-                mv = v_f >= tv; mh = h_f >= th_
-                msv = sv_f >= tsv; msh = sh_f >= tsh
-                jacc[r]["A_v"] += int(mv.sum().item())
-                jacc[r]["A_h"] += int(mh.sum().item())
-                jacc[r]["inter_vh"] += int((mv & mh).sum().item())
-                jacc[r]["A_sv"] += int(msv.sum().item())
-                jacc[r]["A_sh"] += int(msh.sum().item())
-                jacc[r]["inter_svh"] += int((msv & msh).sum().item())
-            del v_f, h_f, d_sq, sv_f, sh_f
-
-        def _j(inter, a, b):
-            u = a + b - inter
-            return (inter / u) if u > 0 else 0.0
-
-        agg_cmp = {
-            "iter": int(iteration),
-            "k_samples": int(k_samples),
-            "total_expert_numel": N_total,
-            "pearson_v_habs": pearson_vh,
-            "jaccard_top0.1pct_bare": _j(jacc[0.001]["inter_vh"], jacc[0.001]["A_v"], jacc[0.001]["A_h"]),
-            "jaccard_top1pct_bare":   _j(jacc[0.01]["inter_vh"],  jacc[0.01]["A_v"],  jacc[0.01]["A_h"]),
-            "jaccard_top10pct_bare":  _j(jacc[0.1]["inter_vh"],   jacc[0.1]["A_v"],   jacc[0.1]["A_h"]),
-            "pearson_score": pearson_svh,
-            "jaccard_top0.1pct_score": _j(jacc[0.001]["inter_svh"], jacc[0.001]["A_sv"], jacc[0.001]["A_sh"]),
-            "jaccard_top1pct_score":   _j(jacc[0.01]["inter_svh"],  jacc[0.01]["A_sv"],  jacc[0.01]["A_sh"]),
-            "jaccard_top10pct_score":  _j(jacc[0.1]["inter_svh"],   jacc[0.1]["A_sv"],   jacc[0.1]["A_sh"]),
-        }
-        if (not torch.distributed.is_available()
-                or not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0):
-            print(
-                f"[proposal] v_t-vs-H @iter{iteration}: "
-                f"bare P={agg_cmp['pearson_v_habs']:+.3f} "
-                f"J@1%={agg_cmp['jaccard_top1pct_bare']:.3f} "
-                f"J@10%={agg_cmp['jaccard_top10pct_bare']:.3f}  "
-                f"score P={agg_cmp['pearson_score']:+.3f} "
-                f"J@1%={agg_cmp['jaccard_top1pct_score']:.3f} "
-                f"J@10%={agg_cmp['jaccard_top10pct_score']:.3f}",
-                flush=True,
-            )
-            cmp_log = _config.get("_hessian_comparison_log")
-            if cmp_log:
-                import json as _json
-                Path(cmp_log).parent.mkdir(parents=True, exist_ok=True)
-                with open(cmp_log, "a") as _f:
-                    _f.write(_json.dumps(agg_cmp) + "\n")
-    except Exception as _exc:
-        if (not torch.distributed.is_available()
-                or not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0):
-            print(f"[proposal] v_t-vs-H comparison FAILED @iter{iteration}: {_exc}", flush=True)
-
-    if (not torch.distributed.is_available()
-            or not torch.distributed.is_initialized()
-            or torch.distributed.get_rank() == 0):
-        print(
-            f"[proposal] refresh_gnb @iter{iteration} K={k_samples} "
-            f"{elapsed_ms:.0f} ms  ({n_elem:,} expert elements)",
-            flush=True,
-        )
-    # Restore RNG so training's dropout/MoE-routing stream is unaffected
-    # by this refresh probe. (Same restoration also runs on all error paths
-    # via _restore_rng defined earlier.)
-    _restore_rng()
-
-    return {"iter": iteration, "k_samples": k_samples, "ms": elapsed_ms, "numel": n_elem}
-
-
-from .hessian import (
-    compute_hessian_hutchinson as _hutchinson_compute_H,
-    compute_hessian_finite_diff as _finite_diff_compute_H,
-    compare_hessian_estimators as _compare_hessian_estimators,
-)
-
-
-def proposal_refresh_hutchinson(
-    model, forward_step_func, data_iterator, iteration,
-    k_samples: int = 4,
-) -> Optional[Dict[str, Any]]:
-    """Fold a K-sample Hutchinson |H_diag| estimate (true-label CE, 2nd-order
-    autograd) into tracker._H_ema, then async-persist it. Optionally runs a
-    parallel GNB pass on the same param state and dumps Hutchinson-vs-GNB
-    Pearson/Jaccard to `_hessian_cross_check_log`."""
-    if not _enabled or _tracker is None:
-        return None
-    dedicated = _config.get("_hessian_dedicated_valid_iter")
-    if dedicated is not None:
-        data_iterator = dedicated
-
-    import time as _time
-    inner_model = _config["_inner_model"]
-    tracked = [(n, p) for n, p in inner_model.named_parameters()
-               if p.requires_grad and getattr(p, "allreduce", True) is False]
-    if not tracked:
-        return None
-
-    _cpu_rng_state = torch.get_rng_state()
-    _cuda_rng_state = (torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
-    if hasattr(model[0], "module"):
-        net = model[0].module
-    else:
-        net = model[0]
-    was_training = net.training
-    net.train()
-    m0 = model[0] if isinstance(model, (list, tuple)) else model
-    ds_engine = m0
-    prev_flag = getattr(ds_engine, "_running_engine_backward", False)
-    try: ds_engine._running_engine_backward = True
-    except Exception: pass
-
-    def _restore_rng():
-        try:
-            torch.set_rng_state(_cpu_rng_state)
-            if _cuda_rng_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(_cuda_rng_state)
-        except Exception: pass
-
-    def _finalize(ret):
-        try: ds_engine._running_engine_backward = prev_flag
-        except Exception: pass
-        net.train(was_training); _restore_rng()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return ret
-
-    expert_ps = [p for _, p in tracked]
-    names = [n for n, _ in tracked]
-
-    t0 = _time.perf_counter()
-    h_hutch = _hutchinson_compute_H(model, forward_step_func, data_iterator, expert_ps, k_samples)
-    if h_hutch is None:
-        return _finalize(None)
-    t1 = _time.perf_counter()
-
-    # Fold Hutchinson |H| into H_ema; disk persist is opt-in.
-    _fold_diag = _fold_h(names, h_hutch,
-                         flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
-    _config["_h_diag_records"].append({
-        "iter": int(iteration), "estimator": "hutchinson",
-        "expert_coverage": _fold_diag["expert_coverage"],
-        "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
-    })
-    _persist_h_ema(int(iteration))
-
-    elapsed_ms = (t1 - t0) * 1000.0
-    n_elem = sum(p.numel() for p in expert_ps)
-
-    # Magnitude log (reuses refresh_gnb formatting).
-    try:
-        if _should_write():
-            import statistics as _st
-            h_abs_means = [float(h.mean().item()) for h in h_hutch]
-            h_abs_maxs  = [float(h.max().item())  for h in h_hutch]
-            d_abs_means = []; d_abs_maxs = []
-            for (name, p) in tracked:
-                fc = _tracker.theta_cp.get(name)
-                if fc is not None:
-                    d = (p.data.to(torch.float32) - fc.to(torch.float32)).abs_()
-                    d_abs_means.append(float(d.mean().item()))
-                    d_abs_maxs.append(float(d.max().item()))
-            print(
-                f"[proposal] scale @iter{iteration}: "
-                f"|H| mean={_st.mean(h_abs_means):.3e} max={max(h_abs_maxs):.3e}  "
-                f"|\u03b4| mean={_st.mean(d_abs_means):.3e} max={max(d_abs_maxs):.3e}  "
-                f"(score=|H|\u00b7\u03b4\u00b2 \u2248 "
-                f"{_st.mean(h_abs_means) * (_st.mean(d_abs_means) ** 2):.3e})",
-                flush=True,
-            )
-    except Exception as _exc:
-        if _should_write():
-            print(f"[proposal] scale log FAILED: {_exc}", flush=True)
-
-    # -----------------------------------------------------------------------
-    # TEMP ANALYSIS: non-expert |H| probe. Disabled (commented-out) — the
-    # experiment has finished collecting data. Re-enable by uncommenting.
-    # Runs only on score_diag_iters to bound overhead. Dumps expert vs
-    # non-expert |H| percentile comparison when --proposal-h-nonexpert-probe-log
-    # is set. Adds ~10 GB peak GPU memory on each probe iter (fresh forward
-    # for non-expert + Hutchinson 2nd-order).
-    # -----------------------------------------------------------------------
-    # _ne_probe_log = _config.get("_h_nonexpert_probe_log")
-    # _sd_iters = _config.get("_score_diag_iters") or set()
-    # if _ne_probe_log and int(iteration) in _sd_iters:
-    #     try:
-    #         nonexpert_ps = [
-    #             p for n, p in inner_model.named_parameters()
-    #             if p.requires_grad and getattr(p, "allreduce", True) is True
-    #         ]
-    #         if nonexpert_ps:
-    #             h_ne = _hutchinson_compute_H(
-    #                 model, forward_step_func, data_iterator, nonexpert_ps, k_samples,
-    #             )
-    #             if h_ne is not None:
-    #                 LOG_LO, LOG_HI, BINS = -40.0, 20.0, 600
-    #                 def _pct_stats(h_list):
-    #                     device = h_list[0].device
-    #                     hist = torch.zeros(BINS, dtype=torch.int64, device=device)
-    #                     total = 0; mean_sum = 0.0; max_val = 0.0
-    #                     for hh in h_list:
-    #                         hf = hh.detach().flatten()
-    #                         total += hf.numel()
-    #                         mean_sum += float(hf.sum().item())
-    #                         max_val = max(max_val, float(hf.max().item()))
-    #                         log_v = torch.log10(hf.clamp_min(1e-40))
-    #                         idx = ((log_v - LOG_LO) * (BINS / (LOG_HI - LOG_LO))).clamp_(0, BINS - 1).long()
-    #                         hist += torch.bincount(idx, minlength=BINS)
-    #                     cum = torch.cumsum(hist, 0)
-    #                     def _pct(p):
-    #                         target = p / 100.0 * total
-    #                         nz = (cum >= target).nonzero(as_tuple=True)[0]
-    #                         if nz.numel() == 0:
-    #                             return max_val
-    #                         i = int(nz[0].item())
-    #                         bw = (LOG_HI - LOG_LO) / BINS
-    #                         return 10.0 ** (LOG_LO + i * bw)
-    #                     return {
-    #                         "numel": total,
-    #                         "mean": mean_sum / max(total, 1),
-    #                         "max": max_val,
-    #                         "p50": _pct(50), "p90": _pct(90), "p99": _pct(99),
-    #                         "p99.9": _pct(99.9), "p99.99": _pct(99.99),
-    #                     }
-    #                 agg_ne = {
-    #                     "iter": int(iteration),
-    #                     "k_samples": int(k_samples),
-    #                     "expert_stats": _pct_stats(h_hutch),
-    #                     "nonexpert_stats": _pct_stats(h_ne),
-    #                 }
-    #                 if _should_write():
-    #                     es = agg_ne["expert_stats"]
-    #                     ns = agg_ne["nonexpert_stats"]
-    #                     print(
-    #                         f"[proposal] H-probe @iter{iteration}: "
-    #                         f"expert  mean={es['mean']:.3e} max={es['max']:.3e} "
-    #                         f"p99={es['p99']:.3e}  "
-    #                         f"nonexpert mean={ns['mean']:.3e} max={ns['max']:.3e} "
-    #                         f"p99={ns['p99']:.3e}",
-    #                         flush=True,
-    #                     )
-    #                     import json as _json
-    #                     Path(_ne_probe_log).parent.mkdir(parents=True, exist_ok=True)
-    #                     with open(_ne_probe_log, "a") as _f:
-    #                         _f.write(_json.dumps(agg_ne) + "\n")
-    #                 del h_ne
-    #     except Exception as _exc:
-    #         if _should_write():
-    #             print(f"[proposal] H-probe nonexpert FAILED @iter{iteration}: {_exc}", flush=True)
-    # ---------- end temp analysis block ----------
-
-    # -----------------------------------------------------------------------
-    # DISABLED: Hutchinson-vs-GNB cross-check block. Commented out after
-    # analysis run (exp_etc_hutch / exp_etc_hutch_k4pct) — Pearson/Jaccard
-    # data collected. Re-enable by uncommenting when needed. Adds ~5 GB peak
-    # GPU memory (fresh GNB forward pass + similarity computation).
-    # -----------------------------------------------------------------------
-    # if _config.get("_hessian_cross_check", False):
-    #     try:
-    #         h_gnb = _gnb_compute_H(model, data_iterator, expert_ps, k_samples=1)
-    #         if h_gnb is not None:
-    #             agg = _hutchinson_vs_gnb_similarity(
-    #                 iteration, tracked, h_hutch, h_gnb, _tracker.theta_cp)
-    #             if _should_write():
-    #                 print(
-    #                     f"[proposal] hutch-vs-gnb @iter{iteration}: "
-    #                     f"bare P={agg['pearson_hutch_gnb_bare']:+.3f} "
-    #                     f"J@1%={agg['jaccard_top1pct_bare']:.3f} "
-    #                     f"J@10%={agg['jaccard_top10pct_bare']:.3f}  "
-    #                     f"score P={agg['pearson_hutch_gnb_score']:+.3f} "
-    #                     f"J@1%={agg['jaccard_top1pct_score']:.3f} "
-    #                     f"J@10%={agg['jaccard_top10pct_score']:.3f}",
-    #                     flush=True,
-    #                 )
-    #                 cross_log = _config.get("_h_cross_check_log")
-    #                 if cross_log:
-    #                     import json as _json
-    #                     Path(cross_log).parent.mkdir(parents=True, exist_ok=True)
-    #                     with open(cross_log, "a") as _f:
-    #                         _f.write(_json.dumps(agg) + "\n")
-    #             del h_gnb
-    #     except Exception as _exc:
-    #         if _should_write():
-    #             print(f"[proposal] hutch-vs-gnb comparison FAILED @iter{iteration}: {_exc}", flush=True)
-
-    if _should_write():
-        print(
-            f"[proposal] refresh_hutchinson @iter{iteration} K={k_samples} "
-            f"{elapsed_ms:.0f} ms  ({n_elem:,} expert elements)",
-            flush=True,
-        )
-
-    return _finalize({"iter": iteration, "k_samples": k_samples, "ms": elapsed_ms, "numel": n_elem})
 
 
 def proposal_refresh_finite_diff(
     model, forward_step_func, data_iterator, iteration,
     k_samples: int = 4,
 ) -> Optional[Dict[str, Any]]:
-    """Fold a finite-difference Hessian-vector |H_diag| estimate into
-    tracker._H_ema. Plain 1st-order grads × 2 (central diff) per Rademacher
-    sample; routing freeze applied around the +/- forwards (default ON).
+    """Overwrite ``tracker._H`` with a fresh finite-difference Hessian-
+    vector |H_diag| estimate. Plain 1st-order grads × 2 (central diff)
+    per Rademacher sample; routing freeze always applied around the +/-
+    forwards (production default).
 
-    Falls back to Hutchinson if compute_hessian_finite_diff returns None
-    for any reason (gate-id failure, OOM during sweep, NaN, etc.). Training
-    MUST continue.
-
-    Optional cross-check: when --proposal-finite-diff-cross-check is set,
-    Hutchinson is run on the same param state and the Hutchinson-vs-finite_diff
-    Pearson/Jaccard is dumped to the cross-check log (label_a='hutch',
-    label_b='finite_diff').
+    Optional cross-check: when ``--proposal-finite-diff-cross-check`` is
+    set, Hutchinson is run on the same param state and the Hutch-vs-FD
+    Pearson/Jaccard is dumped via :func:`compare_hessian_estimators`.
     """
+    from .hessian import (
+        compute_hessian_finite_diff as _finite_diff_compute_H,
+        compute_hessian_hutchinson as _hutchinson_compute_H,
+        compare_hessian_estimators as _compare_hessian_estimators,
+    )
     if not _enabled or _tracker is None:
         return None
     dedicated = _config.get("_hessian_dedicated_valid_iter")
@@ -1944,7 +1479,6 @@ def proposal_refresh_finite_diff(
     names = [n for n, _ in tracked]
 
     eps = _config.get("_finite_diff_eps")
-    use_freeze = bool(_config.get("_finite_diff_routing_freeze", True))
     cross_check_on = bool(_config.get("_finite_diff_cross_check", False))
 
     # CRN compliance for cross-check: capture the batch ONCE at refresh
@@ -2002,15 +1536,38 @@ def proposal_refresh_finite_diff(
             crn_step_func = forward_step_func
             crn_di = data_iterator
 
+    # PROPOSAL_FD_ONE_SIDED=1 → forward-difference instead of central.
+    # Cuts fwd+bwd from 2K to K+1 (47% at K=16) at the cost of O(ε) vs
+    # O(ε²) truncation. Validated against central baseline — see
+    # results/exp_etc_FDvsHutch_K16_* runs.
+    import os as _os_fd1
+    _one_sided = _os_fd1.environ.get("PROPOSAL_FD_ONE_SIDED", "") in ("1", "true", "TRUE")
+
+    multi_k_track = bool(_config.get("_fd_multi_k_track", False))
+    multi_k_values = sorted(set(int(v) for v in
+                                _config.get("_fd_multi_k_values", []) or []
+                                if int(v) >= 1))
+    multi_k_log_path = _config.get("_fd_multi_k_log")
+    multi_k_max = max(multi_k_values) if (multi_k_track and multi_k_values) else None
+    fd_k_used = int(multi_k_max) if multi_k_max is not None else int(k_samples)
+
     t0 = _time.perf_counter()
-    h_fd = _finite_diff_compute_H(
+    fd_ret = _finite_diff_compute_H(
         model, crn_step_func if crn_batch is not None else forward_step_func,
         crn_di if crn_batch is not None else data_iterator,
-        expert_ps, k_samples,
-        eps=eps, use_routing_freeze=use_freeze,
+        expert_ps, fd_k_used,
+        eps=eps, use_routing_freeze=True,
         batch_override=crn_batch,
+        one_sided=_one_sided,
+        track_k_values=(multi_k_values if multi_k_track else None),
     )
     t1 = _time.perf_counter()
+    fd_snapshots: Optional[Dict[int, List[torch.Tensor]]] = None
+    if multi_k_track and isinstance(fd_ret, dict):
+        fd_snapshots = fd_ret
+        h_fd = fd_ret.get(int(multi_k_max)) if fd_ret else None
+    else:
+        h_fd = fd_ret
 
     if h_fd is None:
         # Graceful fallback to Hutchinson — print warning and re-run.
@@ -2028,15 +1585,15 @@ def proposal_refresh_finite_diff(
             "expert_coverage": _fold_diag["expert_coverage"],
             "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
         })
-        _persist_h_ema(int(iteration))
+        _persist_h(int(iteration))
         elapsed_ms = (_time.perf_counter() - t0) * 1000.0
         return _finalize({"iter": iteration, "k_samples": k_samples,
                           "ms": elapsed_ms, "fallback": True})
 
-    # Fold into H_ema with outlier protection.
+    # Fold into H cache with outlier protection.
     _fold_diag = _fold_h(names, h_fd,
                          flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
-    _persist_h_ema(int(iteration))
+    _persist_h(int(iteration))
 
     elapsed_ms = (t1 - t0) * 1000.0
     n_elem = sum(p.numel() for p in expert_ps)
@@ -2050,46 +1607,118 @@ def proposal_refresh_finite_diff(
         "expert_coverage": _fold_diag["expert_coverage"],
         "flip_skip_ratio": _fold_diag["flip_skip_ratio"],
         "eps": eps_actual,
-        "routing_freeze": use_freeze,
+        "routing_freeze": True,
+        "one_sided": bool(_one_sided),
     }
     _config["_h_diag_records"].append(diag_record)
 
-    # Magnitude log.
-    try:
-        if _should_write():
+    # Magnitude log (|H| only — δ tracking is now group-level via accum_sq
+    # and not exposed at refresh time).
+    if _should_write():
+        try:
             import statistics as _st
             h_abs_means = [float(h.mean().item()) for h in h_fd]
-            h_abs_maxs  = [float(h.max().item())  for h in h_fd]
-            d_abs_means = []; d_abs_maxs = []
-            for (name, p) in tracked:
-                fc = _tracker.theta_cp.get(name)
-                if fc is not None:
-                    d = (p.data.to(torch.float32) - fc.to(torch.float32)).abs_()
-                    d_abs_means.append(float(d.mean().item()))
-                    d_abs_maxs.append(float(d.max().item()))
+            h_abs_maxs = [float(h.max().item()) for h in h_fd]
             print(
                 f"[proposal] scale @iter{iteration} (finite_diff): "
                 f"|H| mean={_st.mean(h_abs_means):.3e} max={max(h_abs_maxs):.3e}  "
-                f"|δ| mean={_st.mean(d_abs_means):.3e} max={max(d_abs_maxs):.3e}  "
                 f"(eps={eps_actual:.3e}, coverage={_fold_diag['expert_coverage']:.3f}, "
                 f"flip_skip={_fold_diag['flip_skip_ratio']:.4f})",
                 flush=True,
             )
-    except Exception as _exc:
-        if _should_write():
-            print(f"[proposal] scale log FAILED: {_exc}", flush=True)
+        except Exception:
+            pass
 
-    # ---- Optional cross-check: ALSO run Hutchinson and dump similarity. ----
+    # ---- Multi-K FD pearson + Jaccard logging ----
+    # When --proposal-fd-multi-k-track is set, compute pearson + Jaccard@top%
+    # for each K_x vs K_max, plus same vs prev_refresh K_max for stability.
+    # h_fd above is K_max snapshot already.
+    if (fd_snapshots is not None and multi_k_max is not None
+            and len(multi_k_values) >= 1):
+        try:
+            from .hessian import compare_hessian_estimators as _cmp_h
+            ref_list = fd_snapshots[int(multi_k_max)]
+            # δ-weighted score requires theta_cp (legacy); fast path stores
+            # δ_g per-group only. Pass empty dict so the comparator computes
+            # bare-|H| Pearson/Jaccard (the production-relevant metrics).
+            theta_cp_for_cmp: Dict[str, torch.Tensor] = {}
+
+            rec: Dict[str, Any] = {
+                "iter": int(iteration),
+                "k_max": int(multi_k_max),
+                "values": list(multi_k_values),
+            }
+            console_pieces: List[str] = []
+            for kk in multi_k_values:
+                if kk == multi_k_max or kk not in fd_snapshots:
+                    continue
+                cand_list = fd_snapshots[int(kk)]
+                agg = _cmp_h(
+                    iteration, tracked, cand_list, ref_list,
+                    theta_cp_for_cmp,
+                    label_a=f"K{kk}", label_b=f"K{multi_k_max}",
+                )
+                p_bare_key = next((k for k in agg if k.startswith("pearson_") and k.endswith("_bare")), None)
+                p_bare = float(agg.get(p_bare_key, 0.0)) if p_bare_key else 0.0
+                rec[f"K{kk}_pearson_bare"] = p_bare
+                rec[f"K{kk}_jaccard_top0.1pct_bare"] = float(agg.get("jaccard_top0.1pct_bare", 0.0))
+                rec[f"K{kk}_jaccard_top1pct_bare"] = float(agg.get("jaccard_top1pct_bare", 0.0))
+                rec[f"K{kk}_jaccard_top5pct_bare"] = float(agg.get("jaccard_top5pct_bare", 0.0))
+                p_score_key = next((k for k in agg if k.startswith("pearson_") and k.endswith("_score")), None)
+                rec[f"K{kk}_pearson_score"] = float(agg.get(p_score_key, 0.0)) if p_score_key else 0.0
+                rec[f"K{kk}_jaccard_top1pct_score"] = float(agg.get("jaccard_top1pct_score", 0.0))
+                console_pieces.append(
+                    f"K{kk}=P{p_bare:+.2f}/J@1%{rec[f'K{kk}_jaccard_top1pct_bare']:.2f}"
+                )
+
+            # prev-refresh stability
+            prev_list_cpu = _config.get("_fd_multi_k_prev_max_list")
+            if (prev_list_cpu is not None and len(prev_list_cpu) == len(ref_list)
+                    and all(p.numel() == r.numel() for p, r in zip(prev_list_cpu, ref_list))):
+                prev_list_gpu = [p.to(r.device, non_blocking=True)
+                                 for p, r in zip(prev_list_cpu, ref_list)]
+                agg_prev = _cmp_h(
+                    iteration, tracked, prev_list_gpu, ref_list,
+                    theta_cp_for_cmp,
+                    label_a="prev", label_b=f"K{multi_k_max}",
+                )
+                p_bare_key = next((k for k in agg_prev if k.startswith("pearson_") and k.endswith("_bare")), None)
+                pp = float(agg_prev.get(p_bare_key, 0.0)) if p_bare_key else 0.0
+                rec["prev_pearson_bare"] = pp
+                rec["prev_jaccard_top0.1pct_bare"] = float(agg_prev.get("jaccard_top0.1pct_bare", 0.0))
+                rec["prev_jaccard_top1pct_bare"] = float(agg_prev.get("jaccard_top1pct_bare", 0.0))
+                rec["prev_jaccard_top5pct_bare"] = float(agg_prev.get("jaccard_top5pct_bare", 0.0))
+                console_pieces.append(
+                    f"prev=P{pp:+.2f}/J@1%{rec['prev_jaccard_top1pct_bare']:.2f}"
+                )
+                del prev_list_gpu
+            else:
+                rec["prev_pearson_bare"] = None
+                console_pieces.append("prev=N/A")
+            # Cache CURRENT K_max snapshot to CPU for next refresh's prev-comparison.
+            _config["_fd_multi_k_prev_max_list"] = [t.detach().cpu() for t in ref_list]
+
+            if _should_write():
+                print(
+                    f"[proposal] multi_k @iter{iteration} K_max={multi_k_max}: "
+                    + " ".join(console_pieces),
+                    flush=True,
+                )
+            if multi_k_log_path and _should_write():
+                import json as _json_mk
+                with open(multi_k_log_path, "a") as _f:
+                    _f.write(_json_mk.dumps(rec) + "\n")
+            fd_snapshots.clear()
+        except Exception as _mkexc:
+            if _should_write():
+                import traceback as _tb_mk
+                print(f"[proposal] multi_k FAILED @iter{iteration}: "
+                      f"{_mkexc}\n{_tb_mk.format_exc()}", flush=True)
+
+    # ---- Optional cross-check: 4-way estimator comparison vs truth + ----
+    # ---- per-estimator temporal stability (i-th vs (i+1)-th refresh). ----
     if cross_check_on:
         try:
-            # CRN: pass the SAME crn_step_func (which closes over the
-            # captured batch) so Hutchinson sees the same batch as FD.
-            # ALSO wrap Hutchinson in the same RoutingFreezeContext that FD
-            # used internally — otherwise FD differentiates lm_loss (with
-            # l_aux zeroed by freeze) while Hutch differentiates
-            # lm_loss + λ·l_aux. Different losses → different |H| → low
-            # cross-Pearson. Per spec ("finite-diff는 task loss만 사용"),
-            # the fair comparison is to make Hutch see the same task loss.
             from .hessian import _unwrap_model as _uw
             from ._routing_freeze import (
                 RoutingFreezeContext as _RFC,
@@ -2099,123 +1728,395 @@ def proposal_refresh_finite_diff(
             hutch_step = (crn_step_func if crn_batch is not None
                           else forward_step_func)
             hutch_di = (crn_di if crn_batch is not None else data_iterator)
-            # Cross-check Hutchinson K is decoupled from FD's K. FD scales
-            # K to exploit its memory advantage (e.g. K=16) but Hutchinson's
-            # baseline is fixed at K=4 (per CLAUDE.md scaled-OLMoE Hutchinson
-            # spec). Comparing FD-K=16 against Hutch-K=16 would inflate Hutch
-            # cost and obscure the headline metric (FD vs the established
-            # Hutch baseline). The cross-check Pearson is upper-bounded by
-            # Hutch's K=4 noise floor; FD with higher K narrows the gap.
-            xc_hutch_k = min(4, k_samples)
-            # PROPOSAL_TRUTH_K: optional 3rd Hutch run with high K (e.g. 128)
-            # as a near-truth reference. Used by small-MoE diagnostic runs
-            # to test whether prod cross-check Pearson is FD-distance or
-            # Hutch-noise. Disabled (==0) by default. When >0 we ALSO log
-            # FD-vs-truth and HutchK4-vs-truth Pearson alongside the
-            # standard FD-vs-HutchK4 metric.
+
+            # PROPOSAL_TRUTH_K: Hutch K used as truth reference (default 64).
+            # PROPOSAL_FD_KS:    comma list of FD K values (default "4,8,16").
+            # PROPOSAL_HUTCH_KS: comma list of Hutch K values (default "4").
             import os as _os_xc
-            truth_k = int(_os_xc.environ.get("PROPOSAL_TRUTH_K", "0"))
-            h_hutch_truth = None
-            if gates_xc and use_freeze:
-                with _RFC(gates_xc) as _ctx_xc:
-                    try:
-                        _ctx_xc.capture(
-                            lambda: hutch_step(hutch_di, _uw(model))
+            truth_k = int(_os_xc.environ.get("PROPOSAL_TRUTH_K", "64"))
+            fd_ks = [int(x) for x in _os_xc.environ.get(
+                "PROPOSAL_FD_KS", "4,8,16").split(",") if x.strip()]
+            hutch_ks = [int(x) for x in _os_xc.environ.get(
+                "PROPOSAL_HUTCH_KS", "4").split(",") if x.strip()]
+
+            # Iter-varying base seed + per-candidate offset breaks two
+            # artifacts:
+            #  (a) vs-PREV: same z reused across refreshes makes the noise
+            #      term pick the same "spurious top" consistently → inflated
+            #      J@.01%. Iter mixing fixes this.
+            #  (b) vs-TRUTH: truth (Hutch K=64) and a candidate (e.g. Hutch
+            #      K=4) sharing seed → candidate's z's are a SUBSET of
+            #      truth's → inflated J@X from sample reuse, not from real
+            #      H agreement. Per-candidate offset fixes this — each
+            #      estimator draws independent z's from the same batch.
+            _seed_base = 0xBADCAFE ^ (int(iteration) * 2654435761 & 0xFFFFFFFF)
+
+            def _seed_for(name: str) -> int:
+                # Stable per-name offset (hash) so the same candidate always
+                # gets the same offset across refreshes — only iteration
+                # varies the absolute seed.
+                _h = 0
+                for _c in name:
+                    _h = (_h * 131 + ord(_c)) & 0xFFFFFFFF
+                return (_seed_base ^ _h) & 0xFFFFFFFF
+
+            def _run_hutch(k, step_fn, di, seed: int):
+                """Hutchinson with routing freeze (caller-wrapped)."""
+                if gates_xc:
+                    with _RFC(gates_xc) as _ctx_h:
+                        try:
+                            _ctx_h.capture(
+                                lambda: step_fn(di, _uw(model))
+                            )
+                        except Exception:
+                            pass
+                        return _hutchinson_compute_H(
+                            model, step_fn, di, expert_ps, k,
+                            rng_seed=seed,
                         )
-                    except Exception as _exc:
-                        if _should_write():
-                            print(f"[proposal] xc routing-freeze capture failed: "
-                                  f"{_exc} — Hutch will see un-frozen gate "
-                                  f"(loss-alignment violation, Pearson floor)",
-                                  flush=True)
-                    h_hutch_xc = _hutchinson_compute_H(
-                        model, hutch_step, hutch_di, expert_ps, xc_hutch_k,
-                    )
-                    if truth_k > 0 and h_hutch_xc is not None:
-                        h_hutch_truth = _hutchinson_compute_H(
-                            model, hutch_step, hutch_di, expert_ps, truth_k,
-                        )
-            else:
-                h_hutch_xc = _hutchinson_compute_H(
-                    model, hutch_step, hutch_di, expert_ps, xc_hutch_k,
+                return _hutchinson_compute_H(
+                    model, step_fn, di, expert_ps, k,
+                    rng_seed=seed,
                 )
-                if truth_k > 0 and h_hutch_xc is not None:
-                    h_hutch_truth = _hutchinson_compute_H(
-                        model, hutch_step, hutch_di, expert_ps, truth_k,
-                    )
-            if h_hutch_xc is not None:
-                agg = _compare_hessian_estimators(
-                    iteration, tracked, h_hutch_xc, h_fd, _tracker.theta_cp,
-                    label_a="hutch", label_b="finite_diff",
+
+            def _run_fd(k, batch, step_fn, di, seed: int):
+                return _finite_diff_compute_H(
+                    model, step_fn, di, expert_ps, k,
+                    eps=eps, use_routing_freeze=True,
+                    batch_override=batch, one_sided=False,
+                    rng_seed=seed,
                 )
-                # Augment record with diag info.
-                agg["expert_coverage"] = _fold_diag["expert_coverage"]
-                agg["flip_skip_ratio"] = _fold_diag["flip_skip_ratio"]
-                agg["eps"] = eps_actual
-                agg["routing_freeze"] = use_freeze
+
+            def _build_candidates(batch, step_fn, di, include_truth: bool):
+                """Compute Hutch + FD candidates against (batch, step_fn, di).
+                Each estimator gets an independent seed so vs-TRUTH J@X
+                isn't inflated by Rademacher z subset-sharing.
+                Returns (h_truth or None, dict[name] -> H tensors)."""
+                _truth = (_run_hutch(truth_k, step_fn, di, _seed_for("truth"))
+                          if include_truth else None)
+                _cands: Dict[str, Optional[List[torch.Tensor]]] = {}
+                for kk in hutch_ks:
+                    nm = f"hutch_k{kk}"
+                    _cands[nm] = _run_hutch(kk, step_fn, di, _seed_for(nm))
+                for kk in fd_ks:
+                    nm = f"fd_k{kk}"
+                    _cands[nm] = _run_fd(kk, batch, step_fn, di, _seed_for(nm))
+                return _truth, _cands
+
+            # ---- Steps 1+2: truth + candidate estimators on batch A (CRN) ----
+            h_truth, candidates = _build_candidates(
+                crn_batch, hutch_step, hutch_di, include_truth=True,
+            )
+            if h_truth is None:
+                raise RuntimeError("truth Hutch K=%d failed" % truth_k)
+
+            cross_log = _config.get("_finite_diff_cross_check_log")
+            import json as _json
+
+            def _emit(agg, tag, name):
+                key_p = next((k for k in agg
+                              if k.startswith("pearson_") and k.endswith("_bare")), None)
+                p = float(agg.get(key_p, 0.0)) if key_p else 0.0
                 if _should_write():
-                    p_bare = agg.get("pearson_hutch_finite_diff_bare", 0.0)
-                    p_score = agg.get("pearson_hutch_finite_diff_score", 0.0)
                     print(
-                        f"[proposal] hutch-vs-finite_diff @iter{iteration}: "
-                        f"bare P={p_bare:+.3f} "
-                        f"J@1%={agg.get('jaccard_top1pct_bare', 0.0):.3f} "
-                        f"J@10%={agg.get('jaccard_top10pct_bare', 0.0):.3f}  "
-                        f"score P={p_score:+.3f} "
-                        f"J@1%={agg.get('jaccard_top1pct_score', 0.0):.3f} "
-                        f"J@10%={agg.get('jaccard_top10pct_score', 0.0):.3f}",
+                        f"[proposal] {tag} @iter{iteration}: {name:>10s} "
+                        f"P={p:+.3f} "
+                        f"J@.01%={agg.get('jaccard_top0.01pct_bare',0):.3f} "
+                        f"J@.1%={agg.get('jaccard_top0.1pct_bare',0):.3f} "
+                        f"J@1%={agg.get('jaccard_top1pct_bare',0):.3f} "
+                        f"J@5%={agg.get('jaccard_top5pct_bare',0):.3f} "
+                        f"J@10%={agg.get('jaccard_top10pct_bare',0):.3f}",
                         flush=True,
                     )
-                    cross_log = _config.get("_hessian_cross_check_log")
                     if cross_log:
-                        import json as _json
+                        agg_out = dict(agg)
+                        agg_out["tag"] = tag
+                        agg_out["name"] = name
                         Path(cross_log).parent.mkdir(parents=True, exist_ok=True)
                         with open(cross_log, "a") as _f:
-                            _f.write(_json.dumps(agg) + "\n")
-                # Optional truth-K Hutch comparison (PROPOSAL_TRUTH_K env).
-                if h_hutch_truth is not None:
-                    try:
-                        agg_fd_t = _compare_hessian_estimators(
-                            iteration, tracked, h_hutch_truth, h_fd, _tracker.theta_cp,
-                            label_a="hutchTRUTH", label_b="finite_diff",
-                        )
-                        agg_h_t = _compare_hessian_estimators(
-                            iteration, tracked, h_hutch_truth, h_hutch_xc, _tracker.theta_cp,
-                            label_a="hutchTRUTH", label_b="hutchK4",
-                        )
-                        for _agg in (agg_fd_t, agg_h_t):
-                            _agg["expert_coverage"] = _fold_diag["expert_coverage"]
-                            _agg["flip_skip_ratio"] = _fold_diag["flip_skip_ratio"]
-                            _agg["truth_k"] = int(truth_k)
+                            _f.write(_json.dumps(agg_out) + "\n")
+
+            # ---- Step 3: vs-TRUTH per candidate ----
+            for name, h in candidates.items():
+                if h is None:
+                    if _should_write():
+                        print(f"[proposal] vs-TRUTH @iter{iteration}: {name} FAILED",
+                              flush=True)
+                    continue
+                agg = _compare_hessian_estimators(
+                    iteration, tracked, h_truth, h, {},
+                    label_a="truth", label_b=name,
+                )
+                agg["truth_k"] = int(truth_k)
+                _emit(agg, "vs-TRUTH", name)
+
+            # ---- Step 4: temporal stability — prev refresh vs current per estimator ----
+            prev_hs = _config.get("_prev_cross_h", {})
+            for name, h in candidates.items():
+                if h is None:
+                    continue
+                prev_h = prev_hs.get(name)
+                if prev_h is None:
+                    continue
+                agg_t = _compare_hessian_estimators(
+                    iteration, tracked, prev_h, h, {},
+                    label_a="prev", label_b=name,
+                )
+                _emit(agg_t, "vs-PREV", name)
+
+            # Save current candidates for next-refresh comparison.
+            # Memory: |candidates| × |expert_ps| FP32. For 4M expert × 4 cands ≈ 64 MB.
+            _config["_prev_cross_h"] = {
+                name: [t.detach().clone() for t in h]
+                for name, h in candidates.items() if h is not None
+            }
+
+            # ---- Step 4d: Group-wise scoring sweep ----
+            # PROPOSAL_GROUP_SIZE_PROBE=1: for each group_size in {2,4,8,16,32}:
+            #   capture_rate = ΔL fraction protected by group-wise top-K (vs element)
+            #   missed_severity = max/sum of element scores missed
+            #   CV_H, CV_delta = within-group spread (lower = more correlation)
+            # Uses TRUTH H (Hutch K=64) and current θ - θ_CP for δ.
+            group_probe_on = _os_xc.environ.get(
+                "PROPOSAL_GROUP_SIZE_PROBE", "") in ("1", "true", "TRUE")
+            if group_probe_on:
+                try:
+                    K_PCT = float(_os_xc.environ.get(
+                        "PROPOSAL_GROUP_K_PCT", "0.01"))
+                    GROUP_SIZES = [int(g) for g in _os_xc.environ.get(
+                        "PROPOSAL_GROUP_SIZES", "2,4,8,16,32").split(",")]
+                    # Concatenate ALL expert tensors into one flat vector for
+                    # global top-K analysis (matches production behavior).
+                    # δ_fresh = |FP32(θ_now) - FP32(θ_prev_snapshot)|
+                    # Use FP32 master weights from optimizer (mapper.get_param)
+                    # to avoid BF16 quantization noise (BF16 ULP ≈ 5e-4 at θ=0.1
+                    # > typical 40-iter Δθ ~ 4e-4 → most elements get rounded to 0).
+                    from ._ds_state import get_mapper as _get_mapper_gp
+                    _mapper_gp = _get_mapper_gp()
+                    h_flat_list = []
+                    delta_fresh_list = []
+                    theta_now_list = []  # for next probe's snapshot
+                    have_fresh = "_group_probe_theta_snap" in _config
+                    if have_fresh:
+                        prev_snap = _config["_group_probe_theta_snap"]
+                    for (name, p), h in zip(tracked, h_truth):
+                        max_g = max(GROUP_SIZES)
+                        n_tensor = (h.numel() // max_g) * max_g
+                        h_flat_list.append(h.detach().reshape(-1)[:n_tensor].to(torch.float32))
+                        # FP32 master weight (precision-safe for δ measurement)
+                        fp32_now = (_mapper_gp.get_param(p)
+                                    if _mapper_gp is not None
+                                    else p.data.to(torch.float32))
+                        if have_fresh and name in prev_snap:
+                            # Keep SIGNED delta (no abs) so we can measure both:
+                            #   mean(|δ|)        — current (no cancellation)
+                            #   |mean(δ_signed)| — production group-reset semantics
+                            d_signed_fresh = (fp32_now - prev_snap[name]).reshape(-1)[:n_tensor]
+                            delta_fresh_list.append(d_signed_fresh)
+                        theta_now_list.append((name, fp32_now.detach().clone()))
+                    H_all = torch.cat(h_flat_list)
+                    if have_fresh and len(delta_fresh_list) == len(h_flat_list):
+                        delta_fresh_all = torch.cat(delta_fresh_list)
+                    else:
+                        delta_fresh_all = None
+                    # Save snapshot for next probe (memory: ~|expert_ps| FP32 = 2× BF16)
+                    _config["_group_probe_theta_snap"] = {
+                        name: t for name, t in theta_now_list
+                    }
+                    # Only fresh delta now (rot removed; was rotation-noise-dominated)
+                    if delta_fresh_all is None:
                         if _should_write():
-                            p_fd_t = agg_fd_t.get("pearson_hutchTRUTH_finite_diff_bare", 0.0)
-                            j_fd_t = agg_fd_t.get("jaccard_top1pct_bare", 0.0)
-                            p_h_t = agg_h_t.get("pearson_hutchTRUTH_hutchK4_bare", 0.0)
-                            j_h_t = agg_h_t.get("jaccard_top1pct_bare", 0.0)
-                            print(
-                                f"[proposal] vs-TRUTH(K={truth_k}) @iter{iteration}: "
-                                f"FDk{k_samples}->truth bare P={p_fd_t:+.3f} J@1%={j_fd_t:.3f}  "
-                                f"Hk{xc_hutch_k}->truth bare P={p_h_t:+.3f} J@1%={j_h_t:.3f}",
-                                flush=True,
+                            print(f"[proposal] group_probe @iter{iteration}: "
+                                  f"snapshot init only", flush=True)
+                        delta_variants = []
+                    else:
+                        delta_variants = [("fresh", delta_fresh_all)]
+                    # delta_all is now SIGNED. Compute element-wise abs for element score.
+                    for delta_label, delta_signed_all in delta_variants:
+                        delta_abs_all = delta_signed_all.abs()
+                        delta_sq_all = delta_signed_all ** 2  # δ² (sign doesn't matter)
+                        score_elem = H_all * delta_sq_all
+                        total_score = float(score_elem.sum().item())
+                        n_total = score_elem.numel()
+                        k_elem = max(1, int(K_PCT * n_total))
+                        if total_score <= 0:
+                            if _should_write():
+                                print(f"[proposal] group_probe[{delta_label}] "
+                                      f"@iter{iteration}: score sum=0, skipped",
+                                      flush=True)
+                            continue
+                        elem_threshold = float(torch.kthvalue(
+                            score_elem, n_total - k_elem + 1).values.item())
+                        elem_mask = score_elem >= elem_threshold
+                        captured_elem = float(score_elem[elem_mask].sum().item())
+                        capture_rate_elem = captured_elem / total_score
+
+                        delta_topk_th = float(torch.kthvalue(
+                            delta_abs_all, n_total - k_elem + 1).values.item())
+                        delta_top_mask = delta_abs_all >= delta_topk_th
+                        H_topk_th = float(torch.kthvalue(
+                            H_all, n_total - k_elem + 1).values.item())
+                        H_top_mask = H_all >= H_topk_th
+
+                        for g in GROUP_SIZES:
+                            n_groups = n_total // g
+                            H_g = H_all.view(n_groups, g).mean(dim=1)
+                            # Two group score variants:
+                            #   _abs:    mean(|δ|)        — no sign cancellation
+                            #   _signed: |mean(δ_signed)| — production group-reset
+                            d_g_abs = delta_abs_all.view(n_groups, g).mean(dim=1)
+                            d_g_signed = delta_signed_all.view(n_groups, g).mean(dim=1).abs_()
+                            score_g_abs = H_g * (d_g_abs ** 2)
+                            score_g_signed = H_g * (d_g_signed ** 2)
+                            k_g = max(1, int(K_PCT * n_groups))
+                            # Capture rate for ABS variant
+                            g_thr_abs = float(torch.kthvalue(
+                                score_g_abs, n_groups - k_g + 1).values.item())
+                            g_mask_abs = score_g_abs >= g_thr_abs
+                            elem_from_abs = g_mask_abs.repeat_interleave(g)
+                            cap_abs = float(score_elem[elem_from_abs].sum().item()) / total_score
+                            # Capture rate for SIGNED variant (production)
+                            g_thr_signed = float(torch.kthvalue(
+                                score_g_signed, n_groups - k_g + 1).values.item())
+                            g_mask_signed = score_g_signed >= g_thr_signed
+                            elem_from_signed = g_mask_signed.repeat_interleave(g)
+                            cap_signed = float(score_elem[elem_from_signed].sum().item()) / total_score
+                            # CVs (use abs for CV_δ as ranking is on magnitude)
+                            H_grp = H_all.view(n_groups, g)
+                            d_abs_grp = delta_abs_all.view(n_groups, g)
+                            score_grp = score_elem.view(n_groups, g)
+                            cv_h = (H_grp.std(dim=1) /
+                                    H_grp.mean(dim=1).clamp_min(1e-30))
+                            cv_d = (d_abs_grp.std(dim=1) /
+                                    d_abs_grp.mean(dim=1).clamp_min(1e-30))
+                            d_sq_grp = d_abs_grp ** 2
+                            cv_d_sq = (d_sq_grp.std(dim=1) /
+                                       d_sq_grp.mean(dim=1).clamp_min(1e-30))
+                            cv_score = (score_grp.std(dim=1) /
+                                        score_grp.mean(dim=1).clamp_min(1e-30))
+                            # Sign-cancellation ratio:
+                            # |mean(δ_signed)| / mean(|δ|)
+                            #   = 1 (all same sign) ~ 0 (perfect cancellation)
+                            cancellation_ratio = float(
+                                (d_g_signed / d_g_abs.clamp_min(1e-30)).median().item()
                             )
-                            if cross_log:
-                                with open(cross_log, "a") as _f:
-                                    _f.write(_json.dumps(agg_fd_t) + "\n")
-                                    _f.write(_json.dumps(agg_h_t) + "\n")
-                    except Exception as _texc:
-                        if _should_write():
-                            print(f"[proposal] truth-K compare FAILED @iter{iteration}: "
-                                  f"{_texc}", flush=True)
-                    del h_hutch_truth
-                del h_hutch_xc
+                            cv_h_med = float(cv_h.median().item())
+                            cv_d_med = float(cv_d.median().item())
+                            cv_d_sq_med = float(cv_d_sq.median().item())
+                            cv_score_med = float(cv_score.median().item())
+
+                            if _should_write():
+                                print(
+                                    f"[proposal] group_probe[{delta_label}] g={g:>2d} "
+                                    f"@iter{iteration}: "
+                                    f"cap_abs={cap_abs:.3f} cap_signed={cap_signed:.3f} "
+                                    f"(elem={capture_rate_elem:.3f}) "
+                                    f"CV_H={cv_h_med:.2f} CV_|δ|={cv_d_med:.2f} "
+                                    f"CV_δ²={cv_d_sq_med:.2f} CV_score={cv_score_med:.2f} "
+                                    f"cancel={cancellation_ratio:.3f}",
+                                    flush=True,
+                                )
+                except Exception as _gpexc:
+                    if _should_write():
+                        import traceback as _tb
+                        print(f"[proposal] group_probe FAILED @iter{iteration}: "
+                              f"{_gpexc}\n{_tb.format_exc()}", flush=True)
+
+            # ---- Step 4c: EMA-vs-TRUTH probe ----
+            # Test whether EMA over multiple raw refreshes converges to truth.
+            # Hypothesis: raw H ~= truth + independent_noise per refresh.
+            # If true: EMA averages noise out → EMA-vs-TRUTH J@1% > raw-vs-TRUTH J@1%.
+            # If false: noise is correlated or H drifts faster than EMA averages →
+            # EMA stays similar to raw.
+            # Uses the SAME α as production (CLAUDE.md default 0.9).
+            _xc_ema_alpha = float(_os_xc.environ.get("PROPOSAL_XC_EMA_ALPHA", "0.9"))
+            _ema_store = _config.get("_xc_ema_h", {})
+            for name, h in candidates.items():
+                if h is None:
+                    continue
+                prev_ema = _ema_store.get(name)
+                if prev_ema is None:
+                    # Initialize EMA with first sample.
+                    _ema_store[name] = [t.detach().clone() for t in h]
+                    continue
+                # Update EMA: ema = α·prev + (1-α)·new
+                new_ema = []
+                for prev_t, new_t in zip(prev_ema, h):
+                    e = (prev_t * _xc_ema_alpha
+                         + new_t * (1.0 - _xc_ema_alpha)).detach()
+                    new_ema.append(e)
+                _ema_store[name] = new_ema
+                # Compare EMA against truth (CURRENT truth, since production
+                # would use EMA H to compare against current data).
+                agg_e = _compare_hessian_estimators(
+                    iteration, tracked, h_truth, new_ema, {},
+                    label_a="truth", label_b=f"{name}_ema",
+                )
+                agg_e["truth_k"] = int(truth_k)
+                agg_e["ema_alpha"] = _xc_ema_alpha
+                _emit(agg_e, "vs-TRUTH-EMA", name)
+            _config["_xc_ema_h"] = _ema_store
+
+            # ---- Step 5: optional batch-noise test ----
+            # PROPOSAL_BATCH_NOISE_TEST=1: capture a SECOND batch (advance
+            # iterator) and recompute candidates against the same θ. The
+            # vs-BATCH J@X is "pure batch noise" — no model drift since we
+            # haven't taken any optimizer step. Comparing to vs-PREV J@X
+            # tells us how much of the temporal turnover is batch noise vs
+            # real model drift over the refresh interval.
+            batch_noise_on = _os_xc.environ.get(
+                "PROPOSAL_BATCH_NOISE_TEST", "") in ("1", "true", "TRUE")
+            if batch_noise_on:
+                try:
+                    from pretrain_gpt import get_batch as _get_batch_b
+                    di_b = data_iterator[0] if isinstance(
+                        data_iterator, (list, tuple)) else data_iterator
+                    batch_b = _get_batch_b(di_b)
+                    tokens_b, labels_b, lm_b, am_b, pid_b = batch_b[:5]
+                    import torch.nn.functional as _Fb
+                    def _step_b(_di, m):
+                        out = m(tokens_b, pid_b, am_b)
+                        logits = out[0] if isinstance(out, tuple) else out
+                        flat = logits.reshape(-1, logits.size(-1))
+                        lbl = labels_b.reshape(-1)
+                        if lm_b is not None and lm_b.numel() == flat.size(0):
+                            per = _Fb.cross_entropy(flat.float(), lbl, reduction="none")
+                            denom = lm_b.view(-1).float().sum().clamp_min(1.0)
+                            loss = (per * lm_b.view(-1).float()).sum() / denom
+                        else:
+                            loss = _Fb.cross_entropy(flat.float(), lbl, reduction="mean")
+                        return loss, {}
+                    class _StubB:
+                        def __next__(self): return None
+                    di_b_stub = _StubB()
+                    _, candidates_b = _build_candidates(
+                        batch_b, _step_b, di_b_stub, include_truth=False,
+                    )
+                    for name, h_a in candidates.items():
+                        h_b = candidates_b.get(name)
+                        if h_a is None or h_b is None:
+                            continue
+                        agg_b = _compare_hessian_estimators(
+                            iteration, tracked, h_a, h_b, {},
+                            label_a="batchA", label_b=name,
+                        )
+                        _emit(agg_b, "vs-BATCH", name)
+                    del candidates_b
+                except Exception as _bexc:
+                    if _should_write():
+                        print(f"[proposal] batch-noise test FAILED @iter{iteration}: "
+                              f"{_bexc}", flush=True)
+
+            del h_truth, candidates
         except Exception as _exc:
             if _should_write():
-                print(f"[proposal] hutch-vs-finite_diff comparison FAILED "
-                      f"@iter{iteration}: {_exc}", flush=True)
+                import traceback as _tb
+                print(f"[proposal] cross-check 4way+temporal FAILED @iter{iteration}: "
+                      f"{_exc}\n{_tb.format_exc()}", flush=True)
 
     if _should_write():
         print(
-            f"[proposal] refresh_finite_diff @iter{iteration} K={k_samples} "
+            f"[proposal] refresh_finite_diff @iter{iteration} K={fd_k_used} "
             f"{elapsed_ms:.0f} ms  ({n_elem:,} expert elements)",
             flush=True,
         )
@@ -2384,7 +2285,7 @@ def proposal_hutchinson_probe(
         v = v_map[name]
         h_abs = h.abs()
         # δ² from tracker's theta_cp cache (same buffer the live selection uses).
-        fc = _tracker.theta_cp.get(name)
+        fc = {}.get(name)
         if fc is not None:
             delta_sq = (p.data.to(torch.float32) - fc.to(torch.float32)).pow_(2).flatten()
         else:

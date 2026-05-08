@@ -50,6 +50,22 @@ from typing import Any, Callable, List, Optional
 import torch
 
 
+# Module-level side CUDA stream for D2H copies. Lazy-init on first call so
+# CPU-only test imports don't fail. The d2h_stream is shared across all
+# callers (snapshot_nonexpert_dc / _collect_param_payload) — they all
+# launch their async H2D copies on it. main stream's stage write is
+# synchronized via cuda events.
+_d2h_stream: Optional["torch.cuda.Stream"] = None
+
+
+def get_d2h_stream() -> Optional["torch.cuda.Stream"]:
+    """Lazy-init D2H side stream. Returns None on CPU-only setups."""
+    global _d2h_stream
+    if _d2h_stream is None and torch.cuda.is_available():
+        _d2h_stream = torch.cuda.Stream()
+    return _d2h_stream
+
+
 @dataclass
 class WriteRecord:
     """Mutable handoff record. Main thread creates it, worker fills it in.
@@ -73,6 +89,13 @@ class WriteRecord:
     file_bytes: int = 0
     error: Optional[str] = None
     on_complete: List[Callable[[], None]] = field(default_factory=list)
+    # Optional cuda event the worker must synchronize on BEFORE writing.
+    # Use case: caller issued a non_blocking D2H copy producing the payload's
+    # CPU tensors; the event marks the copy's completion. Without this,
+    # async non_blocking H2D + worker disk-write would race on the host
+    # buffer (torch.save would serialize incomplete data). The wait happens
+    # on the worker thread → main thread sees no host blocking.
+    cuda_event: Optional[Any] = None
 
 
 class AsyncWriter:
@@ -130,6 +153,7 @@ class AsyncWriter:
         tag: str = "dc",
         on_complete: Optional[List[Callable[[], None]]] = None,
         save_fn: Optional[Callable[[Any, Path], None]] = None,
+        cuda_event: Optional[Any] = None,
     ) -> WriteRecord:
         """Enqueue a payload for async writing. Returns a mutable
         :class:`WriteRecord` that the worker will fill in.
@@ -151,6 +175,7 @@ class AsyncWriter:
             path=Path(path),
             submit_time=time.perf_counter(),
             on_complete=list(on_complete) if on_complete else [],
+            cuda_event=cuda_event,
         )
         self._queue.put((payload, rec, save_fn))
         with self._lock:
@@ -168,6 +193,14 @@ class AsyncWriter:
                 if item is self._SENTINEL:
                     return
                 payload, rec, save_fn = item
+                # Block worker until any pending non_blocking D2H copy that
+                # produced this payload's CPU tensors has completed. main
+                # thread sees no wait — only this worker thread.
+                if rec.cuda_event is not None:
+                    try:
+                        rec.cuda_event.synchronize()
+                    except Exception:
+                        pass
                 start = time.perf_counter()
                 rec.queue_delay_ms = (start - rec.submit_time) * 1000.0
                 try:

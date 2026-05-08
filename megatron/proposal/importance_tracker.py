@@ -53,6 +53,79 @@ except ImportError:
         return param.grad
 
 
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+
+    @triton.jit
+    def _accum_delta_sq_triton_kernel(
+        m_ptr, v_ptr, accum_ptr,
+        n_groups,
+        lr_over_bc1, sqrt_bc2_inv, eps,
+        G: tl.constexpr,           # group size (block_quant_g)
+        GROUPS_PER_BLOCK: tl.constexpr,  # # groups handled per program
+    ):
+        """Each program handles ``GROUPS_PER_BLOCK`` consecutive groups
+        (each group has G elements) → BLOCK_SIZE = G * GROUPS_PER_BLOCK
+        elements. Larger blocks improve SM occupancy when G is small (e.g.
+        g=8). Uses plain load/add/store (no atomic) since each gid is
+        unique to one program — accumulation across iters is naturally
+        ordered by stream.
+        """
+        BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
+        pid = tl.program_id(axis=0)
+        gid_start = pid * GROUPS_PER_BLOCK
+        elem_off = gid_start * G + tl.arange(0, BLOCK_SIZE)
+        elem_mask = elem_off < n_groups * G
+        m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
+        v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
+        denom = tl.sqrt(v) * sqrt_bc2_inv + eps
+        delta = lr_over_bc1 * m / denom
+        delta_sq = delta * delta
+        delta_sq_2d = tl.reshape(delta_sq, (GROUPS_PER_BLOCK, G))
+        block_sums = tl.sum(delta_sq_2d, axis=1)
+        gid_off = gid_start + tl.arange(0, GROUPS_PER_BLOCK)
+        gid_mask = gid_off < n_groups
+        prev = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
+        tl.store(accum_ptr + gid_off, prev + block_sums, mask=gid_mask)
+except Exception:
+    _HAS_TRITON = False
+
+
+def _accum_delta_sq_triton(flat_m, flat_v, flat_accum, total_a, g, lr_over_bc1, sqrt_bc2_inv, eps):
+    """Launch Triton kernel: each program covers ``GROUPS_PER_BLOCK`` groups
+    of ``g`` elements (BLOCK_SIZE = G * GROUPS_PER_BLOCK). For small g (e.g.
+    8) we pick GROUPS_PER_BLOCK so BLOCK_SIZE ~ 256 — the smallest size that
+    saturates an A100 SM well (4 warps × 32 threads = 128 threads + 2× ILP)."""
+    n_groups = total_a // g
+    if n_groups == 0:
+        return
+    if not _HAS_TRITON:
+        flat = (flat_m[:total_a].to(torch.float32) /
+                ((flat_v[:total_a].to(torch.float32).sqrt() * sqrt_bc2_inv) + eps)
+                ) * lr_over_bc1
+        flat = flat * flat
+        flat_accum.add_(flat.view(-1, g).sum(dim=1))
+        return
+    # Pick GROUPS_PER_BLOCK so the kernel block is at least 256 elements
+    # (saturates an A100 SM). For g >= 256 we keep GROUPS_PER_BLOCK = 1.
+    target_block = 256
+    gpb = max(1, target_block // max(1, g))
+    # Round to next power of 2 for Triton.
+    p = 1
+    while p < gpb:
+        p *= 2
+    gpb = p
+    n_progs = (n_groups + gpb - 1) // gpb
+    grid = (n_progs,)
+    _accum_delta_sq_triton_kernel[grid](
+        flat_m, flat_v, flat_accum,
+        n_groups, lr_over_bc1, sqrt_bc2_inv, eps,
+        G=g, GROUPS_PER_BLOCK=gpb,
+    )
+
+
 def _fp32_grad(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
     """FP32 reduced grad for a param (DeepSpeed hp mapping when available)."""
     g = safe_get_full_grad(param) if _HAS_SAFE_GRAD else None
@@ -91,6 +164,10 @@ class NonExpertDCStats:
     bytes: int
     missing_grads: int
     compute_time_ms: float
+    # CUDA event marking completion of the (non_blocking) D2H copy that
+    # produced the payload. Caller forwards this to AsyncWriter.submit so
+    # the worker thread waits for the copy before reading the host buffer.
+    cuda_event: Optional["torch.cuda.Event"] = None
 
 
 @dataclass
@@ -126,10 +203,18 @@ class ImportanceTracker:
         num_experts: Optional[int] = None,
         random_seed: int = 0,
         async_writer: Optional["AsyncWriter"] = None,  # type: ignore[name-defined]
+        block_quant_g: int = 1,
     ) -> None:
         self._random_seed_salt = int(random_seed) * 2654435761 & 0xFFFFFFFF
         self.model = model
         self.topk_ratio = float(topk_ratio)
+        self.block_quant_g = max(1, int(block_quant_g))
+        # Per-tensor per-group δ_g accumulator (Σ_step Δθ_i² summed within
+        # each contiguous block_quant_g-block). H_g (mean over group) is
+        # stored in _H_g and used at score time.
+        self._delta_g_accum: Dict[str, torch.Tensor] = {}
+        # Group-level H cache (computed at refresh time).
+        self._H_g: Dict[str, torch.Tensor] = {}
         self._async_writer = async_writer
         # Cached GPU staging + pinned CPU buffers for batched
         # snapshot_nonexpert_dc transfer. See ``FCManager._collect_param_payload``
@@ -157,9 +242,9 @@ class ImportanceTracker:
         # Persisted to ``cp/hessian/h_ema_iter{N}.pt`` so recovery restores
         # EMA continuity — a fresh refresh after fault would otherwise only
         # reflect one sample, temporarily degrading selection quality.
-        self._H_ema: Dict[str, torch.Tensor] = {}
+        self._H: Dict[str, torch.Tensor] = {}
         # Number of EMA updates applied. Used for diagnostics / bias correction.
-        self._H_ema_updates: int = 0
+        self._H_updates: int = 0  # bumped every refresh
         self.num_experts = int(num_experts) if num_experts is not None else None
 
         self._tracked_names: List[str] = []
@@ -206,27 +291,6 @@ class ImportanceTracker:
             cursor += p.numel()
         self._flat_total = cursor
 
-        # θ_CP cache: BF16 GPU-resident snapshot of each tracked param's value
-        # at the time of its last FC or per-element state snapshot. Initialize
-        # to current param value so δ = 0 at construction (no elements selected
-        # until some drift accumulates — consistent with a "fresh FC" view).
-        self.theta_cp: Dict[str, torch.Tensor] = {}
-        for name in self._tracked_names:
-            p = self._name_to_param[name]
-            self.theta_cp[name] = (
-                _fp32_param(p).detach().to(torch.bfloat16).clone()
-            )
-
-        # Diagnostic θ_CP for NON-expert params. Used ONLY for measuring
-        # non-expert score distribution to compare against expert. Refreshed
-        # whenever non-expert FC fires (on_nonexpert_fc). BF16 to save RAM.
-        self.theta_fc_nonexpert: Dict[str, torch.Tensor] = {}
-        for name in self._full_save_names:
-            p = self._name_to_full_save_param[name]
-            self.theta_fc_nonexpert[name] = (
-                _fp32_param(p).detach().to(torch.bfloat16).clone()
-            )
-
         self._flat_offset_list: List[Tuple[str, int, int]] = [
             (n, s, e) for n, (s, e) in self._flat_offsets.items()
         ]
@@ -247,26 +311,18 @@ class ImportanceTracker:
         # both products of non-negatives) so we never need to track it.
         self._prev_s_max: Optional[float] = None
 
-        # Persistent FP32 + bool scratch for chunked cat in p2/p3. Without
-        # this, each chunk allocates a fresh ~134 MB FP32 buffer (and a
-        # ~33 MB bool mask) — 72 alloc/free per iter at exp_3 scale, which
-        # progressively fragments the CUDA caching allocator. Empirically
-        # this caused p2 to drift from ~70 ms (iter 10) to ~220 ms (iter
-        # 50) as the run proceeded. A single scratch sized to the largest
-        # possible chunk avoids all of that churn.
-        #
-        # Sized for the worst case: the CHUNK_SIZE largest tracked tensors.
-        # On exp_3 the per-expert tensors are uniform so this matches a
-        # typical chunk; on the legacy 12L config it slightly over-allocates.
-        sizes_desc = sorted(
-            (self._name_to_param[n].numel() for n in self._tracked_names),
-            reverse=True,
-        )
-        self._max_chunk_numel = sum(sizes_desc[:64])  # CHUNK = 64
-        # Lazy: alloc on first step() so __init__ stays cheap and avoids
-        # claiming GPU memory before the model has placed all params.
-        self._cat_scratch_fp32: Optional[torch.Tensor] = None
-        self._cat_scratch_bool: Optional[torch.Tensor] = None
+        # B2: separate cuda stream for tracker GPU work. Launching
+        # update_delta_accum + tracker chunk loop on this stream lets
+        # main-stream forward(T+1) / backward(T+1) overlap with tracker
+        # work(T). The host-blocking sync is deferred to the NEXT iter's
+        # tracker.step entry (1-iter pipeline). Race guard:
+        # proposal_pre_step inserts main_stream.wait_event(prev event)
+        # before optimizer.step(T+1) writes m, v.
+        self._tracker_stream: Optional["torch.cuda.Stream"] = None
+        # Pending state from previous iter's tracker.step. Carried here
+        # because cp_hooks dispatches it on the next iter's tracker entry.
+        self._pending_tracker_event: Optional["torch.cuda.Event"] = None
+        self._pending_dispatch: Optional[Dict] = None
 
         self.total_tracked = self._flat_total
         self.total_full_save = sum(self._full_save_numel_per_name.values())
@@ -321,46 +377,36 @@ class ImportanceTracker:
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def on_expert_fc(self, tensor_name: str) -> int:
-        """Refresh θ_CP for one expert tensor to the current param value.
-
-        Called by FCManager immediately after an expert FC snapshot lands in
-        the write queue. DeepSpeed's separated layout means each tracked tensor
-        belongs to exactly one expert, so this is a bulk copy of the full slice.
+    def gpu_memory_breakdown(self) -> Tuple[float, List[Tuple[str, float]]]:
+        """Sum of all GPU tensors held by this tracker (MB) + per-item
+        breakdown. Used to compare against torch.cuda.memory_allocated()
+        to detect missing accountings.
         """
-        if tensor_name not in self.theta_cp:
-            return 0
-        p = self._name_to_param[tensor_name]
-        buf = self.theta_cp[tensor_name]
-        # _fp32_param -> bf16 copy (auto-cast via copy_).
-        buf.copy_(_fp32_param(p).detach())
-        return int(buf.numel())
-
-    @torch.no_grad()
-    def on_state_snapshot(
-        self, tensor_name: str, flat_indices: torch.Tensor
-    ) -> int:
-        """Scatter-update θ_CP for the selected flat indices of one tensor."""
-        if tensor_name not in self.theta_cp or flat_indices.numel() == 0:
-            return 0
-        p = self._name_to_param[tensor_name]
-        buf = self.theta_cp[tensor_name]  # bf16, GPU
-        dev = buf.device
-        idx = flat_indices.to(device=dev, dtype=torch.long, non_blocking=True)
-        src = _fp32_param(p).detach().reshape(-1).to(torch.bfloat16)
-        buf.view(-1).index_copy_(0, idx, src.index_select(0, idx))
-        return int(idx.numel())
-
-    @torch.no_grad()
-    def on_nonexpert_fc(self) -> int:
-        """Refresh non-expert θ_FC diagnostic cache. Called when non-expert FC fires."""
-        n = 0
-        for name in self._full_save_names:
-            p = self._name_to_full_save_param[name]
-            buf = self.theta_fc_nonexpert[name]
-            buf.copy_(_fp32_param(p).detach())
-            n += buf.numel()
-        return n
+        items: List[Tuple[str, float]] = []
+        for attr in [
+            "_g_fast_dg_flat", "_g_fast_h_g_bf16_flat", "_g_fast_exc_mask",
+            "_g_fast_chunk_buf", "_g_fast_global_hist", "_g_fast_sel_buf",
+            "_g_fast_offsets_t", "_g_fast_arange_g",
+            "_g_fast_prev_threshold_t",
+            "_dc_stage_gpu",
+            "_chunk_scratch_m", "_chunk_scratch_v",
+            "_flat_delta_g",
+        ]:
+            t = getattr(self, attr, None)
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                items.append((attr, t.element_size() * t.numel() / 1e6))
+        for dict_attr in ("_H", "_H_g"):
+            d = getattr(self, dict_attr, {}) or {}
+            n = 0
+            sz = 0.0
+            for t in d.values():
+                if isinstance(t, torch.Tensor) and t.is_cuda:
+                    sz += t.element_size() * t.numel() / 1e6
+                    n += 1
+            if n > 0:
+                items.append((f"{dict_attr}[{n}]", sz))
+        total = sum(v for _, v in items)
+        return total, items
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -408,17 +454,10 @@ class ImportanceTracker:
         total_numel = offset
         device = entries[0][1].device
 
-        stage = self._dc_stage_gpu
-        if stage is None or stage.numel() < total_numel or stage.device != device:
-            self._dc_stage_gpu = torch.empty(
-                total_numel, dtype=torch.float32, device=device,
-            )
-            stage = self._dc_stage_gpu
-
-        _t_copy0 = _time.perf_counter()
-        for (_n, off, n, _s), (_n2, src) in zip(plan, entries):
-            stage.narrow(0, off, n).copy_(src.reshape(-1))
-        _copy_ms = (_time.perf_counter() - _t_copy0) * 1000.0
+        # GPU stage UNUSED: per-source D2H directly to pinned host narrow
+        # views. Saves ~total_numel × 4 bytes persistent GPU stage
+        # (e.g. 388 MB for non-expert DC at exp_etc scale).
+        _copy_ms = 0.0  # no GPU2GPU stage cat anymore
 
         _t_wait0 = _time.perf_counter()
         if self._async_writer is not None and self._dc_pinned_cpu is not None:
@@ -434,7 +473,35 @@ class ImportanceTracker:
 
         _t_xfer0 = _time.perf_counter()
         flat_cpu = pinned.narrow(0, 0, total_numel)
-        flat_cpu.copy_(stage.narrow(0, 0, total_numel), non_blocking=False)
+        # Per-source D2H directly to pinned host narrow views — no GPU
+        # stage. main_event syncs main-stream prior work (grad ready);
+        # all D2Hs run on the dedicated d2h_stream so they overlap with
+        # main forward/tracker. cuda_event records the LAST D2H — writer
+        # thread waits on it before SSD write.
+        cuda_event: Optional["torch.cuda.Event"] = None
+        if torch.cuda.is_available():
+            from .async_writer import get_d2h_stream
+            d2h_stream = get_d2h_stream()
+            main_event = torch.cuda.Event()
+            main_event.record()  # main: grads are ready by this point
+            with torch.cuda.stream(d2h_stream):
+                d2h_stream.wait_event(main_event)
+                for (_n, off, n, _shape), (_n2, src) in zip(plan, entries):
+                    dst = flat_cpu.narrow(0, off, n)
+                    src_flat = src.reshape(-1)
+                    if src_flat.dtype != torch.float32:
+                        # FP32 cast first (in d2h_stream, transient buf)
+                        dst.copy_(src_flat.to(torch.float32),
+                                  non_blocking=True)
+                    else:
+                        dst.copy_(src_flat, non_blocking=True)
+                cuda_event = torch.cuda.Event()
+                cuda_event.record(d2h_stream)
+        else:
+            for (_n, off, n, _shape), (_n2, src) in zip(plan, entries):
+                flat_cpu.narrow(0, off, n).copy_(
+                    src.reshape(-1).to(torch.float32),
+                )
         _xfer_ms = (_time.perf_counter() - _t_xfer0) * 1000.0
 
         payload: Dict[str, torch.Tensor] = {}
@@ -450,507 +517,576 @@ class ImportanceTracker:
             step=global_step, tensors=len(payload), numel=total_numel,
             bytes=bytes_total, missing_grads=missing,
             compute_time_ms=_enum_ms + _copy_ms + _xfer_ms,
+            cuda_event=cuda_event,
         )
         return payload, stats
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def step(
+    def pre_step_snap(self) -> None:
+        """accum_sq mode: NO-OP. Adam state derivation in update_delta_accum
+        avoids needing a θ_before snapshot — Δθ is recomputed from m, v
+        post-step using the fused-Adam formula: Δθ = -lr × m_hat / (sqrt(v_hat)
+        + ε). Persistent memory cost: 0 extra beyond flat δ_g (~3 MB g=256).
+        """
+        return
+
+    @torch.no_grad()
+    def _init_accum_sq_flat(self, optimizer) -> None:
+        """One-time setup for accum_sq (option A: per-BF16-group ZERO-COPY).
+
+        Splits tracked tensors by their owning BF16-Opt group (via
+        Fp32StateMapper coords). For each group, attempts to build a flat
+        view across the group's tracked m, v slices — these all live inside
+        one master storage so the contiguity check passes (which it didn't
+        for the merged-across-groups view). Falls back to chunked scratch
+        per-group if some group still doesn't pass.
+        """
+        if getattr(self, "_flat_layout_done", False):
+            return
+        mapper = get_mapper()
+        g = max(1, int(self.block_quant_g))
+
+        # Bucket tracked tensors by BF16-Opt group index (g_idx). For each
+        # bucket we capture m, v refs, per-tensor sizes, and the original
+        # tracked-name order so _delta_g_accum[name] views align.
+        buckets: Dict[int, Dict[str, list]] = {}
+        for n in self._tracked_names:
+            p = self._name_to_param.get(n)
+            if p is None:
+                continue
+            m = (mapper.get_state(p, "exp_avg")
+                 if mapper is not None
+                 else optimizer.state.get(p, {}).get("exp_avg"))
+            v = _fp32_v_t(optimizer, p)
+            if m is None or v is None:
+                continue
+            # Resolve which BF16-Opt group this tensor lives in. Use the
+            # mapper's coord table when available; otherwise fall back to a
+            # synthetic single-bucket index 0 (best-effort for non-DS modes).
+            g_idx = 0
+            if mapper is not None and hasattr(mapper, "_coords"):
+                coord = mapper._coords.get(id(p))
+                if coord is not None:
+                    g_idx = coord[0]
+            b = buckets.setdefault(g_idx, {
+                "names": [], "sizes": [], "m_refs": [], "v_refs": [],
+            })
+            b["names"].append(n)
+            b["sizes"].append(int(p.numel()))
+            b["m_refs"].append(m.detach().reshape(-1))
+            b["v_refs"].append(v.detach().reshape(-1))
+
+        if not buckets:
+            return
+
+        device = next(iter(buckets.values()))["m_refs"][0].device
+
+        def _try_flat_view(refs):
+            """Try to build a single 1-D flat view spanning refs in
+            storage-offset order. Returns (flat or None, reason str)."""
+            if not refs:
+                return None, "empty"
+            try:
+                base = refs[0]
+                base_storage = base.untyped_storage()
+                base_ptr = base_storage.data_ptr()
+                cur_off = base.storage_offset()
+                esize = base.element_size()
+                for idx, r in enumerate(refs):
+                    if r.untyped_storage().data_ptr() != base_ptr:
+                        return None, (
+                            f"ref[{idx}] storage ptr "
+                            f"{hex(r.untyped_storage().data_ptr())} "
+                            f"!= base {hex(base_ptr)}"
+                        )
+                    if r.storage_offset() != cur_off:
+                        return None, (
+                            f"ref[{idx}] off={r.storage_offset()}, "
+                            f"expected {cur_off}"
+                        )
+                    if r.element_size() != esize or r.dtype != base.dtype:
+                        return None, f"ref[{idx}] dtype/size mismatch"
+                    cur_off += r.numel()
+                total_n = cur_off - base.storage_offset()
+                flat = torch.empty(0, dtype=base.dtype, device=base.device)
+                flat.set_(
+                    base_storage,
+                    storage_offset=base.storage_offset(),
+                    size=(total_n,),
+                    stride=(1,),
+                )
+                return flat, None
+            except Exception as e:
+                return None, f"exception: {e!r}"
+
+        # === Z1 layout unification ===
+        # Allocate ONE dg_flat in master order (= sorted-by-g_idx, name order
+        # within each master). Per-group dg_buf becomes a narrow view into
+        # this flat tensor, and per-name views live in the same memory. This
+        # lets Phase 1 compute score = h_g × dg with a SINGLE torch.mul over
+        # the whole flat buffer (instead of 160 per-name launches).
+        total_elems = 0
+        total_groups = 0
+        for g_idx in sorted(buckets.keys()):
+            b = buckets[g_idx]
+            total_elems += sum(b["sizes"])
+            total_groups += sum(sz // g for sz in b["sizes"])
+
+        # dg_flat: per-group δ accumulator (state). FP32 required (Δθ²
+        # accumulation precision).
+        self._g_fast_dg_flat = torch.zeros(
+            total_groups, dtype=torch.float32, device=device,
+        )
+        # h_g_flat: BF16 cache (was FP32). Memory halved. mul with FP32
+        # dg auto-promotes to FP32 in chunk_buf.
+        self._g_fast_h_g_bf16_flat = torch.zeros(
+            total_groups, dtype=torch.bfloat16, device=device,
+        )
+        # Exclusion mask (bool, 1 byte/element). Was FP32 (4 bytes) → 1/4.
+        # False = excluded. mul-with-bool requires cast at use site.
+        self._g_fast_exc_mask = torch.ones(
+            total_groups, dtype=torch.bool, device=device,
+        )
+        # X-C: chunk_buf replaces the per-iter flat_sg buffer. Score is
+        # computed chunk-by-chunk into this buffer; histc + cumsum/scatter
+        # all run on chunk-sized slices. Buffer is reused across chunks AND
+        # across iters → fixed transient memory regardless of total_groups.
+        # Size: min(total_groups, CHUNK_SIZE) — for small total_groups
+        # (g large) we don't waste space.
+        import os as _os_chunk
+        _chunk_mb = int(_os_chunk.environ.get("PROPOSAL_DG_CHUNK_MB", "100"))
+        chunk_size = min(total_groups, max(1, _chunk_mb) * 1024 * 1024 // 4)
+        self._g_fast_chunk_size = chunk_size
+        self._g_fast_chunk_buf = torch.empty(
+            chunk_size, dtype=torch.float32, device=device,
+        )
+        # No flat_sg / sg_views — chunked path doesn't need them. (kept None
+        # for any legacy reference safety.)
+        self._g_fast_flat_sg = None
+        self._g_fast_sg_views = None
+        # Persistent global histogram (reused across chunks).
+        self._g_fast_n_bins = 10000
+        self._g_fast_global_hist = torch.zeros(
+            self._g_fast_n_bins, dtype=torch.float32, device=device,
+        )
+        # Delayed threshold: this iter uses prev iter's threshold;
+        # current iter's hist is built for next iter's threshold.
+        self._g_fast_prev_threshold_t = torch.zeros((), dtype=torch.float32,
+                                                    device=device)
+        self._g_fast_h_built_at = -1  # rebuild marker
+
+        # Build per-group state. Each group's dg_buf is a master-region view
+        # into _g_fast_dg_flat.
+        self._groups: List[Dict] = []
+        self._delta_g_accum = {}
+        # Per-name views into the same flat buffer (in master order).
+        self._g_fast_name_list: List[str] = []
+        self._g_fast_offsets_cpu: List[int] = [0]
+        # Note: only h_g_views / exc_views are still used (h_g rebuild /
+        # exc mask updates). dg_views / sg_views are no longer needed in
+        # the chunked X-C path.
+        self._g_fast_h_g_views: List[torch.Tensor] = []
+        self._g_fast_exc_views: List[torch.Tensor] = []
+
+        all_zero_copy = True
+        zc_reasons: List[str] = []
+        cur_off = 0  # cumulative position in flat (master order)
+        for g_idx in sorted(buckets.keys()):
+            b = buckets[g_idx]
+            sizes = b["sizes"]
+            names = b["names"]
+            m_refs = b["m_refs"]
+            v_refs = b["v_refs"]
+            group_total = sum(sizes)
+            group_groups = group_total // g
+            master_dg = self._g_fast_dg_flat.narrow(0, cur_off, group_groups)
+
+            # Per-name views (in this master's region).
+            for n, sz in zip(names, sizes):
+                n_g = sz // g
+                if n_g == 0:
+                    continue
+                self._delta_g_accum[n] = self._g_fast_dg_flat.narrow(
+                    0, cur_off, n_g,
+                )
+                self._g_fast_h_g_views.append(
+                    self._g_fast_h_g_bf16_flat.narrow(0, cur_off, n_g),
+                )
+                self._g_fast_exc_views.append(
+                    self._g_fast_exc_mask.narrow(0, cur_off, n_g),
+                )
+                self._g_fast_name_list.append(n)
+                cur_off += n_g
+                self._g_fast_offsets_cpu.append(cur_off)
+
+            m_flat, m_why = _try_flat_view(m_refs)
+            v_flat, v_why = _try_flat_view(v_refs)
+            zc = (m_flat is not None and v_flat is not None
+                  and m_flat.numel() == group_total
+                  and v_flat.numel() == group_total)
+            if not zc:
+                all_zero_copy = False
+                zc_reasons.append(
+                    f"g_idx={g_idx} m_why={m_why} v_why={v_why}"
+                )
+            self._groups.append({
+                "g_idx": g_idx,
+                "names": names,
+                "sizes": sizes,
+                "m_refs": m_refs,
+                "v_refs": v_refs,
+                "m_flat": m_flat,
+                "v_flat": v_flat,
+                "dg_buf": master_dg,  # master-region view into dg_flat
+                "zero_copy": zc,
+                "total": group_total,
+                "total_aligned": (group_total // g) * g,
+            })
+
+        self._zero_copy = all_zero_copy
+
+        # Direct VRAM measurement (real, not estimated).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _post_alloc = torch.cuda.memory_allocated() / 1e6
+            print(f"[proposal] accum_sq_flat init: VRAM after lazy buffers "
+                  f"= {_post_alloc:.1f} MB allocated", flush=True)
+
+        try:
+            mode_str = "ZERO-COPY all groups" if all_zero_copy else \
+                       "MIXED (some FALLBACK)"
+            # Persistent memory accounting (only items truly retained
+            # across iters; transient chunk-loop tensors like cumsum
+            # results, full_kmax, chunk_arange are allocated per-iter and
+            # the cuda allocator pools them — they don't persist).
+            mem_dg = total_groups * 4 / 1e6
+            mem_h_g = total_groups * 2 / 1e6
+            mem_exc = total_groups * 1 / 1e6
+            mem_chunk = chunk_size * 4 / 1e6
+            mem_hist = self._g_fast_n_bins * 4 / 1e6
+            # sel_buf is lazy-built on first chunk loop; size depends on
+            # K_max which we don't know yet at init time. Estimate
+            # K_groups + 5*avg_per_bin × 8 bytes (long).
+            K_total_est = max(1, int(self.topk_ratio * total_elems))
+            K_groups_est = max(1, K_total_est // g)
+            avg_per_bin = max(1, total_groups // self._g_fast_n_bins)
+            K_max_est = K_groups_est + 5 * avg_per_bin
+            mem_sel = (K_max_est + 1) * 8 / 1e6
+            mem_total = (mem_dg + mem_h_g + mem_exc + mem_chunk
+                         + mem_hist + mem_sel)
+            ideal_mb = total_groups * 4 / 1e6  # dg_flat alone
+            print(f"[proposal] accum_sq init: {mode_str}, "
+                  f"bf16_groups={len(self._groups)}, "
+                  f"total={total_elems} elements, groups={total_groups}, "
+                  f"n_tracked={len(self._delta_g_accum)}, "
+                  f"chunk_size={chunk_size}",
+                  flush=True)
+            print(f"[proposal] accum_sq mem persistent: "
+                  f"dg_flat={mem_dg:.1f}MB h_g_bf16={mem_h_g:.1f}MB "
+                  f"exc_bool={mem_exc:.1f}MB chunk_buf={mem_chunk:.1f}MB "
+                  f"sel_buf~={mem_sel:.1f}MB hist={mem_hist:.3f}MB → "
+                  f"total={mem_total:.1f}MB "
+                  f"(ideal/dg_only={ideal_mb:.1f}MB, "
+                  f"ratio={mem_total/max(ideal_mb,1):.2f}x)",
+                  flush=True)
+            for grp in self._groups:
+                print(f"[proposal] accum_sq g_idx={grp['g_idx']}: "
+                      f"n_tensors={len(grp['names'])}, "
+                      f"total={grp['total']}, "
+                      f"zero_copy={grp['zero_copy']}",
+                      flush=True)
+            if zc_reasons:
+                for r in zc_reasons:
+                    print(f"[proposal] accum_sq zc-fail {r}", flush=True)
+        except Exception:
+            pass
+
+        self._flat_layout_done = True
+
+    @torch.no_grad()
+    def update_delta_accum(
         self,
         optimizer: torch.optim.Optimizer,
         global_step: int,
-        lossless_fc_eids: Optional[List[Tuple[int, int]]] = None,
-    ) -> Tuple[
-        TrackerStepStats,
-        Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
-    ]:
-        """Compute score = H × δ², pick Top-K, return sparse state triples.
-
-        Args:
-            optimizer: the Adam (or variant) optimizer — Adam m/v are
-                copied out for the selected elements via ``_fp32_v_t``.
-            global_step: 1-indexed iteration number.
-            lossless_fc_eids: experts that are performing full-lossless
-                FC on this iteration (via FCManager). Their tensors are
-                excluded from the top-K scoring (score forced to 0) and
-                from the lossy-FC append — per CLAUDE.md § "Expert lossless
-                FC가 실행대상이 되는 expert들은 제외한 전체 expert 원소에
-                대해 importance score를 계산".
+    ) -> None:
+        """accum_sq fast path. ZERO-COPY mode (preferred): reads DS flat m/v
+        in place via storage view, computes Δθ² + group reduce + accumulator
+        add in a single Triton kernel — no scratch tensors, no extra VRAM.
+        FALLBACK mode: if storage isn't shared (older DS / unusual ZeRO
+        config), falls back to flat-scratch path.
         """
-        excluded_eids = (
-            set(lossless_fc_eids) if lossless_fc_eids else set()
+        self._init_accum_sq_flat(optimizer)
+        if not getattr(self, "_flat_layout_done", False):
+            return
+        import os as _os_dbg
+        # B2 note: DEBUG sync would force a main-stream synchronize() that
+        # serializes tracker_stream against forward — disabling 1-iter
+        # pipeline. We disable measurement when called from within tracker_stream.
+        _dbg_time = (
+            _os_dbg.environ.get("PROPOSAL_DEBUG_TIME_ACCUM", "")
+            in ("1", "true", "TRUE")
+            and not getattr(self, "_inside_tracker_stream", False)
         )
-        t0 = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-        t1 = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-        if t0 is not None:
-            t0.record()
-
+        if _dbg_time:
+            import time as _time_dbg
+            torch.cuda.synchronize()
+            _vram_alloc_before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            _t0_dbg = _time_dbg.perf_counter()
+        # Adam hyper-params
+        beta1 = 0.9
         beta2 = 0.999
-        for group in optimizer.param_groups:
-            if "betas" in group:
-                beta2 = float(group["betas"][1])
-                break
-        bias_corr_2 = max(1.0 - beta2 ** max(global_step, 1), 1e-12)
+        eps_adam = 1e-8
+        lr = 1.0
+        for grp in optimizer.param_groups:
+            if "betas" in grp:
+                b = grp["betas"]
+                if isinstance(b, (tuple, list)) and len(b) >= 2:
+                    beta1 = float(b[0])
+                    beta2 = float(b[1])
+            if "lr" in grp:
+                lr = float(grp["lr"])
+            if "eps" in grp:
+                eps_adam = float(grp["eps"])
+            break
+        gs = max(int(global_step), 1)
+        bc1 = max(1.0 - beta1 ** gs, 1e-12)
+        bc2 = max(1.0 - beta2 ** gs, 1e-12)
+        sqrt_bc2_inv = (1.0 / (bc2 ** 0.5))
+        lr_over_bc1 = lr / bc1
 
+        g = max(1, int(self.block_quant_g))
+        total = sum(grp["total"] for grp in self._groups)
+
+        # Lazy chunked-fallback scratch (only allocated if some BF16-Opt
+        # group fails the ZERO-COPY check). Reused across groups + steps.
+        scratch_m = getattr(self, "_chunk_scratch_m", None)
+        scratch_v = getattr(self, "_chunk_scratch_v", None)
+        import os as _os_b
+        _budget_mb = int(_os_b.environ.get("PROPOSAL_DG_SCRATCH_MB", "50"))
+        CHUNK_BUDGET = max(1, _budget_mb) * 1024 * 1024 // 4  # FP32 elems
+
+        for grp in self._groups:
+            dg_buf = grp["dg_buf"]
+            total_a = grp["total_aligned"]
+            if grp["zero_copy"]:
+                _accum_delta_sq_triton(
+                    grp["m_flat"], grp["v_flat"], dg_buf,
+                    total_a, g, lr_over_bc1, sqrt_bc2_inv, eps_adam,
+                )
+            else:
+                # Per-group chunked fallback (shared persistent scratch).
+                sizes = grp["sizes"]
+                m_refs = grp["m_refs"]
+                v_refs = grp["v_refs"]
+                n_params = len(sizes)
+                cap = max(CHUNK_BUDGET, max(sizes))
+                if (scratch_m is None or scratch_m.numel() < cap
+                        or scratch_m.device != dg_buf.device):
+                    self._chunk_scratch_m = torch.empty(
+                        cap, dtype=torch.float32, device=dg_buf.device)
+                    self._chunk_scratch_v = torch.empty(
+                        cap, dtype=torch.float32, device=dg_buf.device)
+                    scratch_m = self._chunk_scratch_m
+                    scratch_v = self._chunk_scratch_v
+                i = 0
+                dg_offset = 0
+                while i < n_params:
+                    j = i
+                    cnumel = 0
+                    while j < n_params and (cnumel == 0 or
+                                            cnumel + sizes[j] <= CHUNK_BUDGET):
+                        cnumel += sizes[j]
+                        j += 1
+                    m_dst: List[torch.Tensor] = []
+                    v_dst: List[torch.Tensor] = []
+                    off = 0
+                    for k in range(i, j):
+                        sz = sizes[k]
+                        m_dst.append(scratch_m.narrow(0, off, sz))
+                        v_dst.append(scratch_v.narrow(0, off, sz))
+                        off += sz
+                    torch._foreach_copy_(m_dst, m_refs[i:j])
+                    torch._foreach_copy_(v_dst, v_refs[i:j])
+                    m_flat = scratch_m.narrow(0, 0, cnumel)
+                    v_flat = scratch_v.narrow(0, 0, cnumel)
+                    v_flat.sqrt_().mul_(sqrt_bc2_inv).add_(eps_adam)
+                    m_flat.div_(v_flat).mul_(lr_over_bc1).pow_(2)
+                    cgroups = cnumel // g
+                    if cgroups > 0:
+                        inc = m_flat.view(-1, g).sum(dim=1)
+                        dg_buf.narrow(0, dg_offset, cgroups).add_(inc)
+                    dg_offset += cgroups
+                    i = j
+
+        if _dbg_time:
+            torch.cuda.synchronize()
+            _t1_dbg = _time_dbg.perf_counter()
+            _vram_peak = torch.cuda.max_memory_allocated()
+            _vram_alloc_after = torch.cuda.memory_allocated()
+            _peak_delta = (_vram_peak - _vram_alloc_before) / 1e6
+            _persistent_delta = (_vram_alloc_after - _vram_alloc_before) / 1e6
+            n_zc = sum(1 for grp in self._groups if grp["zero_copy"])
+            n_fb = len(self._groups) - n_zc
+            mode = f"ZC={n_zc}/FB={n_fb}"
+            print(f"[proposal] update_delta_accum @iter{global_step} ({mode}): "
+                  f"{(_t1_dbg - _t0_dbg)*1000:.2f} ms (total={total} elements), "
+                  f"vram peak+={_peak_delta:.1f}MB persistent+={_persistent_delta:.1f}MB",
+                  flush=True)
+
+    @torch.no_grad()
+    def _aggregate_h_g(self) -> None:
+        """Derive H_g (group mean) from per-element H_ema.
+        Only runs when g=1 (degenerate, copies H_ema). For g>1, H_g is populated
+        directly at refresh time by ``_fold_h`` (BF16) so this is a no-op."""
+        g = max(1, int(self.block_quant_g))
+        if g > 1:
+            return  # H_g_ema is set by refresh fold; nothing to aggregate
+        for n, h in self._H.items():
+            h_flat = h.detach().reshape(-1).to(torch.float32)
+            nt = h_flat.numel()
+            nt_a = (nt // g) * g
+            if nt_a == 0:
+                self._H_g.pop(n, None)
+                continue
+            h_g = h_flat[:nt_a].reshape(-1, g).mean(dim=1)
+            self._H_g[n] = h_g
+
+    @torch.no_grad()
+    def _dispatch_pending_payload(
+        self, optimizer: torch.optim.Optimizer,
+        current_iter_excluded: Optional[set] = None,
+    ) -> None:
+        """B2: Dispatch the previous iter's tracker work — runs at the
+        START of the next iter's tracker.step. By then the tracker_stream
+        GPU work is finished (forward+backward+optimizer of the new iter
+        run in parallel on main_stream), so the host-blocking sync here
+        is short.
+
+        Operations:
+          1. event_tracker.synchronize()  — wait for prev tracker GPU work
+          2. seg_bounds.cpu()             — small sync (n_names+1 longs)
+          3. for each name: index_select p, m, v + delta_g reset + H2D
+          4. lossy_fc_append per expert (async writer queue push)
+
+        ``current_iter_excluded`` (CLAUDE.md correctness): experts that
+        FIRED a lossless FC on the CURRENT iter (T) must be excluded
+        from this dispatch even though pending was stashed at T-1 with
+        T-1's excluded set. Reason: at T-1 the about-to-fire experts had
+        non-zero score and may have ended up in top_idx_sorted; at T,
+        ``ExpertLosslessFC.fire_if_due`` already enqueued a lossless
+        write for them on the same raw-queue (FIFO). If we still append
+        T-1's lossy data here, the worker would scatter T-1's stale
+        values *on top of* the just-written T LFCL — a recovery
+        regression. Skipping them here keeps T's LFCL authoritative.
+        """
+        pending = self._pending_dispatch
+        if pending is None:
+            return
+        ev = self._pending_tracker_event
+        if ev is not None:
+            try:
+                ev.synchronize()
+            except Exception:
+                pass
+            self._pending_tracker_event = None
+
+        seg_bounds = pending["seg_bounds"]
+        top_idx_sorted = pending["top_idx_sorted"]
+        name_list = pending["name_list"]
+        offsets_cpu = pending["offsets_cpu"]
+        # Union T-1's stashed excluded set with T's fired set so any
+        # expert that started a lossless FC at T is skipped from T-1's
+        # pending lossy append. Without this, T-1 stale lossy values
+        # would land on the fresh LFCL/dense buffer (recovery bug).
+        excluded_eids = set(pending["excluded_eids"])
+        if current_iter_excluded:
+            excluded_eids |= set(current_iter_excluded)
+        prev_step = pending["step"]
+
+        seg_bounds_cpu = seg_bounds.cpu()
         device = next(self.model.parameters()).device
-        total = self._flat_total
-        use_hessian = (self.selection_mode == "hessian")
-        use_random = (self.selection_mode == "random")
+        g_blk = max(1, int(self.block_quant_g))
+        arange_g = self._g_fast_arange_g
         mapper = get_mapper()
+        stream = self._tracker_stream
 
-        # Chunk size for foreach + cat batching. Trade-off:
-        #   - too small → kernel-launch overhead returns (~thousands of launches)
-        #   - too large → transient GPU memory (FP32 cast lists) grows
-        # 64 keeps per-chunk transient ≈ 200-300 MB on the exp_3 config
-        # (avg expert tensor ~525K elem) while collapsing 2304 tracked
-        # tensors into 36 foreach kernel batches.
-        CHUNK = 64
+        from contextlib import nullcontext as _nullcontext
+        sm = torch.cuda.stream(stream) if stream is not None else _nullcontext()
 
-        # Lazy-init persistent scratch for chunked cat (allocator churn fix).
-        if (
-            self._cat_scratch_fp32 is None
-            or self._cat_scratch_fp32.device != device
-        ):
-            self._cat_scratch_fp32 = torch.empty(
-                self._max_chunk_numel, dtype=torch.float32, device=device,
-            )
-            self._cat_scratch_bool = torch.empty(
-                self._max_chunk_numel, dtype=torch.bool, device=device,
-            )
-
-        # Phase timers (CPU wall-clock per pass).
-        import time as _time
-        _p1_t0 = _time.perf_counter()
-
-        # Partition tracked names: included (eligible for top-K scoring)
-        # vs excluded (currently undergoing lossless FC — score forced to
-        # 0 to keep them out of selection without polluting bin range).
-        included_names: List[str] = []
-        excluded_names: List[str] = []
-        for (name, _s, _e) in self._flat_offset_list:
-            eid = self._tname_to_eid.get(name)
-            if eid is not None and eid in excluded_eids:
-                excluded_names.append(name)
-            else:
-                included_names.append(name)
-
-        scores_by_name: Dict[str, torch.Tensor] = {}
-        name_to_m: Dict[str, Optional[torch.Tensor]] = {}
-
-        # GPU scalar tensors (one per chunk) for late-bundled diagnostic
-        # reductions. _foreach_norm(list, ord=inf) returns one scalar per
-        # input — _stack().max()/.sum() at the end batches all chunks into
-        # a single sync.
-        chunk_smax_list: List[torch.Tensor] = []
-        chunk_ssum_list: List[torch.Tensor] = []
-        chunk_maxA_list: List[torch.Tensor] = []
-        chunk_maxd_list: List[torch.Tensor] = []
-
-        # Pre-fill excluded tensors with zero scores. m is fetched here so
-        # Pass 3 doesn't have to re-resolve mapper state for excluded names.
-        for name in excluded_names:
-            p = self._name_to_param[name]
-            scores_by_name[name] = torch.zeros(
-                p.numel(), dtype=torch.float32, device=device,
-            )
-            name_to_m[name] = (
-                mapper.get_state(p, "exp_avg") if mapper is not None
-                else optimizer.state.get(p, {}).get("exp_avg")
-            )
-
-        # ---- Pass 1: chunked foreach pipeline ------------------------
-        # For each chunk of up to CHUNK tracked tensors:
-        #   1. Build aligned FP32 flat lists (pv, fc, v_or_h)
-        #   2. Pipeline (all in-place on pv_list, no extra alloc):
-        #        pv ← pv − fc                  (foreach_sub_)
-        #        pv ← |pv|                     (foreach_abs_)         = δ
-        #        pv ← pv²                      (foreach_pow_(2))      = δ²
-        #        pv ← pv × A (= v or H)        (foreach_mul_)         = score
-        #        if not hessian: pv ← pv / bias (foreach_div_)
-        #   3. Record per-chunk diagnostics via _foreach_norm
-        # Net: ~6-9 GPU kernels per chunk vs ~13 per *tensor* in the legacy path.
-        for chunk_start in range(0, len(included_names), CHUNK):
-            cnames = included_names[chunk_start:chunk_start + CHUNK]
-            pv_list: List[torch.Tensor] = []
-            fc_list: List[torch.Tensor] = []
-            for n in cnames:
-                p = self._name_to_param[n]
-                pv_list.append(
-                    _fp32_param(p).detach().reshape(-1).to(torch.float32)
-                )
-                fc_list.append(
-                    self.theta_cp[n].view(-1).to(torch.float32)
-                )
-                name_to_m[n] = (
-                    mapper.get_state(p, "exp_avg") if mapper is not None
-                    else optimizer.state.get(p, {}).get("exp_avg")
-                )
-
-            # delta = |pv - fc|, in-place on pv_list
-            torch._foreach_sub_(pv_list, fc_list)
-            del fc_list  # free chunk's FC FP32 cast (~134 MB at exp_3 scale)
-            torch._foreach_abs_(pv_list)
-            # diagnostic: per-chunk max |delta| (scores ≥ 0 so abs irrelevant
-            # for inf-norm, but we want this BEFORE the squaring step).
-            chunk_maxd_list.append(
-                torch.stack(torch._foreach_norm(pv_list, ord=float('inf'))).max()
-            )
-            # δ² in-place
-            torch._foreach_pow_(pv_list, 2)
-
-            # Build A (= |H_diag| in hessian mode, = v_t in v_hat/random mode).
-            # Note: random mode still computes v_hat × δ² scores here so the
-            # importance diagnostics (max_A, score_total, per_param_score_sum)
-            # remain meaningful — these scores are then OVERWRITTEN with rand
-            # below for the actual selection. Mirrors the legacy two-pass
-            # invariant of "diagnostics over importance, selection over rand".
-            v_list: List[torch.Tensor] = []
-            for n in cnames:
-                if use_hessian:
-                    h = self._H_ema.get(n)
-                    if h is None:
-                        v_list.append(torch.zeros_like(pv_list[len(v_list)]))
-                    else:
-                        v_list.append(h.detach().reshape(-1))
-                else:
-                    p = self._name_to_param[n]
-                    v = _fp32_v_t(optimizer, p)
-                    if v is None:
-                        v_list.append(torch.zeros_like(pv_list[len(v_list)]))
-                    else:
-                        v_list.append(v.detach().flatten().to(torch.float32))
-
-            if use_hessian:
-                chunk_maxA_list.append(
-                    torch.stack(torch._foreach_norm(v_list, ord=float('inf'))).max()
-                )
-            else:
-                chunk_maxA_list.append(
-                    torch.stack(torch._foreach_norm(v_list, ord=float('inf'))).max()
-                    / bias_corr_2
-                )
-
-            # score = δ² × A (in-place into pv_list)
-            torch._foreach_mul_(pv_list, v_list)
-            del v_list
-            if not use_hessian:
-                # Adam bias correction (skipped for |H| since the GNB/Hutchinson
-                # estimators are already unbiased).
-                torch._foreach_div_(pv_list, bias_corr_2)
-
-            # Per-chunk score reductions (scores ≥ 0 → ord=1 norm = sum).
-            chunk_smax_list.append(
-                torch.stack(torch._foreach_norm(pv_list, ord=float('inf'))).max()
-            )
-            chunk_ssum_list.append(
-                torch.stack(torch._foreach_norm(pv_list, ord=1.0)).sum()
-            )
-
-            # Move scores into the dict (pv_list elements ARE the score tensors).
-            for i, n in enumerate(cnames):
-                scores_by_name[n] = pv_list[i]
-
-        # ---- Random mode: replace scores with rand for selection -----
-        # Importance scores stay in `importance_scores_for_diag` so we can
-        # still report per-param score sums (used by score_diag plotting).
-        if use_random:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(
-                (int(global_step) * (2 ** 20) + 0xBADCAFE) ^ self._random_seed_salt
-            )
-            rand_scores: Dict[str, torch.Tensor] = {}
-            rand_smax_list: List[torch.Tensor] = []
-            rand_ssum_list: List[torch.Tensor] = []
-            for chunk_start in range(0, len(included_names), CHUNK):
-                cnames = included_names[chunk_start:chunk_start + CHUNK]
-                r_list: List[torch.Tensor] = [
-                    torch.rand(
-                        scores_by_name[n].numel(), generator=gen,
-                        device=device, dtype=torch.float32,
-                    )
-                    for n in cnames
-                ]
-                rand_smax_list.append(
-                    torch.stack(torch._foreach_norm(r_list, ord=float('inf'))).max()
-                )
-                rand_ssum_list.append(
-                    torch.stack(torch._foreach_norm(r_list, ord=1.0)).sum()
-                )
-                for i, n in enumerate(cnames):
-                    rand_scores[n] = r_list[i]
-            # Excluded experts: rand uses zeros (consistent with importance pass).
-            for name in excluded_names:
-                rand_scores[name] = scores_by_name[name]
-            importance_scores_for_diag = scores_by_name
-            scores_by_name = rand_scores
-            # Selection histogram is over rand → swap the bound lists.
-            chunk_smax_list = rand_smax_list
-            chunk_ssum_list = rand_ssum_list
-            # max_A / max_delta diagnostics carry over from importance pass.
-        else:
-            importance_scores_for_diag = scores_by_name
-
-        _p2_t0 = _time.perf_counter()
-        phase_pass1_ms = (_p2_t0 - _p1_t0) * 1000.0
-
-        # ---- Pass 2: histc with delayed bounds (no GPU→CPU sync) -----
-        # s_min = 0 always (scores are products of non-negatives:
-        # v × δ² ≥ 0; |H| × δ² ≥ 0; rand ∈ [0,1)). No reduction needed.
-        # s_max: reuse the previous step's actual s_max with 1.5× safety
-        # margin so newly-emerged outliers fall inside the bin range. The
-        # current step's actual s_max is computed on GPU and the host-side
-        # value is captured in the end-of-step diagnostic bundle, where
-        # the sync overlaps the index_select / theta_cp / H2D launches.
-        n_bins = 10000
-        s_min = 0.0
-        if self._prev_s_max is not None and self._prev_s_max > 0.0:
-            s_max = self._prev_s_max * 1.5
-        else:
-            # Cold start: one blocking sync to seed the cache. Subsequent
-            # steps are sync-free.
-            if chunk_smax_list:
-                s_max = max(
-                    float(torch.stack(chunk_smax_list).max().item()), 1e-6,
-                )
-            else:
-                s_max = 1e-6
-        if s_max <= 0.0:
-            s_max = 1e-6
-
-        # Chunked histc: cat 64-tensor groups before histc to amortize
-        # kernel launch + atomic-bin contention. Uses the persistent
-        # `_cat_scratch_fp32` buffer (sized to max_chunk_numel) — torch.cat
-        # with `out=` writes directly into the scratch slice, eliminating
-        # the per-chunk alloc/free that fragments the CUDA allocator.
-        global_hist = torch.zeros(n_bins, dtype=torch.float32, device=device)
-        score_items_list: List[Tuple[str, torch.Tensor]] = list(scores_by_name.items())
-        for chunk_start in range(0, len(score_items_list), CHUNK):
-            chunk_scores = [
-                s for _, s in score_items_list[chunk_start:chunk_start + CHUNK]
-            ]
-            total_n = sum(s.numel() for s in chunk_scores)
-            flat = self._cat_scratch_fp32[:total_n]
-            torch.cat(chunk_scores, out=flat)
-            global_hist += torch.histc(flat, bins=n_bins, min=s_min, max=s_max)
-
-        # Threshold from cumulative top-K count.
-        k = max(1, int(self.topk_ratio * total))
-        cumsum = global_hist.flip(0).cumsum(0)
-        bin_idx_t = (cumsum >= k).nonzero(as_tuple=True)[0]
-        bin_width = (s_max - s_min) / n_bins
-        if bin_idx_t.numel() > 0:
-            threshold = s_max - float(bin_idx_t[0].item()) * bin_width
-        else:
-            threshold = s_min
-
-        _p3_t0 = _time.perf_counter()
-        phase_pass2_ms = (_p3_t0 - _p2_t0) * 1000.0
-
-        # ---- Pass 3: chunked nonzero + searchsorted segment split ----
-        # Per-tensor nonzero would force ~N (=2304 in exp_3 scale) implicit
-        # syncs because nonzero produces a dynamic-shape tensor and any
-        # downstream op needing the count blocks the CPU. Chunked nonzero
-        # collapses these to ~N/CHUNK syncs:
-        #
-        #   1. cat the chunk's score tensors → one flat
-        #   2. flat_mask = flat >= threshold  (1 launch)
-        #   3. flat_sel = flat_mask.nonzero(...)  (1 launch + 1 SHAPE SYNC)
-        #   4. searchsorted(flat_sel, chunk_offsets) → segment boundaries
-        #      (1 launch, no sync; flat_sel is sorted ascending so the
-        #       boundary positions exactly delimit each tensor's slice)
-        #   5. seg_bounds.cpu()  (1 small sync — ~CHUNK+1 longs)
-        #   6. for each tensor in chunk: slice flat_sel via CPU offsets,
-        #      subtract chunk_offset to get tensor-local indices, then run
-        #      the same index_select / theta_cp / H2D pipeline as before.
-        #
-        # Net: 2 syncs per chunk × ⌈N_tensors/CHUNK⌉ chunks vs the legacy
-        # 1 sync × N_tensors. At N=2304, CHUNK=64: 72 syncs vs 2304.
-        selected_payload: Dict[
-            str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
+        selected_payload: Dict[str, Tuple[torch.Tensor, torch.Tensor,
+                                          torch.Tensor, torch.Tensor]] = {}
         per_param_selected: Dict[str, int] = {}
-        per_param_score_sum: Dict[str, float] = {}
-        selected_bytes = 0
-        k_actual = 0
 
-        # Per-param score sum for diagnostics. _foreach_norm(ord=1.0) gives
-        # sum-of-abs which equals sum for our non-negative scores. Stack +
-        # one .cpu() at the end of step() bundles the sync.
-        diag_scores_items = list(importance_scores_for_diag.items())
-        per_param_sum_gpu: List[torch.Tensor] = []
-        for chunk_start in range(0, len(diag_scores_items), CHUNK):
-            chunk_sc = [
-                s for _, s in diag_scores_items[chunk_start:chunk_start + CHUNK]
-            ]
-            per_param_sum_gpu.extend(
-                torch._foreach_norm(chunk_sc, ord=1.0)
-            )
-
-        # Process p3 in chunks: chunked nonzero + searchsorted-based split.
-        for chunk_start in range(0, len(score_items_list), CHUNK):
-            chunk_items = score_items_list[chunk_start:chunk_start + CHUNK]
-            chunk_names_p3 = [n for n, _ in chunk_items]
-            chunk_scores = [s for _, s in chunk_items]
-            n_in_chunk = len(chunk_names_p3)
-
-            total_n = sum(s.numel() for s in chunk_scores)
-            flat = self._cat_scratch_fp32[:total_n]
-            torch.cat(chunk_scores, out=flat)
-            flat_mask = self._cat_scratch_bool[:total_n]
-            torch.ge(flat, threshold, out=flat_mask)
-            # Single nonzero per chunk: returns sorted indices into `flat`.
-            flat_sel = flat_mask.nonzero(as_tuple=True)[0]
-            # Note: flat / flat_mask are views into persistent scratch — no
-            # del needed; the slices will be overwritten on next chunk.
-
-            # Cumulative chunk-local offsets: chunk_off[i] is where tensor i
-            # starts in the cat'd flat. Boundary at chunk_off[i+1] means
-            # tensor i's selections live in flat_sel[searchsorted(flat_sel,
-            # chunk_off[i]) : searchsorted(flat_sel, chunk_off[i+1])].
-            chunk_off_cpu: List[int] = [0]
-            for s in chunk_scores:
-                chunk_off_cpu.append(chunk_off_cpu[-1] + s.numel())
-            chunk_off_t = torch.tensor(
-                chunk_off_cpu, dtype=torch.long, device=device,
-            )
-            seg_bounds = torch.searchsorted(flat_sel, chunk_off_t)
-            seg_bounds_cpu = seg_bounds.cpu()  # small sync (CHUNK+1 longs)
-
-            # Process each tensor in chunk using already-computed boundaries.
-            # No further nonzero / shape syncs are needed: cnt is derived
-            # from CPU-side seg_bounds, and `flat_sel[s:e]` is a known-size
-            # view whose length we got from seg_bounds_cpu.
-            for i, name in enumerate(chunk_names_p3):
-                s = int(seg_bounds_cpu[i].item())
-                e = int(seg_bounds_cpu[i + 1].item())
-                cnt = e - s
-                per_param_selected[name] = cnt
-                k_actual += cnt
-                if cnt == 0:
+        with sm:
+            for i, name in enumerate(name_list):
+                s_b = int(seg_bounds_cpu[i].item())
+                e_b = int(seg_bounds_cpu[i + 1].item())
+                cnt_g = e_b - s_b
+                # Early-skip: if this expert is in the effective exclusion
+                # (T-1 fired ∪ T fired), don't bother with index_select +
+                # D2H. The lossy_fc_append below would skip it anyway, but
+                # this saves the wasted GPU work + pinned host transfer.
+                eid_skip = self._tname_to_eid.get(name)
+                if cnt_g == 0 or (
+                    eid_skip is not None and eid_skip in excluded_eids
+                ):
                     selected_payload[name] = (
                         torch.empty(0, dtype=torch.int32),
                         torch.empty(0, dtype=torch.float32),
                         torch.empty(0, dtype=torch.float32),
                         torch.empty(0, dtype=torch.float32),
                     )
+                    per_param_selected[name] = 0
+                    # NB: dg index_fill_ for T-1 selected groups under a
+                    # T-fired expert is also skipped. That's fine — the
+                    # whole-expert dg zero is already done by
+                    # ExpertLosslessFC._fire_one (and tracker.step's
+                    # defensive backup) for fired_T experts, so the dg
+                    # state for these experts is uniformly 0 regardless.
                     continue
-
-                # Tensor-local indices: subtract this tensor's offset within
-                # the cat'd chunk. flat_sel[s:e] is a contiguous slice (no
-                # launch); the subtract is one elementwise op.
-                offset_i = chunk_off_cpu[i]
-                local_sel = flat_sel[s:e].sub(offset_i)
+                local_g = top_idx_sorted[s_b:e_b].sub(offsets_cpu[i])
+                elem_idx = (
+                    local_g.unsqueeze(1) * g_blk + arange_g.unsqueeze(0)
+                ).flatten()
+                cnt_e = elem_idx.numel()
 
                 p = self._name_to_param[name]
                 p_flat = _fp32_param(p).detach().reshape(-1)
-                p_sel = p_flat.index_select(0, local_sel).to(torch.float32)
-                m_src = name_to_m[name]
+                p_sel = p_flat.index_select(0, elem_idx).to(torch.float32)
+                m_src = (mapper.get_state(p, "exp_avg") if mapper is not None
+                         else optimizer.state.get(p, {}).get("exp_avg"))
                 if m_src is None:
-                    m_sel_gpu = torch.zeros(cnt, dtype=torch.float32, device=device)
+                    m_sel = torch.zeros(cnt_e, dtype=torch.float32,
+                                        device=device)
                 else:
-                    m_flat = m_src.detach().reshape(-1).to(torch.float32)
-                    m_sel_gpu = m_flat.index_select(0, local_sel)
+                    m_sel = m_src.detach().reshape(-1).to(torch.float32) \
+                                  .index_select(0, elem_idx)
                 v_src = _fp32_v_t(optimizer, p)
                 if v_src is None:
-                    v_sel_gpu = torch.zeros(cnt, dtype=torch.float32, device=device)
+                    v_sel = torch.zeros(cnt_e, dtype=torch.float32,
+                                        device=device)
                 else:
-                    v_flat = v_src.detach().flatten().to(torch.float32)
-                    v_sel_gpu = v_flat.index_select(0, local_sel)
+                    v_sel = v_src.detach().reshape(-1).to(torch.float32) \
+                                  .index_select(0, elem_idx)
 
-                # Update θ_CP for selected positions (GPU-only, no PCIe).
-                self.theta_cp[name].view(-1).index_copy_(
-                    0, local_sel, p_sel.to(torch.bfloat16)
-                )
+                d_g_buf = self._delta_g_accum.get(name)
+                if d_g_buf is not None and d_g_buf.numel() > 0:
+                    d_g_buf.index_fill_(0, local_g, 0.0)
 
-                idx_cpu = local_sel.to(torch.int32).to("cpu", non_blocking=True)
+                idx_cpu = elem_idx.to(torch.int32).to("cpu", non_blocking=True)
                 p_cpu = p_sel.to("cpu", non_blocking=True)
-                m_cpu = m_sel_gpu.to("cpu", non_blocking=True)
-                v_cpu = v_sel_gpu.to("cpu", non_blocking=True)
+                m_cpu = m_sel.to("cpu", non_blocking=True)
+                v_cpu = v_sel.to("cpu", non_blocking=True)
                 selected_payload[name] = (idx_cpu, p_cpu, m_cpu, v_cpu)
-                selected_bytes += (
-                    idx_cpu.numel() * idx_cpu.element_size()
-                    + p_cpu.numel() * p_cpu.element_size()
-                    + m_cpu.numel() * m_cpu.element_size()
-                    + v_cpu.numel() * v_cpu.element_size()
-                )
+                per_param_selected[name] = cnt_e
 
-        # ---- End-of-step bundled diagnostic sync ---------------------
-        # Aggregate all per-chunk reductions + per-param sums into one
-        # stacked tensor, single .cpu() transfer. By this point all p3 GPU
-        # work has been launched, so the sync overlaps with the kernels
-        # still in flight (index_select, index_copy_, H2D) — net cost ~0.
-        if chunk_smax_list:
-            cur_s_max_t = torch.stack(chunk_smax_list).max()
-            cur_s_sum_t = torch.stack(chunk_ssum_list).sum()
-            cur_max_A_t = torch.stack(chunk_maxA_list).max().clamp_min(1e-12)
-            cur_max_d_t = torch.stack(chunk_maxd_list).max()
-        else:
-            zero = torch.zeros((), device=device)
-            cur_s_max_t = zero
-            cur_s_sum_t = zero
-            cur_max_A_t = torch.full((), 1e-12, device=device)
-            cur_max_d_t = zero
+        # Ensure all H2D non_blocking copies in tracker_stream are done
+        # before the writer thread reads the CPU tensors.
+        if stream is not None:
+            stream.synchronize()
 
-        if per_param_sum_gpu:
-            per_param_sum_stack = torch.stack(per_param_sum_gpu)
-        else:
-            per_param_sum_stack = torch.zeros(0, device=device)
-
-        # One bundled sync.
-        diag_bundle = torch.cat([
-            torch.stack([cur_s_max_t, cur_s_sum_t, cur_max_A_t, cur_max_d_t]),
-            per_param_sum_stack,
-        ]).cpu()
-        s_max_actual = float(diag_bundle[0].item())
-        score_total = float(diag_bundle[1].item())
-        max_A = float(diag_bundle[2].item())
-        max_delta = float(diag_bundle[3].item())
-        score_mean = score_total / max(total, 1)
-        score_max = s_max_actual
-
-        # Match per-param sums to names (importance order, includes excluded zeros).
-        for i, (name, _) in enumerate(diag_scores_items):
-            per_param_score_sum[name] = float(diag_bundle[4 + i].item())
-        # Excluded names whose scores are zeros are already in
-        # diag_scores_items (importance pass populated zeros for them in
-        # scores_by_name before random swap), so the loop above covers them.
-        # Random mode swaps importance_scores_for_diag = original scores_by_name
-        # which still contains the excluded zeros. Either way, every name
-        # is represented.
-        for name in self._tracked_names:
-            per_param_score_sum.setdefault(name, 0.0)
-
-        # Cache actual s_max for next step's delayed bound.
-        self._prev_s_max = s_max_actual
-
-        # Free scoring tensors (5+ GB at exp_3 scale).
-        scores_by_name.clear()
-        if use_random:
-            importance_scores_for_diag.clear()
-
-        if t1 is not None:
-            t1.record()
-            torch.cuda.synchronize()
-            compute_ms = float(t0.elapsed_time(t1))
-        else:
-            compute_ms = 0.0
-
-        _p3_end = _time.perf_counter()
-        phase_pass3_ms = (_p3_end - _p3_t0) * 1000.0
-        # Save most-recent phase breakdown for cp_hooks diagnostic print.
-        self.last_phase_ms = {
-            "pass1": phase_pass1_ms,
-            "pass2": phase_pass2_ms,
-            "pass3": phase_pass3_ms,
-        }
-
-        # Push selected element state into the ExpertState append log.
-        # Collect each expert's tensor updates into one lossy_fc_append
-        # call per CLAUDE.md spec. Experts already doing lossless FC this
-        # iter (in excluded_eids) are skipped — their full state is being
-        # captured by the lossless FC path. The sync above guarantees
-        # non_blocking H2D copies have landed before we read these CPU
-        # tensors.
         if self._expert_state is not None:
             per_expert_batch: Dict[Tuple[int, int],
                                    List[Tuple[str, torch.Tensor,
@@ -966,379 +1102,375 @@ class ImportanceTracker:
                 )
             for eid, updates in per_expert_batch.items():
                 self._expert_state.lossy_fc_append(
-                    expert_id=eid, step=int(global_step),
+                    expert_id=eid, step=int(prev_step),
                     tensor_updates=updates,
                 )
 
-        stats = TrackerStepStats(
-            step=global_step,
-            total_tracked=total,
-            k=k_actual,
-            topk_ratio=k_actual / max(total, 1),
-            max_A=max_A,
-            max_delta=max_delta,
-            score_mean=score_mean,
-            score_max=score_max,
-            selected_bytes_sparse=selected_bytes,
-            full_save_bytes=self.full_save_bytes,
-            full_save_numel=self.total_full_save,
-            compute_time_ms=compute_ms,
-            per_param_selected=per_param_selected,
-            per_param_score_sum=per_param_score_sum,
-        )
-        return stats, selected_payload
+        self._pending_dispatch = None
+        self._last_dispatch_per_param_selected = per_param_selected
 
-    # ------------------------------------------------------------------
     @torch.no_grad()
-    def measure_score_distribution(
+    def step(
         self,
         optimizer: torch.optim.Optimizer,
         global_step: int,
-        num_bins: int = 1024,
-        topk_ratio_for_membership: Optional[float] = None,
-    ) -> Dict:
-        """Diagnostic: compute score = v̂_t × δ² for BOTH expert and non-expert
-        params. Returns histograms + per-layer aggregates + overlap percentile.
+        lossless_fc_eids: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[
+        TrackerStepStats,
+        Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
+        """Compute score = H_g × δ_g², pick group-level Top-K, dispatch
+        the previous iter's selected payload to ExpertState.
 
-        Expensive (~hundreds of ms). Call sparingly (e.g., every 100-200 iter).
+        Args:
+            optimizer: Adam (or variant). m / v are read for dispatch.
+            global_step: 1-indexed iteration number.
+            lossless_fc_eids: experts undergoing lossless FC THIS iter;
+                their tensors are excluded from top-K scoring (score=0)
+                AND from the lossy-FC append (no stale lossy on top of
+                fresh LFCL). See _dispatch_pending_payload docstring.
 
-        Returns dict::
-            {
-              "step": int,
-              "expert": {
-                "total_numel": int,
-                "min": float, "max": float, "mean": float, "p50": float,
-                "p90": float, "p99": float, "p99.9": float,
-                "hist_edges": [...], "hist_counts": [...],
-                "per_layer": {layer_idx: {"sum": float, "numel": int,
-                                          "expert_count": int, "avg_per_expert": float}}
-              },
-              "nonexpert": {same structure, no per_layer aggregation},
-              "overlap": {
-                "nonexpert_p999_value": float,     # 99.9-percentile of non-expert score
-                "expert_max_value": float,          # max of expert score
-                "expert_elements_above_ne_p999": int,   # how many expert elems > ne-p99.9
-                "expert_elements_above_ne_p999_pct": float,
-              }
-            }
+        1-iter pipeline + tracker stream: the current iter LAUNCHES all
+        GPU work on tracker_stream (no host-blocking sync here); the
+        previous iter's pending result is dispatched at the start of
+        THIS call (the only host-blocking sync, but short because the
+        prev tracker GPU work has overlapped with this iter's
+        forward+backward+optimizer in main_stream).
         """
-        beta2 = 0.999
-        for group in optimizer.param_groups:
-            if "betas" in group:
-                beta2 = float(group["betas"][1])
-                break
-        bias_corr_2 = max(1.0 - beta2 ** max(global_step, 1), 1e-12)
-
-        def _score_for_params(
-            names: List[str], name_to_p: Dict[str, torch.nn.Parameter],
-            theta_cp_dict: Dict[str, torch.Tensor],
-        ) -> Tuple[torch.Tensor, Dict[int, Tuple[float, int]],
-                   Dict[Tuple[int, int], List[torch.Tensor]], Dict[str, float]]:
-            """Compute scores for given param set. Returns
-            (flat_scores_cpu, per_layer_stats, per_expert_chunks, diag_stats).
-
-            diag_stats includes max/mean of |δ|, |v̂_t|, |param|, and ΔL proxy
-            (0.5 × Σ score), for detecting anomalies in score scale.
-            """
-            chunks: List[torch.Tensor] = []
-            per_layer_sum: Dict[int, float] = {}
-            per_layer_numel: Dict[int, int] = {}
-            per_expert_chunks: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-            # Diag aggregates (max / mean across all tracked tensors)
-            d_max = d_sum = d_count = 0.0
-            v_max = v_sum = 0.0
-            p_abs_max = p_abs_sum = 0.0
-            score_sum = 0.0
-            import re as _re
-            layer_re = _re.compile(r"\.layers\.(\d+)\.")
-            expert_re = _re.compile(r"deepspeed_experts\.(\d+)\.")
-            for name in names:
-                p = name_to_p[name]
-                v = _fp32_v_t(optimizer, p)
-                if v is None:
-                    continue
-                p_fp32 = _fp32_param(p).detach().flatten()
-                fc_fp32 = theta_cp_dict[name].view(-1).float()
-                delta = (p_fp32 - fc_fp32).abs()
-                vhat = v.detach().flatten().div(bias_corr_2)
-                score = vhat * delta * delta
-                score_cpu = score.to("cpu")
-                chunks.append(score_cpu)
-                # Diag accumulation
-                numel = delta.numel()
-                d_max = max(d_max, float(delta.max().item()))
-                d_sum += float(delta.sum().item())
-                d_count += numel
-                v_max = max(v_max, float(vhat.max().item()))
-                v_sum += float(vhat.sum().item())
-                p_abs = p_fp32.abs()
-                p_abs_max = max(p_abs_max, float(p_abs.max().item()))
-                p_abs_sum += float(p_abs.sum().item())
-                score_sum += float(score.sum().item())
-                # per-layer aggregation
-                lm = layer_re.search(name)
-                layer_idx = int(lm.group(1)) if lm else -1
-                per_layer_sum[layer_idx] = per_layer_sum.get(layer_idx, 0.0) + float(score.sum().item())
-                per_layer_numel[layer_idx] = per_layer_numel.get(layer_idx, 0) + int(score.numel())
-                # per-(layer, expert) accumulation — only for expert tensors
-                em = expert_re.search(name)
-                if em is not None and lm is not None:
-                    eid = (int(lm.group(1)), int(em.group(1)))
-                    per_expert_chunks.setdefault(eid, []).append(score_cpu)
-            diag_stats = {
-                "delta_max": d_max,
-                "delta_mean": d_sum / max(d_count, 1),
-                "vhat_max": v_max,
-                "vhat_mean": v_sum / max(d_count, 1),
-                "param_abs_max": p_abs_max,
-                "param_abs_mean": p_abs_sum / max(d_count, 1),
-                "score_sum": score_sum,
-                "delta_L_proxy": 0.5 * score_sum,  # ΔL ≈ 0.5 × Σ v̂ × δ²
-                "numel_total": int(d_count),
-            }
-            if not chunks:
-                return torch.empty(0, dtype=torch.float32), {}, {}, diag_stats
-            flat = torch.cat(chunks)
-            per_layer = {
-                k: (per_layer_sum[k], per_layer_numel[k])
-                for k in per_layer_sum
-            }
-            return flat, per_layer, per_expert_chunks, diag_stats
-
-        def _summary(flat: torch.Tensor, num_bins: int = 1024) -> Dict:
-            if flat.numel() == 0:
-                return {"total_numel": 0, "min": 0.0, "max": 0.0, "mean": 0.0,
-                        "p50": 0.0, "p90": 0.0, "p99": 0.0,
-                        "p99.5": 0.0, "p99.9": 0.0,
-                        "hist_edges": [], "hist_counts": []}
-            fmin = float(flat.min().item())
-            fmax = float(flat.max().item())
-            fmean = float(flat.mean().item())
-            # Percentiles via torch.quantile on a sample if too large.
-            sample = flat if flat.numel() < 1_000_000 else flat[torch.randperm(flat.numel())[:1_000_000]]
-            qs = torch.quantile(sample, torch.tensor([0.5, 0.9, 0.99, 0.995, 0.999]))
-            # Histogram on linear bins from fmin to fmax. Previously used a
-            # 1e-12 guard against fmax==fmin which dominated when scores
-            # are tiny (~1e-21), forcing all values into bin 0. Use a
-            # relative epsilon (or 1e-30 floor) so the histogram resolves
-            # the actual data range.
-            hi = fmax if fmax > fmin else fmin + max(abs(fmin) * 1e-6, 1e-30)
-            edges = torch.linspace(fmin, hi, num_bins + 1)
-            hist = torch.histc(flat, bins=num_bins, min=fmin, max=hi)
-            return {
-                "total_numel": int(flat.numel()),
-                "min": fmin, "max": fmax, "mean": fmean,
-                "p50": float(qs[0].item()), "p90": float(qs[1].item()),
-                "p99": float(qs[2].item()),
-                "p99.5": float(qs[3].item()), "p99.9": float(qs[4].item()),
-                "hist_edges": edges.tolist(),
-                "hist_counts": hist.tolist(),
-            }
-
-        # ==========================================================
-        # (A) Expert score = v̂_t × δ²  —  expert-vs-expert 비교용
-        # ==========================================================
-        exp_flat, exp_per_layer, exp_per_expert_chunks, exp_diag = _score_for_params(
-            self._tracked_names, self._name_to_param, self.theta_cp,
+        import time as _time
+        _t0_entry = _time.perf_counter()
+        excluded_eids = (
+            set(lossless_fc_eids) if lossless_fc_eids else set()
         )
-        exp_summary = _summary(exp_flat, num_bins)
-        exp_summary["diag"] = exp_diag  # δ, v̂, param, ΔL proxy
-        import re as _re
-        exp_idx_re = _re.compile(r"deepspeed_experts\.(\d+)\.")
-        layer_re2 = _re.compile(r"\.layers\.(\d+)\.")
-        per_layer_experts: Dict[int, set] = {}
-        for name in self._tracked_names:
-            lm = layer_re2.search(name)
-            em = exp_idx_re.search(name)
-            if lm and em:
-                per_layer_experts.setdefault(int(lm.group(1)), set()).add(int(em.group(1)))
-        exp_per_layer_out = {}
-        for layer_idx, (s, n) in exp_per_layer.items():
-            ncount = len(per_layer_experts.get(layer_idx, set())) or 1
-            exp_per_layer_out[layer_idx] = {
-                "sum": s, "numel": n,
-                "expert_count": ncount,
-                "avg_per_expert": s / ncount,
-            }
-        exp_summary["per_layer"] = exp_per_layer_out
+        device = next(self.model.parameters()).device
+        g_blk = max(1, int(self.block_quant_g))
+        mapper = get_mapper()
 
-        # Per-(layer, expert) summary for expert-vs-expert comparison.
-        per_expert_out: Dict[str, Dict[str, float]] = {}
-        per_expert_flat: Dict[str, torch.Tensor] = {}
-        for (L, E), parts in exp_per_expert_chunks.items():
-            ftens = torch.cat(parts) if len(parts) > 1 else parts[0]
-            n = int(ftens.numel())
-            if n == 0:
-                continue
-            per_expert_flat[f"L{L}_E{E}"] = ftens
-            qs = torch.quantile(ftens, torch.tensor([0.5, 0.9, 0.99, 0.999]))
-            per_expert_out[f"L{L}_E{E}"] = {
-                "layer": int(L), "expert": int(E), "numel": n,
-                "sum": float(ftens.sum().item()),
-                "mean": float(ftens.mean().item()),
-                "max": float(ftens.max().item()),
-                "p50": float(qs[0].item()), "p90": float(qs[1].item()),
-                "p99": float(qs[2].item()), "p99.9": float(qs[3].item()),
-            }
-        exp_summary["per_expert"] = per_expert_out
-
-        # ==========================================================
-        # (B) Top-K membership — expert score 상위 k%에 포함된 비율
-        #     layer별, expert별로 집계
-        # ==========================================================
-        k_ratio = float(topk_ratio_for_membership or self.topk_ratio)
-        topk_membership_out: Dict = {"topk_ratio": k_ratio}
-        if exp_flat.numel() > 0:
-            k = max(1, int(k_ratio * exp_flat.numel()))
-            # Global threshold at top-k (descending): value at rank k
-            sorted_scores, _ = exp_flat.sort(descending=True)
-            threshold = float(sorted_scores[k - 1].item())
-            topk_membership_out["threshold"] = threshold
-            topk_membership_out["k"] = int(k)
-            # Per-(layer, expert) inclusion count/fraction
-            per_expert_topk: Dict[str, Dict[str, float]] = {}
-            per_layer_topk_count: Dict[int, int] = {}
-            per_layer_topk_numel: Dict[int, int] = {}
-            for key, ftens in per_expert_flat.items():
-                n_in = int((ftens >= threshold).sum().item())
-                n_total = int(ftens.numel())
-                per_expert_topk[key] = {
-                    "count": n_in,
-                    "numel": n_total,
-                    "frac": n_in / max(n_total, 1),
-                }
-                L = per_expert_out[key]["layer"]
-                per_layer_topk_count[L] = per_layer_topk_count.get(L, 0) + n_in
-                per_layer_topk_numel[L] = per_layer_topk_numel.get(L, 0) + n_total
-            topk_membership_out["per_expert"] = per_expert_topk
-            topk_membership_out["per_layer"] = {
-                L: {
-                    "count": per_layer_topk_count[L],
-                    "numel": per_layer_topk_numel[L],
-                    "frac": per_layer_topk_count[L] / max(per_layer_topk_numel[L], 1),
-                }
-                for L in per_layer_topk_count
-            }
-        exp_summary["topk_membership"] = topk_membership_out
-
-        # ==========================================================
-        # (C) v_t percentile distributions  —  non-expert vs expert CDF 용
-        #     각 카테고리의 v_t (FP32 Adam 2nd moment) 원본 분포를 측정.
-        #     v̂_t(bias-correction)는 단조 스케일이므로 v_t 분위만 저장해도 동치.
-        # ==========================================================
-        # Dense percentile grid tailored for long-tail CDF visualization:
-        # 0, 1, 2, ..., 98   (per-1%)
-        # 99.0, 99.1, ..., 99.9  (per-0.1%)
-        # 99.99
-        pct_list = (
-            [i * 1.0 for i in range(0, 99)]
-            + [99.0 + i * 0.1 for i in range(0, 10)]
-            + [99.99]
+        # === STEP 0: dispatch previous iter's pending payload ===
+        # Pass THIS iter's excluded set so dispatch can skip experts that
+        # fired a lossless FC at T (their fresh LFCL would be clobbered
+        # otherwise — see _dispatch_pending_payload docstring).
+        _t0_dispatch_start = _time.perf_counter()
+        self._dispatch_pending_payload(
+            optimizer, current_iter_excluded=excluded_eids,
         )
-        pct_keys = [f"p{p:.2f}" for p in pct_list]
+        _t0_dispatch_end = _time.perf_counter()
+        phase_dispatch_ms = (_t0_dispatch_end - _t0_dispatch_start) * 1000.0
 
-        def _collect_vt(names: List[str], name_to_p: Dict[str, torch.nn.Parameter]) -> torch.Tensor:
-            """Concat v_t across the given param set (CPU)."""
-            chunks: List[torch.Tensor] = []
-            for name in names:
-                p = name_to_p[name]
-                v = _fp32_v_t(optimizer, p)
-                if v is None:
-                    continue
-                chunks.append(v.detach().flatten().to("cpu"))
-            return torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.float32)
+        # === STEP 1: launch current iter's GPU work on tracker_stream ===
+        if self._tracker_stream is None and torch.cuda.is_available():
+            self._tracker_stream = torch.cuda.Stream()
+        stream = self._tracker_stream
+        prev_stream = None
+        if stream is not None:
+            # Option 2: narrow the dependency. Instead of
+            # wait_stream(main) (which waits for ALL prior main-stream
+            # ops), record an event right at this point in main_stream
+            # and wait only on it. This is equivalent in time (FIFO)
+            # but is the more idiomatic stream-event pattern, and lets
+            # main_stream issue forward(T+1) immediately without being
+            # entangled in tracker_stream's prior wait_stream chain.
+            cur_main = torch.cuda.current_stream()
+            ev_opt = torch.cuda.Event()
+            ev_opt.record(cur_main)
+            stream.wait_event(ev_opt)
+            # Switch default stream → tracker_stream so all GPU launches
+            # below land in tracker_stream without an extra `with` block.
+            prev_stream = cur_main
+            torch.cuda.set_stream(stream)
+        # Mark we're inside tracker_stream so update_delta_accum's DEBUG
+        # sync (which would block main stream) is suppressed.
+        self._inside_tracker_stream = True
 
-        def _percentiles(flat: torch.Tensor) -> Dict[str, float]:
-            if flat.numel() == 0:
-                return {k: 0.0 for k in pct_keys}
-            # torch.quantile memory-limits at ~16M elems; sample if larger.
-            sample = (
-                flat if flat.numel() < 1_000_000
-                else flat[torch.randperm(flat.numel())[:1_000_000]]
+        # update_delta_accum (m, v read + dg write) — same stream as score.
+        self.update_delta_accum(optimizer, global_step)
+
+        # B2 expert-lossless-FC compatibility: zero out the dg accumulator
+        # for any expert that fired a lossless FC this iter. CLAUDE.md spec:
+        # "Expert lossless FC 수행 시 ... θ_CP = θ_current → δ = 0".
+        # ExpertLosslessFC.fire_if_due ALSO does this reset (race-free
+        # there since same tracker_stream). This block is a defensive
+        # backup for callers that pass lossless_fc_eids without going
+        # through ExpertLosslessFC. Idempotent (zero-of-zero is fine).
+        if excluded_eids and getattr(self, "_flat_layout_done", False):
+            for name in self._g_fast_name_list:
+                eid = self._tname_to_eid.get(name)
+                if eid is not None and eid in excluded_eids:
+                    d_g = self._delta_g_accum.get(name)
+                    if d_g is not None and d_g.numel() > 0:
+                        d_g.zero_()
+
+        _t0_p1 = _time.perf_counter()
+
+        # --- Phase 1: group-level score = h_g × dg in ONE torch.mul ------
+        # Layout (set at init): flat_sg, dg_flat, h_g_fp32_flat, exc_mask
+        # all share the same master-order layout (per-name views laid out
+        # contiguously per BF16-Opt group). h_g_fp32_flat is rebuilt only
+        # when _H_updates changes (every refresh ~40 iters); excluded
+        # mask is touched only for the (usually 0-few) experts undergoing
+        # lossless FC this iter.
+        if not getattr(self, "_flat_layout_done", False):
+            # init not done yet — return early stats (defensive).
+            self._inside_tracker_stream = False
+            if prev_stream is not None:
+                torch.cuda.set_stream(prev_stream)
+            stats = TrackerStepStats(
+                step=global_step, total_tracked=0, k=0, topk_ratio=0.0,
+                max_A=0.0, max_delta=0.0, score_mean=0.0, score_max=0.0,
+                selected_bytes_sparse=0,
+                full_save_bytes=self.full_save_bytes,
+                full_save_numel=self.total_full_save, compute_time_ms=0.0,
             )
-            qs = torch.quantile(sample, torch.tensor([p / 100.0 for p in pct_list]))
-            return {pct_keys[i]: float(qs[i].item()) for i in range(len(pct_list))}
+            self.last_phase_ms = {
+                "setup": 0.0, "pass1": 0.0, "pass2": 0.0,
+                "pass3": 0.0, "post": 0.0,
+            }
+            return stats, {}
 
-        exp_vt_flat = _collect_vt(self._tracked_names, self._name_to_param)
-        ne_vt_flat = _collect_vt(self._full_save_names, self._name_to_full_save_param)
-        expert_vt_pcts = _percentiles(exp_vt_flat)
-        nonexpert_vt_pcts = _percentiles(ne_vt_flat)
+        # offsets_t / arange_g lazy-init (once).
+        if not hasattr(self, "_g_fast_offsets_t"):
+            self._g_fast_offsets_t = torch.tensor(
+                self._g_fast_offsets_cpu, dtype=torch.long, device=device,
+            )
+            self._g_fast_arange_g = torch.arange(
+                g_blk, dtype=torch.long, device=device,
+            )
 
-        # ---------------- |H| and score_H = |H|·δ² percentiles ----------------
-        # Only populated when H cache is active (selection_mode='hessian'
-        # or refresh_hessian called periodically). Gives user a per-iter CDF
-        # of raw |H_diag| and the Hessian-based selection score.
-        h_cache = getattr(self, "_H_ema", {}) or {}
-        h_percentiles: Dict[str, float] = {}
-        score_h_percentiles: Dict[str, float] = {}
-        h_numel = 0
-        score_h_numel = 0
-        if h_cache:
-            h_chunks: List[torch.Tensor] = []
-            sh_chunks: List[torch.Tensor] = []
-            for name in self._tracked_names:
-                h = h_cache.get(name)
-                if h is None:
-                    continue
-                h_flat = h.detach().flatten().to("cpu")
-                h_chunks.append(h_flat)
-                # score_H = |H| · δ²
-                p = self._name_to_param[name]
-                fc = self.theta_cp.get(name)
-                if fc is not None:
-                    p_fp32 = _fp32_param(p).detach().flatten()
-                    delta_sq = (p_fp32 - fc.view(-1).float()).pow_(2).to("cpu")
-                    sh_chunks.append(h_flat * delta_sq)
-            h_flat_all = torch.cat(h_chunks) if h_chunks else torch.empty(0, dtype=torch.float32)
-            sh_flat_all = torch.cat(sh_chunks) if sh_chunks else torch.empty(0, dtype=torch.float32)
-            h_percentiles = _percentiles(h_flat_all)
-            score_h_percentiles = _percentiles(sh_flat_all)
-            h_numel = int(h_flat_all.numel())
-            score_h_numel = int(sh_flat_all.numel())
+        name_list = self._g_fast_name_list
+        offsets_cpu = self._g_fast_offsets_cpu
+        offsets_t = self._g_fast_offsets_t
+        arange_g = self._g_fast_arange_g
+        dg_flat = self._g_fast_dg_flat
+        h_g_flat = self._g_fast_h_g_bf16_flat
+        exc_mask = self._g_fast_exc_mask
+        chunk_buf = self._g_fast_chunk_buf
+        chunk_size = self._g_fast_chunk_size
+        global_hist = self._g_fast_global_hist
+        n_bins = self._g_fast_n_bins
+        total_groups = dg_flat.numel()
+        total_elems = total_groups * g_blk
 
-        # ==========================================================
-        # (D) Legacy non-expert score (v̂×δ², for backward compat only)
-        # ==========================================================
-        ne_flat, _, _, ne_diag = _score_for_params(
-            self._full_save_names, self._name_to_full_save_param, self.theta_fc_nonexpert,
-        )
-        ne_summary = _summary(ne_flat, num_bins)
-        ne_summary["diag"] = ne_diag
+        # B2 simplification: _fold_h now writes h_g IN-PLACE directly into
+        # _g_fast_h_g_bf16_flat via per-name views, and _H_g dict
+        # entries point to the same views (storage shared). Hence no
+        # rebuild copy needed here — h_g_flat always reflects the latest
+        # _fold_h result. Saves a redundant ~47 MB BF16 copy per refresh
+        # AND eliminates the _H_g dict's separate-storage allocation.
 
-        ne_p999 = ne_summary["p99.9"]
-        if exp_flat.numel() > 0 and ne_p999 > 0:
-            n_above = int((exp_flat > ne_p999).sum().item())
-            pct_above = n_above / exp_flat.numel() * 100.0
+        # Build exclusion mask: True normally, False for experts in lossless FC.
+        prev_exc = getattr(self, "_g_fast_prev_exc_eids", None)
+        if prev_exc != excluded_eids:
+            exc_mask.fill_(True)
+            if excluded_eids:
+                for i, n in enumerate(name_list):
+                    eid = self._tname_to_eid.get(n)
+                    if eid is not None and eid in excluded_eids:
+                        self._g_fast_exc_views[i].fill_(False)
+            self._g_fast_prev_exc_eids = set(excluded_eids)
+
+        _t0_p2 = _time.perf_counter()
+        phase_pass1_ms = (_t0_p2 - _t0_p1) * 1000.0
+
+        # --- Phase 2 (X-C: unified chunked loop) ------------------------
+        # Goal: process Phase 1 (score = h_g × dg × exc) + Phase 2 (histc
+        # accumulation, cumsum/scatter packed selection) in a SINGLE chunk
+        # loop with fixed chunk_buf transient memory (~100 MB). This makes
+        # the path memory-stable across all g (1..256) — no flat_sg buffer
+        # scaling with total_groups.
+        #
+        # Threshold: 1-iter delayed. Current iter's selection uses previous
+        # iter's threshold; current iter's chunk-summed hist updates the
+        # threshold for the next iter. Cold start: threshold = 0 → all
+        # groups pass first iter → sel_buf[0..K_max-1] holds first
+        # K_max indices (whatever they are). Top-K accuracy converges
+        # within 2-3 iters as the threshold catches up.
+        K_total = max(1, int(self.topk_ratio * total_elems))
+        K_groups = max(1, K_total // g_blk)
+        K_groups = min(K_groups, total_groups)
+        avg_per_bin = max(1, total_groups // n_bins)
+        K_max = K_groups + 5 * avg_per_bin
+
+        # Persistent sel buffer (lazy-init / re-alloc on size change).
+        sel_buf = getattr(self, "_g_fast_sel_buf", None)
+        if sel_buf is None or sel_buf.numel() < K_max + 1:
+            self._g_fast_sel_buf = torch.empty(
+                K_max + 1, dtype=torch.long, device=device,
+            )
+            sel_buf = self._g_fast_sel_buf
+        sel_buf.fill_(-1)
+        global_hist.zero_()
+
+        threshold_t = self._g_fast_prev_threshold_t  # GPU scalar
+
+        # Delayed s_max bound for histc range (host-side carry).
+        prev_smax_g = getattr(self, "_prev_s_max_g", None)
+        if prev_smax_g is not None and prev_smax_g > 0.0:
+            s_max = prev_smax_g * 1.5
         else:
-            n_above = 0
-            pct_above = 0.0
+            # Cold start: probe one chunk to seed s_max. Single sync.
+            cold = chunk_buf[: min(chunk_size, total_groups)]
+            # h_g (BF16) × dg (FP32) → FP32 in cold via .to() promotion.
+            torch.mul(
+                h_g_flat[: cold.numel()].to(torch.float32),
+                dg_flat[: cold.numel()],
+                out=cold,
+            )
+            cold.mul_(exc_mask[: cold.numel()].to(torch.float32))
+            s_max = float(cold.max().item())
+            if s_max <= 0.0:
+                s_max = 1e-6
+        bin_width = s_max / n_bins
 
-        return {
-            "step": int(global_step),
-            "expert": exp_summary,           # (A) expert score + (B) top-K membership
-            "nonexpert": ne_summary,         # legacy (v̂×δ² score for non-expert) — compat
-            "vt_percentiles": {              # (C) v_t CDF for cross-category comparison
-                "percentile_labels": pct_list,
-                "expert": {
-                    "numel": int(exp_vt_flat.numel()),
-                    "values": expert_vt_pcts,
-                },
-                "nonexpert": {
-                    "numel": int(ne_vt_flat.numel()),
-                    "values": nonexpert_vt_pcts,
-                },
-            },
-            # (E) |H| and score_H = |H|·δ² CDFs — populated when H
-            # cache is active (selection_mode='hessian' or periodic refresh).
-            "h_percentiles": {
-                "percentile_labels": pct_list,
-                "H_diag": {"numel": h_numel, "values": h_percentiles},
-                "score_h": {"numel": score_h_numel, "values": score_h_percentiles},
-            },
-            "overlap": {
-                "nonexpert_p999_value": ne_p999,
-                "expert_max_value": exp_summary["max"],
-                "expert_elements_above_ne_p999": n_above,
-                "expert_elements_above_ne_p999_pct": pct_above,
-            },
+        # Note: per-chunk arange / full_kmax are transient (PyTorch caching
+        # allocator reuses across chunks + iters → no measurable benefit
+        # from making them persistent, only memory waste).
+
+        # GPU-side timing of the chunk loop + sort/searchsorted (cuda
+        # events). This isolates the actual GPU work from the host-side
+        # blocking sync at seg_bounds.cpu(), which absorbs prior-stream
+        # wait. Set PROPOSAL_DEBUG_TIME_ACCUM=1 to print.
+        import os as _os_pe
+        _dbg_pe = _os_pe.environ.get("PROPOSAL_DEBUG_TIME_ACCUM", "") in (
+            "1", "true", "TRUE",
+        )
+        _ev0 = _ev1 = None
+        if _dbg_pe and torch.cuda.is_available():
+            _ev0 = torch.cuda.Event(enable_timing=True)
+            _ev1 = torch.cuda.Event(enable_timing=True)
+            _ev0.record()
+
+        # Running True-count cumulative (GPU scalar).
+        true_cum = torch.zeros((), dtype=torch.long, device=device)
+
+        for chunk_start in range(0, total_groups, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_groups)
+            chunk_n = chunk_end - chunk_start
+            chunk_view = chunk_buf[:chunk_n]
+            # Score: h_g (BF16) × dg (FP32) → FP32 in chunk_view.
+            torch.mul(
+                h_g_flat.narrow(0, chunk_start, chunk_n).to(torch.float32),
+                dg_flat.narrow(0, chunk_start, chunk_n),
+                out=chunk_view,
+            )
+            # Apply exclusion mask (bool → multiply zeros out excluded).
+            exc_chunk = exc_mask.narrow(0, chunk_start, chunk_n)
+            chunk_view.mul_(exc_chunk)  # bool * float OK in PyTorch
+            # Histogram accumulate (for NEXT iter's threshold).
+            global_hist.add_(
+                torch.histc(chunk_view, bins=n_bins, min=0.0, max=s_max)
+            )
+            # Mask + cumsum + scatter using THIS iter's (prev) threshold.
+            # Use cumsum(dtype=long) to skip an explicit .long() cast +
+            # in-place sub_/add_ to avoid transient new tensors.
+            mask_chunk = chunk_view >= threshold_t
+            positions_chunk = mask_chunk.cumsum(0, dtype=torch.long)
+            positions_chunk.sub_(1).add_(true_cum)
+            full_kmax = torch.full_like(positions_chunk, K_max)
+            target_pos = torch.where(
+                mask_chunk, positions_chunk, full_kmax,
+            )
+            target_pos.clamp_(min=0, max=K_max)
+            chunk_idx = torch.arange(
+                chunk_start, chunk_end, device=device, dtype=torch.long,
+            )
+            sel_buf.scatter_(0, target_pos, chunk_idx)
+            # mask.sum(dtype=long) skips the explicit .long() cast.
+            true_cum = true_cum + mask_chunk.sum(dtype=torch.long)
+
+        # Update threshold for NEXT iter (GPU scalar; no host sync).
+        cumsum_rev = global_hist.flip(0).cumsum(0)
+        ge_k = cumsum_rev >= K_groups
+        bin_idx_t = ge_k.to(torch.int8).argmax(dim=0)
+        next_threshold = s_max - bin_idx_t.to(torch.float32) * bin_width
+        self._g_fast_prev_threshold_t = next_threshold
+        self._prev_s_max_g = float(s_max)  # host-side carry
+
+        # Replace -1 padding with total_groups so sort puts them at end.
+        n_groups_full = torch.full(
+            (1,), total_groups, dtype=torch.long, device=device,
+        )
+        valid_part = sel_buf[:K_max]
+        valid_part = torch.where(
+            valid_part >= 0, valid_part, n_groups_full.expand_as(valid_part),
+        )
+        top_idx_sorted, _ = valid_part.sort()
+        seg_bounds = torch.searchsorted(top_idx_sorted, offsets_t)
+        if _ev1 is not None:
+            _ev1.record()
+        # NOTE: NO seg_bounds.cpu() here — defer to next iter dispatch.
+
+        _t0_p2_end = _time.perf_counter()
+        phase_pass2_ms = (_t0_p2_end - _t0_p2) * 1000.0
+
+        # Restore main default stream (we set tracker_stream as default
+        # at STEP 1 entry).
+        self._inside_tracker_stream = False
+        if prev_stream is not None:
+            torch.cuda.set_stream(prev_stream)
+
+        # Record tracker work completion event (so next iter dispatch can
+        # synchronize and main stream race guard can wait_event).
+        event_tracker = None
+        if stream is not None:
+            event_tracker = torch.cuda.Event()
+            event_tracker.record(stream)
+        self._pending_tracker_event = event_tracker
+        self._pending_dispatch = {
+            "step": global_step,
+            "seg_bounds": seg_bounds,
+            "top_idx_sorted": top_idx_sorted,
+            "name_list": list(name_list),
+            "offsets_cpu": list(offsets_cpu),
+            "excluded_eids": set(excluded_eids),
         }
+
+        _t0_end = _time.perf_counter()
+        phase_launch_ms = (_t0_end - _t0_dispatch_end) * 1000.0
+        phase_setup_ms = (_t0_p1 - _t0_dispatch_end) * 1000.0
+        self.last_phase_ms = {
+            "setup": phase_setup_ms,
+            "pass1": phase_pass1_ms,
+            "pass2": phase_pass2_ms,
+            "pass3": 0.0,  # deferred to next iter dispatch
+            "post": 0.0,
+            "dispatch": phase_dispatch_ms,
+            "launch": phase_launch_ms,
+        }
+
+        # GPU event timing (debug only)
+        if _ev0 is not None and _ev1 is not None:
+            try:
+                _ev1.synchronize()
+                gpu_ms = _ev0.elapsed_time(_ev1)
+                print(f"[proposal] tracker.step.p2 GPU work "
+                      f"@iter{global_step}: gpu={gpu_ms:.2f} ms host="
+                      f"{phase_pass2_ms:.2f} ms (launch only)",
+                      flush=True)
+            except Exception:
+                pass
+
+        # Diagnostics: zeros (selected_payload is dispatched next iter).
+        per_param_score_sum = {n: 0.0 for n in self._tracked_names}
+        per_param_selected = getattr(
+            self, "_last_dispatch_per_param_selected", {},
+        )
+        for n in self._tracked_names:
+            per_param_selected.setdefault(n, 0)
+
+        stats = TrackerStepStats(
+            step=global_step,
+            total_tracked=total_elems,
+            k=sum(per_param_selected.values()),
+            topk_ratio=0.0,
+            max_A=0.0,
+            max_delta=0.0,
+            score_mean=0.0,
+            score_max=0.0,
+            selected_bytes_sparse=0,
+            full_save_bytes=self.full_save_bytes,
+            full_save_numel=self.total_full_save,
+            compute_time_ms=0.0,
+            per_param_selected=per_param_selected,
+            per_param_score_sum=per_param_score_sum,
+        )
+        return stats, {}

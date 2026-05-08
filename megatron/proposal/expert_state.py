@@ -260,20 +260,31 @@ class ExpertState:
         initial_state: Dict[str, Tuple[torch.Tensor,
                                        Optional[torch.Tensor],
                                        Optional[torch.Tensor]]],
+        cuda_event: Optional["torch.cuda.Event"] = None,
     ) -> None:
         """Write full (param, m, v) snapshot for ``expert_id`` and reset
         its lossy FC log.
 
-        **Training-thread work**: build the immutable header bytes and a
-        per-tensor ``(name, param_bytes, m_bytes, v_bytes)`` list. All
-        numpy conversions use the already-CPU tensors handed in by
-        ``FCManager._collect_expert_payload``.
+        **Training-thread work**: just build the immutable header bytes
+        and dispatch. The (cuda_event.synchronize + tobytes() copy) is
+        delegated to the worker so the training thread is NEVER blocked
+        on D2H completion or the ~50 ms host memcpy. CRITICAL: matches
+        the no-blocking-on-main-stream contract — without this, the
+        per-source D2H from ExpertLosslessFC may still be in-flight on
+        d2h_stream when ``tobytes()`` reads pinned memory, producing
+        stale checkpoint bytes.
 
-        **Background-thread work** (in ``_do_lossless_fc``): open temp fd,
-        writev the header + payload, fsync, atomic rename, unlink the
-        previous lossy log, open a fresh lossy fd. Because the I/O thread
-        is a single consumer of a FIFO queue, later lossy_fc_append jobs
-        for the same expert are guaranteed to see the fresh fd.
+        **Background-thread work** (in ``_do_lossless_fc``):
+          1. ``cuda_event.synchronize()`` — wait for d2h_stream to
+             finish writing the pinned tensor views captured here.
+          2. for each tensor: ``_to_fp32_numpy(p).tobytes()`` (memcpy
+             from pinned host RAM to a heap bytes object that the
+             writev call below borrows; freed after fsync).
+          3. open temp fd, writev header + payload, fsync, atomic
+             rename, unlink the previous lossy log, open a fresh lossy
+             fd. Because the I/O thread is a single FIFO consumer,
+             later lossy_fc_append jobs for the same expert are
+             guaranteed to see the fresh fd.
         """
         ent = self._entries.get(expert_id)
         if ent is None:
@@ -292,13 +303,47 @@ class ExpertState:
         }
         header = _pack_header(MAGIC_LFCL, header_meta)
 
-        # Extract CPU-side tensor bytes on the training thread; the I/O
-        # worker only handles the writev/fsync/rename. ``.copy()`` detaches
-        # from the caller's tensor memory so later iterations' mutation
-        # can't corrupt the queued write.
+        # Capture the per-tensor schema and the (still-pinned) initial_state
+        # tensor refs in a closure. Worker syncs on cuda_event before
+        # touching the bytes — no training-thread block.
+        schema_snapshot = list(ent.tensor_schema)
+        initial_state_snapshot = dict(initial_state)
+
+        # Dispatch to AsyncWriter's raw thread (or run sync if no writer).
+        L, E = ent.expert_id
+        self._dispatch(
+            self._do_lossless_fc, ent, int(step), header,
+            schema_snapshot, initial_state_snapshot, cuda_event,
+            tag=f"lossless_L{L:02d}_E{E:02d}",
+        )
+
+    # ------------------------------------------------------------------
+    # Background lossless FC handler
+    # ------------------------------------------------------------------
+    def _do_lossless_fc(
+        self,
+        ent: "_ExpertEntry",
+        step: int,
+        header: bytes,
+        schema_snapshot: List[Tuple[str, "torch.Size", int]],
+        initial_state_snapshot: Dict[str, Tuple[torch.Tensor,
+                                                Optional[torch.Tensor],
+                                                Optional[torch.Tensor]]],
+        cuda_event: Optional["torch.cuda.Event"],
+    ) -> None:
+        # 0) Wait for the d2h_stream copies that produced our pinned
+        # source tensors. Done on this worker thread so the training
+        # thread is never blocked on D2H or the host memcpy below.
+        if cuda_event is not None:
+            try:
+                cuda_event.synchronize()
+            except Exception:
+                pass
+
+        # 1) Build (param/m/v) bytes from the now-stable pinned views.
         tensor_bytes: List[Tuple[str, bytes, bytes, bytes]] = []
-        for (tname, _shape, numel) in ent.tensor_schema:
-            triple = initial_state.get(tname)
+        for (tname, _shape, numel) in schema_snapshot:
+            triple = initial_state_snapshot.get(tname)
             if triple is None:
                 zero_np = np.zeros(int(numel), dtype=np.float32)
                 tensor_bytes.append(
@@ -319,24 +364,7 @@ class ExpertState:
                 (tname, p_np.tobytes(), m_np.tobytes(), v_np.tobytes())
             )
 
-        # Dispatch to AsyncWriter's raw thread (or run sync if no writer).
-        L, E = ent.expert_id
-        self._dispatch(
-            self._do_lossless_fc, ent, int(step), header, tensor_bytes,
-            tag=f"lossless_L{L:02d}_E{E:02d}",
-        )
-
-    # ------------------------------------------------------------------
-    # Background lossless FC handler
-    # ------------------------------------------------------------------
-    def _do_lossless_fc(
-        self,
-        ent: "_ExpertEntry",
-        step: int,
-        header: bytes,
-        tensor_bytes: List[Tuple[str, bytes, bytes, bytes]],
-    ) -> None:
-        # 1) Close the current lossy fd (we own fd lifecycle here).
+        # 2) Close the current lossy fd (we own fd lifecycle here).
         if ent.lossy_fd is not None:
             try:
                 os.close(ent.lossy_fd)
@@ -344,7 +372,7 @@ class ExpertState:
                 pass
             ent.lossy_fd = None
 
-        # 2) Serialise new lossless FC to <path>.tmp → atomic rename.
+        # 3) Serialise new lossless FC to <path>.tmp → atomic rename.
         tmp_path = ent.lossless_path.with_suffix(ent.lossless_path.suffix + ".tmp")
         fd = os.open(str(tmp_path),
                      os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
@@ -354,7 +382,7 @@ class ExpertState:
                 os.write(fd, p_bytes)
                 os.write(fd, m_bytes)
                 os.write(fd, v_bytes)
-            # fsync + rename now runs on the AsyncWriter raw worker, so
+            # fsync + rename runs on the AsyncWriter raw worker, so
             # blocking here does NOT stall the training thread.
             os.fsync(fd)
         finally:
@@ -363,14 +391,14 @@ class ExpertState:
         ent.lossless_step = int(step)
         ent.step = int(step)
 
-        # 3) Unlink previous lossy log (if any).
+        # 4) Unlink previous lossy log (if any).
         if ent.lossy_path.exists():
             try:
                 ent.lossy_path.unlink()
             except OSError:
                 pass
 
-        # 4) Pre-create fresh lossy FC file with its header for upcoming
+        # 5) Pre-create fresh lossy FC file with its header for upcoming
         # appends. _open_fresh_lossy runs on this BG thread, which owns
         # all fd mutations.
         self._open_fresh_lossy(ent, step=int(step))

@@ -81,7 +81,6 @@ class FCEventStats:
     write_time_ms: float = 0.0
     queue_delay_ms: float = 0.0
     async_mode: bool = False
-    theta_cp_elements_updated: int = 0
 
 
 class FCManager:
@@ -96,8 +95,6 @@ class FCManager:
         expert_fc_D: Optional[int] = None,
         nonexpert_fc_W: int = 10,
         async_writer: Optional[AsyncWriter] = None,
-        on_expert_fc_fn: Optional[Callable[[str], int]] = None,
-        on_nonexpert_fc_fn: Optional[Callable[[], int]] = None,
         keep_last_per_expert: int = 1,
         keep_last_nonexpert: int = 1,
         schedule: str = "proposal",
@@ -127,8 +124,6 @@ class FCManager:
         self._D_spec = expert_fc_D
         self.W = int(nonexpert_fc_W)
         self._async_writer = async_writer
-        self._on_expert_fc = on_expert_fc_fn
-        self._on_nonexpert_fc = on_nonexpert_fc_fn
         self.keep_last_per_expert = int(keep_last_per_expert)
         self.keep_last_nonexpert = int(keep_last_nonexpert)
 
@@ -198,8 +193,7 @@ class FCManager:
         self._write_records: List[Optional[WriteRecord]] = []
 
         # Last-tick phase breakdown (diagnostic). Populated by ``tick()``.
-        # Keys: collect_expert_ms, on_expert_fc_ms, lossless_dispatch_ms,
-        #       nonexpert_fc_ms, n_experts_fired.
+        # Keys: nonexpert_fc_ms, n_experts_fired.
         self.last_tick_phase_ms: Dict[str, float] = {}
 
         # Cached GPU staging buffer for batched _collect_param_payload. Grows
@@ -308,58 +302,19 @@ class FCManager:
     def tick(self, step: int) -> Tuple[List[ExpertId], bool]:
         """Advance FC schedule for iteration ``step`` (1-indexed).
 
-        Returns ``(fired_experts, nonexpert_fired)``. ``fired_experts``
-        is the list of experts doing lossless FC on this iter — the
-        caller passes this to ImportanceTracker as an exclusion list so
-        those experts are skipped in the lossy-FC append.
+        Returns ``(fired_experts, nonexpert_fired)``. NOTE (post-B2):
+        expert lossless FC is dispatched OUT-OF-BAND by ExpertLosslessFC
+        (separate module, runs on tracker_stream). This method now
+        ONLY handles non-expert FC; ``fired_experts`` returned here is
+        always [] for backward compatibility — callers that need the
+        fired list must read it from ExpertLosslessFC.fire_if_due()
+        directly.
         """
         fired_experts: List[ExpertId] = []
         sub: Dict[str, float] = {
-            "collect_expert_ms": 0.0,
-            "on_expert_fc_ms": 0.0,
-            "lossless_dispatch_ms": 0.0,
             "nonexpert_fc_ms": 0.0,
             "n_experts_fired": 0.0,
         }
-        if self._schedule == "sequential":
-            # MoC-System baseline (paper-correct): LAYER-wise round robin.
-            # Every `self.D` iter, fire ALL experts of ONE layer in burst.
-            # Full cycle: D × num_layers iter (each layer FC'd once).
-            if self._num_layers > 0 and (step - 1) % max(self.D, 1) == 0:
-                layer_idx = self._layer_rr_tick % self._num_layers
-                layer = self._sorted_layers[layer_idx]
-                for eid in self._all_expert_ids:
-                    if eid[0] == layer:
-                        ph = self._fire_expert_fc(eid, step)
-                        fired_experts.append(eid)
-                        if ph is not None:
-                            sub["collect_expert_ms"] += ph["collect_ms"]
-                            sub["on_expert_fc_ms"] += ph["on_expert_fc_ms"]
-                            sub["lossless_dispatch_ms"] += ph["lossless_dispatch_ms"]
-                self._layer_rr_tick += 1
-        else:  # proposal
-            # CLAUDE.md § Expert 저장 전략:
-            # Every D iters, the next ⌈num_experts × F / 100⌉ experts in
-            # round-robin slot order get lossless FC. Per-expert cycle =
-            # D × ⌈100/F⌉ iters.
-            if (
-                self._num_expert_slots > 0
-                and self._experts_per_lossless_event > 0
-                and step > 0
-                and step % max(self.D, 1) == 0
-            ):
-                n_fire = self._experts_per_lossless_event
-                for i in range(n_fire):
-                    slot = (self._rr_cursor + i) % self._num_expert_slots
-                    eid = self._all_expert_ids[slot]
-                    ph = self._fire_expert_fc(eid, step)
-                    fired_experts.append(eid)
-                    if ph is not None:
-                        sub["collect_expert_ms"] += ph["collect_ms"]
-                        sub["on_expert_fc_ms"] += ph["on_expert_fc_ms"]
-                        sub["lossless_dispatch_ms"] += ph["lossless_dispatch_ms"]
-                self._rr_cursor = (self._rr_cursor + n_fire) % self._num_expert_slots
-        sub["n_experts_fired"] = float(len(fired_experts))
 
         nonexpert_fired = False
         # Fire non-expert FC at iter 1 unconditionally so that any early
@@ -377,16 +332,26 @@ class FCManager:
     # ------------------------------------------------------------------
     def _collect_param_payload(
         self, names: List[str], named_params: Dict[str, torch.nn.Parameter],
+        *, private: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """Snapshot FP32 master + FP32 Adam state for each param.
 
-        Batch path: concatenate all (param, exp_avg, exp_avg_sq) sources into
-        a single cached GPU staging buffer, perform ONE GPU→CPU transfer,
-        then hand back payload-dict views into the resulting flat CPU tensor.
-        This collapses hundreds of per-tensor CUDA syncs into a single sync.
-        ZeRO ``get_param`` / ``get_state`` return views into the live master,
-        so enumerating them adds no GPU allocation — peak GPU delta equals
-        the staging buffer size (reused across calls). See CLAUDE.md.
+        Per-source path: launches one non_blocking D2H per source straight
+        into a pinned host buffer, returns payload-dict views into that
+        buffer. ``cuda_event`` is recorded on d2h_stream and stashed on
+        ``self._last_collect_cuda_event`` so the caller can forward it to
+        the writer (which must wait on it before reading the host data).
+
+        ``private=False`` (default, non-expert FC path): reuses the cached
+        ``self._collect_pinned_cpu`` buffer; previous in-flight torch-queue
+        write is drained first.
+
+        ``private=True`` (expert FC path): allocates a FRESH pinned buffer
+        for THIS call. Required when several callers share the writer's
+        raw worker queue — the worker may not have consumed the previous
+        payload yet, so reusing the cached buffer would corrupt it. Torch's
+        caching pinned allocator recycles freed buffers, so steady-state
+        cost is small.
         """
         _t_enum0 = time.perf_counter()
         entries: List[Tuple[str, torch.Tensor]] = []
@@ -413,38 +378,66 @@ class FCManager:
         total_numel = offset
         device = entries[0][1].device
 
-        stage = getattr(self, "_collect_stage_gpu", None)
-        if stage is None or stage.numel() < total_numel or stage.device != device:
-            # Grow-only cache. Allocated once per (device, max total_numel).
-            self._collect_stage_gpu = torch.empty(
-                total_numel, dtype=torch.float32, device=device,
-            )
-            stage = self._collect_stage_gpu
+        # GPU stage UNUSED: per-source D2H directly to pinned host narrow
+        # views. Saves ~total_numel × 4 bytes persistent GPU stage
+        # (e.g. 1163 MB for full FC of non-expert + Adam state).
+        _copy_ms = 0.0
 
-        _t_copy0 = time.perf_counter()
-        for (_k, off, n, _shape), (_k2, src) in zip(plan, entries):
-            stage.narrow(0, off, n).copy_(src.reshape(-1))
-        _copy_ms = (time.perf_counter() - _t_copy0) * 1000.0
-
-        # Wait for any prior torch.save to finish reading the pinned buffer
-        # before we overwrite it. Typically a no-op (pending=1 drains fast).
         _t_wait0 = time.perf_counter()
-        if self._async_writer is not None and self._collect_pinned_cpu is not None:
+        if (not private and self._async_writer is not None
+                and self._collect_pinned_cpu is not None):
+            # Cached-buffer path: previous torch-queue write must finish
+            # before we overwrite. Private path allocates fresh, so no
+            # drain is required (and the raw queue isn't drained by
+            # drain_torch anyway).
             self._async_writer.drain_torch()
         _wait_ms = (time.perf_counter() - _t_wait0) * 1000.0
 
-        pinned = self._collect_pinned_cpu
-        if pinned is None or pinned.numel() < total_numel:
-            # Grow-only pinned allocation. Cost is paid once (or very
-            # rarely) per training run.
-            self._collect_pinned_cpu = torch.empty(
+        if private:
+            # Fresh pinned buffer for THIS call only — caller (typically
+            # ExpertLosslessFC) hands the resulting payload views to the
+            # raw-worker queue, where the closure owns the buffer until
+            # consumption. Torch's pinned caching allocator recycles
+            # freed buffers, so steady-state alloc cost is small.
+            pinned = torch.empty(
                 total_numel, dtype=torch.float32, pin_memory=True,
             )
+        else:
             pinned = self._collect_pinned_cpu
+            if pinned is None or pinned.numel() < total_numel:
+                # Grow-only pinned allocation. Cost is paid once (or very
+                # rarely) per training run.
+                self._collect_pinned_cpu = torch.empty(
+                    total_numel, dtype=torch.float32, pin_memory=True,
+                )
+                pinned = self._collect_pinned_cpu
 
         _t_xfer0 = time.perf_counter()
         flat_cpu = pinned.narrow(0, 0, total_numel)
-        flat_cpu.copy_(stage.narrow(0, 0, total_numel), non_blocking=False)
+        # Per-source D2H directly to pinned narrow views — no GPU stage.
+        cuda_event: Optional["torch.cuda.Event"] = None
+        if torch.cuda.is_available():
+            from .async_writer import get_d2h_stream
+            d2h_stream = get_d2h_stream()
+            main_event = torch.cuda.Event()
+            main_event.record()
+            with torch.cuda.stream(d2h_stream):
+                d2h_stream.wait_event(main_event)
+                for (_k, off, n, _shape), (_k2, src) in zip(plan, entries):
+                    dst = flat_cpu.narrow(0, off, n)
+                    src_flat = src.reshape(-1)
+                    if src_flat.dtype != torch.float32:
+                        dst.copy_(src_flat.to(torch.float32),
+                                  non_blocking=True)
+                    else:
+                        dst.copy_(src_flat, non_blocking=True)
+                cuda_event = torch.cuda.Event()
+                cuda_event.record(d2h_stream)
+        else:
+            for (_k, off, n, _shape), (_k2, src) in zip(plan, entries):
+                flat_cpu.narrow(0, off, n).copy_(
+                    src.reshape(-1).to(torch.float32),
+                )
         _xfer_ms = (time.perf_counter() - _t_xfer0) * 1000.0
 
         payload: Dict[str, torch.Tensor] = {}
@@ -456,168 +449,23 @@ class FCManager:
             "xfer_ms": _xfer_ms, "wait_ms": _wait_ms,
             "nentries": len(entries),
         }
+        # Stash the event for the immediate caller's submit().
+        self._last_collect_cuda_event = cuda_event
         return payload, total_bytes
 
-    def _collect_expert_payload(
-        self, layer: int, expert_idx: int,
-    ) -> Tuple[Dict[str, torch.Tensor], int, List[str]]:
-        named_params = dict(self.model.named_parameters())
-        tensor_names = list(self._separated_tensors_by_slot.get((layer, expert_idx), []))
-        payload, total_bytes = self._collect_param_payload(tensor_names, named_params)
-        return payload, total_bytes, tensor_names
 
     def _collect_nonexpert_payload(self) -> Tuple[Dict[str, torch.Tensor], int]:
         named_params = dict(self.model.named_parameters())
         return self._collect_param_payload(self._non_expert_names, named_params)
 
     # ------------------------------------------------------------------
-    def _fire_expert_fc(self, expert_id: ExpertId, step: int) -> Optional[Dict[str, float]]:
-        """Fire one expert FC. Returns per-phase timing dict (ms) for
-        diagnostics: ``collect_ms`` (GPU→CPU), ``on_expert_fc_ms``
-        (θ_CP refresh on GPU), ``lossless_dispatch_ms`` (enqueue to
-        AsyncWriter raw queue). ``None`` on the legacy torch.save path."""
-        layer, expert_idx = expert_id
-        _t_col0 = time.perf_counter()
-        payload, payload_bytes, tnames = self._collect_expert_payload(layer, expert_idx)
-        _col_ms = (time.perf_counter() - _t_col0) * 1000.0
-        theta_cp_updated = 0
-        _t_cb0 = time.perf_counter()
-        if self._on_expert_fc is not None:
-            for tname in tnames:
-                theta_cp_updated += int(self._on_expert_fc(tname))
-        _cb_ms = (time.perf_counter() - _t_cb0) * 1000.0
-
-        # Fire expert lossless FC (proposal mode): write full expert
-        # snapshot to fc_expert_L##_E##.bin, truncate the expert's lossy
-        # FC log, and mark θ_CP clean (already done via on_expert_fc_fn
-        # above). Sequential (MoC) mode skips this and falls through to
-        # the legacy per-iter torch.save path below.
-        if self._expert_state is not None:
-            initial_state: Dict[str, Tuple[torch.Tensor,
-                                           Optional[torch.Tensor],
-                                           Optional[torch.Tensor]]] = {}
-            for tname in tnames:
-                p_cpu = payload.get(f"{tname}:param")
-                if p_cpu is None:
-                    continue
-                m_cpu = payload.get(f"{tname}:exp_avg")
-                v_cpu = payload.get(f"{tname}:exp_avg_sq")
-                initial_state[tname] = (p_cpu, m_cpu, v_cpu)
-            _t_dp0 = time.perf_counter()
-            if initial_state:
-                self._expert_state.lossless_fc(expert_id, step=int(step),
-                                               initial_state=initial_state)
-            _dp_ms = (time.perf_counter() - _t_dp0) * 1000.0
-            # Record an event so callers can count FC fires for schedule
-            # diagnostics. `path` points at the expert's lossless FC file
-            # (disk mode) or a synthetic placeholder (DRAM mode — no path
-            # since the buffer lives in host RAM). DRAM mode reports
-            # `file_bytes=0` because the dense buffer is bounded by the
-            # expert's parameter count, not by per-FC growth.
-            L, E = expert_id
-            entries = getattr(self._expert_state, "_entries", None)
-            if entries is not None and expert_id in entries:
-                lossless_path = entries[expert_id].lossless_path
-                try:
-                    file_bytes = int(lossless_path.stat().st_size)
-                except (OSError, FileNotFoundError):
-                    file_bytes = 0
-            else:
-                lossless_path = Path("<dram_expert_state>")
-                file_bytes = 0
-            self.write_log.append(FCEventStats(
-                kind="expert",
-                step=int(step),
-                expert_id=expert_id,
-                tensor_names=tnames,
-                path=lossless_path,
-                payload_bytes=payload_bytes,
-                file_bytes=file_bytes,
-                async_mode=False,
-                theta_cp_elements_updated=theta_cp_updated,
-            ))
-            self._write_records.append(None)
-            return {
-                "collect_ms": _col_ms,
-                "on_expert_fc_ms": _cb_ms,
-                "lossless_dispatch_ms": _dp_ms,
-            }
-
-        # Sequential (MoC) mode: write expert FC as PRPTENS .bin to match the
-        # proposal-mode layout (saves disk + bypasses pickle overhead).
-        # Located in expert_output_dir for cleaner separation from non-expert
-        # FC/DC files. Recovery's `_EXPERT_FC_RE` accepts both .bin and the
-        # legacy .pt extension for backward compat with older runs.
-        path = (
-            self.expert_output_dir
-            / f"fc_expert_L{layer:02d}_E{expert_idx:02d}_iter{step:08d}.bin"
-        )
-
-        to_unlink: List[Path] = []
-        history = self._expert_fc_files.setdefault(expert_id, [])
-        history.append((path, None))
-        while len(history) > self.keep_last_per_expert:
-            old_path, _ = history.pop(0)
-            to_unlink.append(old_path)
-
-        def _unlink(paths: List[Path] = to_unlink) -> None:
-            for p in paths:
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
-
-        stats = FCEventStats(
-            kind="expert",
-            step=int(step),
-            expert_id=expert_id,
-            tensor_names=tnames,
-            path=path,
-            payload_bytes=payload_bytes,
-            async_mode=self._async_writer is not None,
-            theta_cp_elements_updated=theta_cp_updated,
-        )
-
-        # PRPTENS binary writer (consistent with non-expert FC + ExpertState).
-        def _save_fc_bin(payload_dict, p):
-            save_binary(p, payload_dict)
-        if self._async_writer is None:
-            t0 = time.perf_counter()
-            save_binary(path, payload)
-            t1 = time.perf_counter()
-            stats.write_time_ms = (t1 - t0) * 1000.0
-            try:
-                stats.file_bytes = int(path.stat().st_size)
-            except FileNotFoundError:
-                stats.file_bytes = 0
-            _unlink()
-            rec: Optional[WriteRecord] = None
-        else:
-            rec = self._async_writer.submit(
-                payload, path, tag="fc",
-                on_complete=[_unlink] if to_unlink else None,
-                save_fn=_save_fc_bin,
-            )
-            history[-1] = (path, rec)
-
-        self.write_log.append(stats)
-        self._write_records.append(rec)
-        return None
-
     # ------------------------------------------------------------------
     def _fire_nonexpert_fc(self, step: int) -> None:
         _t_col0 = time.perf_counter()
         payload, payload_bytes = self._collect_nonexpert_payload()
         self._last_nonexpert_collect_ms = (time.perf_counter() - _t_col0) * 1000.0
         self._last_nonexpert_collect_sub_ms = dict(getattr(self, "_last_collect_sub_ms", {}))
-        # Refresh non-expert θ_FC diagnostic cache (used by measure_score_distribution).
-        if self._on_nonexpert_fc is not None:
-            try:
-                self._on_nonexpert_fc()
-            except Exception:
-                pass
-        # New raw-binary format (PRPTENS magic). Recovery auto-detects magic
-        # and falls back to torch.load for legacy ``.pt`` pickle files.
+        # Raw-binary format (PRPTENS magic).
         path = self.output_dir / f"fc_nonexpert_iter{step:08d}.bin"
 
         to_unlink: List[Path] = []
@@ -641,7 +489,6 @@ class FCManager:
             path=path,
             payload_bytes=payload_bytes,
             async_mode=self._async_writer is not None,
-            theta_cp_elements_updated=0,
         )
 
         def _save_binary(payload, p):
@@ -663,6 +510,7 @@ class FCManager:
                 payload, path, tag="fc",
                 on_complete=[_unlink] if to_unlink else None,
                 save_fn=_save_binary,
+                cuda_event=getattr(self, "_last_collect_cuda_event", None),
             )
             self._nonexpert_fc_files[-1] = (path, rec)
 
@@ -695,7 +543,6 @@ class FCManager:
                 "write_time_ms": s.write_time_ms,
                 "queue_delay_ms": s.queue_delay_ms,
                 "async_mode": s.async_mode,
-                "theta_cp_elements_updated": s.theta_cp_elements_updated,
             }
             for s in self.write_log
         ]
