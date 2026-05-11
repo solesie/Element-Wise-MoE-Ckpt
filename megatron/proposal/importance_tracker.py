@@ -360,34 +360,48 @@ class ImportanceTracker:
                 f"selection_mode must be 'v_hat'|'random'|'hessian', got {selection_mode!r}."
             )
         self.selection_mode = selection_mode
-        # Diagonal Hessian EMA; updated by proposal_refresh_hessian every
-        # `--proposal-hessian-refresh-every` iters as:
-        #     H_ema = α · H_ema + (1-α) · H_new
-        # (α = args.proposal_hessian_ema_alpha, default 0.9 → effective sample
-        # count 1/(1-α) = 10, which absorbs the K=1-per-refresh variance.)
-        # When selection_mode == 'hessian', H_ema replaces v̂_t in the score:
-        #     score = |H_diag| × δ²       (instead of v̂_t × δ²)
-        # Persisted to ``cp/hessian/h_ema_iter{N}.pt`` so recovery restores
-        # EMA continuity — a fresh refresh after fault would otherwise only
-        # reflect one sample, temporarily degrading selection quality.
-        self._H: Dict[str, torch.Tensor] = {}
-        # Number of EMA updates applied. Used for diagnostics / bias correction.
-        self._H_updates: int = 0  # bumped every refresh
+        # Production stores group-level diagonal Hessian only — see
+        # ``self._H_g`` above (BF16 view into ``_g_fast_h_g_bf16_flat``).
+        # When ``selection_mode == 'hessian'``, the score is:
+        #     score_elem(i)  = |H_g(group(i))| × Δθ_i²        # single-iter
+        #     score_group(g) = |H_g(g)|        × δ_g[g]       # time-window
+        # Both pools live on the same per-element axis and compete in the
+        # unified_topk walk under a single K-budget. Refresh
+        # (``proposal_refresh_finite_diff``) overwrites ``_H_g`` directly
+        # via ``_fold_h``; there is no element-level FP32 H cache, no
+        # EMA, and no disk persist path. Post-fault recovery relies on
+        # the next FD refresh to repopulate H_g.
 
-        # Outlier-promotion (Intent A–E). Off by default; enabled by
-        # PROPOSAL_OUTLIER_PROMOTE=1. When ON, the accum_sq Triton kernel
-        # additionally (a) bins H_g·Δθ²_i into _outlier_elem_hist for next
-        # iter's element threshold, (b) tags elements whose score ≥
-        # _outlier_prev_th into _outlier_sel_idx (atomic FIFO), and (c)
-        # excludes those elements' Δθ²_i from the dg group sum (Intent E).
-        # All buffers are persistent and small (< 100 KB GPU); the per-
-        # iter selection idx buffer is sized once at first use.
+        # Outlier-promotion (Intent A–E) — enabled ONLY at g_blk >= 2.
+        # When ON, the accum_sq Triton kernel additionally
+        #   (a) bins H_g·Δθ²_i into _outlier_elem_hist for next iter's
+        #       element threshold,
+        #   (b) tags elements whose score ≥ _outlier_prev_th into
+        #       _outlier_sel_idx (atomic FIFO), and
+        #   (c) excludes those elements' Δθ²_i from the dg group sum
+        #       (Intent E selective fold).
+        # The element pool only makes sense when groups smooth Δθ² —
+        # i.e. g >= 2. At g=1 a "group" is one element, so the element
+        # pool would compete against the SAME element's δ accumulator
+        # under a different time scale — the user-specified semantics
+        # is to feed every element's Δθ² straight into δ_g and rank on
+        # ``H × δ_g`` alone. Outlier path is therefore force-disabled
+        # at g=1 regardless of ``PROPOSAL_OUTLIER_PROMOTE``.
+        # All outlier buffers stay None when disabled (zero VRAM cost).
         import os as _os_op
-        self._outlier_promote = _os_op.environ.get(
+        _env_outlier = _os_op.environ.get(
             "PROPOSAL_OUTLIER_PROMOTE", ""
         ) in ("1", "true", "TRUE")
+        self._outlier_promote = _env_outlier and (self.block_quant_g >= 2)
+        # Element-pool histogram bin count. Default matches the group-
+        # pool histogram (``_g_fast_n_bins = 10000``) so the unified
+        # two-pool top-K walk has equal score-axis precision on both
+        # pools. Both histograms cover the per-element score axis after
+        # the per-element conversion in dispatch (group bin → score /
+        # g_blk), so equal bin count = equal threshold quantisation.
+        # Override via ``PROPOSAL_OUTLIER_N_BINS`` for ablation.
         self._outlier_n_bins = int(_os_op.environ.get(
-            "PROPOSAL_OUTLIER_N_BINS", "4096"
+            "PROPOSAL_OUTLIER_N_BINS", "10000"
         ))
         # Lazy: alloc on first kernel call (need device + total numel).
         self._outlier_elem_hist: Optional[torch.Tensor] = None  # (n_bins,) i32
@@ -452,6 +466,15 @@ class ImportanceTracker:
                 self._name_to_full_save_param[name] = p
                 self._full_save_numel_per_name[name] = int(p.numel())
 
+        # Cached (name, p) pairs for hot-loop iteration in
+        # snapshot_nonexpert_dc — eliminates per-iter dict lookup over
+        # _name_to_full_save_param (~5 us × N saved). The list is stable
+        # because membership doesn't change after init.
+        self._full_save_entries: List[Tuple[str, torch.nn.Parameter]] = [
+            (n, self._name_to_full_save_param[n])
+            for n in self._full_save_names
+        ]
+
         self._flat_offsets: Dict[str, Tuple[int, int]] = {}
         cursor = 0
         for name in self._tracked_names:
@@ -485,7 +508,7 @@ class ImportanceTracker:
         # main-stream forward(T+1) / backward(T+1) overlap with tracker
         # work(T). The host-blocking sync is deferred to the NEXT iter's
         # tracker.step entry (1-iter pipeline). Race guard:
-        # proposal_pre_step inserts main_stream.wait_event(prev event)
+        # proposal_dc_snap_grads inserts main_stream.wait_event(prev event)
         # before optimizer.step(T+1) writes m, v.
         self._tracker_stream: Optional["torch.cuda.Stream"] = None
         # Pending state from previous iter's tracker.step. Carried here
@@ -564,7 +587,7 @@ class ImportanceTracker:
             t = getattr(self, attr, None)
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 items.append((attr, t.element_size() * t.numel() / 1e6))
-        for dict_attr in ("_H", "_H_g"):
+        for dict_attr in ("_H_g",):
             d = getattr(self, dict_attr, {}) or {}
             n = 0
             sz = 0.0
@@ -582,22 +605,40 @@ class ImportanceTracker:
     def snapshot_nonexpert_dc(
         self,
         global_step: int,
+        target_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[Dict[str, torch.Tensor], NonExpertDCStats]:
-        """Clone FP32 non-expert grads to CPU (lossless dense DC path).
+        """Clone non-expert grads to pinned host (lossless dense DC path).
 
-        Batch path: concatenates all grads into a single GPU staging buffer
-        and issues ONE pinned GPU→CPU transfer. Collapses hundreds of
-        per-tensor CUDA syncs (observed 100-250 ms/iter) to a single
-        contiguous transfer at pinned bandwidth.
+        Reads per-param BF16 ``param.grad`` (alive both pre-optimizer.step
+        and post-optimizer.step in DS BF16: ``clear_lp_grads`` only fires
+        in next iter's ``backward_prologue``). FP32 master flat is also
+        accessible via ``safe_get_full_grad`` but is zeroed by
+        ``clear_hp_grads`` at end of each ``step()``, so we always source
+        from ``param.grad`` at post-step usage.
+
+        ``target_dtype``: dtype of the pinned host buffer.
+          - ``None`` (default): use source dtype (BF16 → BF16 pinned, no
+            cast — preferred when caller wants raw bytes and writer thread
+            handles any conversion).
+          - ``torch.float32``: cast on d2h_stream. Pinned buffer is FP32.
+            DC bundle will be FP32 directly; recovery skips the cast.
+            Cost: ~2× pinned host bytes + 1 cast kernel per source tensor
+            on d2h_stream + ~2× PCIe bandwidth.
         """
         import time as _time
         _t_enum0 = _time.perf_counter()
 
         entries: List[Tuple[str, torch.Tensor]] = []
         missing = 0
-        for name in self._full_save_names:
-            p = self._name_to_full_save_param[name]
-            g = _fp32_grad(p)
+        # Always source from ``param.grad`` (BF16 in DS BF16 mode). The
+        # FP32 master grad is zeroed by ``clear_hp_grads`` at end of
+        # ``optimizer.step()``, so it's only valid pre-step and unusable
+        # post-step. ``param.grad`` is alive both pre-step and post-step
+        # (cleared only by next iter's ``backward_prologue.clear_lp_grads``).
+        # Source dtype is BF16 in DS BF16 mode; target_dtype controls
+        # whether we cast to FP32 in d2h_stream.
+        for name, p in self._full_save_entries:
+            g = p.grad
             if g is None:
                 missing += 1
                 continue
@@ -614,19 +655,71 @@ class ImportanceTracker:
                 missing_grads=missing, compute_time_ms=_enum_ms,
             )
 
-        plan: List[Tuple[str, int, int, torch.Size]] = []
-        offset = 0
-        for name, g in entries:
-            n = int(g.numel())
-            plan.append((name, offset, n, g.shape))
-            offset += n
-        total_numel = offset
-        device = entries[0][1].device
+        # Group entries by underlying storage (data_ptr) and build span
+        # plans. Each storage group becomes ONE D2H spanning the contiguous
+        # range covering all params in that storage. Saves vs per-tensor
+        # copies: (a) per-launch driver overhead (~5-10 us each × N), (b)
+        # transient GPU buffer for FP32 cast (we now keep BF16 instead).
+        # Cache the plan across iters — param storage is stable post-init,
+        # so we just refresh the (presumed unchanged) span_view via the
+        # first entry's tensor on cache hit.
+        plan_groups = getattr(self, "_dc_plan_cache", None)
+        cache_key = getattr(self, "_dc_plan_cache_key", None)
+        # Quick cache validity probe: compare (data_ptr, storage_offset,
+        # numel) of the first entry. Storage moves are rare (only on
+        # explicit reallocation), so this is sufficient as a sanity check.
+        first_g = entries[0][1].reshape(-1)
+        new_key = (
+            first_g.untyped_storage().data_ptr(),
+            first_g.storage_offset(),
+            int(first_g.numel()),
+            len(entries),
+        )
+        if plan_groups is None or cache_key != new_key:
+            plan_groups = []
+            storage_buckets: Dict[int, List[Tuple[str, torch.Tensor, int, int, torch.Size]]] = {}
+            seen_ptrs: List[int] = []
+            for name, g in entries:
+                g_flat = g.reshape(-1)
+                sptr = g_flat.untyped_storage().data_ptr()
+                soff = g_flat.storage_offset()
+                n = int(g_flat.numel())
+                if sptr not in storage_buckets:
+                    seen_ptrs.append(sptr)
+                storage_buckets.setdefault(sptr, []).append(
+                    (name, g_flat, soff, n, g.shape)
+                )
+            for sptr in seen_ptrs:
+                items = storage_buckets[sptr]
+                min_off = min(it[2] for it in items)
+                max_end = max(it[2] + it[3] for it in items)
+                span_n = max_end - min_off
+                base = items[0][1]
+                span_view = base.as_strided(
+                    size=(span_n,), stride=(1,),
+                    storage_offset=min_off,
+                )
+                per_item_plan: List[Tuple[str, int, int, torch.Size]] = []
+                for (n_name, _g_flat, soff, sz, shape) in items:
+                    per_item_plan.append((n_name, soff - min_off, sz, shape))
+                plan_groups.append((span_view, min_off, span_n, per_item_plan))
+            self._dc_plan_cache = plan_groups
+            self._dc_plan_cache_key = new_key
 
-        # GPU stage UNUSED: per-source D2H directly to pinned host narrow
-        # views. Saves ~total_numel × 4 bytes persistent GPU stage
-        # (e.g. 388 MB for non-expert DC at exp_etc scale).
-        _copy_ms = 0.0  # no GPU2GPU stage cat anymore
+        # Compute global pinned offset for each span.
+        # Pinned dtype = target_dtype if specified, else source dtype.
+        # When target_dtype != source dtype, copy_ does an implicit cast
+        # on d2h_stream (~1 cast kernel per source tensor; PyTorch may
+        # fuse cast+D2H but per-launch overhead dominates).
+        total_numel = sum(span_n for (_v, _o, span_n, _it) in plan_groups)
+        device = entries[0][1].device
+        sample_dtype = entries[0][1].dtype
+        all_same_dtype = all(e[1].dtype == sample_dtype for e in entries)
+        if target_dtype is not None:
+            pinned_dtype = target_dtype
+        else:
+            pinned_dtype = sample_dtype if all_same_dtype else torch.float32
+        _copy_ms = 0.0
 
         _t_wait0 = _time.perf_counter()
         if self._async_writer is not None and self._dc_pinned_cpu is not None:
@@ -634,49 +727,92 @@ class ImportanceTracker:
         _wait_ms = (_time.perf_counter() - _t_wait0) * 1000.0
 
         pinned = self._dc_pinned_cpu
-        if pinned is None or pinned.numel() < total_numel:
+        # Re-allocate when first time, when too small, or when the dtype
+        # has changed (rare; usually one-time at init).
+        if (pinned is None or pinned.numel() < total_numel
+                or pinned.dtype != pinned_dtype):
             self._dc_pinned_cpu = torch.empty(
-                total_numel, dtype=torch.float32, pin_memory=True,
+                total_numel, dtype=pinned_dtype, pin_memory=True,
             )
             pinned = self._dc_pinned_cpu
 
         _t_xfer0 = _time.perf_counter()
         flat_cpu = pinned.narrow(0, 0, total_numel)
-        # Per-source D2H directly to pinned host narrow views — no GPU
-        # stage. main_event syncs main-stream prior work (grad ready);
-        # all D2Hs run on the dedicated d2h_stream so they overlap with
-        # main forward/tracker. cuda_event records the LAST D2H — writer
-        # thread waits on it before SSD write.
+
+        # Optimization A: cache the (dsts, srcs_no_cast, payload) lists.
+        # The narrow views into flat_cpu (dsts) and per-name payload views
+        # are stable as long as the pinned buffer + plan_groups + dtype
+        # are unchanged. ``span_view`` is also stable (storage shared with
+        # grad which is reallocated by torch lazily but pointer is stable
+        # post-init in DS BF16 mode). The fast path skips ~130 narrow()
+        # calls + ~130 list appends per iter (~1 ms saved).
+        # Cache invalidates on:
+        #   - plan_groups rebuild (caught by id() check below)
+        #   - pinned buffer realloc (caught by data_ptr() check)
+        #   - pinned_dtype change (caller-driven)
+        cache = getattr(self, "_dc_xfer_cache", None)
+        cache_id = (
+            id(plan_groups), pinned.data_ptr(), pinned_dtype,
+        )
+        cache_valid = cache is not None and cache.get("id") == cache_id
+        if cache_valid:
+            dsts = cache["dsts"]
+            srcs_resolved = cache["srcs_resolved"]
+            payload_template = cache["payload_template"]
+        else:
+            dsts = []
+            srcs_no_cast: List[torch.Tensor] = []
+            payload_template: Dict[str, torch.Tensor] = {}
+            global_off = 0
+            for (span_view, _min_off, span_n, per_item) in plan_groups:
+                dsts.append(flat_cpu.narrow(0, global_off, span_n))
+                srcs_no_cast.append(span_view)
+                for (n_name, rel_off, n_sz, shape) in per_item:
+                    payload_template[n_name] = (
+                        flat_cpu.narrow(0, global_off + rel_off, n_sz)
+                        .view(shape)
+                    )
+                global_off += span_n
+            # Resolve srcs once: when all dtypes match pinned_dtype use
+            # the views directly (zero-copy / zero-cast); otherwise
+            # capture per-source ``.to(pinned_dtype)`` views (these are
+            # also stable as the underlying storage doesn't move).
+            # Per-iter ``all(...)`` check is removed — dtypes are part
+            # of the cache invalidation key implicitly (a dtype change
+            # would require cache invalidation by the caller).
+            if all(s.dtype == pinned_dtype for s in srcs_no_cast):
+                srcs_resolved = srcs_no_cast
+            else:
+                srcs_resolved = [
+                    s if s.dtype == pinned_dtype else s.to(pinned_dtype)
+                    for s in srcs_no_cast
+                ]
+            self._dc_xfer_cache = {
+                "id": cache_id,
+                "dsts": dsts,
+                "srcs_resolved": srcs_resolved,
+                "payload_template": payload_template,
+            }
+
         cuda_event: Optional["torch.cuda.Event"] = None
         if torch.cuda.is_available():
             from .async_writer import get_d2h_stream
             d2h_stream = get_d2h_stream()
             main_event = torch.cuda.Event()
-            main_event.record()  # main: grads are ready by this point
+            main_event.record()
             with torch.cuda.stream(d2h_stream):
                 d2h_stream.wait_event(main_event)
-                for (_n, off, n, _shape), (_n2, src) in zip(plan, entries):
-                    dst = flat_cpu.narrow(0, off, n)
-                    src_flat = src.reshape(-1)
-                    if src_flat.dtype != torch.float32:
-                        # FP32 cast first (in d2h_stream, transient buf)
-                        dst.copy_(src_flat.to(torch.float32),
-                                  non_blocking=True)
-                    else:
-                        dst.copy_(src_flat, non_blocking=True)
+                torch._foreach_copy_(dsts, srcs_resolved, non_blocking=True)
                 cuda_event = torch.cuda.Event()
                 cuda_event.record(d2h_stream)
         else:
-            for (_n, off, n, _shape), (_n2, src) in zip(plan, entries):
-                flat_cpu.narrow(0, off, n).copy_(
-                    src.reshape(-1).to(torch.float32),
-                )
+            for dst, src in zip(dsts, srcs_resolved):
+                dst.copy_(src)
         _xfer_ms = (_time.perf_counter() - _t_xfer0) * 1000.0
 
-        payload: Dict[str, torch.Tensor] = {}
-        for name, off, n, shape in plan:
-            payload[name] = flat_cpu.narrow(0, off, n).view(shape)
-        bytes_total = int(total_numel * 4)
+        # Cached payload views — same storage as last iter, no rebuild.
+        payload: Dict[str, torch.Tensor] = payload_template
+        bytes_total = int(total_numel * pinned.element_size())
 
         self.last_dc_sub_ms = {
             "enum_ms": _enum_ms, "copy_ms": _copy_ms, "wait_ms": _wait_ms,
@@ -1187,24 +1323,6 @@ class ImportanceTracker:
                   flush=True)
 
     @torch.no_grad()
-    def _aggregate_h_g(self) -> None:
-        """Derive H_g (group mean) from per-element H_ema.
-        Only runs when g=1 (degenerate, copies H_ema). For g>1, H_g is populated
-        directly at refresh time by ``_fold_h`` (BF16) so this is a no-op."""
-        g = max(1, int(self.block_quant_g))
-        if g > 1:
-            return  # H_g_ema is set by refresh fold; nothing to aggregate
-        for n, h in self._H.items():
-            h_flat = h.detach().reshape(-1).to(torch.float32)
-            nt = h_flat.numel()
-            nt_a = (nt // g) * g
-            if nt_a == 0:
-                self._H_g.pop(n, None)
-                continue
-            h_g = h_flat[:nt_a].reshape(-1, g).mean(dim=1)
-            self._H_g[n] = h_g
-
-    @torch.no_grad()
     def _dispatch_pending_payload(
         self, optimizer: torch.optim.Optimizer,
         current_iter_excluded: Optional[set] = None,
@@ -1279,7 +1397,15 @@ class ImportanceTracker:
         mapper = get_mapper()
         stream = self._tracker_stream
 
-        # === Form 1: Merged walk on TWO histograms — single K-budget. ==
+        # === Unified two-pool top-K: merged-walk on two histograms ===
+        # === under a single K-budget.                              ===
+        # Role: produce ONE element-axis threshold (and its group-axis
+        # equivalent ``elem_th × g_blk``) by ranking element-pool bins
+        # and group-pool bins on the SAME per-element score axis, then
+        # walking the merged-sorted list under a weighted cumsum until
+        # the K-budget = ``topk_ratio × N_total_elements`` is reached.
+        # element-pool bin: weight 1, group-pool bin: weight g_blk.
+        #
         # CLAUDE.md spec: "production 그룹 score 와 동일 K-budget 에서
         # single-iter element score H_g·Δθ²_i 가 경쟁."
         #
@@ -1303,10 +1429,74 @@ class ImportanceTracker:
         # Effect: elements with high individual contribution displace
         # groups whose mean element contribution is lower — true unified
         # top-K under K-budget. Total selected ≤ K_total elements.
-        if (self._outlier_promote
+        # Branch by g_blk:
+        #   g >= 2 : two-pool unified top-K walk (element pool + group
+        #            pool compete on a per-element score axis).
+        #   g == 1 : single-pool walk on the group histogram only (the
+        #            "group" is one element, ranking on H × δ_g[i] is
+        #            the canonical element-wise score; element pool is
+        #            disabled — see ``_outlier_promote`` gate).
+        if (g_blk == 1 and getattr(self, "_flat_layout_done", False)):
+            import numpy as _np_walk
+            group_hist = self._g_fast_global_hist
+            total_groups_g1 = self._g_fast_dg_flat.numel()
+            K_total_g1 = max(1, int(self.topk_ratio * total_groups_g1))
+
+            group_smax = getattr(self, "_prev_s_max_g", None)
+            if group_smax is None or group_smax <= 0.0:
+                group_smax = 1e-6
+            group_score_max_used = max(group_smax * 1.5, 1e-30)
+            group_n_bins = group_hist.numel()
+            group_bin_width = group_score_max_used / group_n_bins
+
+            group_np = group_hist.cpu().numpy().astype(_np_walk.int64)
+            # Descending walk: bin midpoint score, weight = 1 per element
+            # (groups are 1 element at g=1).
+            group_bin_idx = _np_walk.arange(group_n_bins)
+            group_scores = (group_bin_idx + 0.5) * group_bin_width
+            order = _np_walk.argsort(-group_scores, kind="stable")
+            sorted_scores = group_scores[order]
+            sorted_counts = group_np[order]
+            cum = _np_walk.cumsum(sorted_counts)
+            total_w = int(cum[-1]) if cum.size > 0 else 0
+
+            if total_w < K_total_g1:
+                # Cold / under-populated: open the gate.
+                group_th_val = 0.0
+            else:
+                idx_th = int(_np_walk.searchsorted(
+                    cum, K_total_g1, side="left",
+                ))
+                idx_th = min(idx_th, sorted_scores.size - 1)
+                group_th_val = float(sorted_scores[idx_th])
+
+            self._g_fast_prev_threshold_t.fill_(group_th_val)
+
+            # Update prev_s_max_g from highest non-empty bin so next
+            # iter's bin range adapts to the live distribution.
+            group_nonempty = _np_walk.nonzero(group_np)[0]
+            if group_nonempty.size > 0:
+                top_group_bin = int(group_nonempty[-1])
+                self._prev_s_max_g = max(
+                    (top_group_bin + 1) * group_bin_width, 1e-30,
+                )
+
+            import os as _os_od
+            if (_os_od.environ.get("PROPOSAL_OUTLIER_DEBUG", "")
+                    in ("1", "true", "TRUE")
+                    and prev_step % 5 == 0):
+                print(
+                    f"[proposal] g1_walk @iter{prev_step}: "
+                    f"K_total={K_total_g1} "
+                    f"group_hist_total={int(group_np.sum())} "
+                    f"group_smax={group_score_max_used:.3e} "
+                    f"group_th={group_th_val:.3e}",
+                    flush=True,
+                )
+        elif (self._outlier_promote
                 and self._outlier_elem_hist is not None
                 and getattr(self, "_flat_layout_done", False)):
-            import numpy as _np_form1
+            import numpy as _np_walk
             elem_hist = self._outlier_elem_hist
             total_groups_outlier = self._g_fast_dg_flat.numel()
             total_elems_outlier = total_groups_outlier * g_blk
@@ -1327,31 +1517,31 @@ class ImportanceTracker:
             group_bin_width = group_score_max_used / group_n_bins
 
             # --- pull both hists to host (small, ~56 KB total) ---
-            elem_np = elem_hist.cpu().numpy().astype(_np_form1.int64)
+            elem_np = elem_hist.cpu().numpy().astype(_np_walk.int64)
             # group_hist is fp32 (histc accumulator); cast to int64 for
             # weighted cumsum arithmetic.
-            group_np = group_hist.cpu().numpy().astype(_np_form1.int64)
+            group_np = group_hist.cpu().numpy().astype(_np_walk.int64)
 
             # Per-element score for each bin's midpoint, axis: descending.
-            elem_bin_idx = _np_form1.arange(elem_n_bins)
+            elem_bin_idx = _np_walk.arange(elem_n_bins)
             elem_scores = (elem_bin_idx + 0.5) * elem_bin_width
-            group_bin_idx = _np_form1.arange(group_n_bins)
+            group_bin_idx = _np_walk.arange(group_n_bins)
             group_scores_per_elem = (
                 (group_bin_idx + 0.5) * group_bin_width / g_blk
             )
 
             # Concatenate the two pools, then sort by score descending.
             # ``weight``: 1 for element bins, g_blk for group bins.
-            all_scores = _np_form1.concatenate([elem_scores, group_scores_per_elem])
-            all_counts = _np_form1.concatenate([elem_np, group_np])
-            all_weights = _np_form1.concatenate([
-                _np_form1.full(elem_n_bins, 1, dtype=_np_form1.int64),
-                _np_form1.full(group_n_bins, g_blk, dtype=_np_form1.int64),
+            all_scores = _np_walk.concatenate([elem_scores, group_scores_per_elem])
+            all_counts = _np_walk.concatenate([elem_np, group_np])
+            all_weights = _np_walk.concatenate([
+                _np_walk.full(elem_n_bins, 1, dtype=_np_walk.int64),
+                _np_walk.full(group_n_bins, g_blk, dtype=_np_walk.int64),
             ])
-            order = _np_form1.argsort(-all_scores, kind="stable")
+            order = _np_walk.argsort(-all_scores, kind="stable")
             sorted_scores = all_scores[order]
             sorted_weighted = (all_counts[order] * all_weights[order])
-            cum = _np_form1.cumsum(sorted_weighted)
+            cum = _np_walk.cumsum(sorted_weighted)
             total_weighted = int(cum[-1]) if cum.size > 0 else 0
 
             # --- threshold at K_total (selection boundary) ---
@@ -1360,7 +1550,7 @@ class ImportanceTracker:
                 # / group eligible next iter.
                 elem_th_val = 0.0
             else:
-                idx_th = int(_np_form1.searchsorted(cum, K_total, side="left"))
+                idx_th = int(_np_walk.searchsorted(cum, K_total, side="left"))
                 idx_th = min(idx_th, sorted_scores.size - 1)
                 # Lower edge of the bin where cumsum reached K_total.
                 # Using the bin score (midpoint) is good enough — bin
@@ -1373,7 +1563,7 @@ class ImportanceTracker:
                 # to half of next_th — avoids the all-bin scan oscillation.
                 elem_floor_val = elem_th_val * 0.5
             else:
-                idx_floor = int(_np_form1.searchsorted(
+                idx_floor = int(_np_walk.searchsorted(
                     cum, K_total * FLOOR_MULT, side="left",
                 ))
                 idx_floor = min(idx_floor, sorted_scores.size - 1)
@@ -1394,13 +1584,13 @@ class ImportanceTracker:
             # --- update prev_smax (element & group) for next iter's
             # bin range. Element side: highest non-empty element bin.
             # Group side: highest non-empty group bin (in group score).
-            elem_nonempty = _np_form1.nonzero(elem_np)[0]
+            elem_nonempty = _np_walk.nonzero(elem_np)[0]
             if elem_nonempty.size > 0:
                 top_elem_bin = int(elem_nonempty[-1])
                 self._outlier_prev_smax = max(
                     (top_elem_bin + 1) * elem_bin_width, 1e-30,
                 )
-            group_nonempty = _np_form1.nonzero(group_np)[0]
+            group_nonempty = _np_walk.nonzero(group_np)[0]
             if group_nonempty.size > 0:
                 top_group_bin = int(group_nonempty[-1])
                 self._prev_s_max_g = max(
@@ -1422,12 +1612,12 @@ class ImportanceTracker:
                 # walk's threshold: bins above elem_th in each pool.
                 # Element budget = sum of element bin counts above th.
                 elem_above = int(elem_np[
-                    _np_form1.where(elem_scores >= elem_th_val)[0]
+                    _np_walk.where(elem_scores >= elem_th_val)[0]
                 ].sum())
                 # Group budget (in elements) = g_blk × sum of group bin
                 # counts whose per-elem score ≥ elem_th.
                 group_above_groups = int(group_np[
-                    _np_form1.where(group_scores_per_elem >= elem_th_val)[0]
+                    _np_walk.where(group_scores_per_elem >= elem_th_val)[0]
                 ].sum())
                 group_above_elem_units = group_above_groups * g_blk
                 print(
@@ -1485,10 +1675,14 @@ class ImportanceTracker:
             outlier_sorted_global = outlier_elem_idx[sort_idx]
             sorted_name_idx = name_idx_per_o[sort_idx]
             # Boundaries: for each name i, slice is [bnd[i]:bnd[i+1]).
-            bnd = torch.searchsorted(
-                sorted_name_idx,
-                torch.arange(len(name_list) + 1, device=device),
-            )
+            # Cache the arange (len(name_list)+1 is init invariant).
+            _name_arange = getattr(self, "_name_arange_cache", None)
+            if _name_arange is None or _name_arange.numel() != len(name_list) + 1:
+                _name_arange = torch.arange(
+                    len(name_list) + 1, device=device,
+                )
+                self._name_arange_cache = _name_arange
+            bnd = torch.searchsorted(sorted_name_idx, _name_arange)
             outlier_name_bounds_cpu = bnd.cpu().tolist()  # ONE sync
         _t_after_olsort = _time_dsp.perf_counter() if _dsp_dbg else 0.0
 
@@ -1605,6 +1799,92 @@ class ImportanceTracker:
                     0, top_idx_sorted[:last_valid].to(torch.long), 0.0,
                 )
 
+            # Batched per-name count tensors: build ONE GPU tensor for
+            # each of name_cnt_g / name_cnt_o (covering all 130 names
+            # across all 12 BF16 groups), then narrow per BF16 group
+            # inside the loop. Replaces 24 per-iter torch.tensor()
+            # launches (one per group per kind) with 2 launches.
+            # Counts vary each iter so we cannot cache the full tensor;
+            # but we collapse the H2D into 2 calls instead of 24.
+            _all_cnt_g_t = torch.tensor(
+                name_cnt_g, dtype=torch.long, device=device,
+            )
+            _all_cnt_o_t = torch.tensor(
+                name_cnt_o, dtype=torch.long, device=device,
+            )
+
+            # === Batched Phase A pre-computation ===
+            # Replace per-grp [sub(master_off) + mul(g_blk) + add(arange)]
+            # with ONE global sub + ONE global mul/add/flatten across the
+            # whole top_idx_sorted[:last_valid]. Saves ~36 launches
+            # (3 ops × 12 BF16 groups) → 3 launches.
+            #
+            # Per-grp narrow gives back the per-grp slice without launch.
+            # n_per_grp_g (groups count per BF16 grp) comes from seg_bounds.
+            # master_off_per_grp_t cached per init.
+            _g_off_per_grp_cache = getattr(
+                self, "_master_off_per_grp_t_cache", None)
+            if _g_off_per_grp_cache is None:
+                _g_off_per_grp_cache = torch.tensor(
+                    [g["master_off"] for g in self._groups],
+                    dtype=torch.long, device=device,
+                )
+                self._master_off_per_grp_t_cache = _g_off_per_grp_cache
+            _master_off_per_grp_t = _g_off_per_grp_cache
+
+            # Global within_off concat: (offsets_cpu[k] - master_off[grp_of_k])
+            # × g_blk for all 130 names across all BF16 groups, in name
+            # order. Cached at init (init-invariant). Used to globalize
+            # the per-grp ``within_off_per_name.repeat_interleave(cnt)``
+            # call inside the loop into ONE global repeat_interleave.
+            _winoff_concat_cache = getattr(
+                self, "_winoff_concat_cache", None)
+            if _winoff_concat_cache is None:
+                _winoff_list: List[int] = []
+                for grp_init in self._groups:
+                    sn_i = grp_init["start_name_in_grp"]
+                    en_i = grp_init["end_name_in_grp"]
+                    moff_i = grp_init["master_off"]
+                    for k in range(en_i - sn_i):
+                        _winoff_list.append(
+                            (offsets_cpu[sn_i + k] - moff_i) * g_blk
+                        )
+                _winoff_concat_cache = torch.tensor(
+                    _winoff_list, dtype=torch.long, device=device,
+                )
+                self._winoff_concat_cache = _winoff_concat_cache
+            _within_off_concat = _winoff_concat_cache
+
+            # Per-grp groups count (from seg_bounds_cpu).
+            n_per_grp_g_list = [
+                int(seg_bounds_cpu[g["end_name_in_grp"]].item())
+                - int(seg_bounds_cpu[g["start_name_in_grp"]].item())
+                for g in self._groups
+            ]
+            n_per_grp_g_t = torch.tensor(
+                n_per_grp_g_list, dtype=torch.long, device=device,
+            )
+
+            top_active = top_idx_sorted[:last_valid] if last_valid > 0 else None
+            elem_idx_groups_bf16_global: Optional[torch.Tensor] = None
+            grp_g_starts_in_global: List[int] = [0]
+            for n in n_per_grp_g_list:
+                grp_g_starts_in_global.append(
+                    grp_g_starts_in_global[-1] + n
+                )
+
+            if top_active is not None and top_active.numel() > 0:
+                # Build per-element master_off via repeat_interleave.
+                _moff_per_elem = (
+                    _master_off_per_grp_t.repeat_interleave(n_per_grp_g_t)
+                )
+                local_g_in_grp_global = top_active.sub(_moff_per_elem)
+                # elem_idx_groups_bf16_global has shape (last_valid * g_blk,)
+                elem_idx_groups_bf16_global = (
+                    local_g_in_grp_global.unsqueeze(1) * g_blk
+                    + arange_g.unsqueeze(0)
+                ).flatten()
+
             for gi, grp in enumerate(self._groups):
                 sn = grp["start_name_in_grp"]
                 en = grp["end_name_in_grp"]
@@ -1620,19 +1900,17 @@ class ImportanceTracker:
                 v_flat_g = grp["v_flat"]
                 p_flat_g = grp["p_flat"]
 
-                # Group part: top_idx_sorted slice for names [sn:en).
-                # Excluded names' groups are already absent (pass2 zeroed
-                # their score). top_idx_grp is in dg_flat coords.
+                # Group part: narrow into the GLOBAL pre-computed
+                # elem_idx_groups_bf16_global (built once outside the
+                # loop with one sub + mul + add). Saves per-grp launches.
                 s_b_lo = int(seg_bounds_cpu[sn].item())
                 s_b_hi = int(seg_bounds_cpu[en].item())
-                if s_b_hi > s_b_lo:
-                    top_idx_grp = top_idx_sorted[s_b_lo:s_b_hi]
-                    # BF16-group-flat coords (used for index_select).
-                    local_g_in_grp = top_idx_grp.sub(master_off_g)
-                    elem_idx_groups_bf16 = (
-                        local_g_in_grp.unsqueeze(1) * g_blk
-                        + arange_g.unsqueeze(0)
-                    ).flatten()
+                if s_b_hi > s_b_lo and elem_idx_groups_bf16_global is not None:
+                    grp_start_g = grp_g_starts_in_global[gi] * g_blk
+                    grp_n_elems_g = (s_b_hi - s_b_lo) * g_blk
+                    elem_idx_groups_bf16 = elem_idx_groups_bf16_global.narrow(
+                        0, grp_start_g, grp_n_elems_g,
+                    )
                 else:
                     elem_idx_groups_bf16 = torch.empty(
                         0, dtype=torch.long, device=device,
@@ -1694,24 +1972,21 @@ class ImportanceTracker:
                 # ``repeat_interleave`` (one per region: groups, outliers).
                 # within_off_per_name[k] = (offsets_cpu[sn+k] - master_off_g) × g_blk
                 #                                    (in BF16-group ELEMENT coords).
-                within_off_per_name = torch.tensor(
-                    [(offsets_cpu[sn + k] - master_off_g) * g_blk
-                     for k in range(en - sn)],
-                    dtype=torch.long, device=device,
+                # within_off_per_name is now a narrow into the global
+                # concat (cached at init). Saves the per-grp dict lookup
+                # and any potential rebuild path.
+                within_off_per_name = _within_off_concat.narrow(
+                    0, sn, en - sn,
                 )
                 groups_off_per_elem: Optional[torch.Tensor] = None
                 outliers_off_per_elem: Optional[torch.Tensor] = None
                 if elem_idx_groups_bf16.numel() > 0:
-                    cnt_g_per_name_t = torch.tensor(
-                        name_cnt_g[sn:en], dtype=torch.long, device=device,
-                    )
+                    cnt_g_per_name_t = _all_cnt_g_t.narrow(0, sn, en - sn)
                     groups_off_per_elem = within_off_per_name.repeat_interleave(
                         cnt_g_per_name_t,
                     )
                 if elem_idx_outliers_bf16.numel() > 0:
-                    cnt_o_per_name_t = torch.tensor(
-                        name_cnt_o[sn:en], dtype=torch.long, device=device,
-                    )
+                    cnt_o_per_name_t = _all_cnt_o_t.narrow(0, sn, en - sn)
                     outliers_off_per_elem = within_off_per_name.repeat_interleave(
                         cnt_o_per_name_t,
                     )
@@ -1734,6 +2009,11 @@ class ImportanceTracker:
 
         # Phase B: d2h_stream — ONE big copy per field per BF16 group
         # (4 d2h × N_BF16_groups = 12 d2h total; vs 640 per-name).
+        # NOTE: tried `_foreach_copy_` batching here (v6) — measured
+        # WORSE iter time (+7 ms). Likely cause: building 4 dst/src
+        # lists × 12 narrows + foreach_copy fixed overhead exceeds the
+        # savings of fewer launches at N=12. Per-grp copy_ in a tight
+        # loop is the empirical winner.
         if d2h_stream is not None and event_compute is not None:
             d2h_stream.wait_event(event_compute)
         with sm_d2h:
@@ -1756,6 +2036,20 @@ class ImportanceTracker:
                 pinned_v.narrow(0, grp_pinned_start, grp_total).copy_(
                     v_sel_grp, non_blocking=True,
                 )
+        # Cross-stream ownership transfer: Phase A allocated these on
+        # tracker_stream, Phase B queued non_blocking copies onto
+        # d2h_stream. We must NOT free the GPU staging until the H2D
+        # provably completes — otherwise the caching allocator may
+        # reuse the memory under tracker_stream while d2h_stream's
+        # copy is still in flight (UB: writes garbage to pinned host).
+        # Solution: hand ownership to the writer thread. Writer
+        # synchronises on ``event_h2d`` (recorded on d2h_stream below)
+        # then clears the list — at that point the H2D is provably
+        # done. This is the explicit ownership counterpart of the
+        # earlier ``record_stream`` patch.
+        gpu_refs_for_writer: List[torch.Tensor] = [
+            t for gpu in per_grp_gpu if gpu is not None for t in gpu
+        ]
         per_grp_gpu = []  # type: ignore[assignment]
 
         # Build per-name selected_payload as a list of sub-entries.
@@ -1860,6 +2154,7 @@ class ImportanceTracker:
                 step=int(prev_step),
                 per_expert_updates=per_expert_batch,
                 h2d_event=event_h2d,
+                gpu_refs=gpu_refs_for_writer,
             )
 
         self._pending_dispatch = None
@@ -1928,15 +2223,24 @@ class ImportanceTracker:
         device = next(self.model.parameters()).device
         g_blk = max(1, int(self.block_quant_g))
         mapper = get_mapper()
+        # Bench env flags for empirical decomposition of score_step.
+        import os as _os_bench_ss
+        _bench_no_dispatch = _os_bench_ss.environ.get(
+            "PROPOSAL_BENCH_NO_DISPATCH", "") in ("1", "true", "TRUE")
+        _bench_no_tracker_kernel = _os_bench_ss.environ.get(
+            "PROPOSAL_BENCH_NO_TRACKER_KERNEL", "") in ("1", "true", "TRUE")
+        _bench_no_pass2 = _os_bench_ss.environ.get(
+            "PROPOSAL_BENCH_NO_PASS2", "") in ("1", "true", "TRUE")
 
         # === STEP 0: dispatch previous iter's pending payload ===
         # Pass THIS iter's excluded set so dispatch can skip experts that
         # fired a lossless FC at T (their fresh LFCL would be clobbered
         # otherwise — see _dispatch_pending_payload docstring).
         _t0_dispatch_start = _time.perf_counter()
-        self._dispatch_pending_payload(
-            optimizer, current_iter_excluded=excluded_eids,
-        )
+        if not _bench_no_dispatch:
+            self._dispatch_pending_payload(
+                optimizer, current_iter_excluded=excluded_eids,
+            )
         _t0_dispatch_end = _time.perf_counter()
         phase_dispatch_ms = (_t0_dispatch_end - _t0_dispatch_start) * 1000.0
 
@@ -1966,7 +2270,8 @@ class ImportanceTracker:
         self._inside_tracker_stream = True
 
         # update_delta_accum (m, v read + dg write) — same stream as score.
-        self.update_delta_accum(optimizer, global_step)
+        if not _bench_no_tracker_kernel:
+            self.update_delta_accum(optimizer, global_step)
 
         # B2 expert-lossless-FC compatibility: zero out the dg accumulator
         # for any expert that fired a lossless FC this iter. CLAUDE.md spec:
@@ -1986,10 +2291,10 @@ class ImportanceTracker:
         _t0_p1 = _time.perf_counter()
 
         # --- Phase 1: group-level score = h_g × dg in ONE torch.mul ------
-        # Layout (set at init): flat_sg, dg_flat, h_g_fp32_flat, exc_mask
+        # Layout (set at init): flat_sg, dg_flat, h_g_bf16_flat, exc_mask
         # all share the same master-order layout (per-name views laid out
-        # contiguously per BF16-Opt group). h_g_fp32_flat is rebuilt only
-        # when _H_updates changes (every refresh ~40 iters); excluded
+        # contiguously per BF16-Opt group). h_g_bf16_flat is rewritten in
+        # place by ``_fold_h`` every Hessian refresh (~40 iters); excluded
         # mask is touched only for the (usually 0-few) experts undergoing
         # lossless FC this iter.
         if not getattr(self, "_flat_layout_done", False):
@@ -2125,7 +2430,16 @@ class ImportanceTracker:
         # Running True-count cumulative (GPU scalar).
         true_cum = torch.zeros((), dtype=torch.long, device=device)
 
-        for chunk_start in range(0, total_groups, chunk_size):
+        # Bench: skip pass2 chunk loop entirely.
+        import os as _os_p2
+        _bench_no_pass2_local = _os_p2.environ.get(
+            "PROPOSAL_BENCH_NO_PASS2", "") in ("1", "true", "TRUE")
+        _chunk_iter = (
+            iter(())  # empty iterator: skip whole loop
+            if _bench_no_pass2_local
+            else range(0, total_groups, chunk_size)
+        )
+        for chunk_start in _chunk_iter:
             chunk_end = min(chunk_start + chunk_size, total_groups)
             chunk_n = chunk_end - chunk_start
             chunk_view = chunk_buf[:chunk_n]
@@ -2160,16 +2474,17 @@ class ImportanceTracker:
             # mask.sum(dtype=long) skips the explicit .long() cast.
             true_cum = true_cum + mask_chunk.sum(dtype=torch.long)
 
-        # NOTE (Form 1): the per-pool threshold computation is GONE
-        # from pass2. The merged walk in dispatch (next iter) reads
-        # this iter's ``global_hist`` AND ``_outlier_elem_hist`` and
-        # produces a UNIFIED elem_th + group_th (= elem_th × g_blk)
-        # under a single K-budget. ``self._prev_s_max_g`` is still
-        # carried (used by Form 1 walk to pick group score range), but
-        # the merge walk now updates it from the histogram itself —
-        # so the cold-start ``s_max`` probe above is the only place
-        # the host-side carry is set, and only on iter 1 (when the
-        # merge walk's prev_s_max_g is None).
+        # NOTE (unified_topk): the per-pool threshold computation is
+        # GONE from pass2. The unified two-pool top-K walk in dispatch
+        # (next iter) reads this iter's ``global_hist`` AND
+        # ``_outlier_elem_hist`` and produces a UNIFIED elem_th +
+        # group_th (= elem_th × g_blk) under a single K-budget.
+        # ``self._prev_s_max_g`` is still carried (used by the unified
+        # walk to pick group score range), but the merge walk now
+        # updates it from the histogram itself — so the cold-start
+        # ``s_max`` probe above is the only place the host-side carry
+        # is set, and only on iter 1 (when the merge walk's
+        # prev_s_max_g is None).
         if getattr(self, "_prev_s_max_g", None) is None:
             self._prev_s_max_g = float(s_max)
 

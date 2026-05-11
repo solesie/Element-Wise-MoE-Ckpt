@@ -487,6 +487,7 @@ class ExpertState:
                                                        torch.Tensor, torch.Tensor,
                                                        torch.Tensor]]],
         h2d_event: Optional[Any] = None,
+        gpu_refs: Optional[List[torch.Tensor]] = None,
     ) -> int:
         """Batch variant of ``lossy_fc_append``: takes ALL per-expert
         updates for one iter and submits a SINGLE writer-thread job that
@@ -532,7 +533,7 @@ class ExpertState:
             return 0
         self._dispatch(
             self._do_lossy_fc_batch_write,
-            int(step), prepared, h2d_event,
+            int(step), prepared, h2d_event, gpu_refs,
             tag=f"lossy_batch_iter{int(step)}",
         )
         return grand_total
@@ -544,6 +545,7 @@ class ExpertState:
                                                               torch.Tensor, torch.Tensor,
                                                               torch.Tensor]]]],
         h2d_event: Optional[Any] = None,
+        gpu_refs: Optional[List[torch.Tensor]] = None,
     ) -> None:
         """Writer-thread handler for the batched variant — performs the
         per-expert numpy assembly + writev sequentially.
@@ -556,6 +558,11 @@ class ExpertState:
                 h2d_event.synchronize()
             except Exception:
                 pass
+        # H2D provably done → release Phase A GPU staging tensors so the
+        # caching allocator can reuse their memory (was held alive by
+        # the training thread to avoid cross-stream UB).
+        if gpu_refs is not None:
+            gpu_refs.clear()
         for (ent, total_n, filtered) in prepared:
             arr = np.empty(total_n, dtype=_RECORD_DTYPE)
             cursor = 0

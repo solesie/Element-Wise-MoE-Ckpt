@@ -299,8 +299,9 @@ class FCManager:
         return self._all_expert_ids[slot]
 
     # ------------------------------------------------------------------
-    def tick(self, step: int) -> Tuple[List[ExpertId], bool]:
-        """Advance FC schedule for iteration ``step`` (1-indexed).
+    def fire_nonexpert_fc_if_due(self, step: int) -> Tuple[List[ExpertId], bool]:
+        """Fire non-expert FC at iteration ``step`` (1-indexed) if due
+        (step == 1 or step % W == 0).
 
         Returns ``(fired_experts, nonexpert_fired)``. NOTE (post-B2):
         expert lossless FC is dispatched OUT-OF-BAND by ExpertLosslessFC
@@ -353,30 +354,57 @@ class FCManager:
         caching pinned allocator recycles freed buffers, so steady-state
         cost is small.
         """
+        # Optimization B: cache the per-name (FP32 master view) entries
+        # + plan + total_numel. Each iter's enum loop calls
+        # ``_fp32_param`` and ``_fp32_opt_state`` on 130 params × 3 keys
+        # = 390 mapper lookups + ``narrow().view()`` view creations
+        # (~10 µs each → 4 ms enum cost). The returned views share storage
+        # with the DS FP32 master flat which is stable post-init —
+        # caching the views is invariant. Cache key includes ``names``
+        # tuple identity + ``private`` (private path uses fresh pinned
+        # so the dst/payload caches must differ).
         _t_enum0 = time.perf_counter()
-        entries: List[Tuple[str, torch.Tensor]] = []
-        for name in names:
-            p = named_params[name]
-            src = _fp32_param(p).detach()
-            entries.append((f"{name}:param", src))
-            for key in ("exp_avg", "exp_avg_sq"):
-                v = _fp32_opt_state(self.optimizer, p, key)
-                if v is None:
-                    continue
-                entries.append((f"{name}:{key}", v.detach()))
+        cache_key = (id(names), private, len(names))
+        enum_cache = getattr(self, "_collect_enum_cache", None)
+        if enum_cache is not None and enum_cache.get("key") == cache_key:
+            entries = enum_cache["entries"]
+            plan = enum_cache["plan"]
+            total_numel = enum_cache["total_numel"]
+            device = enum_cache["device"]
+        else:
+            entries: List[Tuple[str, torch.Tensor]] = []
+            for name in names:
+                p = named_params[name]
+                src = _fp32_param(p).detach()
+                entries.append((f"{name}:param", src))
+                for key in ("exp_avg", "exp_avg_sq"):
+                    v = _fp32_opt_state(self.optimizer, p, key)
+                    if v is None:
+                        continue
+                    entries.append((f"{name}:{key}", v.detach()))
+            if not entries:
+                _enum_ms = (time.perf_counter() - _t_enum0) * 1000.0
+                self._last_collect_sub_ms = {"enum_ms": _enum_ms, "copy_ms": 0.0, "xfer_ms": 0.0, "wait_ms": 0.0, "nentries": 0}
+                return {}, 0
+            plan: List[Tuple[str, int, int, torch.Size]] = []
+            offset = 0
+            for key, t in entries:
+                n = int(t.numel())
+                plan.append((key, offset, n, t.shape))
+                offset += n
+            total_numel = offset
+            device = entries[0][1].device
+            self._collect_enum_cache = {
+                "key": cache_key,
+                "entries": entries,
+                "plan": plan,
+                "total_numel": total_numel,
+                "device": device,
+            }
         _enum_ms = (time.perf_counter() - _t_enum0) * 1000.0
         if not entries:
             self._last_collect_sub_ms = {"enum_ms": _enum_ms, "copy_ms": 0.0, "xfer_ms": 0.0, "wait_ms": 0.0, "nentries": 0}
             return {}, 0
-
-        plan: List[Tuple[str, int, int, torch.Size]] = []
-        offset = 0
-        for key, t in entries:
-            n = int(t.numel())
-            plan.append((key, offset, n, t.shape))
-            offset += n
-        total_numel = offset
-        device = entries[0][1].device
 
         # GPU stage UNUSED: per-source D2H directly to pinned host narrow
         # views. Saves ~total_numel × 4 bytes persistent GPU stage
@@ -414,7 +442,39 @@ class FCManager:
 
         _t_xfer0 = time.perf_counter()
         flat_cpu = pinned.narrow(0, 0, total_numel)
-        # Per-source D2H directly to pinned narrow views — no GPU stage.
+
+        # Optimization B (continued): cache dsts + srcs_resolved (already
+        # cast to FP32 if needed) + payload_template. All stable while
+        # ``pinned`` and ``entries`` don't rebuild. Per-iter dtype check
+        # eliminated by capturing the resolved srcs in cache.
+        xfer_cache_key = (cache_key, pinned.data_ptr(), total_numel)
+        xfer_cache = getattr(self, "_collect_xfer_cache", None)
+        if xfer_cache is not None and xfer_cache.get("key") == xfer_cache_key:
+            dsts = xfer_cache["dsts"]
+            srcs_resolved = xfer_cache["srcs_resolved"]
+            payload_template = xfer_cache["payload_template"]
+        else:
+            dsts: List[torch.Tensor] = []
+            srcs_flat: List[torch.Tensor] = []
+            payload_template: Dict[str, torch.Tensor] = {}
+            for (key, off, n, shape), (_k2, src) in zip(plan, entries):
+                dsts.append(flat_cpu.narrow(0, off, n))
+                srcs_flat.append(src.reshape(-1))
+                payload_template[key] = flat_cpu.narrow(0, off, n).view(shape)
+            if all(s.dtype == torch.float32 for s in srcs_flat):
+                srcs_resolved = srcs_flat
+            else:
+                srcs_resolved = [
+                    s if s.dtype == torch.float32 else s.to(torch.float32)
+                    for s in srcs_flat
+                ]
+            self._collect_xfer_cache = {
+                "key": xfer_cache_key,
+                "dsts": dsts,
+                "srcs_resolved": srcs_resolved,
+                "payload_template": payload_template,
+            }
+
         cuda_event: Optional["torch.cuda.Event"] = None
         if torch.cuda.is_available():
             from .async_writer import get_d2h_stream
@@ -423,26 +483,14 @@ class FCManager:
             main_event.record()
             with torch.cuda.stream(d2h_stream):
                 d2h_stream.wait_event(main_event)
-                for (_k, off, n, _shape), (_k2, src) in zip(plan, entries):
-                    dst = flat_cpu.narrow(0, off, n)
-                    src_flat = src.reshape(-1)
-                    if src_flat.dtype != torch.float32:
-                        dst.copy_(src_flat.to(torch.float32),
-                                  non_blocking=True)
-                    else:
-                        dst.copy_(src_flat, non_blocking=True)
+                torch._foreach_copy_(dsts, srcs_resolved, non_blocking=True)
                 cuda_event = torch.cuda.Event()
                 cuda_event.record(d2h_stream)
         else:
-            for (_k, off, n, _shape), (_k2, src) in zip(plan, entries):
-                flat_cpu.narrow(0, off, n).copy_(
-                    src.reshape(-1).to(torch.float32),
-                )
+            torch._foreach_copy_(dsts, srcs_resolved)
         _xfer_ms = (time.perf_counter() - _t_xfer0) * 1000.0
 
-        payload: Dict[str, torch.Tensor] = {}
-        for key, off, n, shape in plan:
-            payload[key] = flat_cpu.narrow(0, off, n).view(shape)
+        payload: Dict[str, torch.Tensor] = payload_template
         total_bytes = int(total_numel * 4)
         self._last_collect_sub_ms = {
             "enum_ms": _enum_ms, "copy_ms": _copy_ms,

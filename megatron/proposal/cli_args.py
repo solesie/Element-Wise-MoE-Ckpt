@@ -74,11 +74,6 @@ def add_proposal_args(parser):
                             "Default 40. Set 0 to disable.")
     group.add_argument("--proposal-hessian-num-samples", type=int, default=4,
                        help="Label draws averaged per Hessian refresh. Default 4.")
-    group.add_argument("--proposal-hessian-persist", action="store_true",
-                       help="Persist |H_diag| to <cp-dir>/hessian/h_iter*.bin after "
-                            "every refresh. Default OFF — the refresh path stays in "
-                            "GPU only, no async-writer pressure. Turn ON when recovery "
-                            "needs to resume H state across faults.")
     group.add_argument("--proposal-hutchinson-at-end", action="store_true",
                        help="At end of training, run one Hutchinson probe and write "
                             "a JSONL log (post-hoc cross-check; production refresh is "
@@ -102,7 +97,11 @@ def add_proposal_args(parser):
                             "fires. Per CLAUDE.md default 2.0 → 1 expert per "
                             "fire for 48-expert model → 200-iter cycle.")
     group.add_argument("--proposal-nonexpert-fc-W", type=int, default=10)
-    group.add_argument("--proposal-dc-retention", type=int, default=0)
+    group.add_argument("--proposal-dc-retention", type=int, default=20,
+                       help="Number of recent non-expert DC dense-grad "
+                            "snapshots to keep. Floored by max(W+2, 3) so "
+                            "at least one FC supersedes the oldest DC. "
+                            "Default 20.")
     group.add_argument("--proposal-async-queue", type=int, default=5)
     group.add_argument("--proposal-cp-mode", type=str, default="proposal",
                        choices=["proposal", "sequential"],

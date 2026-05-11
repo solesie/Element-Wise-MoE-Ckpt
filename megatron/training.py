@@ -52,7 +52,11 @@ from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.proposal.cp_hooks import (
-    init_proposal, proposal_pre_step, proposal_post_step,
+    init_proposal,
+    proposal_dc_snap_grads,
+    proposal_score_step,
+    proposal_fc_fire,
+    proposal_dc_record,
     proposal_recover, proposal_inject_fault, proposal_record_iter_loss,
     proposal_shutdown, proposal_hutchinson_probe,
     proposal_refresh_hessian, set_hessian_valid_iter,
@@ -781,10 +785,18 @@ def train_step(forward_step_func, data_iterator,
                     args.micro_batch_size * \
                     args.data_parallel_size
         if getattr(args, 'proposal_enable', False):
-            proposal_pre_step(model)
+            # Stage A (pre-optimizer): non-expert grad snapshot for DC.
+            proposal_dc_snap_grads(model)
         model[0].step(lr_kwargs={'increment': increment})
         if getattr(args, 'proposal_enable', False):
-            proposal_post_step(model, step=args.iteration + 1)
+            # Stage B / C / D (post-optimizer; m, v are now updated):
+            #   B = expert lossless FC fire + tracker score compute
+            #   C = non-expert lossless FC fire (W-scheduled)
+            #   D = DC bundle record (consumes the stage A payload)
+            _step_post = args.iteration + 1
+            proposal_score_step(model, step=_step_post)
+            proposal_fc_fire(model, step=_step_post)
+            proposal_dc_record(model, step=_step_post)
         update_successful = model[0].was_step_applied()
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)

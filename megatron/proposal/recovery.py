@@ -155,6 +155,21 @@ def _scan_cp_dir(
 def _ensure_optimizer_state(
     model: torch.nn.Module, optimizer: torch.optim.Optimizer
 ) -> None:
+    """Pre-populate optimizer state for non-mapper backends.
+
+    Skipped entirely when the Fp32StateMapper is active (DeepSpeed BF16/Zero
+    paths): in those modes the actual optimizer state lives in the
+    mapper-managed FP32 flat buffers (already allocated at init), and
+    forcing an extra ``optimizer.state[p]`` slot per param adds a
+    redundant BF16 copy of m + v for **every** param. On exp_etc that
+    duplicate is ~785 MB persistent VRAM, which the first fault recovery
+    triggers and never frees. Mapper-aware get/set_state paths in this
+    file (``_apply_payload_dict_to_model``, ``_gather_state_fp32``) read
+    and write only the mapper's flat buffers, so the optimizer.state[p]
+    duplicate is never used and can be safely skipped here.
+    """
+    if get_mapper() is not None:
+        return
     for p in model.parameters():
         if not p.requires_grad:
             continue
@@ -288,52 +303,6 @@ def _fused_adamw_step(
         grad_scale=None, found_inf=None,
     )
     return step_new
-
-
-_H_EMA_RE = re.compile(r"^h_ema_iter(\d+)\.(pt|bin)$")
-
-
-def load_h_ema(
-    hessian_cp_dir: Path,
-    t_fault: int,
-    device: Optional[torch.device] = None,
-) -> Optional[Dict]:
-    """Discover and load the most-recent ``h_ema_iter{N}.pt`` with N ≤
-    t_fault from ``<cp>/hessian/``. Returns the unpickled dict (see
-    ``_apply_h_ema_and_persist`` for schema) with per-tensor values moved
-    to ``device``, or ``None`` if no file exists.
-
-    Recovery strategy: if no file exists (e.g., fault before first refresh),
-    tracker._H_ema stays empty → score = 0 for the first post-recovery iter
-    → nothing selected on that iter. The very next refresh populates the
-    EMA from scratch (same behaviour as a fresh start).
-    """
-    hessian_cp_dir = Path(hessian_cp_dir)
-    if not hessian_cp_dir.is_dir():
-        return None
-    best: Optional[Tuple[int, Path]] = None
-    for entry in hessian_cp_dir.iterdir():
-        m = _H_EMA_RE.match(entry.name)
-        if m is None:
-            continue
-        it = int(m.group(1))
-        if it > t_fault:
-            continue
-        if best is None or it > best[0]:
-            best = (it, entry)
-    if best is None:
-        return None
-    # Magic-detect binary format; legacy .pt pickle files still supported.
-    from .binary_io import is_binary_format, load_binary
-    if is_binary_format(best[1]):
-        tensor_dict, scalars = load_binary(best[1], device=device)
-        obj = dict(scalars)
-        obj["h_ema"] = tensor_dict
-    else:
-        obj = torch.load(best[1], map_location="cpu")
-        if device is not None and isinstance(obj, dict) and "h_ema" in obj:
-            obj["h_ema"] = {n: t.to(device) for n, t in obj["h_ema"].items()}
-    return obj
 
 
 def recover(

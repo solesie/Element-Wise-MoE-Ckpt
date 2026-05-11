@@ -196,6 +196,7 @@ def compute_hessian_finite_diff_core(
     rng_seed: int = 0xFD15CAFE,
     one_sided: bool = False,
     track_k_values: Optional[List[int]] = None,
+    g_blk: int = 1,
 ) -> Optional[Any]:
     """Backend that runs the finite-difference loop on a caller-supplied
     forward closure. Used by both :func:`compute_hessian_finite_diff` (via
@@ -244,16 +245,39 @@ def compute_hessian_finite_diff_core(
     else:
         ctx_mgr = None
 
-    h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
-    gen = torch.Generator(device=expert_ps[0].device).manual_seed(rng_seed)
-    # Multi-K snapshot tracking: when track_k_values is provided, we
-    # accumulate raw sums (no inv_k division during loop) and snapshot
-    # h_sum / k_done at each K boundary. Returns dict {k: list[Tensor]}.
+    # Per-group BF16 accumulator (production path). Reduces |H| from
+    # element-level FP32 (~755 MB at exp_etc) to per-group BF16 (~47 MB
+    # at g=8, ~1.5 MB at g=256) — a >15× memory reduction held over the
+    # whole K-sample loop.  CLAUDE.md spec: "Hessian은 최종적으로 BF16
+    # 으로 group별로 동일한 값을 가진다." We compute the group mean of
+    # element-level |z·hz| per K iter and add into the BF16 accumulator
+    # directly; the FP32 element-level temporary is freed immediately.
+    # Multi-K diagnostic mode (track_k_values) requires element-level
+    # FP32 to support per-K snapshot comparisons, so it falls back to
+    # the original element-level accumulator.
     _track_set: set = set()
     _snapshots: Dict[int, List[torch.Tensor]] = {}
     if track_k_values:
         _track_set = set(int(k) for k in track_k_values
                          if 1 <= int(k) <= int(k_samples))
+    # Production scoring uses BF16 group-level H (``_H_g`` view). At
+    # g_blk=1 the "group" is one element, so the BF16 accumulator is
+    # element-level — same dtype, same shape end-to-end as g_blk>=2,
+    # no FP32 element-level transient. Multi-K diagnostic mode keeps
+    # FP32 element-level so cross-K Pearson is computed on the same
+    # axis as Hutchinson (different requirements there).
+    use_group_accum = not _track_set
+    if use_group_accum:
+        h_accum = [
+            torch.zeros(
+                (p.numel() // max(1, int(g_blk)),),
+                dtype=torch.bfloat16, device=p.device,
+            )
+            for p in expert_ps
+        ]
+    else:
+        h_accum = [torch.zeros_like(p, dtype=torch.float32) for p in expert_ps]
+    gen = torch.Generator(device=expert_ps[0].device).manual_seed(rng_seed)
     try:
         with (ctx_mgr if ctx_mgr is not None else nullcontext()):
             if ctx_mgr is not None:
@@ -299,7 +323,23 @@ def compute_hessian_finite_diff_core(
                         return None
                 for i, (gp, gm, z) in enumerate(zip(grads_plus, grads_minus, zs)):
                     hz = (gp - gm).mul(inv_step).to(torch.float32)
-                    h_accum[i].add_((z.to(torch.float32) * hz).abs_().mul_(inv_k))
+                    contrib = (z.to(torch.float32) * hz).abs_().mul_(inv_k)
+                    if use_group_accum:
+                        # Reduce element-level contrib → per-group mean
+                        # → BF16 → fold into the BF16 accumulator.
+                        # The FP32 contrib is dropped at the end of this
+                        # iteration; only BF16 quantised memory persists.
+                        n_aligned = (contrib.numel() // g_blk) * g_blk
+                        if n_aligned > 0:
+                            h_accum[i].add_(
+                                contrib[:n_aligned]
+                                .reshape(-1, g_blk)
+                                .mean(dim=1)
+                                .to(torch.bfloat16)
+                            )
+                    else:
+                        h_accum[i].add_(contrib)
+                    del contrib, hz
                 k_done = k + 1
                 if k_done in _track_set:
                     _snapshots[k_done] = [
@@ -361,6 +401,7 @@ def compute_hessian_finite_diff(
     rng_seed: int = 0xBADCAFE,
     one_sided: bool = False,
     track_k_values: Optional[List[int]] = None,
+    g_blk: int = 1,
 ) -> Optional[Any]:
     """Diagonal Hessian via central finite-difference Hessian-vector products.
 
@@ -517,6 +558,7 @@ def compute_hessian_finite_diff(
             rng_seed=rng_seed,
             one_sided=one_sided,
             track_k_values=track_k_values,
+            g_blk=g_blk,
         )
 
 

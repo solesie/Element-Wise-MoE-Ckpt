@@ -290,6 +290,7 @@ class DramExpertState:
                                                        torch.Tensor, torch.Tensor,
                                                        torch.Tensor]]],
         h2d_event: Optional[Any] = None,
+        gpu_refs: Optional[List[torch.Tensor]] = None,
     ) -> int:
         """Batch variant: package all per-expert scatter ops and submit
         ONE writer-thread job. Avoids ~80 per-iter ``submit_raw`` lock
@@ -300,7 +301,16 @@ class DramExpertState:
         copies that populated the pinned-host tensors in
         ``per_expert_updates``. Writer thread synchronises on it before
         running the scatter — keeps the H2D off the training-thread
-        critical path while guaranteeing read-after-write ordering."""
+        critical path while guaranteeing read-after-write ordering.
+
+        ``gpu_refs``: optional list of GPU tensors that were the *source*
+        of the H2D copies into ``per_expert_updates``'s pinned tensors.
+        The training thread hands ownership to the writer thread; the
+        writer releases (clears the list) only AFTER ``h2d_event``
+        synchronises, guaranteeing the GPU memory cannot be reclaimed
+        by the caching allocator before the H2D completes. Replaces the
+        prior ``record_stream`` patch with explicit ownership transfer
+        — see Phase B in ``_dispatch_pending_payload``."""
         import os as _os
         if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
             grand = 0
@@ -344,11 +354,11 @@ class DramExpertState:
             return 0
         if self._async_writer is not None:
             self._async_writer.submit_raw(
-                self._do_dram_lossy_batch, prepared, h2d_event,
+                self._do_dram_lossy_batch, prepared, h2d_event, gpu_refs,
                 tag=f"dram_lossy_batch_iter{int(step)}",
             )
         else:
-            self._do_dram_lossy_batch(prepared, h2d_event)
+            self._do_dram_lossy_batch(prepared, h2d_event, gpu_refs)
         return grand_total
 
     @torch.no_grad()
@@ -359,14 +369,20 @@ class DramExpertState:
                                         torch.Tensor, torch.Tensor,
                                         torch.Tensor]]]],
         h2d_event: Optional[Any] = None,
+        gpu_refs: Optional[List[torch.Tensor]] = None,
     ) -> None:
         """Writer-thread handler — synchronises on ``h2d_event`` (if any)
-        then runs the scatter ops sequentially."""
+        then runs the scatter ops sequentially. Releases ``gpu_refs``
+        (Phase A staging tensors) AFTER the event sync so the caching
+        allocator can safely reuse their memory — at which point the
+        H2D is provably complete."""
         if h2d_event is not None:
             try:
                 h2d_event.synchronize()
             except Exception:
                 pass
+        if gpu_refs is not None:
+            gpu_refs.clear()
         for (eid, per_expert) in prepared:
             for (buf, idx_local, p, m, v) in per_expert:
                 idx_long = idx_local.to(torch.long, copy=False)

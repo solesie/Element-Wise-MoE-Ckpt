@@ -294,7 +294,7 @@ case "$VARIANT" in
         fi
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode proposal \
-            --proposal-cp-target dram \
+            --proposal-cp-target ${CP_TARGET:-disk} \
             --proposal-block-quant-g ${BLOCK_QUANT_G:-256} \
             --proposal-selection-mode hessian \
             ${FD_CROSS_CHECK_FLAG} \
@@ -303,9 +303,9 @@ case "$VARIANT" in
             --proposal-topk-ratio ${PROPOSAL_TOPK:-0.04} \
             --proposal-lossless-fc-fraction ${LOSSLESS_FC_FRACTION:-1.0} \
             --proposal-expert-fc-D ${EXPERT_FC_D:-999999} \
-            --proposal-nonexpert-fc-W 10 \
+            --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-10} \
             --proposal-async-queue 5 \
-            --proposal-dc-retention 12 \
+            --proposal-dc-retention 20 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -346,7 +346,6 @@ case "$VARIANT" in
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.03 \
             --proposal-expert-fc-D 2 \
             --proposal-lossless-fc-fraction 2.0 \
@@ -369,7 +368,6 @@ case "$VARIANT" in
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.02 \
             --proposal-expert-fc-D 1 \
             --proposal-lossless-fc-fraction 1.0 \
@@ -387,7 +385,6 @@ case "$VARIANT" in
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
-            ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.04 \
             --proposal-expert-fc-D 1 \
             --proposal-lossless-fc-fraction 1.0 \
@@ -420,7 +417,6 @@ case "$VARIANT" in
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
-            ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.01 \
             --proposal-expert-fc-D 1 \
             --proposal-lossless-fc-fraction 0.5 \
@@ -440,7 +436,6 @@ case "$VARIANT" in
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
             --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
-            ${HESSIAN_PERSIST:+--proposal-hessian-persist} \
             --proposal-topk-ratio 0.04 \
             --proposal-expert-fc-D 1 \
             --proposal-lossless-fc-fraction 1.0 \
@@ -501,7 +496,7 @@ megatron_options=" \
     --train-iters ${TRAIN_ITERS} \
     --lr ${LR} --min-lr ${MIN_LR} --lr-decay-style cosine --lr-warmup-iters ${LR_WARMUP_ITERS} \
     --split 98,2,0 \
-    --log-interval 10 --eval-interval ${EVAL_INTERVAL:-100} --eval-iters ${EVAL_ITERS:-128} \
+    --log-interval ${LOG_INTERVAL:-10} --eval-interval ${EVAL_INTERVAL:-100} --eval-iters ${EVAL_ITERS:-128} \
     --save-interval 100000 \
     --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 \
     --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam \
