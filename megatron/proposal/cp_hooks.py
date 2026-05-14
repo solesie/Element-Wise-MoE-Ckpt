@@ -1,28 +1,66 @@
-"""Integration hooks between Megatron-DeepSpeed's training loop and the proposal CP pipeline."""
+"""Integration hooks between Megatron-DeepSpeed's training loop and the proposal CP pipeline.
+
+The training thread runs **only** training (fwd/bwd/optimizer). All proposal CP
+work — non-expert lossless FC, expert lossless FC, expert lossy FC append, and
+the proposal-mode importance tracker compute — is performed on the two domain
+workers owned by :class:`AsyncWriter`. The handshake is the
+``proposal_arm_post_iter_fc`` / ``proposal_release_post_iter_fc`` pair:
+
+* :func:`proposal_arm_post_iter_fc` runs at the end of ``train_step`` on the
+  training thread. It records a ``cuda.Event`` that signals iter T's
+  ``optimizer.step`` completion and stashes a small task descriptor.
+* :func:`proposal_release_post_iter_fc` is fired by a ``register_forward_hook``
+  on the unwrapped model at the END of the first micro-batch's forward in iter
+  T+1 (between fwd and bwd of mb0). It pushes the descriptor onto the two
+  domain queues and returns immediately. Subsequent micro-batches see the
+  descriptor already consumed (``_armed_post_iter_fc_task is None``) and the
+  hook is a no-op. The d2h is queued on ``d2h_stream`` while main_stream
+  proceeds with mb0's backward — backward contains no host-side ``.to('cuda')``
+  triggers so the PCIe copy-engine FIFO has no contender, and the 44 ms d2h
+  completes well inside the ~1.8 s remaining bwd/fwd/bwd/.../opt window.
+
+Each domain worker thread is bound to one CUDA device via ``set_device`` at
+startup, synchronises on the recorded cuda_event before reading any optimizer
+state, and runs FIFO so single-thread invariants (e.g. ``_pending_dispatch``
+inside :class:`ImportanceTracker`) hold without locks.
+"""
 from __future__ import annotations
 
 import os
 import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from .async_writer import AsyncWriter
-from .checkpoint_manager import CheckpointManager
 from ._ds_state import Fp32StateMapper, set_mapper
 from .fc_manager import FCManager, _detect_expert_layout, DS_EXPERT_IDX_RE
 from .importance_tracker import ImportanceTracker
 from .recovery import recover
 
 
+@dataclass
+class _PostIterFCTask:
+    """Descriptor handed from the training thread to the domain workers.
+
+    The event captures iter T's ``optimizer.step`` completion; both workers
+    synchronise on it before reading any FP32 master / Adam state. ``iter_T``
+    is forwarded into the schedule predicates (W-boundary for non-expert,
+    D-boundary for expert lossless FC).
+    """
+
+    cuda_event: Optional["torch.cuda.Event"]
+    iter_T: int
+
+
 _tracker: Optional[ImportanceTracker] = None
-_ckpt: Optional[CheckpointManager] = None
 _fc: Optional[FCManager] = None
 _writer: Optional[AsyncWriter] = None
 _expert_lossless_fc: Optional[Any] = None  # ExpertLosslessFC, lazy import
-_ne_payload: Optional[Dict[str, torch.Tensor]] = None
-_ne_payload_cuda_event: Optional["torch.cuda.Event"] = None
+_armed_post_iter_fc_task: Optional[_PostIterFCTask] = None
 _enabled: bool = False
 _cp_dir: Optional[Path] = None
 
@@ -83,7 +121,7 @@ def init_proposal(
     cp_root: str,
 ) -> None:
     """Build singletons. Short-circuits if args.proposal_enable is False."""
-    global _tracker, _ckpt, _fc, _writer, _enabled, _cp_dir, _config
+    global _tracker, _fc, _writer, _enabled, _cp_dir, _config
     global _expert_lossless_fc
 
     _enabled = bool(getattr(args, "proposal_enable", False))
@@ -214,7 +252,6 @@ def init_proposal(
             else None
         ),
         "nonexpert_fc_W": int(getattr(args, "proposal_nonexpert_fc_W", 10)),
-        "dc_retention": int(getattr(args, "proposal_dc_retention", 0)),
         "async_queue": int(getattr(args, "proposal_async_queue", 5)),
         "cp_mode": cp_mode,
         "lossless_fc_fraction_pct": float(
@@ -224,7 +261,13 @@ def init_proposal(
         "num_experts_spec": num_experts_spec,
     }
 
-    _writer = AsyncWriter(max_queue_size=_config["async_queue"]) if _should_write() else None
+    _writer = (
+        AsyncWriter(
+            non_expert_queue_size=_config["async_queue"],
+            expert_queue_size=max(_config["async_queue"] * 4, 16),
+        )
+        if _should_write() else None
+    )
 
     _tracker = ImportanceTracker(
         inner_model,
@@ -236,31 +279,23 @@ def init_proposal(
         async_writer=_writer,
         block_quant_g=int(getattr(args, "proposal_block_quant_g", 1)),
     )
-
-    # Non-expert DC retention: prefer the explicit ``--proposal-dc-
-    # retention`` (default 20 — see cli_args). Floor of W+2 ensures at
-    # least one FC supersedes the oldest DC; floor of 3 covers tiny W
-    # corner cases. DC is non-expert only now.
-    _dc_retention_arg = int(_config.get("dc_retention", 0))
-    ne_retention = max(_dc_retention_arg, _config["nonexpert_fc_W"] + 2, 3)
+    # Eager-allocate the per-BF16-group flat buffers (dg, h_g, exc, sel
+    # scratch) so the iter-1 Hessian refresh has valid target views to
+    # write into. With the new arch the first tracker.step runs on the
+    # host_writer_expert worker AFTER iter 1's H refresh on the training
+    # thread; if we left this lazy, ``_fold_h`` would silently skip every
+    # tensor (no view yet) and ``_g_fast_h_g_bf16_flat`` would stay zero
+    # for the full first refresh cycle.
+    _tracker._init_accum_sq_flat(inner_opt)
 
     # CP layout: split non-expert + expert into separate subdirectories
     # so they can be mounted on different devices.
-    #   <cp>/non_expert/  — non-expert dense DC + non-expert full FC
-    #   <cp>/expert/      — expert rolling (lossy-FC) + legacy expert full FC
+    #   <cp>/non_expert/  — non-expert full FC (W-scheduled)
+    #   <cp>/expert/      — expert rolling (lossy-FC) + lossless FC (D-scheduled)
     # H_g is GPU-only (BF16 in ``_g_fast_h_g_bf16_flat``). Recovery
     # rebuilds it on the next FD refresh; no disk persist path.
     _nonexpert_cp_dir = _cp_dir / "non_expert"
     _expert_cp_dir = _cp_dir / "expert"
-
-    if _should_write():
-        _ckpt = CheckpointManager(
-            output_dir=_nonexpert_cp_dir,
-            retention=ne_retention,
-            async_writer=_writer,
-        )
-    else:
-        _ckpt = None
 
     # MoC-System baseline uses round_robin single-expert sequential FC.
     fc_schedule = (
@@ -309,9 +344,11 @@ def init_proposal(
             # own pace without the next _fire_one overwriting in-flight
             # data. Steady-state alloc cost is small (pinned caching
             # allocator recycles freed buffers).
-            named_params = dict(inner_model.named_parameters())
+            # named_params=None: the callee lazily builds it ONLY on cache
+            # miss. Steady-state (cache hit) skips the
+            # ``dict(model.named_parameters())`` walk.
             return _fc._collect_param_payload(
-                tnames, named_params, private=True,
+                tnames, None, private=True,
             )
         _expert_lossless_fc = ExpertLosslessFC(
             model=inner_model,
@@ -337,6 +374,43 @@ def init_proposal(
 
     _config["_inner_model"] = inner_model
     _config["_inner_opt"] = inner_opt
+    # Register a forward hook on the model so that the previous-iter
+    # release fires at the END of the first micro-batch's forward
+    # (instead of at the start, before any forward kernels run).
+    # Timing rationale: at iter-start release, the d2h on d2h_stream
+    # queues on the GPU PCIe copy engine FIFO ahead of the small H2D
+    # transfers that PyTorch's `tensor.to('cuda')` issues during
+    # forward (e.g. `torch.tensor(0.0, device=)` in Megatron
+    # transformer's MoE path × 36 calls/iter). Each such .to() ends
+    # with cudaStreamSynchronize which waits for the queue to drain
+    # — directly observed in perf stack (cuStreamSynchronize /
+    # __clock_gettime in libcuda.so) blocking main thread ~44ms.
+    # By delaying release to *after* mb0's forward, d2h instead
+    # overlaps with mb0's backward (which contains no H2D triggers),
+    # and finishes well before mb1's forward starts. Worker overlap
+    # window is reduced by ~mb0-fwd time (~230 ms) but file-write
+    # (~900 ms) still fits comfortably inside the remaining iter.
+    if inner_model is not None:
+        # Remove any prior hook (idempotent re-init).
+        _prev = _config.get("_release_hook_handle")
+        if _prev is not None:
+            try:
+                _prev.remove()
+            except Exception:
+                pass
+        def _release_on_first_fwd(module, _inputs, _output):
+            # Eval-mode forwards bypass the iter-level arm/release
+            # contract; do not consume the armed task there.
+            if not module.training:
+                return
+            # `_armed_post_iter_fc_task` is the single gate. release
+            # pops it (→ None) — subsequent micro-batches see None
+            # and the call is a no-op.
+            if _armed_post_iter_fc_task is not None:
+                proposal_release_post_iter_fc(None)
+        _config["_release_hook_handle"] = (
+            inner_model.register_forward_hook(_release_on_first_fwd)
+        )
     # Persist fault log path early so proposal_shutdown dumps land next to it
     # even if no faults fire (or training crashes before first fault).
     fault_log = getattr(args, "proposal_fault_log", None)
@@ -395,74 +469,6 @@ def init_proposal(
               flush=True)
 
 
-def proposal_dc_snap_grads(model) -> None:
-    """Pre-optimizer hook (stage A): snapshot non-expert grads for DC.
-
-    Must run BEFORE ``engine.step()``: DS engine calls
-    ``optimizer.zero_grad(set_to_none=True)`` after the inner optimizer
-    step, which sets ``param.grad = None`` and zeroes the FP32 master
-    flat (via ``clear_hp_grads``). After step, no recoverable grad
-    exists.
-
-    Storage: pinned host BF16 (source dtype, no cast). Recovery casts
-    BF16 → FP32 in ``_apply_payload_dict_to_model`` before AdamW
-    replay. Since the source gradient is BF16 in DS BF16 training,
-    storing as FP32 would only pad zeros without adding information —
-    so BF16 storage is numerically lossless and saves 50% pinned host
-    + 1 cast kernel per param + 50% PCIe bandwidth.
-
-    Output: stashes (payload_dict, cuda_event) on module globals for
-    consumption by ``proposal_dc_record`` (post-optimizer stage D).
-    """
-    global _ne_payload, _ne_payload_cuda_event
-    if not _enabled or _tracker is None:
-        return
-    # Bench: skip dc_snap entirely (isolation flag for empirical
-    # decomposition of per-iter overhead).
-    import os as _os_bench_dc
-    if _os_bench_dc.environ.get("PROPOSAL_BENCH_NO_DC_SNAP", "") in ("1", "true", "TRUE"):
-        _ne_payload = None
-        _ne_payload_cuda_event = None
-        return
-
-    # MoC-System baseline (sequential): no DC, no non-expert dense snapshot.
-    seq_mode = _config["cp_mode"] == "sequential"
-    if not seq_mode:
-        import time as _time
-        _t0 = _time.perf_counter()
-        _ne_payload, _ne_stats = _tracker.snapshot_nonexpert_dc(
-            global_step=0,
-        )
-        _ne_payload_cuda_event = getattr(_ne_stats, "cuda_event", None)
-        _config["_phase_ms_dc_snap"] = (_time.perf_counter() - _t0) * 1000.0
-    else:
-        _ne_payload = None
-        _ne_payload_cuda_event = None
-
-    # accum_sq mode: snapshot expert θ before optimizer.step so update_delta_accum
-    # can compute Δθ = θ_after - θ_before in post_step (way cheaper than re-
-    # deriving from Adam m/v).
-    try:
-        _tracker.pre_step_snap()
-    except Exception as _ps_exc:
-        if _should_write():
-            print(f"[proposal] pre_step_snap FAILED: {_ps_exc}", flush=True)
-
-    # B2 race guard: main stream waits for the previous iter's tracker
-    # work to finish reading m, v BEFORE this iter's optimizer.step
-    # writes them. The wait is on a cuda Event (stream-level dependency,
-    # not host-blocking) — typically a no-op because forward+backward
-    # GPU work (~hundreds of ms) >> tracker work (~ms), but we add it
-    # for safety. Without this, fast forward+backward could race with
-    # tracker_stream's m/v read.
-    prev_ev = getattr(_tracker, "_pending_tracker_event", None)
-    if prev_ev is not None and torch.cuda.is_available():
-        try:
-            torch.cuda.current_stream().wait_event(prev_ev)
-        except Exception:
-            pass
-
-
 def proposal_record_iter_loss(step: int, loss_value: Optional[float]) -> None:
     """Called from the pretrain loop after train_step returns. Resolves
     post-fault loss and samples CPU memory.
@@ -488,162 +494,119 @@ def proposal_record_iter_loss(step: int, loss_value: Optional[float]) -> None:
             pass
 
 
-def proposal_score_step(
-    model, step: int,
-) -> Optional[Tuple[List[Tuple[int, int]], bool]]:
-    """Post-optimizer stage B: expert lossless FC + score compute.
+def _execute_non_expert_post_iter(task: _PostIterFCTask) -> None:
+    """Body of the host_writer_non_expert worker task.
 
-    Runs AFTER ``engine.step()`` (m, v are now updated):
-      ① ``ExpertLosslessFC.fire_if_due`` → fired list (round-robin
-         F% expert lossless FC; collect+dispatch on tracker_stream).
-      ② ``tracker.step`` → dispatch prev iter pending payload (small
-         main-stream D2Hs) + launch tracker_stream score compute
-         (Triton outlier kernel + group score chunk-loop). Must run
-         BEFORE ``proposal_fc_fire`` (stage C) so dispatch's small D2H
-         launches on the d2h_stream do not queue behind FC's 75 ms
-         non-expert payload.
+    The worker has CUDA context set; we sync on the iter T optimizer.step
+    event then defer scheduling (W-boundary) to ``FCManager``. The
+    in-flight FC's D2H + disk/DRAM write all run on this thread, FIFO."""
+    if task.cuda_event is not None:
+        task.cuda_event.synchronize()
+    if _fc is not None:
+        _fc.fire_nonexpert_fc_if_due(step=task.iter_T)
 
-    The ``fired_experts`` list is passed into ``tracker.step`` as an
-    exclusion set so dispatch can skip experts whose fresh LFCL would
-    be clobbered by stale lossy entries.
 
-    Returns ``(fired_experts, False)`` for backward compatibility with
-    callers that read both the expert and non-expert fire flags from a
-    single call. Non-expert flag is always False here — see
-    ``proposal_fc_fire``.
+def _execute_expert_post_iter(task: _PostIterFCTask) -> None:
+    """Body of the host_writer_expert worker task.
+
+    Two responsibilities, both single-threaded on this worker:
+      * fire the schedule-due expert lossless FCs (layer-RR in sequential
+        mode, F%-RR in proposal mode). ``ExpertLosslessFC.fire_if_due``
+        internally launches the D2H copies on ``d2h_stream``.
+      * in proposal mode, run ``ImportanceTracker.step``. This dispatches
+        the prev iter's pending payload (D2H on ``d2h_stream``) and
+        launches this iter's scoring compute on ``tracker_stream``. The
+        ``_pending_dispatch`` 1-iter pipeline state is mutated only here,
+        so single-thread invariants hold without locks.
     """
-    if not _enabled or _tracker is None:
-        return None
-    import os as _os_bench_ss
-    if _os_bench_ss.environ.get("PROPOSAL_BENCH_NO_SCORE_STEP", "") in ("1", "true", "TRUE"):
-        return [], False
-
-    seq_mode = _config["cp_mode"] == "sequential"
-    inner_opt = _config["_inner_opt"]
-
+    if task.cuda_event is not None:
+        task.cuda_event.synchronize()
     fired_experts: List[Tuple[int, int]] = []
-
-    import time as _time
-
-    if seq_mode:
-        # MoC baseline runs all FC scheduling synchronously inside
-        # proposal_fc_fire; nothing to do here.
-        return fired_experts, False
-
     if _expert_lossless_fc is not None:
         if _expert_lossless_fc._tracker_stream is None:
             _expert_lossless_fc._tracker_stream = getattr(
                 _tracker, "_tracker_stream", None,
             )
-        fired_experts = _expert_lossless_fc.fire_if_due(step)
-
-    _t_trk0 = _time.perf_counter()
-    _tracker.step(
-        inner_opt, global_step=step,
-        lossless_fc_eids=fired_experts,
-    )
-    _config["_phase_ms_score_step"] = (_time.perf_counter() - _t_trk0) * 1000.0
-
-    # Stash for proposal_dc_record (downstream stage may want fired list
-    # for diagnostics; current pipeline does not).
+        fired_experts = _expert_lossless_fc.fire_if_due(task.iter_T)
     _config["_last_fired_experts"] = fired_experts
-    return fired_experts, False
+    if _config["cp_mode"] != "sequential" and _tracker is not None:
+        inner_opt = _config.get("_inner_opt")
+        if inner_opt is not None:
+            _tracker.step(
+                inner_opt,
+                global_step=task.iter_T,
+                lossless_fc_eids=fired_experts,
+            )
 
 
-def proposal_fc_fire(
-    model, step: int,
-) -> bool:
-    """Post-optimizer stage C: non-expert lossless FC (W-scheduled).
+def proposal_fence_before_optimizer() -> None:
+    """Order this iter's optimizer.step AFTER any in-flight d2h on
+    ``d2h_stream`` that was launched by the forward_hook release.
 
-    Runs AFTER ``proposal_score_step`` (so dispatch's small D2H
-    launches go onto d2h_stream first; then FC's 75 ms heavy load
-    queues behind them on the same DMA engine without blocking
-    dispatch).
-
-    Action: when ``step == 1`` or ``step % W == 0``, snapshot all
-    non-expert params + Adam (m, v) FP32 master state to a pinned host
-    buffer (single batched D2H on d2h_stream), then queue a writer
-    job to persist to disk. Otherwise no-op.
-
-    Returns ``True`` iff a non-expert FC fire occurred this step.
-    Side effect: stashes the flag on ``_config['_last_nonexpert_fired']``
-    so ``proposal_dc_record`` can mark the DC bundle accordingly.
+    Belt-and-suspenders defense: in the normal hook path the d2h
+    (~44 ms) is launched at the end of mb0's forward and finishes
+    well before opt.step (~1.6 s later), so this wait is a no-op
+    (us-level). It guards the corner case where worker pickup or
+    PCIe is unexpectedly delayed, which would otherwise let
+    opt.step's master-write race d2h_stream's master-read.
     """
-    if not _enabled or _tracker is None:
-        return False
-    import os as _os_bench_fc
-    if _os_bench_fc.environ.get("PROPOSAL_BENCH_NO_FC_FIRE", "") in ("1", "true", "TRUE"):
-        _config["_last_nonexpert_fired"] = False
-        return False
-
-    seq_mode = _config["cp_mode"] == "sequential"
-
-    import time as _time
-
-    nonexpert_fired = False
-    _t0 = _time.perf_counter()
-    if _fc is not None:
-        # Sequential mode reuses the same fire path — both branches just
-        # call into FCManager. Difference is only in surrounding stages.
-        _fired_unused, nonexpert_fired = _fc.fire_nonexpert_fc_if_due(step=step)
-    if not seq_mode:
-        _config["_phase_ms_fc_fire"] = (_time.perf_counter() - _t0) * 1000.0
-
-    _config["_last_nonexpert_fired"] = nonexpert_fired
-    return nonexpert_fired
+    if not _enabled or not torch.cuda.is_available():
+        return
+    from .async_writer import get_d2h_stream
+    d2h = get_d2h_stream()
+    if d2h is not None:
+        torch.cuda.current_stream().wait_stream(d2h)
 
 
-def proposal_dc_record(
-    model, step: int,
-    ne_payload: Optional[Dict[str, torch.Tensor]] = None,
-) -> None:
-    """Post-optimizer stage D: queue DC bundle to writer.
+def proposal_arm_post_iter_fc(model, iter_T: int) -> None:
+    """Arm the iter T post-optimizer FC work for next-iter execution.
 
-    Runs LAST in the post-optimizer chain (after stages B, C). Consumes
-    the ``ne_payload`` produced by ``proposal_dc_snap_grads`` (stage A)
-    and the non-expert FC flag from ``proposal_fc_fire`` (stage C).
+    Called from the training thread at the tail of ``train_step``, right
+    after ``model[0].step()`` returns. Records a ``cuda.Event`` on the
+    main stream — the event signals iter T's ``optimizer.step``
+    completion to the domain workers when they synchronise on it. The
+    descriptor is then stashed for :func:`proposal_release_post_iter_fc`
+    to consume at the END of the first micro-batch's forward in iter
+    T+1 (via the ``register_forward_hook`` on the unwrapped model).
 
-    ``ne_payload`` may be passed explicitly; if ``None`` the function
-    falls back to the module-stashed ``_ne_payload`` (default path —
-    matches the existing implicit handoff between stages A and D).
-
-    The writer thread receives a ``cuda.Event`` (recorded on
-    d2h_stream during stage A) and calls ``event.synchronize()`` on
-    the worker side before reading the pinned host data — training
-    thread never blocks.
+    Diagnostics (per-iter probe, GPU memory report, Fisher coverage)
+    capture this iter's training state and are emitted inline because
+    they read the same FP32 master / H_g views as the worker tasks; the
+    worker has not started yet so there is no race.
     """
-    global _ne_payload, _ne_payload_cuda_event
+    global _armed_post_iter_fc_task
     if not _enabled or _tracker is None:
         return
-    if _config["cp_mode"] == "sequential":
+    event = None
+    if torch.cuda.is_available():
+        event = torch.cuda.Event()
+        event.record()
+    _armed_post_iter_fc_task = _PostIterFCTask(
+        cuda_event=event, iter_T=int(iter_T),
+    )
+    _proposal_post_iter_diagnostics(model, int(iter_T))
+
+
+def proposal_release_post_iter_fc(model) -> None:
+    """Release the armed task onto the two domain workers.
+
+    Fired by the ``register_forward_hook`` on the unwrapped model at
+    the END of the first micro-batch's forward in iter T+1. Both
+    submissions are ``queue.put`` calls returning in ~1 microsecond,
+    so the training thread proceeds straight into mb0's backward on
+    ``main_stream``. Each worker independently synchronises on the
+    iter T optimizer.step event before reading optimizer state."""
+    global _armed_post_iter_fc_task
+    task = _armed_post_iter_fc_task
+    _armed_post_iter_fc_task = None
+    if task is None:
         return
-    import os as _os_bench_dr
-    if _os_bench_dr.environ.get("PROPOSAL_BENCH_NO_DC_RECORD", "") in ("1", "true", "TRUE"):
-        _ne_payload = None
-        _ne_payload_cuda_event = None
+    if _writer is None:
+        _execute_non_expert_post_iter(task)
+        _execute_expert_post_iter(task)
         return
-
-    if ne_payload is None:
-        ne_payload = _ne_payload
-    nonexpert_fired = bool(_config.get("_last_nonexpert_fired", False))
-
-    import time as _time
-    _t0 = _time.perf_counter()
-    if _ckpt is not None:
-        _ckpt.record(
-            step=step,
-            nonexpert_payload=ne_payload or {},
-            nonexpert_did_fc=nonexpert_fired,
-            cuda_event=_ne_payload_cuda_event,
-        )
-    _config["_phase_ms_dc_record"] = (_time.perf_counter() - _t0) * 1000.0
-    _ne_payload = None
-    _ne_payload_cuda_event = None
-
-    # Stage E: post-iter observability (probes, AsyncWriter / GPU mem
-    # breakdown, Fisher coverage). All cheap or env-gated; runs after
-    # writer queue submit so it never delays disk I/O.
-    _proposal_post_iter_diagnostics(model, step)
+    _writer.submit_non_expert(_execute_non_expert_post_iter, task)
+    _writer.submit_expert(_execute_expert_post_iter, task)
 
 
 def _proposal_post_iter_diagnostics(model, step: int) -> None:
@@ -658,49 +621,71 @@ def _proposal_post_iter_diagnostics(model, step: int) -> None:
     seq_mode = _config["cp_mode"] == "sequential"
     inner_opt = _config["_inner_opt"]
 
-    # Per-iter group probe (env-flagged): measures whether group score tracks
-    # element score on PER-ITER δ (1 step accumulation). Captures the
-    # production semantics where δ varies every iter.
-    # Env (single window mode):
-    #   PROPOSAL_PERITER_GROUP_PROBE_START=N PROPOSAL_PERITER_GROUP_PROBE_LEN=M
-    #   → probe fires at iter [N, N+M)
-    # Env (periodic mode):
-    #   PROPOSAL_PERITER_GROUP_PROBE_PERIOD=P PROPOSAL_PERITER_GROUP_PROBE_LEN=M
-    #   → probe fires at iter [0, M), [P, P+M), [2P, 2P+M), ...
+    # === PER-ITER PROBE (env-flagged, measurement-only) ===========
+    # Two independent measurements per probe iter:
+    #
+    # (A) "Element-wise (optimal)": maintain per-element residual that
+    #     accumulates δ² since last save. Each iter, select top-K by
+    #     H × residual_wise → captured_score_wise = Σ(H × residual_wise
+    #     of selected) → reset residual_wise[selected] = 0.
+    #
+    # (B) "Element pool only": same fold, but selection by H × δ²_thisiter
+    #     (production single-iter signal). Maintain SEPARATE residual.
+    #     captured_score_pool = Σ(H × residual_pool of selected at this
+    #     iter) → reset residual_pool[selected] = 0.
+    #
+    # Output: captured_score_wise vs captured_score_pool per iter.
+    # Selection signal differs (accumulated optimal vs single-iter),
+    # state evolves separately. Window-start resets all state.
+    #
+    # Probe is MEASUREMENT-ONLY — does not touch production tracker or
+    # parameters. Reads ``_tracker._H_g`` and FP32 master weights.
+    #
+    # Env (sampling pattern):
+    #   PROPOSAL_PERITER_GROUP_PROBE_START=N    window start iter
+    #   PROPOSAL_PERITER_GROUP_PROBE_PERIOD=P   interval (0 = single window)
+    #   PROPOSAL_PERITER_GROUP_PROBE_LEN=M      window length
+    #   PROPOSAL_PERITER_GROUP_K_PCT=0.04       K-budget fraction
+    # NOTE: first iter of each window has no prev θ → no measurement.
     import os as _os_pi
     _pi_start = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_START", "0"))
     _pi_len = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_LEN", "0"))
     _pi_period = int(_os_pi.environ.get("PROPOSAL_PERITER_GROUP_PROBE_PERIOD", "0"))
     if _pi_period > 0 and _pi_len > 0:
-        _pi_in_window = (step % _pi_period) < _pi_len
-        # Reset snapshot at start of each new window so δ is 1-step within window
-        if step % _pi_period == 0:
-            _config.pop("_peritr_theta_snap", None)
+        if step >= _pi_start:
+            offset = (step - _pi_start) % _pi_period
+            _pi_in_window = offset < _pi_len
+            if offset == 0:
+                _config.pop("_peritr_theta_snap", None)
+                _config.pop("_peritr_residual_wise", None)
+                _config.pop("_peritr_residual_pool", None)
+                _config.pop("_peritr_residual_uni", None)
+        else:
+            _pi_in_window = False
     elif _pi_len > 0:
         _pi_in_window = (_pi_start <= step < _pi_start + _pi_len)
+        if step == _pi_start:
+            _config.pop("_peritr_theta_snap", None)
+            _config.pop("_peritr_residual_wise", None)
+            _config.pop("_peritr_residual_pool", None)
+            _config.pop("_peritr_residual_uni", None)
     else:
         _pi_in_window = False
     if _pi_in_window:
         try:
             from ._ds_state import get_mapper as _gm_pi
             _mp_pi = _gm_pi()
-            _gs_pi = [int(g) for g in _os_pi.environ.get(
-                "PROPOSAL_PERITER_GROUP_SIZES", "2,4,8,16,32").split(",")]
             _kpct_pi = float(_os_pi.environ.get(
-                "PROPOSAL_PERITER_GROUP_K_PCT", "0.01"))
+                "PROPOSAL_PERITER_GROUP_K_PCT", "0.04"))
             tracked_pi = _tracker._tracked_names if hasattr(
                 _tracker, "_tracked_names") else None
             if tracked_pi is not None:
-                # Build flat H, θ_now (FP32 master)
+                # Build flat H (element-level) + θ_now
                 h_list_pi = []
                 theta_now_pi = []
-                names_pi = []
-                # Production stores group-level H (_H_g, BF16, 1 entry per
-                # production group). Probe needs element-level H to compare
-                # different probe g values against the element-level baseline.
-                # Broadcast _H_g back to element resolution — H locality is
-                # high (CV_H ≪ CV_|δ|) so this is a faithful proxy for the
-                # purposes of cap_g vs cap_e ratio measurement.
+                # Probe always reads H_g from production at its current
+                # block_quant_g granularity, then broadcasts back to
+                # element resolution for fair element-level comparison.
                 prod_g = max(1, int(getattr(_tracker, "block_quant_g", 1)))
                 for nm in tracked_pi:
                     p_pi = _tracker._name_to_param.get(nm)
@@ -710,19 +695,15 @@ def _proposal_post_iter_diagnostics(model, step: int) -> None:
                     if h_g_view is None:
                         continue
                     h_elem = h_g_view.detach().to(torch.float32).repeat_interleave(prod_g)
-                    max_g = max(_gs_pi)
-                    n_t = (h_elem.numel() // max_g) * max_g
+                    n_t = h_elem.numel()
                     if n_t == 0:
                         continue
-                    h_list_pi.append(h_elem[:n_t])
+                    h_list_pi.append(h_elem)
                     fp32_now = (_mp_pi.get_param(p_pi)
                                 if _mp_pi is not None
                                 else p_pi.data.to(torch.float32))
                     theta_now_pi.append((nm, fp32_now.detach().clone(), n_t))
-                    names_pi.append(nm)
                 if not h_list_pi:
-                    # _H_g not yet populated (first refresh hasn't fired);
-                    # silently skip until refresh runs.
                     return None
                 H_all_pi = torch.cat(h_list_pi)
                 prev_pi = _config.get("_peritr_theta_snap")
@@ -734,113 +715,86 @@ def _proposal_post_iter_diagnostics(model, step: int) -> None:
                             delta_list.append(d)
                     if len(delta_list) == len(theta_now_pi):
                         delta_signed = torch.cat(delta_list)
-                        delta_abs = delta_signed.abs()
+                        # δ² for this iter only (PER-ITER, no accumulator).
                         delta_sq = delta_signed ** 2
-                        score_elem = H_all_pi * delta_sq
-                        total = float(score_elem.sum().item())
-                        n_total = score_elem.numel()
-                        k_elem = max(1, int(_kpct_pi * n_total))
-                        if total > 0:
-                            elem_th = float(torch.kthvalue(
-                                score_elem, n_total - k_elem + 1).values.item())
-                            elem_mask = score_elem >= elem_th
-                            cap_e = float(score_elem[elem_mask].sum().item()) / total
-                            # H-only top-K (δ²=1 가정): isolates impact of H block
-                            # quantization on selection
-                            H_total = float(H_all_pi.sum().item())
-                            H_elem_th = float(torch.kthvalue(
-                                H_all_pi, n_total - k_elem + 1).values.item())
-                            H_elem_mask = H_all_pi >= H_elem_th
-                            cap_h_elem = float(H_all_pi[H_elem_mask].sum().item()) / max(H_total, 1e-30)
-                            # δ²-only top-K (H=1 가정): isolates δ² block quant
-                            d2_total = float(delta_sq.sum().item())
-                            d2_elem_th = float(torch.kthvalue(
-                                delta_sq, n_total - k_elem + 1).values.item())
-                            d2_elem_mask = delta_sq >= d2_elem_th
-                            cap_d2_elem = float(delta_sq[d2_elem_mask].sum().item()) / max(d2_total, 1e-30)
-                            for g in _gs_pi:
-                                ng = n_total // g
-                                # Match production (rank-fair):
-                                #   H_g     = mean_{i∈group}(|H_i|)
-                                #   δ_g     = (1/g) · Σ_{i∈group} Δθ_i²
-                                #   score_g = H_g × δ_g
-                                # Production storage uses bare Σ Δθ_i² (no
-                                # /g) but g is uniform across groups so the
-                                # 1/g constant is rank-invariant. Use mean
-                                # form here for unit consistency with H_g.
-                                H_g = H_all_pi.view(ng, g).mean(dim=1)
-                                d_g_sq = delta_sq.view(ng, g).mean(dim=1)
-                                score_g = H_g * d_g_sq
-                                k_g = max(1, int(_kpct_pi * ng))
-                                g_th = float(torch.kthvalue(
-                                    score_g, ng - k_g + 1).values.item())
-                                g_mask = score_g >= g_th
-                                elem_from_g = g_mask.repeat_interleave(g)
-                                cap_g = float(score_elem[elem_from_g].sum().item()) / total
-                                # H-only group quantization: pick top groups by H_g
-                                Hg_th = float(torch.kthvalue(
-                                    H_g, ng - k_g + 1).values.item())
-                                Hg_mask = H_g >= Hg_th
-                                elem_from_Hg = Hg_mask.repeat_interleave(g)
-                                cap_h_g = float(H_all_pi[elem_from_Hg].sum().item()) / max(H_total, 1e-30)
-                                # δ²-only group quantization: pick top groups
-                                # by Σ_{i∈g} δ_i² (matches production).
-                                d2g_th = float(torch.kthvalue(
-                                    d_g_sq, ng - k_g + 1).values.item())
-                                d2g_mask = d_g_sq >= d2g_th
-                                elem_from_d2g = d2g_mask.repeat_interleave(g)
-                                cap_d2_g = float(delta_sq[elem_from_d2g].sum().item()) / max(d2_total, 1e-30)
-                                # Pearson(score_elem, score_g_broadcast)
-                                score_g_bcast = score_g.repeat_interleave(g)
-                                se_mean = score_elem.mean()
-                                sg_mean = score_g_bcast.mean()
-                                se_d = score_elem - se_mean
-                                sg_d = score_g_bcast - sg_mean
-                                num = float((se_d * sg_d).sum().item())
-                                den = float((se_d.norm() * sg_d.norm()).item())
-                                pearson_sg = num / max(den, 1e-30)
-                                d_abs_g = delta_abs.view(ng, g)
-                                cv_d = (d_abs_g.std(dim=1) /
-                                        d_abs_g.mean(dim=1).clamp_min(1e-30))
-                                cv_d_med = float(cv_d.median().item())
-
-                                # Outlier-promotion variant: union pool of
-                                #   element entry  (score=H_g·Δθ²_i, weight=1)
-                                #   group   entry  (score=H_g·δ_g,  weight=g)
-                                # Greedy by score with element-equivalent
-                                # budget K_total = k_elem.
-                                H_g_be = H_g.repeat_interleave(g)
-                                elem_pool = H_g_be * delta_sq
-                                combined = torch.cat([elem_pool, score_g])
-                                weights = torch.cat([
-                                    torch.ones(elem_pool.numel(), device=combined.device),
-                                    torch.full((ng,), float(g), device=combined.device),
-                                ])
-                                order = torch.argsort(combined, descending=True)
-                                cum_w = torch.cumsum(weights[order], dim=0)
-                                sel_n = int((cum_w < float(k_elem)).sum().item()) + 1
-                                sel = torch.zeros_like(combined, dtype=torch.bool)
-                                sel[order[:sel_n]] = True
-                                e_sel = sel[:elem_pool.numel()]
-                                g_sel = sel[elem_pool.numel():]
-                                saved = e_sel | g_sel.repeat_interleave(g)
-                                cap_promote = float(score_elem[saved].sum().item()) / total
-                                alpha_e = float(e_sel.sum().item()) / max(int(k_elem), 1)
-
-                                if _should_write():
-                                    print(
-                                        f"[proposal] peritr_probe g={g:>2d} "
-                                        f"@iter{step}: cap_g={cap_g:.3f} "
-                                        f"cap_promote={cap_promote:.3f} "
-                                        f"(elem={cap_e:.3f}) "
-                                        f"alpha_e={alpha_e:.2f} "
-                                        f"cap_H={cap_h_g:.3f}/{cap_h_elem:.3f} "
-                                        f"cap_d2={cap_d2_g:.3f}/{cap_d2_elem:.3f} "
-                                        f"pearson={pearson_sg:.3f} "
-                                        f"CV_|δ|={cv_d_med:.2f}",
-                                        flush=True,
-                                    )
-                # Save snapshot for next iter
+                        n_total = delta_sq.numel()
+                        k_select = max(1, int(_kpct_pi * n_total))
+                        device = delta_sq.device
+                        # Per-algorithm residual (reset on save = production
+                        # fold semantic). Each algorithm maintains its OWN
+                        # residual since its OWN saved sets differ.
+                        res_wise = _config.get("_peritr_residual_wise")
+                        res_pool = _config.get("_peritr_residual_pool")
+                        res_uni = _config.get("_peritr_residual_uni")
+                        if res_wise is None or res_wise.numel() != n_total:
+                            res_wise = torch.zeros(n_total, dtype=torch.float32, device=device)
+                        if res_pool is None or res_pool.numel() != n_total:
+                            res_pool = torch.zeros(n_total, dtype=torch.float32, device=device)
+                        if res_uni is None or res_uni.numel() != n_total:
+                            res_uni = torch.zeros(n_total, dtype=torch.float32, device=device)
+                        # 1) update residuals with this iter's δ²
+                        res_wise.add_(delta_sq)
+                        res_pool.add_(delta_sq)
+                        res_uni.add_(delta_sq)
+                        # 2) Element-wise (optimal): select by H × residual_wise
+                        score_wise = H_all_pi * res_wise
+                        th_wise = float(torch.kthvalue(
+                            score_wise, n_total - k_select + 1).values.item())
+                        saved_wise = score_wise >= th_wise
+                        captured_wise = float(score_wise[saved_wise].sum().item())
+                        # 3) Element pool only: select by H × δ²_thisiter (single iter)
+                        score_pool_signal = H_all_pi * delta_sq
+                        th_pool = float(torch.kthvalue(
+                            score_pool_signal, n_total - k_select + 1).values.item())
+                        saved_pool = score_pool_signal >= th_pool
+                        captured_pool = float((H_all_pi * res_pool)[saved_pool].sum().item())
+                        # 4) Unified at probe_g: select by max(element pool
+                        #    signal, group residual mean signal) — production
+                        #    unified semantic.
+                        g_uni = int(_os_pi.environ.get(
+                            "PROPOSAL_PERITER_UNIFIED_G", "8"))
+                        ng_uni = n_total // g_uni
+                        H_g_uni = H_all_pi.view(ng_uni, g_uni).mean(dim=1)
+                        res_uni_g_mean = res_uni.view(ng_uni, g_uni).mean(dim=1)
+                        elem_sig = H_all_pi * delta_sq  # element-level single-iter
+                        group_sig_per_elem = (H_g_uni * res_uni_g_mean).repeat_interleave(g_uni)
+                        m_score = torch.maximum(elem_sig, group_sig_per_elem)
+                        th_uni = float(torch.kthvalue(
+                            m_score, n_total - k_select + 1).values.item())
+                        saved_uni = m_score >= th_uni
+                        captured_uni = float((H_all_pi * res_uni)[saved_uni].sum().item())
+                        # 5) reset selected residuals (= production fold)
+                        res_wise[saved_wise] = 0
+                        res_pool[saved_pool] = 0
+                        res_uni[saved_uni] = 0
+                        # 6) write state back
+                        _config["_peritr_residual_wise"] = res_wise
+                        _config["_peritr_residual_pool"] = res_pool
+                        _config["_peritr_residual_uni"] = res_uni
+                        n_saved_wise = int(saved_wise.sum().item())
+                        n_saved_pool = int(saved_pool.sum().item())
+                        n_saved_uni = int(saved_uni.sum().item())
+                        ratio_pool_over_wise = (
+                            captured_pool / max(captured_wise, 1e-30)
+                        )
+                        ratio_uni_over_wise = (
+                            captured_uni / max(captured_wise, 1e-30)
+                        )
+                        if _should_write():
+                            print(
+                                f"[proposal] peritr_probe K={_kpct_pi:.3f} "
+                                f"g_uni={g_uni} @iter{step}: "
+                                f"captured_wise={captured_wise:.4e} "
+                                f"captured_pool={captured_pool:.4e} "
+                                f"captured_uni={captured_uni:.4e} "
+                                f"pool/wise={ratio_pool_over_wise:.4f} "
+                                f"uni/wise={ratio_uni_over_wise:.4f} "
+                                f"n_saved_wise={n_saved_wise} "
+                                f"n_saved_pool={n_saved_pool} "
+                                f"n_saved_uni={n_saved_uni}",
+                                flush=True,
+                            )
+                # Save θ snapshot for next iter's per-iter delta.
                 _config["_peritr_theta_snap"] = {
                     nm: t for nm, t, _ in theta_now_pi
                 }
@@ -850,70 +804,24 @@ def _proposal_post_iter_diagnostics(model, step: int) -> None:
                 print(f"[proposal] peritr_probe FAILED @iter{step}: "
                       f"{_piexc}\n{_tb_pi.format_exc()}", flush=True)
 
-    # Diagnostic: every 10 iters, report AsyncWriter (torch + raw) queue
-    # state + proposal phase breakdown. Identifies which bucket the
-    # per-iter overhead lives in.
+    # Diagnostic: every 10 iters, report worker queue state. Per-iter
+    # phase timings disappeared along with the synchronous PRE/POST
+    # hooks — the new architecture moves all of that off the training
+    # thread, so what matters now is queue depth (steady-state should
+    # show pending ≤ 1 on both workers; growing depth means the writer
+    # is falling behind the training rate).
     if _writer is not None and step > 0 and step % 10 == 0:
         s = _writer.summary()
-        qmax = _writer._queue.maxsize if hasattr(_writer, "_queue") else -1
-        qrmax = _writer._queue_raw.maxsize if hasattr(_writer, "_queue_raw") else -1
-        ckpt_log = _ckpt.write_log_dict() if _ckpt is not None else []
-        recent = ckpt_log[-10:] if ckpt_log else []
-        avg_queue_delay = (
-            sum(r.get("queue_delay_ms", 0.0) for r in recent) / max(len(recent), 1)
-        )
-        avg_write_ms = (
-            sum(r.get("write_time_ms", 0.0) for r in recent) / max(len(recent), 1)
-        )
-        phase_dc_snap = _config.get("_phase_ms_dc_snap", 0.0)
-        phase_fc_fire = _config.get("_phase_ms_fc_fire", 0.0)
-        phase_score = _config.get("_phase_ms_score_step", 0.0)
-        phase_dc_rec = _config.get("_phase_ms_dc_record", 0.0)
-        trk_phases = getattr(_tracker, "last_phase_ms", None) or {}
-        tp1 = trk_phases.get("pass1", 0.0)
-        tp2 = trk_phases.get("pass2", 0.0)
-        tp3 = trk_phases.get("pass3", 0.0)
-        t_setup = trk_phases.get("setup", 0.0)
-        t_post = trk_phases.get("post", 0.0)
-        t_dispatch = trk_phases.get("dispatch", 0.0)
-        t_launch = trk_phases.get("launch", 0.0)
-        tick_sub = getattr(_fc, "last_tick_phase_ms", None) or {} if _fc is not None else {}
-        t_col = tick_sub.get("collect_expert_ms", 0.0)
-        t_cb = tick_sub.get("on_expert_fc_ms", 0.0)
-        t_dp = tick_sub.get("lossless_dispatch_ms", 0.0)
-        t_ne = tick_sub.get("nonexpert_fc_ms", 0.0)
-        n_fired = int(tick_sub.get("n_experts_fired", 0.0))
-        ne_col = getattr(_fc, "_last_nonexpert_collect_ms", 0.0) if _fc is not None else 0.0
-        ne_sub = getattr(_fc, "_last_nonexpert_collect_sub_ms", {}) if _fc is not None else {}
-        ne_enum = ne_sub.get("enum_ms", 0.0)
-        ne_copy = ne_sub.get("copy_ms", 0.0)
-        ne_xfer = ne_sub.get("xfer_ms", 0.0)
-        ne_wait = ne_sub.get("wait_ms", 0.0)
-        ne_n = int(ne_sub.get("nentries", 0))
-        dc_sub = getattr(_tracker, "last_dc_sub_ms", {}) or {}
-        dc_xfer = dc_sub.get("xfer_ms", 0.0)
-        dc_copy = dc_sub.get("copy_ms", 0.0)
-        dc_enum = dc_sub.get("enum_ms", 0.0)
-        dc_wait = dc_sub.get("wait_ms", 0.0)
+        ne = s["non_expert"]
+        ex = s["expert"]
         print(
             f"[proposal] AsyncWriter@iter{step}: "
-            f"torch pending={s['pending']}/{qmax} max={s['max_queue_depth']} "
-            f"subs={s['submissions']} comps={s['completions']}  "
-            f"raw pending={s['pending_raw']}/{qrmax} max={s['max_queue_depth_raw']} "
-            f"subs={s['submissions_raw']} comps={s['completions_raw']}  "
-            f"torch-write last10 q_delay={avg_queue_delay:.1f}ms "
-            f"write={avg_write_ms:.1f}ms  "
-            f"phase_ms[dc_snap={phase_dc_snap:.1f}"
-            f"(enum={dc_enum:.1f}+copy={dc_copy:.1f}+wait={dc_wait:.1f}+"
-            f"xfer={dc_xfer:.1f}) score_step={phase_score:.1f}"
-            f"(dispatch={t_dispatch:.1f}+launch={t_launch:.1f}"
-            f": setup={t_setup:.1f}+p1={tp1:.1f}+p2={tp2:.1f}+p3={tp3:.1f}"
-            f"+post={t_post:.1f}) fc_fire={phase_fc_fire:.1f}"
-            f"(nfired={n_fired} collect={t_col:.1f}+cb={t_cb:.1f}+"
-            f"dispatch={t_dp:.1f}+ne={t_ne:.1f}"
-            f"[col={ne_col:.1f}:enum={ne_enum:.1f}+copy={ne_copy:.1f}+"
-            f"wait={ne_wait:.1f}+xfer={ne_xfer:.1f} N={ne_n}]) "
-            f"dc_record={phase_dc_rec:.1f}]",
+            f"non_expert pending={ne['pending']} "
+            f"max={ne['max_queue_depth']} "
+            f"subs={ne['submissions']} comps={ne['completions']}  "
+            f"expert pending={ex['pending']} "
+            f"max={ex['max_queue_depth']} "
+            f"subs={ex['submissions']} comps={ex['completions']}",
             flush=True,
         )
         # GPU memory breakdown vs cuda.memory_allocated.
@@ -1051,7 +959,6 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         cp_dir=_cp_dir,
         t_fault=t_fault,
         num_experts=num_experts,
-        dc_replay=True,
         dram_expert_state=_dram_es,
     )
     _t_rec1 = _time.perf_counter()
@@ -1062,8 +969,7 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
     print(
         f"[proposal] proposal_recover: recover_s={recover_s:.3f}  "
         f"(recover={_t_rec1 - _t_rec0:.3f}s h_load={_t_rec2 - _t_rec1:.3f}s)  "
-        f"ne_fc={diag.nonexpert_fc_iter} expert_fc_count={diag.expert_fc_count} "
-        f"dc_replayed={diag.dc_bundles_replayed}/{list(diag.replay_range)}",
+        f"ne_fc={diag.nonexpert_fc_iter} expert_fc_count={diag.expert_fc_count}",
         flush=True,
     )
     return {
@@ -1072,9 +978,6 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         "recover_time_h_s": float(_t_rec2 - _t_rec1),
         "nonexpert_fc_iter": diag.nonexpert_fc_iter,
         "expert_fc_count": diag.expert_fc_count,
-        "dc_bundles_replayed": diag.dc_bundles_replayed,
-        "dc_bundles_found": diag.dc_bundles_found,
-        "replay_range": list(diag.replay_range),
     }
 
 
@@ -1338,7 +1241,6 @@ def proposal_inject_fault(
         cp_dir=_cp_dir,
         t_fault=int(step),
         num_experts=num_experts,
-        dc_replay=True,
         dram_expert_state=_dram_es,
     )
     # H_g is GPU-only; next FD refresh repopulates it.
@@ -1364,8 +1266,6 @@ def proposal_inject_fault(
         "post_fault_loss": None,  # filled on next post_step by caller
         "nonexpert_fc_iter": int(diag.nonexpert_fc_iter),
         "expert_fc_count": int(diag.expert_fc_count),
-        "dc_bundles_replayed": int(diag.dc_bundles_replayed),
-        "replay_range": list(diag.replay_range),
         "B_max_lost_iter": B_max,
     }
     # Store pending — post_fault_loss is filled on next train step.
@@ -2451,9 +2351,16 @@ def proposal_hutchinson_probe(
 
 def proposal_shutdown() -> Dict[str, Any]:
     """Drain writers, dump write-logs + cpu-mem samples to disk, cleanup."""
-    global _tracker, _ckpt, _fc, _writer, _enabled
+    global _tracker, _fc, _writer, _enabled
     if not _enabled:
         return {}
+    _h = _config.get("_release_hook_handle") if _config else None
+    if _h is not None:
+        try:
+            _h.remove()
+        except Exception:
+            pass
+        _config["_release_hook_handle"] = None
     import json
     summary: Dict[str, Any] = {}
     dump_dir: Optional[Path] = None
@@ -2467,17 +2374,6 @@ def proposal_shutdown() -> Dict[str, Any]:
             dump_prefix = base[: -len(".faults.jsonl")] + "."
     elif _cp_dir is not None:
         dump_dir = _cp_dir
-    if _ckpt is not None:
-        _ckpt.finalize()
-        summary["dc_total_bytes"] = _ckpt.total_bytes_written
-        summary["dc_num_bundles"] = _ckpt.num_bundles
-        if dump_dir is not None:
-            try:
-                (dump_dir / f"{dump_prefix}ckpt_write_log.json").write_text(
-                    json.dumps(_ckpt.write_log_dict(), indent=2)
-                )
-            except Exception:
-                pass
     if _fc is not None:
         # Shutdown ExpertState: fsync any open lossy-FC fds and close them
         # cleanly so recovery sees a consistent on-disk snapshot.

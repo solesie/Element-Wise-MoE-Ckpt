@@ -64,25 +64,26 @@ Checkpointing은 모델 훈련 과정에서 예상치못한 상황에서 훈련 
 
 # 용어 정리
 
-- loseless FC(Full Checkpointing):
-non-expert는 특정 간격(W)마다 실행함. 
-expert는 특정 간격(D)마다 실행함.
-Adam Optimizer, model weight 등을 선별 없이 100% 저장하는 가장 일반적인 checkpointing 방법.
+- lossless FC(Full Checkpointing):
+non-expert 는 매 iteration (W=1) 실행.
+expert 는 특정 간격(D) 마다 round-robin F% 만 실행.
+Adam Optimizer 의 (m, v) + model weight (p) 를 선별 없이 100% 저장하는 방법.
 - lossy FC:
-expert에만 적용됨. 
+expert 에만 적용됨.
 매 iteration 마다 element-level score (single iter `H × Δθ²`) 와 group-level score (time-window `H × δ[g]`) 가 **단일 K-budget (= topk_ratio × N_total_elements) 에서 경쟁** 하여 두 pool 의 통합 top 을 선별. 선택된 element / group 의 (idx, p, m, v) 가 expert 의 lossy FC 파일에 append.
-- DC(Differential Checkpointing):
-non-expert에만 적용됨. 
-매 iteration 마다 non-expert의 전체 gradient만을 저장함. 복구 시, non-expert loseless FC 와 W간격동안의 DC를 통해 모델을 lossless하게 복구함.
+
+> **DC (Differential Checkpointing) 는 폐기됨.** DeepSpeed BF16 optimizer 의 `update_hp_grads(clear_lp_grads=True)` 는 매 micro-batch 종료 시 `lp.grad` 를 비우기 때문에, gradient_accumulation_steps > 1 환경에서 `lp.grad` 는 마지막 micro-batch grad 만 남고 누적 grad 는 `hp_grad` 에만 존재. DC 가 captured 하는 dense grad 는 의미 없는 partial 값이라 replay 시 발산. → 매 iter non-expert lossless FC (W=1) 로 대체.
 
 ---
 
 # Non-expert 저장 전략
 
-- 특정 간격(W)마다 전체 non-expert parameters를 loseless FC(Full Checkpointing) 함.
-- 매 iteration 전체 gradient를 저장함 (선별 없음)
-- 복구 시, non-expert loseless FC 와 W간격동안의 DC를 통해 모델을 lossless하게 복구함.
-- 근거: (1) 크기가 전체 모델의 10~20%로 작아 매 iteration 마다 저장해도 부담이 적고, 전체 모델에 미치는 영향이 높아 매 iteration 마다 저장함, (2) gradient 는 optimizer 자체에 영향을 미치기 때문에 중간의 어느 iteration이라도 유실되면 안됨.
+- **매 iteration (W=1)** 전체 non-expert parameters + optimizer state (p, m, v) 를 lossless FC.
+- 복구 시 가장 최근 non-expert lossless FC 파일 로드 → 전체 lossless 복구. (DC replay 없음.)
+- 근거:
+  1. Non-expert 는 전체 모델의 10~20% 로 expert 대비 충분히 작음.
+  2. 4-stream architecture + `host_writer_non_expert` 전담 worker 가 다음 iter 의 forward / backward 와 overlap 처리 → 학습 critical path 위 blocking 0.
+  3. Gradient accumulation 환경에서도 W=1 lossless FC 는 항상 정확한 post-optimizer state 를 snapshot 함 (DC 와 달리 발산 위험 없음).
 
 ---
 
@@ -263,63 +264,120 @@ Taylor 2차 근사:
 
 # Checkpointing Strategy
 
-## 4-stream / writer-thread 아키텍처 (Hard Contract)
+## 4-stream / 2-domain-worker 아키텍처 (Hard Contract)
 
-학습은 **절대로** checkpointing 작업에 의해 중단되지 않는다. 이를 위해 4 계층의 책임 분리를 강제한다.
-
-```
-┌─────────────────┬──────────────────────────────────────────────────────────┐
-│ Stream / Thread │ 책임                                                      │
-├─────────────────┼──────────────────────────────────────────────────────────┤
-│ main_stream     │ 학습 — Megatron/DeepSpeed 의 forward / backward /         │
-│                 │ optimizer 가 launch. 이 stream 위에는 proposal 의 어떤   │
-│                 │ 작업도 enqueue 되어선 안 됨 (critical path).              │
-├─────────────────┼──────────────────────────────────────────────────────────┤
-│ tracker_stream  │ Proposal 의 expert 관련 GPU compute — Triton outlier      │
-│                 │ kernel, group score chunk-loop, index_select, dg index_   │
-│                 │ fill 등. tracker.step 이 진입 시 main_stream 의 grad-     │
-│                 │ ready event 만 wait_event 하고 자체적으로 진행.           │
-├─────────────────┼──────────────────────────────────────────────────────────┤
-│ d2h_stream      │ **모든** GPU → pinned host memory 데이터 이동 (non-       │
-│                 │ expert DC + expert lossy dispatch + LFCL payload). H2D    │
-│                 │ destination 은 반드시 pinned (pageable 은 ~1.2 GB/s,     │
-│                 │ pinned 는 ~16 GB/s + non_blocking 가능). tracker_stream  │
-│                 │ 의 결과를 cuda.Event 로 받아 wait_event 후 copy.          │
-├─────────────────┼──────────────────────────────────────────────────────────┤
-│ writer thread   │ Host DRAM 의 데이터를 DRAM buffer (DRAM mode) /          │
-│ (host CPU)      │ disk file (disk mode) 에 저장. 모든 numpy 조립 / scatter │
-│                 │ / file write 는 여기서. d2h_stream 의 cuda.Event 를      │
-│                 │ writer 가 직접 `event.synchronize()` 호출하여 H2D 완료   │
-│                 │ 후 read. training thread 는 stream sync 호출 안 함.      │
-└─────────────────┴──────────────────────────────────────────────────────────┘
-```
-
-### 데이터 흐름 (per iter)
+학습은 **절대로** checkpointing 작업에 의해 중단되지 않는다. training thread (Python main) 는 **학습 launch 만** 수행하고, CP 관련 GPU compute / H2D copy / file write 는 모두 background stream / thread 로 분리한다.
 
 ```
-forward ─backward─ optimizer.step()                  [main_stream]
-   │                       ↑
-   │                       │ wait_event(grad_ready)
-   ▼                  ┌────┴─────┐
-   (next iter)        │  tracker  │  Triton kernel (atomic histogram +
-                      │  _stream  │  selection + selective fold), pass2
-                      │           │  histc + chunk-loop selection,
-                      │           │  index_select per BF16-group
-                      └────┬──────┘
-                           │ event_compute
-                           ▼
-                      ┌──────────┐
-                      │d2h_stream│  pinned_host.copy_(gpu_tensor,
-                      │          │  non_blocking=True)
-                      └────┬─────┘
-                           │ event_h2d
-                           ▼
-                      ┌──────────┐
-                      │  writer  │  event_h2d.synchronize()
-                      │  thread  │  → numpy assembly / scatter
-                      │          │  → binary_io.write_lossless_payload
-                      │          │    or binary_io.append_lossy_log
-                      └──────────┘
+┌──────────────────────────────┬──────────────────────────────────────────────┐
+│ Stream / Thread              │ 책임                                          │
+├──────────────────────────────┼──────────────────────────────────────────────┤
+│ main_stream                  │ 학습 — Megatron/DeepSpeed 의 forward /        │
+│ (training thread launch)     │ backward / optimizer. 이 stream 위에는       │
+│                              │ proposal 의 어떤 작업도 enqueue 되어선 안    │
+│                              │ 됨. training thread 의 추가 sync 호출 0.     │
+├──────────────────────────────┼──────────────────────────────────────────────┤
+│ tracker_stream               │ Proposal expert score 계산 — Triton outlier  │
+│ (host_writer_expert launch)  │ kernel (atomic hist + selection + selective  │
+│                              │ fold), pass2 histc + chunk-loop, BF16-group  │
+│                              │ index_select. **launch 주체는 training       │
+│                              │ thread 가 아닌 host_writer_expert worker.**  │
+│                              │ wait_event(grad_ready) 후 자체 진행.         │
+├──────────────────────────────┼──────────────────────────────────────────────┤
+│ d2h_stream                   │ **모든** GPU → pinned host memory 데이터 이동│
+│                              │ (non-expert FC payload + expert lossy        │
+│                              │ dispatch + LFCL payload). 두 worker 가 공유. │
+│                              │ H2D destination 은 반드시 pinned (pageable   │
+│                              │ ~1.2 GB/s vs pinned ~16 GB/s + non_blocking).│
+├──────────────────────────────┼──────────────────────────────────────────────┤
+│ host_writer_non_expert       │ Non-expert 전담 — 매 iter (W=1) lossless FC. │
+│ (background CPU thread,      │ d2h_stream 으로 payload copy 후 cuda.Event   │
+│  FIFO queue, GPU context)    │ 를 직접 `event.synchronize()` 하고 numpy     │
+│                              │ scatter / file write / DRAM buffer commit.   │
+│                              │ training thread blocking 0.                  │
+├──────────────────────────────┼──────────────────────────────────────────────┤
+│ host_writer_expert           │ Expert 전담 — tracker_stream kernel launch + │
+│ (background CPU thread,      │ dispatch (lossy log append) + round-robin    │
+│  FIFO queue, GPU context)    │ LFCL. `torch.cuda.set_device` 로 GPU context │
+│                              │ 보장. event sync 후 lossy log / LFCL 파일    │
+│                              │ 작성. training thread blocking 0.            │
+└──────────────────────────────┴──────────────────────────────────────────────┘
+```
+
+### Arm / Release Pair (cross-iter overlap)
+
+매 iter 의 optimizer.step() 직후 task 를 **arm** 만 하고 (cuda.Event record + global stash), 다음 iter 의 **첫 micro-batch forward 직후 (= 첫 backward 직전)** 에 **release** (두 domain worker queue 로 submit). 이로써 background worker 의 d2h 가 첫 backward 와 자연스레 overlap 된다 (forward 와 overlap 하지 않는 이유는 아래 참조).
+
+```
+training thread:
+  iter T:
+    forward_backward → optimizer.step()
+    ┌─────────────────────────────────────────┐
+    │ proposal_arm_post_iter_fc(model, T)     │  ← record cuda.Event on main_stream,
+    │   stash _PostIterFCTask(event, iter_T)  │    stash dataclass globally (no submit)
+    └─────────────────────────────────────────┘
+  iter T+1:
+    mb0 forward (in forward_backward_func)
+    ┌─────────────────────────────────────────┐
+    │ release fired by forward_hook on        │  ← `register_forward_hook` on _inner_model
+    │  _inner_model (after mb0 forward)       │    fires AFTER first mb's forward.
+    │   if _armed_post_iter_fc_task:          │    single-gate (task=None for
+    │     submit_non_expert / submit_expert   │    subsequent mbs → no-op)
+    │     task = None                         │
+    └─────────────────────────────────────────┘
+    mb0 backward → mb1 fwd → mb1 bwd → ... → optimizer.step()
+    ┌─────────────────────────────────────────┐
+    │ proposal_arm_post_iter_fc(model, T+1)   │  ← next iter's arm
+    └─────────────────────────────────────────┘
+    ...
+```
+
+- arm 시점 cost = O(1) (Event.record + dataclass assignment).
+- release 시점 cost = O(1) (queue put × 2). hook fire 자체는 us-level.
+- 두 worker 는 release 직후부터 task 처리. d2h 는 **mb0 backward (~400 ms)** 동안 완료 (44 ms).
+
+### Release timing — 왜 forward 시작 직전이 아니라 첫 mb forward 끝인가
+
+A100 PCIe copy engine 은 stream과 무관하게 **단일 FIFO queue** 로 모든 stream 의 `cudaMemcpyAsync` 를 직렬 처리. PyTorch `tensor.to('cuda')` 는 작은 H2D `cudaMemcpyAsync` + `cudaStreamSynchronize` 호출 (non_blocking=False default). Megatron transformer 의 MoE forward path 에 `torch.tensor(0.0, device=)` 호출이 layer × microbatch 로 누적되어 **forward 동안 H2D 가 매우 자주 발생**.
+
+만약 release 가 forward 시작 직전이면:
+1. d2h_stream 이 1.16 GB cudaMemcpyAsync 를 copy engine FIFO 에 큐잉 (~44 ms 점유)
+2. forward 의 `tensor.to('cuda')` 가 발행한 작은 H2D 가 queue 끝 (44 ms 후) 대기
+3. main thread 가 `cudaStreamSynchronize` 에서 **44 ms 동안 host-blocking wait** (driver function: `cuStreamSynchronize` in libcuda.so → `__clock_gettime` polling). perf stack 으로 직접 측정.
+4. 결과: forward 가 ~+41 ms 늦어짐 (iter time +41 ms 가산)
+
+→ release 를 **첫 forward 끝** 으로 옮기면 forward 의 H2D 호출들이 d2h 와 시간상 분리되어 copy engine queue contention 없음. d2h 는 backward 와 overlap (backward 에는 `tensor.to('cuda')` 호출 없음).
+
+**검증 (DRAM mode, 20 iter)**:
+- W=99999 (no proposal CP): 2030 ms steady
+- W=1 release-before-forward (old): 2098 ms (+41)
+- W=1 release-at-first-bwd (현재): 2044 ms (+14)
+- lm_loss 4-자리 baseline 일치 (correctness 확인).
+
+### 데이터 흐름 (iter T 의 task 가 iter T+1 forward 와 overlap)
+
+```
+iter T training thread:                                 [main_stream]
+  forward → backward → optimizer.step() → arm(T)            ↓
+                                                            │ event_grad_ready
+iter T+1 training thread:                                   ▼
+  release(T)            ┌────────────────────────────────────────────────────┐
+  → forward (main_stream)│  host_writer_non_expert            host_writer_   │
+                         │  ─────────────────────            expert          │
+                         │   d2h_stream:                     ─────────────   │
+                         │     pinned_host_ne.copy_(p_ne,    tracker_stream:  │
+                         │       non_blocking=True)            triton kernel  │
+                         │   event_h2d.synchronize()           pass2 + idx_   │
+                         │   binary_io.write_lossless_         select         │
+                         │     payload (ne)                  d2h_stream:     │
+                         │                                     pinned_host_   │
+                         │                                     ex.copy_       │
+                         │                                   event_h2d.sync   │
+                         │                                   binary_io.append_│
+                         │                                     lossy_log      │
+                         │                                   binary_io.write_ │
+                         │                                     lossless (LFCL)│
+                         └────────────────────────────────────────────────────┘
 ```
 
 ### File I/O 위치 강제 규칙
@@ -328,41 +386,41 @@ forward ─backward─ optimizer.step()                  [main_stream]
 
 binary_io 의 헬퍼 함수들은 모두 **CPU 전용** (torch / cuda dependency 0): bytes / memoryview / numpy array 만 받음. → GPU stream 위에 잘못 호출될 가능성 0.
 
-### Stream sync 의무
+### Stream / Thread sync 의무
 
+- main_stream → tracker_stream: `cuda.Event.record(main_stream)` (grad ready) + `tracker_stream.wait_event(...)` on worker.
 - tracker_stream → d2h_stream: `cuda.Event.record(tracker_stream)` + `d2h_stream.wait_event(...)`. 단일 event 가 phase 전체를 커버 (per-name event 금지 — overhead).
-- d2h_stream → writer thread: `cuda.Event.record(d2h_stream)` 을 writer 호출에 전달. writer 가 `event.synchronize()` 호출 (background thread 라 main_thread blocking 0).
-- main_stream / tracker_stream / d2h_stream 사이의 host-blocking sync (`stream.synchronize()`, `event.synchronize()` on training thread) 는 dispatch 진입 시점의 `ev.synchronize()` (1-iter pipelining) **단 1 회만** 허용. 이는 prev iter 의 tracker work 가 main_stream forward (~2000 ms) 보다 일찍 끝나므로 host wait time = 0.
+- d2h_stream → worker thread: `cuda.Event.record(d2h_stream)` 을 worker task 에 전달. worker 가 `event.synchronize()` 호출 (background thread, training blocking 0).
+- training thread 의 host-blocking sync (`stream.synchronize()`, `event.synchronize()`, `.item()`, `.cpu()`) 는 **0 회**. 예외 1 가지: host_writer_expert 의 dispatch 진입 시점 `ev.synchronize()` (1-iter pipelining) — 이는 training thread 가 아닌 worker thread 위 호출이라 main blocking 아님.
 
-### 1-iter pipelining
+### 1-iter pipelining (expert 측)
 
-- iter T 의 tracker_stream 작업 결과는 iter T+1 의 dispatch 에서 사용 (1-iter 지연).
-- iter T 의 stash 시점에 GPU intermediate (sel_idx, sel_count, etc.) 를 `.clone()` 하여 ref 보관. iter T+1 dispatch 가 `ev.synchronize()` 후 `.item()` 으로 host scalar 추출 (sync 비용 0 — 이미 GPU 작업 완료).
-- 이 방식으로 stash 단계의 어떤 host sync 도 main_thread 를 block 하지 않음.
+- iter T 의 tracker_stream 작업 결과는 iter T+1 의 dispatch (host_writer_expert) 에서 사용.
+- iter T 의 stash 시점에 GPU intermediate (sel_idx, sel_count, etc.) 를 `.clone()` 하여 ref 보관. iter T+1 dispatch 가 `ev.synchronize()` 후 `.item()` 으로 host scalar 추출 — 이 시점엔 prev iter 의 tracker work 가 forward (~2000 ms) 보다 훨씬 일찍 완료되었으므로 host wait time = 0.
+
+### Worker 내부 규칙 (race / deadlock 방지)
+
+- 두 worker 는 **단일-thread FIFO queue**. submit → 순차 처리 → completion record.
+- **자기 자신에게 submit 금지** (self-recursive enqueue 는 deadlock). worker task 안에서 추가 작업이 필요하면 inline 실행.
+- 두 worker queue 간 cross-domain submit 금지 (필요 시 inline 또는 별도 release).
+- Worker thread init 시 `torch.cuda.set_device(self._device)` 호출 — task 안의 모든 GPU 호출이 동일 device context.
+- shared mutable state (pinned host buffer, cuda.Event pool 등) 는 worker 별로 분리되거나 RW lock 보호.
 
 ## Checkpoint 이벤트 — 매 iteration
 
-매 training iteration마다 CP 이벤트가 발생. 
+매 training iteration 마다 CP 이벤트가 발생.
 
-**Non-expert:**
+**Non-expert (host_writer_non_expert 담당):**
 
-- `step % W == 0` → FC (W=10 default). 전체 param + optimizer state 저장.
-- 그 외 → DC. Lossless (전체 gradient dense 저장).
-- results/{실험이름}/cp/non_expert 에 저장
+- 매 iter (W=1) lossless FC. 전체 non-expert param + optimizer state (p, m, v) 저장.
+- 저장 위치: `results/{실험이름}/cp/non_expert`.
+- 이전 non-expert FC 파일은 새 파일 commit (fsync) 후 삭제 — 항상 가장 최근 1 개만 보관.
 
-**각 Expert:**
+**Expert (host_writer_expert 담당):**
 
-- 항상 K%만 저장
-- results/{실험이름}/cp/expert 에 저장
-
-## Differential Checkpoint (DC)
-
-매 iter `dc_iter{step}_dense_ne.pt` 생성 (non-expert dense gradient only;).
-
-- Non-expert: FC하지 않은 iter의 dense gradient
-- Metadata: `step`
-
-Retention: 최근 `max(W, 3)`개만 보관 (구현 정책: `CheckpointManager(retention=W+2)`).
+- 매 iter K% lossy FC append (각 expert lossy log 파일 끝에).
+- 매 D iter 마다 round-robin F% expert lossless FC (해당 expert 전체 p/m/v 새 파일).
+- 저장 위치: `results/{실험이름}/cp/expert`.
 
 ---
 
@@ -371,9 +429,9 @@ Retention: 최근 `max(W, 3)`개만 보관 (구현 정책: `CheckpointManager(re
 | 파라미터 | 설명 | 기본값 |
 | --- | --- | --- |
 | K% | Expert state snapshot 비율 |  |
-| W | Non-expert FC 주기 (iter) | 10 |
+| W | Non-expert lossless FC 주기 (iter) | 1 |
 | D | Expert lossless FC 수행 간격 (iteration) | 4 |
-| async_queue_size | AsyncWriter pending queue | 5 |
+| async_queue_size | Per-domain worker pending queue | 5 |
 | F% | Expert lossless FC 시 선택되는 expert 비율 | 2 |
 
 ---
@@ -516,19 +574,18 @@ dMoE → capacity factor 대체
 CLAUDE.md                       # This file (spec + parameters + conventions)
 megatron/proposal/
 ├── __init__.py                 # Public API exports
-├── cp_hooks.py                 # Training-loop integration (init/pre/post/recover/shutdown) + refresh_hessian dispatch + fault injection + Fisher coverage
+├── cp_hooks.py                 # Training-loop integration: init_proposal / arm_post_iter_fc / release_post_iter_fc / recover / shutdown + refresh_hessian dispatch + fault injection + Fisher coverage
 ├── cli_args.py                 # CLI arg registration (--proposal-*)
 ├── hessian.py                  # State-free Hessian estimators: compute_hessian_hutchinson / compute_hessian_gnb / compare_hutchinson_vs_gnb
 ├── importance_tracker.py       # Element-wise score (H × δ²), global top-K, θ_CP cache
 ├── fc_manager.py               # FC scheduling: element_wise / staggered / sequential
-├── checkpoint_manager.py       # Non-expert DC (dense gradient bundle) manager
 ├── expert_state.py             # Per-expert lossy FC append log (LFSY) + lossless FC snapshot (LFCL) per CLAUDE.md spec
-├── recovery.py                 # Non-expert FC load + DC replay + per-expert lossless + lossy replay (via read_expert_state)
-├── async_writer.py             # Async disk I/O queue (backpressure-bounded)
+├── recovery.py                 # Non-expert lossless FC load + per-expert lossless + lossy replay (via read_expert_state)
+├── async_writer.py             # 2-domain workers (host_writer_non_expert + host_writer_expert) FIFO queue with GPU context
 ├── _ds_state.py                # DeepSpeed ZeRO 0/1/2 FP32 master state mapper
 └── _exp_tools.py               # (measurement) log parsing + plotting utilities
 
-megatron/training.py            # Hook calls: init_proposal / pre_step / post_step / recover / refresh_hessian
+megatron/training.py            # Hook calls: init_proposal / arm_post_iter_fc (after optimizer) / recover / refresh_hessian. release_post_iter_fc is fired by register_forward_hook on _inner_model at end of first micro-batch fwd (not called directly from training.py).
 pretrain_gpt.py                 # Registers add_proposal_args via extra_args_provider
 
 examples_deepspeed/MoE/         # Shell driver scripts

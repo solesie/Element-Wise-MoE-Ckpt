@@ -6,10 +6,11 @@ name pattern ``...deepspeed_experts.{idx}...``.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -202,12 +203,20 @@ class FCManager:
         # never overlap in time.
         self._collect_stage_gpu: Optional[torch.Tensor] = None
 
-        # Cached pinned CPU buffer for fast GPU→CPU transfers. Pageable D2H
-        # tops out at ~1.2 GB/s (observed 820 ms/GB); pinned achieves
-        # ~10-25 GB/s. Reused across FC calls; the writer must finish the
-        # previous torch.save (which pickles from this buffer) before we
-        # overwrite it — enforced via ``async_writer.drain_torch()`` below.
+        # Cached pinned CPU buffer for fast GPU→CPU transfers. Reused across
+        # non-expert FC calls (which all run on the host_writer_non_expert
+        # worker so the buffer has a single owner). The expert path passes
+        # private=True and gets a fresh pinned allocation per call.
         self._collect_pinned_cpu: Optional[torch.Tensor] = None
+
+        # ``_collect_param_payload`` is invoked from the two domain workers
+        # (private=True on host_writer_expert, private=False on
+        # host_writer_non_expert) so the per-call enum / xfer caches are
+        # touched by two threads. CPython dict ops are GIL-atomic but a
+        # concurrent resize during ``__setitem__`` is unsafe; the lock
+        # serialises the rare cache-miss writes. Cache hits don't take the
+        # lock — they read a stable dict via ``.get()`` which is atomic.
+        self._collect_cache_lock = threading.Lock()
 
         # Per-expert state (lossy FC append-only log + round-robin lossless
         # FC snapshot). See ``expert_state.ExpertState``. Skipped in
@@ -218,35 +227,41 @@ class FCManager:
         # public surface used downstream (lossless_fc / lossy_fc_append /
         # flush / shutdown / total_bytes / lossless_fc_step). Recovery has
         # a separate fast path for DRAM mode — see recovery.recover().
-        # Sequential (MoC) mode does not use ExpertState at all, so the
-        # cp_target flag is a no-op for that schedule.
+        #
+        # ExpertState is created for BOTH schedules. The two modes differ
+        # only in (a) which experts fire each iter (see
+        # ExpertLosslessFC._select_fired_experts) and (b) whether the
+        # importance tracker is exercised (proposal yes, sequential no
+        # — see cp_hooks.proposal_score_step). In sequential mode the
+        # lossy-FC entry point (lossy_fc_append_batch) is never invoked
+        # — the only writer traffic is the per-D-iter layer-RR
+        # lossless_fc snapshots. Without an ExpertState the fired
+        # payload would be silently dropped, which is exactly the bug
+        # that made sequential mode a no-op before this fix.
         if cp_target not in ("disk", "dram"):
             raise ValueError(
                 f"cp_target must be 'disk' or 'dram', got {cp_target!r}"
             )
         self.cp_target = cp_target
-        if self._schedule == "sequential":
-            self._expert_state: Optional[Any] = None
+        named_params = dict(self.model.named_parameters())
+        expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]] = {}
+        for eid, tnames in self._separated_tensors_by_slot.items():
+            entries: List[Tuple[str, torch.Size, int]] = []
+            for tname in tnames:
+                p = named_params[tname]
+                entries.append((tname, p.shape, int(p.numel())))
+            expert_tensor_map[eid] = entries
+        if cp_target == "dram":
+            from .dram_expert_state import DramExpertState
+            self._expert_state = DramExpertState(
+                expert_tensor_map, output_dir=self.expert_output_dir,
+                fresh=fresh_expert_state, async_writer=self._async_writer,
+            )
         else:
-            named_params = dict(self.model.named_parameters())
-            expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]] = {}
-            for eid, tnames in self._separated_tensors_by_slot.items():
-                entries: List[Tuple[str, torch.Size, int]] = []
-                for tname in tnames:
-                    p = named_params[tname]
-                    entries.append((tname, p.shape, int(p.numel())))
-                expert_tensor_map[eid] = entries
-            if cp_target == "dram":
-                from .dram_expert_state import DramExpertState
-                self._expert_state = DramExpertState(
-                    expert_tensor_map, output_dir=self.expert_output_dir,
-                    fresh=fresh_expert_state, async_writer=self._async_writer,
-                )
-            else:
-                self._expert_state = ExpertState(
-                    expert_tensor_map, output_dir=self.expert_output_dir,
-                    fresh=fresh_expert_state, async_writer=self._async_writer,
-                )
+            self._expert_state = ExpertState(
+                expert_tensor_map, output_dir=self.expert_output_dir,
+                fresh=fresh_expert_state, async_writer=self._async_writer,
+            )
 
     # ------------------------------------------------------------------
     def _enumerate_params(self) -> None:
@@ -332,7 +347,9 @@ class FCManager:
 
     # ------------------------------------------------------------------
     def _collect_param_payload(
-        self, names: List[str], named_params: Dict[str, torch.nn.Parameter],
+        self,
+        names: List[str],
+        named_params: Optional[Dict[str, torch.nn.Parameter]] = None,
         *, private: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """Snapshot FP32 master + FP32 Adam state for each param.
@@ -365,13 +382,25 @@ class FCManager:
         # so the dst/payload caches must differ).
         _t_enum0 = time.perf_counter()
         cache_key = (id(names), private, len(names))
-        enum_cache = getattr(self, "_collect_enum_cache", None)
-        if enum_cache is not None and enum_cache.get("key") == cache_key:
-            entries = enum_cache["entries"]
-            plan = enum_cache["plan"]
-            total_numel = enum_cache["total_numel"]
-            device = enum_cache["device"]
+        # Multi-key cache: non-expert FC (private=False) and expert FC
+        # (private=True) hit this function with DIFFERENT cache_keys.
+        # A single-entry cache thrashed between them so every call paid
+        # the full enum cost (~5-6 ms / call). Storing one entry per
+        # cache_key keeps both paths warm. Per-key memory is small (list
+        # of tensor views + plan tuples), so the dict adds <100 KB
+        # total across all callers.
+        if not hasattr(self, "_collect_enum_cache_by_key"):
+            self._collect_enum_cache_by_key: Dict[Any, Dict[str, Any]] = {}
+        cached = self._collect_enum_cache_by_key.get(cache_key)
+        if cached is not None:
+            entries = cached["entries"]
+            plan = cached["plan"]
+            total_numel = cached["total_numel"]
+            device = cached["device"]
         else:
+            # Cache miss — only here do we need the named_params dict.
+            if named_params is None:
+                named_params = dict(self.model.named_parameters())
             entries: List[Tuple[str, torch.Tensor]] = []
             for name in names:
                 p = named_params[name]
@@ -386,6 +415,18 @@ class FCManager:
                 _enum_ms = (time.perf_counter() - _t_enum0) * 1000.0
                 self._last_collect_sub_ms = {"enum_ms": _enum_ms, "copy_ms": 0.0, "xfer_ms": 0.0, "wait_ms": 0.0, "nentries": 0}
                 return {}, 0
+            # Sort entries by (storage_data_ptr, storage_offset) so that
+            # entries living in the SAME underlying flat tensor and at
+            # contiguous offsets become adjacent → enables the merged
+            # cudaMemcpyAsync path below. Stable sort preserves
+            # within-storage ordering when offsets coincide.
+            def _sort_key(it):
+                _k, t = it
+                try:
+                    return (t.untyped_storage().data_ptr(), t.storage_offset())
+                except Exception:
+                    return (0, 0)
+            entries = sorted(entries, key=_sort_key)
             plan: List[Tuple[str, int, int, torch.Size]] = []
             offset = 0
             for key, t in entries:
@@ -394,13 +435,13 @@ class FCManager:
                 offset += n
             total_numel = offset
             device = entries[0][1].device
-            self._collect_enum_cache = {
-                "key": cache_key,
-                "entries": entries,
-                "plan": plan,
-                "total_numel": total_numel,
-                "device": device,
-            }
+            with self._collect_cache_lock:
+                self._collect_enum_cache_by_key[cache_key] = {
+                    "entries": entries,
+                    "plan": plan,
+                    "total_numel": total_numel,
+                    "device": device,
+                }
         _enum_ms = (time.perf_counter() - _t_enum0) * 1000.0
         if not entries:
             self._last_collect_sub_ms = {"enum_ms": _enum_ms, "copy_ms": 0.0, "xfer_ms": 0.0, "wait_ms": 0.0, "nentries": 0}
@@ -411,15 +452,14 @@ class FCManager:
         # (e.g. 1163 MB for full FC of non-expert + Adam state).
         _copy_ms = 0.0
 
-        _t_wait0 = time.perf_counter()
-        if (not private and self._async_writer is not None
-                and self._collect_pinned_cpu is not None):
-            # Cached-buffer path: previous torch-queue write must finish
-            # before we overwrite. Private path allocates fresh, so no
-            # drain is required (and the raw queue isn't drained by
-            # drain_torch anyway).
-            self._async_writer.drain_torch()
-        _wait_ms = (time.perf_counter() - _t_wait0) * 1000.0
+        # No buffer-reuse barrier needed: the non-expert worker is the
+        # sole caller with private=False and processes tasks FIFO, so by
+        # the time this method runs the previous _do_save has already
+        # returned (the worker only pulls the next task after
+        # ``queue.task_done`` for the current one). Calling
+        # ``drain_non_expert`` here would self-join the worker's own
+        # queue and deadlock.
+        _wait_ms = 0.0
 
         if private:
             # Fresh pinned buffer for THIS call only — caller (typically
@@ -448,11 +488,15 @@ class FCManager:
         # ``pinned`` and ``entries`` don't rebuild. Per-iter dtype check
         # eliminated by capturing the resolved srcs in cache.
         xfer_cache_key = (cache_key, pinned.data_ptr(), total_numel)
-        xfer_cache = getattr(self, "_collect_xfer_cache", None)
-        if xfer_cache is not None and xfer_cache.get("key") == xfer_cache_key:
-            dsts = xfer_cache["dsts"]
-            srcs_resolved = xfer_cache["srcs_resolved"]
-            payload_template = xfer_cache["payload_template"]
+        if not hasattr(self, "_collect_xfer_cache_by_key"):
+            self._collect_xfer_cache_by_key: Dict[Any, Dict[str, Any]] = {}
+        xfer_cached = self._collect_xfer_cache_by_key.get(xfer_cache_key)
+        if xfer_cached is not None:
+            dsts = xfer_cached["dsts"]
+            srcs_resolved = xfer_cached["srcs_resolved"]
+            payload_template = xfer_cached["payload_template"]
+            merged_dsts = xfer_cached["merged_dsts"]
+            merged_srcs = xfer_cached["merged_srcs"]
         else:
             dsts: List[torch.Tensor] = []
             srcs_flat: List[torch.Tensor] = []
@@ -468,12 +512,89 @@ class FCManager:
                     s if s.dtype == torch.float32 else s.to(torch.float32)
                     for s in srcs_flat
                 ]
-            self._collect_xfer_cache = {
-                "key": xfer_cache_key,
-                "dsts": dsts,
-                "srcs_resolved": srcs_resolved,
-                "payload_template": payload_template,
-            }
+            # === MERGED COPY PATH ====================================
+            # Group consecutive entries whose source is contiguous in
+            # the SAME underlying storage. Each run becomes a SINGLE
+            # cudaMemcpyAsync (390 small launches → ~6 big launches in
+            # the typical MoE layout where non-expert params are packed
+            # into 1-2 DS group flat tensors). dst side is always
+            # contiguous by construction (plan offsets are sequential).
+            merged_dsts: List[torch.Tensor] = []
+            merged_srcs: List[torch.Tensor] = []
+            run_storage = None       # underlying storage data_ptr
+            run_src_offset = -1      # next expected element offset in source storage
+            run_dst_offset = -1      # starting plan offset of current run
+            run_total_n = 0          # accumulated elements in current run
+            def _flush_run():
+                nonlocal run_total_n, run_storage, run_dst_offset
+                if run_total_n <= 0 or run_storage is None:
+                    return
+                # Use storage of the original src tensor to build a flat view.
+                # All entries in this run share the same storage; we use
+                # the first entry's src.untyped_storage().
+                # Rebuild via narrow on a flat view of the storage.
+                start_off = run_dst_offset
+                length = run_total_n
+                merged_dsts.append(flat_cpu.narrow(0, start_off, length))
+                # src_view via storage offset:
+                merged_srcs.append(run_storage.narrow(0, run_src_offset - length, length))
+            for (key, off, n, shape), (_k2, src) in zip(plan, entries):
+                src_resolved = src
+                if src_resolved.dtype != torch.float32:
+                    # Non-FP32 source can't be merged into the flat-storage path
+                    # (precision conversion required). Flush current run, treat
+                    # this entry alone via the small-copy fallback.
+                    _flush_run()
+                    run_storage = None; run_src_offset = -1; run_total_n = 0
+                    # Append as a singleton merge entry pointing at the
+                    # converted tensor (still 1 cudaMemcpyAsync — equivalent
+                    # to small-copy path for this entry).
+                    converted = src_resolved.to(torch.float32).reshape(-1)
+                    merged_dsts.append(flat_cpu.narrow(0, off, n))
+                    merged_srcs.append(converted)
+                    continue
+                src_view = src_resolved.reshape(-1)
+                storage = src_view.untyped_storage()
+                # element offset of src_view's first element inside storage
+                src_elem_offset = src_view.storage_offset()
+                # underlying flat-view tensor sharing the storage (FP32)
+                # used so we can later .narrow(0, off, n) cleanly
+                flat_storage_view = torch.empty(0, dtype=torch.float32,
+                                                device=src_view.device).set_(
+                    storage, 0, (storage.nbytes() // 4,), (1,))
+                if (run_storage is not None
+                        and storage.data_ptr() == run_storage.untyped_storage().data_ptr()
+                        and src_elem_offset == run_src_offset):
+                    # Extend current run
+                    run_total_n += n
+                    run_src_offset += n
+                else:
+                    _flush_run()
+                    run_storage = flat_storage_view
+                    run_src_offset = src_elem_offset + n
+                    run_dst_offset = off
+                    run_total_n = n
+            _flush_run()
+            # One-time diagnostic on cache miss only.
+            try:
+                ds_pinned = [bool(d.is_pinned()) for d in dsts[:3]]
+                ds_contig = [bool(d.is_contiguous()) for d in dsts[:3]]
+                src_contig = [bool(s.is_contiguous()) for s in merged_srcs[:3]]
+                src_strides = [tuple(s.stride()) for s in merged_srcs[:3]]
+                print(f"[ne-diag] dst_pinned[:3]={ds_pinned} dst_contig[:3]={ds_contig} "
+                      f"src_contig[:3]={src_contig} src_strides[:3]={src_strides} "
+                      f"merged_count={len(merged_srcs)} total_numel={total_numel}",
+                      flush=True)
+            except Exception:
+                pass
+            with self._collect_cache_lock:
+                self._collect_xfer_cache_by_key[xfer_cache_key] = {
+                    "dsts": dsts,
+                    "srcs_resolved": srcs_resolved,
+                    "payload_template": payload_template,
+                    "merged_dsts": merged_dsts,
+                    "merged_srcs": merged_srcs,
+                }
 
         cuda_event: Optional["torch.cuda.Event"] = None
         if torch.cuda.is_available():
@@ -483,11 +604,11 @@ class FCManager:
             main_event.record()
             with torch.cuda.stream(d2h_stream):
                 d2h_stream.wait_event(main_event)
-                torch._foreach_copy_(dsts, srcs_resolved, non_blocking=True)
+                torch._foreach_copy_(merged_dsts, merged_srcs, non_blocking=True)
                 cuda_event = torch.cuda.Event()
                 cuda_event.record(d2h_stream)
         else:
-            torch._foreach_copy_(dsts, srcs_resolved)
+            torch._foreach_copy_(merged_dsts, merged_srcs)
         _xfer_ms = (time.perf_counter() - _t_xfer0) * 1000.0
 
         payload: Dict[str, torch.Tensor] = payload_template
@@ -503,8 +624,10 @@ class FCManager:
 
 
     def _collect_nonexpert_payload(self) -> Tuple[Dict[str, torch.Tensor], int]:
-        named_params = dict(self.model.named_parameters())
-        return self._collect_param_payload(self._non_expert_names, named_params)
+        # named_params=None: the callee will lazily build it ONLY if the
+        # enum cache misses. Steady-state (cache hit) skips the
+        # ~few-ms dict(model.named_parameters()) walk.
+        return self._collect_param_payload(self._non_expert_names, None)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -542,26 +665,44 @@ class FCManager:
         def _save_binary(payload, p):
             save_binary(p, payload)
 
-        if self._async_writer is None:
-            t0 = time.perf_counter()
-            _save_binary(payload, path)
-            t1 = time.perf_counter()
-            stats.write_time_ms = (t1 - t0) * 1000.0
-            try:
-                stats.file_bytes = int(path.stat().st_size)
-            except FileNotFoundError:
-                stats.file_bytes = 0
-            _unlink()
-            rec: Optional[WriteRecord] = None
-        else:
-            rec = self._async_writer.submit(
-                payload, path, tag="fc",
-                on_complete=[_unlink] if to_unlink else None,
-                save_fn=_save_binary,
-                cuda_event=getattr(self, "_last_collect_cuda_event", None),
-            )
-            self._nonexpert_fc_files[-1] = (path, rec)
+        cuda_event = getattr(self, "_last_collect_cuda_event", None)
+        rec = WriteRecord(tag="fc", path=path, submit_time=time.perf_counter())
 
+        def _do_save(
+            _payload=payload, _path=path, _save_fn=_save_binary,
+            _cuda_event=cuda_event, _on_complete=_unlink, _rec=rec,
+            _stats=stats,
+        ) -> None:
+            t0 = time.perf_counter()
+            _rec.queue_delay_ms = (t0 - _rec.submit_time) * 1000.0
+            try:
+                if _cuda_event is not None:
+                    _cuda_event.synchronize()
+                _save_fn(_payload, _path)
+                try:
+                    _rec.file_bytes = int(_path.stat().st_size)
+                except FileNotFoundError:
+                    _rec.file_bytes = 0
+            except Exception as exc:
+                _rec.error = f"{type(exc).__name__}: {exc}"
+            _rec.write_time_ms = (time.perf_counter() - t0) * 1000.0
+            _rec.done = True
+            _stats.write_time_ms = _rec.write_time_ms
+            _stats.file_bytes = _rec.file_bytes
+            _stats.queue_delay_ms = _rec.queue_delay_ms
+            if _rec.error is None:
+                _on_complete()
+
+        # Run inline. ``_fire_nonexpert_fc`` is invoked either from the
+        # host_writer_non_expert worker (new arch) or from the training
+        # thread directly (legacy / no-writer fallback). In the worker
+        # case we already own the CUDA context and the FIFO ordering
+        # guarantees the previous fire fully completed; submitting back
+        # to our own queue would self-join during ``drain_non_expert``
+        # callers downstream, so we just synchronously synchronise on
+        # the cuda_event and call save_fn here.
+        _do_save()
+        self._nonexpert_fc_files[-1] = (path, rec)
         self.write_log.append(stats)
         self._write_records.append(rec)
 
@@ -569,13 +710,7 @@ class FCManager:
     def finalize(self) -> None:
         if self._async_writer is None:
             return
-        self._async_writer.drain()
-        for stats, rec in zip(self.write_log, self._write_records):
-            if rec is None:
-                continue
-            stats.write_time_ms = rec.write_time_ms
-            stats.file_bytes = rec.file_bytes
-            stats.queue_delay_ms = rec.queue_delay_ms
+        self._async_writer.drain_non_expert()
 
     # ------------------------------------------------------------------
     def write_log_dict(self) -> List[Dict]:

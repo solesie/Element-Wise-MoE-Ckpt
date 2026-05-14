@@ -94,8 +94,9 @@ try:
     def _accum_with_outlier_kernel(
         m_ptr, v_ptr, accum_ptr, h_g_ptr,
         elem_hist_ptr, sel_idx_ptr, sel_count_ptr,
-        prev_th_ptr, floor_ptr,
+        prev_th_ptr, floor_ptr, group_th_ptr,
         n_groups, score_max, sel_max,
+        master_off_elem,
         lr_over_bc1, sqrt_bc2_inv, eps,
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
@@ -112,9 +113,16 @@ try:
              K-th rank determination as long as |above-floor| > K.
              This collapses the atomic_add count from N_total down
              to ~5-15 % under heavy-tail δ² distributions.
-          2. if score ≥ prev_th: stream-compact via cumsum + 1
-             scalar atomic per program block; emit global idx to
-             sel_idx (capacity sel_max).
+          2. if score ≥ prev_th AND group will not be picked by pass2:
+             stream-compact via cumsum + 1 scalar atomic per program
+             block; emit global idx to sel_idx (capacity sel_max).
+             The group-pick prediction uses the unfolded post-update
+             δ_g (= prev_dg + Σ Δθ²) which is an UPPER BOUND on the
+             actual folded δ_g pass2 will see (fold only decreases).
+             Conservative: if (h_g × unfolded_dg) ≥ group_th the
+             group is CERTAIN to be picked → skip element emission
+             (pure dedup, no false-positives, only false-negatives
+             where dedup is missed by ~few %).
           3. accumulates the group sum of Δθ²_i EXCLUDING elements
              that hit (2) — Intent E (self-correcting accumulator).
         """
@@ -153,25 +161,63 @@ try:
         bin_idx = tl.maximum(bin_idx, 0)
         tl.atomic_add(elem_hist_ptr + bin_idx, 1, mask=above_floor)
 
-        # 2) Selection: emit idx if score >= prev_th. Stream-compact via
-        # block-local cumsum + 1 global atomic_add per program (returns
-        # this block's starting slot).
+        # 2a) Group-pick prediction (dedup): use ``prev_dg`` (= δ_g
+        # accumulated up to this iter, BEFORE this iter's update) as
+        # a STRICT LOWER BOUND on what pass2 will see post-fold.
+        #   prev_dg  ≤  folded_dg  =  prev_dg + Σ_{i ∈ group, not selected} Δθ_i²
+        #            ≤  unfolded_dg = prev_dg + Σ_{i ∈ group} Δθ_i²
+        # If h_g · prev_dg ≥ group_th, then h_g · folded_dg ≥ group_th
+        # holds for ANY fold decision (selected element set is empty,
+        # all, or anywhere in between) → group is CERTAINLY picked.
+        # Skipping the element under this condition is a SAFE dedup
+        # with **zero false positives** (no element is dedup'd whose
+        # group could have failed group_th after fold). Trade-off:
+        # missed dedup opportunities for groups whose membership
+        # changes pass / fail status across the fold (rare in steady
+        # state where prev_dg dominates).
+        prev_dg = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
+        group_score_lb = h_g_per_g.to(tl.float32) * prev_dg
+        group_th = tl.load(group_th_ptr)
+        group_picked = group_score_lb >= group_th  # [GROUPS_PER_BLOCK]
+        group_picked_2d = tl.broadcast_to(
+            group_picked[:, None], (GROUPS_PER_BLOCK, G),
+        )
+        group_picked_flat = tl.reshape(group_picked_2d, (BLOCK_SIZE,))
+
+        # 2b) Selection: emit idx if score >= prev_th AND its group
+        # is NOT certain to be picked. Skipping elements whose group
+        # will be picked by pass2 prevents the redundant entry that
+        # would otherwise consume K-budget for an element already
+        # covered by its group's g-element entry.
         prev_th = tl.load(prev_th_ptr)
-        selected = (elem_score >= prev_th) & elem_mask
+        selected = (elem_score >= prev_th) & elem_mask & ~group_picked_flat
         sel_int = selected.to(tl.int32)
         within_block_pos = tl.cumsum(sel_int, axis=0) - sel_int  # 0..block_n-1
         block_n = tl.sum(sel_int, axis=0)
         block_start = tl.atomic_add(sel_count_ptr, block_n)
         write_pos = block_start + within_block_pos
         write_ok = selected & (write_pos < sel_max)
-        tl.store(sel_idx_ptr + write_pos, elem_off, mask=write_ok)
+        # Convert BF16-group-local elem_off → GLOBAL elem_off for sel_idx.
+        # The dispatch path (line ~1735, ~1993) treats sel_idx contents as
+        # GLOBAL coordinates: it does ``searchsorted(offsets_t, idx//g_blk)``
+        # to map idx → name, then subtracts each BF16 group's
+        # ``master_off_g_elem`` to convert back to BF16-local for index_select
+        # on the local ``m_flat``. The kernel's loads (m_ptr/v_ptr/h_g_ptr)
+        # use the BF16-group-local elem_off because those pointers are local
+        # views; ONLY the sel_idx store needs to be globalised.
+        # Pre-fix bug: kernel stored elem_off raw → every outlier from
+        # BF16 group ≥ 1 was misattributed to the first names in BF16 group 0
+        # (their LOCAL offsets collided with GLOBAL offsets of group 0's
+        # leading tensors), concentrating ALL lossy dispatch on those names.
+        tl.store(
+            sel_idx_ptr + write_pos, elem_off + master_off_elem, mask=write_ok,
+        )
 
         # 3) Selective fold: zero out selected elements before group sum.
         selected_2d = tl.reshape(selected, (GROUPS_PER_BLOCK, G))
         delta_sq_kept = tl.where(selected_2d, 0.0, delta_sq_2d)
         block_sums = tl.sum(delta_sq_kept, axis=1)
-        prev = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
-        tl.store(accum_ptr + gid_off, prev + block_sums, mask=gid_mask)
+        tl.store(accum_ptr + gid_off, prev_dg + block_sums, mask=gid_mask)
 except Exception:
     _HAS_TRITON = False
 
@@ -213,8 +259,9 @@ def _accum_with_outlier(
     flat_m, flat_v, flat_accum, h_g_flat,
     elem_hist, sel_idx, sel_count,
     total_a, g,
-    prev_th, prev_floor,
+    prev_th, prev_floor, group_th,
     score_max, sel_max,
+    master_off_elem,
     lr_over_bc1, sqrt_bc2_inv, eps,
 ):
     """Outlier-promotion path: same group sum as ``_accum_delta_sq_triton``
@@ -247,8 +294,9 @@ def _accum_with_outlier(
     _accum_with_outlier_kernel[grid](
         flat_m, flat_v, flat_accum, h_g_flat,
         elem_hist, sel_idx, sel_count,
-        prev_th, prev_floor,
+        prev_th, prev_floor, group_th,
         n_groups, score_max, sel_max,
+        master_off_elem,
         lr_over_bc1, sqrt_bc2_inv, eps,
         G=g, GROUPS_PER_BLOCK=gpb, N_BINS=n_bins,
     )
@@ -281,21 +329,6 @@ def _fp32_param(param: torch.nn.Parameter) -> torch.Tensor:
     if m is not None:
         return m.get_param(param)
     return param.data.to(torch.float32)
-
-
-@dataclass
-class NonExpertDCStats:
-    """Cost of one non-expert DC snapshot (LowDiff lossless path)."""
-    step: int
-    tensors: int
-    numel: int
-    bytes: int
-    missing_grads: int
-    compute_time_ms: float
-    # CUDA event marking completion of the (non_blocking) D2H copy that
-    # produced the payload. Caller forwards this to AsyncWriter.submit so
-    # the worker thread waits for the copy before reading the host buffer.
-    cuda_event: Optional["torch.cuda.Event"] = None
 
 
 @dataclass
@@ -344,15 +377,6 @@ class ImportanceTracker:
         # Group-level H cache (computed at refresh time).
         self._H_g: Dict[str, torch.Tensor] = {}
         self._async_writer = async_writer
-        # Cached GPU staging + pinned CPU buffers for batched
-        # snapshot_nonexpert_dc transfer. See ``FCManager._collect_param_payload``
-        # for the same pattern — pageable D2H runs at ~1.2 GB/s while pinned
-        # reaches ~20 GB/s. The pinned buffer is reused each step; we wait
-        # for any in-flight torch.save reading the prior payload to finish
-        # before overwriting (``drain_torch``).
-        self._dc_stage_gpu: Optional[torch.Tensor] = None
-        self._dc_pinned_cpu: Optional[torch.Tensor] = None
-        self.last_dc_sub_ms: Dict[str, float] = {}
         self.expert_only = bool(expert_only)
         self.expert_pattern = expert_pattern
         if selection_mode not in ("v_hat", "random", "hessian"):
@@ -389,9 +413,17 @@ class ImportanceTracker:
         # at g=1 regardless of ``PROPOSAL_OUTLIER_PROMOTE``.
         # All outlier buffers stay None when disabled (zero VRAM cost).
         import os as _os_op
-        _env_outlier = _os_op.environ.get(
-            "PROPOSAL_OUTLIER_PROMOTE", ""
-        ) in ("1", "true", "TRUE")
+        # Default ON: the unified two-pool top-K (element pool + group
+        # pool competing under a single K-budget) IS the production
+        # algorithm per CLAUDE.md. The env override remains so the path
+        # can still be flipped OFF for ablation. ``OFF``/``0``/``false``
+        # disables; anything else (including the empty default) enables.
+        _env_outlier_raw = _os_op.environ.get(
+            "PROPOSAL_OUTLIER_PROMOTE", "1",
+        )
+        _env_outlier = _env_outlier_raw not in (
+            "0", "false", "FALSE", "off", "OFF",
+        )
         self._outlier_promote = _env_outlier and (self.block_quant_g >= 2)
         # Element-pool histogram bin count. Default matches the group-
         # pool histogram (``_g_fast_n_bins = 10000``) so the unified
@@ -465,15 +497,6 @@ class ImportanceTracker:
                 self._full_save_names.append(name)
                 self._name_to_full_save_param[name] = p
                 self._full_save_numel_per_name[name] = int(p.numel())
-
-        # Cached (name, p) pairs for hot-loop iteration in
-        # snapshot_nonexpert_dc — eliminates per-iter dict lookup over
-        # _name_to_full_save_param (~5 us × N saved). The list is stable
-        # because membership doesn't change after init.
-        self._full_save_entries: List[Tuple[str, torch.nn.Parameter]] = [
-            (n, self._name_to_full_save_param[n])
-            for n in self._full_save_names
-        ]
 
         self._flat_offsets: Dict[str, Tuple[int, int]] = {}
         cursor = 0
@@ -599,242 +622,6 @@ class ImportanceTracker:
                 items.append((f"{dict_attr}[{n}]", sz))
         total = sum(v for _, v in items)
         return total, items
-
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def snapshot_nonexpert_dc(
-        self,
-        global_step: int,
-        target_dtype: Optional[torch.dtype] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], NonExpertDCStats]:
-        """Clone non-expert grads to pinned host (lossless dense DC path).
-
-        Reads per-param BF16 ``param.grad`` (alive both pre-optimizer.step
-        and post-optimizer.step in DS BF16: ``clear_lp_grads`` only fires
-        in next iter's ``backward_prologue``). FP32 master flat is also
-        accessible via ``safe_get_full_grad`` but is zeroed by
-        ``clear_hp_grads`` at end of each ``step()``, so we always source
-        from ``param.grad`` at post-step usage.
-
-        ``target_dtype``: dtype of the pinned host buffer.
-          - ``None`` (default): use source dtype (BF16 → BF16 pinned, no
-            cast — preferred when caller wants raw bytes and writer thread
-            handles any conversion).
-          - ``torch.float32``: cast on d2h_stream. Pinned buffer is FP32.
-            DC bundle will be FP32 directly; recovery skips the cast.
-            Cost: ~2× pinned host bytes + 1 cast kernel per source tensor
-            on d2h_stream + ~2× PCIe bandwidth.
-        """
-        import time as _time
-        _t_enum0 = _time.perf_counter()
-
-        entries: List[Tuple[str, torch.Tensor]] = []
-        missing = 0
-        # Always source from ``param.grad`` (BF16 in DS BF16 mode). The
-        # FP32 master grad is zeroed by ``clear_hp_grads`` at end of
-        # ``optimizer.step()``, so it's only valid pre-step and unusable
-        # post-step. ``param.grad`` is alive both pre-step and post-step
-        # (cleared only by next iter's ``backward_prologue.clear_lp_grads``).
-        # Source dtype is BF16 in DS BF16 mode; target_dtype controls
-        # whether we cast to FP32 in d2h_stream.
-        for name, p in self._full_save_entries:
-            g = p.grad
-            if g is None:
-                missing += 1
-                continue
-            entries.append((name, g))
-        _enum_ms = (_time.perf_counter() - _t_enum0) * 1000.0
-
-        if not entries:
-            self.last_dc_sub_ms = {
-                "enum_ms": _enum_ms, "copy_ms": 0.0, "wait_ms": 0.0,
-                "xfer_ms": 0.0, "nentries": 0,
-            }
-            return {}, NonExpertDCStats(
-                step=global_step, tensors=0, numel=0, bytes=0,
-                missing_grads=missing, compute_time_ms=_enum_ms,
-            )
-
-        # Group entries by underlying storage (data_ptr) and build span
-        # plans. Each storage group becomes ONE D2H spanning the contiguous
-        # range covering all params in that storage. Saves vs per-tensor
-        # copies: (a) per-launch driver overhead (~5-10 us each × N), (b)
-        # transient GPU buffer for FP32 cast (we now keep BF16 instead).
-        # Cache the plan across iters — param storage is stable post-init,
-        # so we just refresh the (presumed unchanged) span_view via the
-        # first entry's tensor on cache hit.
-        plan_groups = getattr(self, "_dc_plan_cache", None)
-        cache_key = getattr(self, "_dc_plan_cache_key", None)
-        # Quick cache validity probe: compare (data_ptr, storage_offset,
-        # numel) of the first entry. Storage moves are rare (only on
-        # explicit reallocation), so this is sufficient as a sanity check.
-        first_g = entries[0][1].reshape(-1)
-        new_key = (
-            first_g.untyped_storage().data_ptr(),
-            first_g.storage_offset(),
-            int(first_g.numel()),
-            len(entries),
-        )
-        if plan_groups is None or cache_key != new_key:
-            plan_groups = []
-            storage_buckets: Dict[int, List[Tuple[str, torch.Tensor, int, int, torch.Size]]] = {}
-            seen_ptrs: List[int] = []
-            for name, g in entries:
-                g_flat = g.reshape(-1)
-                sptr = g_flat.untyped_storage().data_ptr()
-                soff = g_flat.storage_offset()
-                n = int(g_flat.numel())
-                if sptr not in storage_buckets:
-                    seen_ptrs.append(sptr)
-                storage_buckets.setdefault(sptr, []).append(
-                    (name, g_flat, soff, n, g.shape)
-                )
-            for sptr in seen_ptrs:
-                items = storage_buckets[sptr]
-                min_off = min(it[2] for it in items)
-                max_end = max(it[2] + it[3] for it in items)
-                span_n = max_end - min_off
-                base = items[0][1]
-                span_view = base.as_strided(
-                    size=(span_n,), stride=(1,),
-                    storage_offset=min_off,
-                )
-                per_item_plan: List[Tuple[str, int, int, torch.Size]] = []
-                for (n_name, _g_flat, soff, sz, shape) in items:
-                    per_item_plan.append((n_name, soff - min_off, sz, shape))
-                plan_groups.append((span_view, min_off, span_n, per_item_plan))
-            self._dc_plan_cache = plan_groups
-            self._dc_plan_cache_key = new_key
-
-        # Compute global pinned offset for each span.
-        # Pinned dtype = target_dtype if specified, else source dtype.
-        # When target_dtype != source dtype, copy_ does an implicit cast
-        # on d2h_stream (~1 cast kernel per source tensor; PyTorch may
-        # fuse cast+D2H but per-launch overhead dominates).
-        total_numel = sum(span_n for (_v, _o, span_n, _it) in plan_groups)
-        device = entries[0][1].device
-        sample_dtype = entries[0][1].dtype
-        all_same_dtype = all(e[1].dtype == sample_dtype for e in entries)
-        if target_dtype is not None:
-            pinned_dtype = target_dtype
-        else:
-            pinned_dtype = sample_dtype if all_same_dtype else torch.float32
-        _copy_ms = 0.0
-
-        _t_wait0 = _time.perf_counter()
-        if self._async_writer is not None and self._dc_pinned_cpu is not None:
-            self._async_writer.drain_torch()
-        _wait_ms = (_time.perf_counter() - _t_wait0) * 1000.0
-
-        pinned = self._dc_pinned_cpu
-        # Re-allocate when first time, when too small, or when the dtype
-        # has changed (rare; usually one-time at init).
-        if (pinned is None or pinned.numel() < total_numel
-                or pinned.dtype != pinned_dtype):
-            self._dc_pinned_cpu = torch.empty(
-                total_numel, dtype=pinned_dtype, pin_memory=True,
-            )
-            pinned = self._dc_pinned_cpu
-
-        _t_xfer0 = _time.perf_counter()
-        flat_cpu = pinned.narrow(0, 0, total_numel)
-
-        # Optimization A: cache the (dsts, srcs_no_cast, payload) lists.
-        # The narrow views into flat_cpu (dsts) and per-name payload views
-        # are stable as long as the pinned buffer + plan_groups + dtype
-        # are unchanged. ``span_view`` is also stable (storage shared with
-        # grad which is reallocated by torch lazily but pointer is stable
-        # post-init in DS BF16 mode). The fast path skips ~130 narrow()
-        # calls + ~130 list appends per iter (~1 ms saved).
-        # Cache invalidates on:
-        #   - plan_groups rebuild (caught by id() check below)
-        #   - pinned buffer realloc (caught by data_ptr() check)
-        #   - pinned_dtype change (caller-driven)
-        cache = getattr(self, "_dc_xfer_cache", None)
-        cache_id = (
-            id(plan_groups), pinned.data_ptr(), pinned_dtype,
-        )
-        cache_valid = cache is not None and cache.get("id") == cache_id
-        if cache_valid:
-            dsts = cache["dsts"]
-            srcs_resolved = cache["srcs_resolved"]
-            payload_template = cache["payload_template"]
-        else:
-            dsts = []
-            srcs_no_cast: List[torch.Tensor] = []
-            payload_template: Dict[str, torch.Tensor] = {}
-            global_off = 0
-            for (span_view, _min_off, span_n, per_item) in plan_groups:
-                dsts.append(flat_cpu.narrow(0, global_off, span_n))
-                srcs_no_cast.append(span_view)
-                for (n_name, rel_off, n_sz, shape) in per_item:
-                    payload_template[n_name] = (
-                        flat_cpu.narrow(0, global_off + rel_off, n_sz)
-                        .view(shape)
-                    )
-                global_off += span_n
-            # Resolve srcs once: when all dtypes match pinned_dtype use
-            # the views directly (zero-copy / zero-cast); otherwise
-            # capture per-source ``.to(pinned_dtype)`` views (these are
-            # also stable as the underlying storage doesn't move).
-            # Per-iter ``all(...)`` check is removed — dtypes are part
-            # of the cache invalidation key implicitly (a dtype change
-            # would require cache invalidation by the caller).
-            if all(s.dtype == pinned_dtype for s in srcs_no_cast):
-                srcs_resolved = srcs_no_cast
-            else:
-                srcs_resolved = [
-                    s if s.dtype == pinned_dtype else s.to(pinned_dtype)
-                    for s in srcs_no_cast
-                ]
-            self._dc_xfer_cache = {
-                "id": cache_id,
-                "dsts": dsts,
-                "srcs_resolved": srcs_resolved,
-                "payload_template": payload_template,
-            }
-
-        cuda_event: Optional["torch.cuda.Event"] = None
-        if torch.cuda.is_available():
-            from .async_writer import get_d2h_stream
-            d2h_stream = get_d2h_stream()
-            main_event = torch.cuda.Event()
-            main_event.record()
-            with torch.cuda.stream(d2h_stream):
-                d2h_stream.wait_event(main_event)
-                torch._foreach_copy_(dsts, srcs_resolved, non_blocking=True)
-                cuda_event = torch.cuda.Event()
-                cuda_event.record(d2h_stream)
-        else:
-            for dst, src in zip(dsts, srcs_resolved):
-                dst.copy_(src)
-        _xfer_ms = (_time.perf_counter() - _t_xfer0) * 1000.0
-
-        # Cached payload views — same storage as last iter, no rebuild.
-        payload: Dict[str, torch.Tensor] = payload_template
-        bytes_total = int(total_numel * pinned.element_size())
-
-        self.last_dc_sub_ms = {
-            "enum_ms": _enum_ms, "copy_ms": _copy_ms, "wait_ms": _wait_ms,
-            "xfer_ms": _xfer_ms, "nentries": len(entries),
-        }
-        stats = NonExpertDCStats(
-            step=global_step, tensors=len(payload), numel=total_numel,
-            bytes=bytes_total, missing_grads=missing,
-            compute_time_ms=_enum_ms + _copy_ms + _xfer_ms,
-            cuda_event=cuda_event,
-        )
-        return payload, stats
-
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def pre_step_snap(self) -> None:
-        """accum_sq mode: NO-OP. Adam state derivation in update_delta_accum
-        avoids needing a θ_before snapshot — Δθ is recomputed from m, v
-        post-step using the fused-Adam formula: Δθ = -lr × m_hat / (sqrt(v_hat)
-        + ε). Persistent memory cost: 0 extra beyond flat δ_g (~3 MB g=256).
-        """
-        return
 
     @torch.no_grad()
     def _init_accum_sq_flat(self, optimizer) -> None:
@@ -1248,13 +1035,26 @@ class ImportanceTracker:
             dg_buf = grp["dg_buf"]
             total_a = grp["total_aligned"]
             if outlier_on and grp["zero_copy"]:
+                # group_th (= elem_th × g_blk; written by the unified-
+                # topK walk in dispatch) is consumed by the kernel for
+                # LB dedup: element emission is suppressed when its
+                # group is certain to be picked by pass2. No false
+                # positives → strict no-double-counting at steady state.
+                # master_off_elem = this BF16 group's start offset in
+                # ELEMENT coordinates (master_off is in groups; × g_blk).
+                # The kernel adds this to its BF16-local elem_off when
+                # storing to sel_idx so dispatch reads back GLOBAL
+                # element indices — see kernel comment above the store.
+                master_off_elem = int(grp["master_off"]) * g
                 _accum_with_outlier(
                     grp["m_flat"], grp["v_flat"], dg_buf, grp["h_g_buf"],
                     self._outlier_elem_hist, self._outlier_sel_idx,
                     self._outlier_sel_count,
                     total_a, g,
                     self._outlier_prev_th, self._outlier_prev_floor,
+                    self._g_fast_prev_threshold_t,
                     score_max, sel_max,
+                    master_off_elem,
                     lr_over_bc1, sqrt_bc2_inv, eps_adam,
                 )
             elif grp["zero_copy"]:
@@ -1493,6 +1293,80 @@ class ImportanceTracker:
                     f"group_th={group_th_val:.3e}",
                     flush=True,
                 )
+        elif (g_blk >= 2 and not self._outlier_promote
+                and getattr(self, "_flat_layout_done", False)):
+            # g_blk >= 2 path with outlier-promote OFF: walk group_hist
+            # alone. Without this branch ``_g_fast_prev_threshold_t``
+            # stays at its initial 0.0 (set at __init__) → pass2's
+            # mask_chunk = chunk_view >= 0 selects EVERY positive group,
+            # sel_buf overflows in chunk order, and only the first
+            # ~K_max groups in master-flat order (= first names in the
+            # first BF16 group, e.g. L01_E00/E01) survive. That misroutes
+            # ALL lossy dispatch to those few names regardless of where
+            # the real top scores live.
+            #
+            # K-budget: CLAUDE.md spec is K = topk_ratio × N_total_elements.
+            # Each group bin represents one group = g_blk elements, so
+            # picking it spends g_blk units of the element budget.
+            # K_total_groups = K_total_elements / g_blk = topk_ratio ×
+            # n_total_groups. Walk group_hist with weight=1 per bin
+            # (group-level) under the K_total_groups budget; the
+            # resulting threshold is already in GROUP score units, so
+            # it can be written directly into ``_g_fast_prev_threshold_t``
+            # (which pass2's chunk-loop compares against group scores).
+            import numpy as _np_walk
+            group_hist = self._g_fast_global_hist
+            total_groups_g2 = self._g_fast_dg_flat.numel()
+            K_total_groups = max(
+                1, int(self.topk_ratio * total_groups_g2)
+            )
+
+            group_smax = getattr(self, "_prev_s_max_g", None)
+            if group_smax is None or group_smax <= 0.0:
+                group_smax = 1e-6
+            group_score_max_used = max(group_smax * 1.5, 1e-30)
+            group_n_bins = group_hist.numel()
+            group_bin_width = group_score_max_used / group_n_bins
+
+            group_np = group_hist.cpu().numpy().astype(_np_walk.int64)
+            group_bin_idx = _np_walk.arange(group_n_bins)
+            group_scores = (group_bin_idx + 0.5) * group_bin_width
+            order = _np_walk.argsort(-group_scores, kind="stable")
+            sorted_scores = group_scores[order]
+            sorted_counts = group_np[order]
+            cum = _np_walk.cumsum(sorted_counts)
+            total_w = int(cum[-1]) if cum.size > 0 else 0
+
+            if total_w < K_total_groups:
+                group_th_val = 0.0
+            else:
+                idx_th = int(_np_walk.searchsorted(
+                    cum, K_total_groups, side="left",
+                ))
+                idx_th = min(idx_th, sorted_scores.size - 1)
+                group_th_val = float(sorted_scores[idx_th])
+
+            self._g_fast_prev_threshold_t.fill_(group_th_val)
+
+            group_nonempty = _np_walk.nonzero(group_np)[0]
+            if group_nonempty.size > 0:
+                top_group_bin = int(group_nonempty[-1])
+                self._prev_s_max_g = max(
+                    (top_group_bin + 1) * group_bin_width, 1e-30,
+                )
+
+            import os as _os_od
+            if (_os_od.environ.get("PROPOSAL_OUTLIER_DEBUG", "")
+                    in ("1", "true", "TRUE")
+                    and prev_step % 5 == 0):
+                print(
+                    f"[proposal] g2_walk @iter{prev_step}: "
+                    f"K_total_groups={K_total_groups} "
+                    f"group_hist_total={int(group_np.sum())} "
+                    f"group_smax={group_score_max_used:.3e} "
+                    f"group_th={group_th_val:.3e}",
+                    flush=True,
+                )
         elif (self._outlier_promote
                 and self._outlier_elem_hist is not None
                 and getattr(self, "_flat_layout_done", False)):
@@ -1543,6 +1417,35 @@ class ImportanceTracker:
             sorted_weighted = (all_counts[order] * all_weights[order])
             cum = _np_walk.cumsum(sorted_weighted)
             total_weighted = int(cum[-1]) if cum.size > 0 else 0
+
+            # === EXACT unique-budget walk under K_total =================
+            # Why "exact" without statistical approximation:
+            #   ``elem_hist`` is populated by the outlier kernel only
+            #   for elements that are NOT covered by a picked group
+            #   (kernel mask ``~group_picked_flat`` keyed off lower-
+            #   bound ``group_score_lb = h_g × prev_dg``). So an
+            #   element bin's count and a group bin's count refer to
+            #   DISJOINT element sets at the steady state — there is
+            #   no double-counting to subtract. Adding 1 per element
+            #   bin and ``g_blk`` per group bin therefore counts
+            #   UNIQUE elements exactly. The walk is just a cumulative
+            #   sum until the unique-element budget K_total is met.
+            #
+            # User intent reflected: element entries (single-iter
+            # Δθ²) and group entries (accumulated δ) compete on the
+            # same per-element score axis — whichever ranks higher
+            # wins each unique slot. With the kernel dedup, the
+            # combined saved set has |S| ≈ K_total unique elements
+            # AND ⊇ the elements that would be picked by group-only
+            # at the same K_total budget (because group entries can
+            # only be displaced by element entries with strictly
+            # higher per-element score).
+            #
+            # Multi-GPU: histograms (≈56 KB) are the only state that
+            # must be allreduced. The walk runs identically on every
+            # rank from the reduced histograms → identical threshold;
+            # no per-rank overhead.
+            # ============================================================
 
             # --- threshold at K_total (selection boundary) ---
             if total_weighted < K_total:
@@ -1649,6 +1552,7 @@ class ImportanceTracker:
             n_sel = min(n_sel, sel_idx_snap.numel())
             if n_sel > 0:
                 outlier_elem_idx = sel_idx_snap[:n_sel].to(torch.long)
+
         # Pre-sort by tensor name_idx so each tensor's outliers are a
         # contiguous slice — the per-name dispatch loop can use plain
         # integer slicing instead of bool-masking (which would trigger
@@ -2156,6 +2060,49 @@ class ImportanceTracker:
                 h2d_event=event_h2d,
                 gpu_refs=gpu_refs_for_writer,
             )
+            # Per-expert dispatch coverage diagnostic — runs at every
+            # ``log_interval`` boundary to confirm routing is balanced.
+            # ``n_experts_dispatched`` is the # of distinct experts that
+            # received at least one entry this iter. A healthy run shows
+            # this near ``num_expert_slots``; if it stays at 1-2 the
+            # routing is concentrated (the bug we previously diagnosed
+            # and fixed). Total entries equals K_total under steady
+            # state. Cheap: O(n_experts) sums + one print.
+            if prev_step > 0 and prev_step % 10 == 0:
+                _n_experts = len(per_expert_batch)
+                _total_entries = 0
+                _max_entries = 0
+                _min_entries = float("inf") if _n_experts > 0 else 0
+                for _eid, _bucket in per_expert_batch.items():
+                    # Each bucket entry is a list of (name, idx, p, m, v)
+                    # tuples. The idx tensor's numel is the count for
+                    # that sub-entry. Summing across sub-entries gives
+                    # per-expert total.
+                    _per_expert = 0
+                    for (_n, _idx_cpu, _p, _m, _v) in _bucket:
+                        _per_expert += int(_idx_cpu.numel())
+                    _total_entries += _per_expert
+                    if _per_expert > _max_entries:
+                        _max_entries = _per_expert
+                    if _per_expert < _min_entries:
+                        _min_entries = _per_expert
+                if _n_experts == 0:
+                    _min_entries = 0
+                _total_slots = (
+                    len(getattr(self, "_tname_to_eid", {}))
+                    or 0
+                )
+                # Total expert slots = unique eids in tname_to_eid (one
+                # eid maps to multiple tensors so we need unique values).
+                _unique_eids = len(set(self._tname_to_eid.values())) if self._tname_to_eid else 0
+                print(
+                    f"[proposal] dispatch_coverage @prev_iter{prev_step}: "
+                    f"n_experts_dispatched={_n_experts}/{_unique_eids} "
+                    f"total_entries={_total_entries} "
+                    f"per_expert[min={_min_entries if _n_experts else 0} "
+                    f"max={_max_entries}]",
+                    flush=True,
+                )
 
         self._pending_dispatch = None
         self._last_dispatch_per_param_selected = per_param_selected

@@ -53,10 +53,8 @@ from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.proposal.cp_hooks import (
     init_proposal,
-    proposal_dc_snap_grads,
-    proposal_score_step,
-    proposal_fc_fire,
-    proposal_dc_record,
+    proposal_arm_post_iter_fc,
+    proposal_fence_before_optimizer,
     proposal_recover, proposal_inject_fault, proposal_record_iter_loss,
     proposal_shutdown, proposal_hutchinson_probe,
     proposal_refresh_hessian, set_hessian_valid_iter,
@@ -747,6 +745,11 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
+    # The previous iter's armed proposal CP work is released at the END
+    # of the first micro-batch's forward by a forward hook registered
+    # inside ``init_proposal`` (so d2h overlaps with backward rather
+    # than forward, avoiding PCIe copy-engine contention with
+    # PyTorch's `tensor.to('cuda')` sync inside forward).
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -778,25 +781,26 @@ def train_step(forward_step_func, data_iterator,
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
-    # Update parameters.
+    # Order this iter's optimizer (which writes the FP32 master) AFTER
+    # any in-flight d2h on d2h_stream that is reading the master.
+    # No-op in practice (d2h finishes ~1.6 s before this point), kept
+    # as belt-and-suspenders guard against worker pickup / PCIe stalls.
+    if getattr(args, 'proposal_enable', False):
+        proposal_fence_before_optimizer()
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
-        if getattr(args, 'proposal_enable', False):
-            # Stage A (pre-optimizer): non-expert grad snapshot for DC.
-            proposal_dc_snap_grads(model)
         model[0].step(lr_kwargs={'increment': increment})
         if getattr(args, 'proposal_enable', False):
-            # Stage B / C / D (post-optimizer; m, v are now updated):
-            #   B = expert lossless FC fire + tracker score compute
-            #   C = non-expert lossless FC fire (W-scheduled)
-            #   D = DC bundle record (consumes the stage A payload)
-            _step_post = args.iteration + 1
-            proposal_score_step(model, step=_step_post)
-            proposal_fc_fire(model, step=_step_post)
-            proposal_dc_record(model, step=_step_post)
+            # Record iter T's optimizer.step completion event and stash
+            # the post-iter FC descriptor. The forward_hook registered
+            # on _inner_model (init_proposal) consumes this descriptor
+            # at the END of the first micro-batch's forward in iter
+            # T+1, submitting it to the two domain workers. Training
+            # thread does no CP work itself beyond this arm.
+            proposal_arm_post_iter_fc(model, iter_T=args.iteration + 1)
         update_successful = model[0].was_step_applied()
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
@@ -1366,8 +1370,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                         args=args, pre_fault_loss=cur_loss_value)
             print_rank_0(
                 f"[proposal] FAULT@{iteration}: recover_s={rec.get('recover_time_s',0):.2f} "
-                f"ne_fc={rec.get('nonexpert_fc_iter')} dc_replay="
-                f"{rec.get('dc_bundles_replayed')}/{rec.get('replay_range')} "
+                f"ne_fc={rec.get('nonexpert_fc_iter')} "
                 f"B={rec.get('B_max_lost_iter')} pre_loss={cur_loss_value}"
             )
 

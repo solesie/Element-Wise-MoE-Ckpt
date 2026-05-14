@@ -228,13 +228,10 @@ class DramExpertState:
                 else:
                     buf["v"].zero_()
 
-        if self._async_writer is not None:
-            self._async_writer.submit_raw(
-                _do_lossless_fc,
-                tag=f"dram_lossless_L{expert_id[0]:02d}_E{expert_id[1]:02d}",
-            )
-        else:
-            _do_lossless_fc()
+        # Caller (ExpertLosslessFC._fire_one) already runs on the
+        # host_writer_expert worker — inline avoids self-recursive
+        # enqueueing into the same FIFO.
+        _do_lossless_fc()
 
     # ------------------------------------------------------------------
     # Lossy FC (per-iter sparse updates → scatter into dense buffer)
@@ -352,13 +349,10 @@ class DramExpertState:
                 grand_total += n_eid
         if not prepared:
             return 0
-        if self._async_writer is not None:
-            self._async_writer.submit_raw(
-                self._do_dram_lossy_batch, prepared, h2d_event, gpu_refs,
-                tag=f"dram_lossy_batch_iter{int(step)}",
-            )
-        else:
-            self._do_dram_lossy_batch(prepared, h2d_event, gpu_refs)
+        # Caller (ImportanceTracker._dispatch_pending_payload) already
+        # runs on the host_writer_expert worker — inline avoids a
+        # self-recursive submit into the same FIFO.
+        self._do_dram_lossy_batch(prepared, h2d_event, gpu_refs)
         return grand_total
 
     @torch.no_grad()
@@ -399,7 +393,7 @@ class DramExpertState:
         del only_eids
         if self._async_writer is not None:
             try:
-                self._async_writer.drain()
+                self._async_writer.drain_expert()
             except Exception:
                 pass
 

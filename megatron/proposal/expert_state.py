@@ -224,10 +224,13 @@ class ExpertState:
     # else execute synchronously (test / offline path).
     # ------------------------------------------------------------------
     def _dispatch(self, fn: "Callable[..., None]", *args: Any, tag: str) -> None:
-        if self._async_writer is not None:
-            self._async_writer.submit_raw(fn, *args, tag=tag)
-        else:
-            fn(*args)
+        # Always run inline. In the new arch every caller of ExpertState
+        # (ExpertLosslessFC, ImportanceTracker.dispatch) already lives on
+        # the host_writer_expert worker, so submitting back to that same
+        # queue here would simply enqueue extra steps without parallelism
+        # — and would self-join inside any later drain_expert.
+        del tag
+        fn(*args)
 
     # ------------------------------------------------------------------
     # Introspection
@@ -596,7 +599,7 @@ class ExpertState:
         # we fsync.
         if self._async_writer is not None:
             try:
-                self._async_writer.drain()
+                self._async_writer.drain_expert()
             except Exception:
                 pass
         target = set(only_eids) if only_eids is not None else None
@@ -611,7 +614,7 @@ class ExpertState:
                 )
         if self._async_writer is not None:
             try:
-                self._async_writer.drain()
+                self._async_writer.drain_expert()
             except Exception:
                 pass
 

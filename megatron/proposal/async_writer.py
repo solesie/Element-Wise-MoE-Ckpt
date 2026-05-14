@@ -1,65 +1,47 @@
-"""
-AsyncWriter — background thread that takes (payload, path) work items off a
-queue and calls ``torch.save``, decoupling training-loop critical path from
-disk IO. 
+"""Domain-split asynchronous I/O for proposal CP.
 
-Design choices
---------------
-- **Single writer thread.** Phase 4 established that the disk is bandwidth-
-  bound at ~950 MiB/s, so parallelizing writers buys nothing and only adds
-  synchronization overhead. One consumer thread is enough.
+Two single-thread workers, each owning one domain:
 
-- **Bounded queue.** If the training thread is submitting faster than the
-  writer drains, the queue back-pressures via a blocking ``put`` on a
-  full queue. In practice this only happens if `compute_per_iter < write_per_iter`
-  for an extended stretch — a healthy warning that the machine is under-
-  provisioned for the checkpoint strategy.
+* ``host_writer_non_expert`` — all non-expert lossless FC writes (and
+  recovery reads). Owned by ``FCManager``.
+* ``host_writer_expert``     — all expert work: ``tracker_stream`` GPU
+  launches (proposal mode), expert lossless FC, expert lossy FC log
+  scatter/write, and expert recovery reads. Owned by ``ExpertState`` /
+  ``ExpertLosslessFC`` / ``ImportanceTracker.step``.
 
-- **WriteRecord handoff.** `submit()` returns a mutable ``WriteRecord``.
-  The main thread stores this record alongside its own stats and reads
-  timing/byte fields *after* ``drain()`` completes. This avoids any cross-
-  thread mutable state beyond the record itself.
+Each worker:
+  * sets ``torch.cuda.set_device(...)`` once at startup so it can launch
+    GPU kernels and record / wait on ``cuda.Event`` directly,
+  * processes tasks FIFO from its private queue (back-pressure via
+    bounded ``queue.Queue``),
+  * holds **all** state mutated by its domain — there is no
+    cross-thread access to ``_pending_dispatch``, ``ExpertState`` dense
+    buffers, or pinned host CP buffers.
 
-- **Clean shutdown.** ``drain()`` waits for all submitted work; ``shutdown()``
-  sends a sentinel and joins the worker thread. Both are idempotent-safe.
-
-Error handling
---------------
-If ``torch.save`` raises inside the worker, the exception is recorded on
-``WriteRecord.error`` (string) and the worker continues. The main thread
-can inspect records after ``drain()``. We do **not** propagate exceptions
-across threads silently — any error field is reported in the stats.
-
-Consistency guarantee
----------------------
-The caller is responsible for ensuring the payload tensors are **CPU-
-resident** and **not mutated after submission**. Both CheckpointManager
-and FCManager already clone tensors to CPU before calling ``submit``, so
-this invariant holds by construction.
+The training thread never launches GPU work for proposal CP. Its only
+proposal-related interaction is ``queue.put`` of small task closures at
+the iteration boundary (``proposal_arm_post_iter_fc`` /
+``proposal_release_post_iter_fc``).
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import torch
 
 
-# Module-level side CUDA stream for D2H copies. Lazy-init on first call so
-# CPU-only test imports don't fail. The d2h_stream is shared across all
-# callers (snapshot_nonexpert_dc / _collect_param_payload) — they all
-# launch their async H2D copies on it. main stream's stage write is
-# synchronized via cuda events.
 _d2h_stream: Optional["torch.cuda.Stream"] = None
 
 
 def get_d2h_stream() -> Optional["torch.cuda.Stream"]:
-    """Lazy-init D2H side stream. Returns None on CPU-only setups."""
+    """Lazy-init the shared D2H stream. Both domain workers launch their
+    GPU→pinned-host copies on this single stream — PCIe is the
+    bottleneck and a second D2H stream would only fragment kernel
+    submission order without freeing bandwidth."""
     global _d2h_stream
     if _d2h_stream is None and torch.cuda.is_available():
         _d2h_stream = torch.cuda.Stream()
@@ -68,286 +50,165 @@ def get_d2h_stream() -> Optional["torch.cuda.Stream"]:
 
 @dataclass
 class WriteRecord:
-    """Mutable handoff record. Main thread creates it, worker fills it in.
+    """Mutable handoff for a single non-expert FC submission. The worker
+    fills in ``done`` / timings after processing; the main thread reads
+    them after ``drain_non_expert()`` returns."""
 
-    Fields below ``submit_time`` are written by the worker thread only;
-    read them **after** ``AsyncWriter.drain()`` returns.
-
-    ``on_complete`` is an optional list of zero-argument callables invoked
-    (on the worker thread) **after** a successful ``torch.save``. The
-    intended use is per-write cleanup — for instance, "delete these older
-    DC files now that the FC that supersedes them is safely on disk". If
-    ``torch.save`` raises, ``on_complete`` is **not** invoked and the
-    cleanup is skipped so the caller can still roll back / retry.
-    """
-    tag: str                   # "dc" | "fc" — for log grouping only
-    path: Path
-    submit_time: float         # time.perf_counter() at submit
+    tag: str
+    path: "Optional[object]" = None
+    submit_time: float = 0.0
     done: bool = False
     queue_delay_ms: float = 0.0
     write_time_ms: float = 0.0
     file_bytes: int = 0
     error: Optional[str] = None
-    on_complete: List[Callable[[], None]] = field(default_factory=list)
-    # Optional cuda event the worker must synchronize on BEFORE writing.
-    # Use case: caller issued a non_blocking D2H copy producing the payload's
-    # CPU tensors; the event marks the copy's completion. Without this,
-    # async non_blocking H2D + worker disk-write would race on the host
-    # buffer (torch.save would serialize incomplete data). The wait happens
-    # on the worker thread → main thread sees no host blocking.
-    cuda_event: Optional[Any] = None
 
 
-class AsyncWriter:
-    """Single-thread async writer for torch.save payloads.
+class _DomainWorker:
+    """Single-thread FIFO worker bound to one CUDA device.
 
-    Usage::
-
-        writer = AsyncWriter(max_queue_size=32)
-        rec = writer.submit(payload, path, tag="dc")
-        ...
-        writer.drain()            # block until queue empty
-        assert rec.done
-        print(rec.write_time_ms, rec.file_bytes)
-        writer.shutdown()         # terminate worker thread
+    Accepts arbitrary callables and runs them on the worker thread. The
+    callable is responsible for any GPU synchronisation it needs (e.g.
+    ``cuda_event.synchronize()`` before reading the result of a D2H
+    copy). The worker only guarantees FIFO ordering and that
+    ``torch.cuda.set_device(...)`` was set on its thread before the
+    first task runs.
     """
 
     _SENTINEL = object()
 
     def __init__(
         self,
-        max_queue_size: int = 32,
-        raw_queue_size: int = 1024,
+        name: str,
+        device: Optional[int],
+        max_queue_size: int,
     ) -> None:
-        # Queue A: pickled payloads written via torch.save (non-expert DC,
-        # non-expert FC, legacy per-iter expert FC in MoC mode).
-        self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
-        # Queue B: raw callables for ExpertState's binary LFCL/LFSY format
-        # (submit_raw). Separate worker so DC and expert writes can proceed
-        # in parallel and don't share a head-of-line block.
-        self._queue_raw: queue.Queue = queue.Queue(maxsize=int(raw_queue_size))
+        self._name = name
+        self._device = device
+        self._queue: queue.Queue = queue.Queue(maxsize=int(max_queue_size))
         self._thread = threading.Thread(
-            target=self._run, name="AsyncWriter-torch", daemon=True,
-        )
-        self._thread_raw = threading.Thread(
-            target=self._run_raw, name="AsyncWriter-raw", daemon=True,
+            target=self._run, name=name, daemon=True,
         )
         self._submissions = 0
         self._completions = 0
-        self._submissions_raw = 0
-        self._completions_raw = 0
-        self._total_write_ms = 0.0
-        self._total_file_bytes = 0
         self._max_queue_depth = 0
-        self._max_queue_depth_raw = 0
-        self._lock = threading.Lock()  # protects counters
+        self._lock = threading.Lock()
         self._shutdown_sent = False
         self._thread.start()
-        self._thread_raw.start()
 
-    # ------------------------------------------------------------------
-    def submit(
-        self,
-        payload: Any,
-        path: Path,
-        tag: str = "dc",
-        on_complete: Optional[List[Callable[[], None]]] = None,
-        save_fn: Optional[Callable[[Any, Path], None]] = None,
-        cuda_event: Optional[Any] = None,
-    ) -> WriteRecord:
-        """Enqueue a payload for async writing. Returns a mutable
-        :class:`WriteRecord` that the worker will fill in.
-
-        ``on_complete`` is a list of zero-argument callables invoked on
-        the worker thread after a successful write (see WriteRecord
-        docstring).
-
-        ``save_fn`` lets the caller swap the default ``torch.save`` for a
-        custom writer, e.g. the raw-binary ``save_binary`` used by
-        non-expert FC and H_ema CPs to bypass pickle overhead. Signature
-        must be ``save_fn(payload, path) -> None``; exceptions are captured
-        on ``rec.error`` just like torch.save's.
-        """
+    def submit(self, fn: Callable[..., None], *args: Any) -> None:
         if self._shutdown_sent:
-            raise RuntimeError("AsyncWriter.submit() called after shutdown()")
-        rec = WriteRecord(
-            tag=tag,
-            path=Path(path),
-            submit_time=time.perf_counter(),
-            on_complete=list(on_complete) if on_complete else [],
-            cuda_event=cuda_event,
-        )
-        self._queue.put((payload, rec, save_fn))
+            raise RuntimeError(f"{self._name}.submit() after shutdown()")
+        self._queue.put((fn, args))
         with self._lock:
             self._submissions += 1
             depth = self._queue.qsize()
             if depth > self._max_queue_depth:
                 self._max_queue_depth = depth
-        return rec
 
-    # ------------------------------------------------------------------
+    def drain(self) -> None:
+        self._queue.join()
+
+    def shutdown(self) -> None:
+        if self._shutdown_sent:
+            return
+        self._shutdown_sent = True
+        self._queue.join()
+        self._queue.put(self._SENTINEL)
+        self._thread.join()
+
     def _run(self) -> None:
+        if self._device is not None and torch.cuda.is_available():
+            torch.cuda.set_device(self._device)
+            # Move this worker's current_stream off the legacy NULL
+            # stream onto an explicit NonBlocking stream. Without this,
+            # torch ops invoked inside worker tasks (e.g. importance
+            # tracker's torch.sort / torch.searchsorted in dispatch)
+            # land on cuda_stream=0x0, triggering CUDA's NULL-stream
+            # implicit sync rule and cascade-blocking other streams
+            # (verified via nsys: 62 NULL kernels/run with sort family
+            # from worker thread before this fix).
+            self._worker_stream = torch.cuda.Stream()
+            torch.cuda.set_stream(self._worker_stream)
         while True:
             item = self._queue.get()
             try:
                 if item is self._SENTINEL:
                     return
-                payload, rec, save_fn = item
-                # Block worker until any pending non_blocking D2H copy that
-                # produced this payload's CPU tensors has completed. main
-                # thread sees no wait — only this worker thread.
-                if rec.cuda_event is not None:
-                    try:
-                        rec.cuda_event.synchronize()
-                    except Exception:
-                        pass
-                start = time.perf_counter()
-                rec.queue_delay_ms = (start - rec.submit_time) * 1000.0
-                try:
-                    if save_fn is not None:
-                        save_fn(payload, rec.path)
-                    else:
-                        torch.save(payload, rec.path)
-                    try:
-                        rec.file_bytes = int(rec.path.stat().st_size)
-                    except FileNotFoundError:
-                        rec.file_bytes = 0
-                except Exception as exc:
-                    rec.error = f"{type(exc).__name__}: {exc}"
-                end = time.perf_counter()
-                rec.write_time_ms = (end - start) * 1000.0
-                rec.done = True
-                with self._lock:
-                    self._completions += 1
-                    self._total_write_ms += rec.write_time_ms
-                    self._total_file_bytes += rec.file_bytes
-                # Run post-success cleanups (ONLY on success) — e.g., unlink
-                # the older DC bundles that this FC has just superseded.
-                # Done on the worker thread so the main loop never blocks.
-                if rec.error is None:
-                    for cb in rec.on_complete:
-                        try:
-                            cb()
-                        except Exception as cb_exc:
-                            # Record the first callback failure on the rec
-                            # so the main thread can inspect it, but keep
-                            # processing subsequent callbacks.
-                            if rec.error is None:
-                                rec.error = (
-                                    f"on_complete: "
-                                    f"{type(cb_exc).__name__}: {cb_exc}"
-                                )
-            finally:
-                self._queue.task_done()
-
-    # ------------------------------------------------------------------
-    def submit_raw(
-        self,
-        fn: Callable[..., None],
-        *args: Any,
-        tag: str = "raw",
-    ) -> None:
-        """Enqueue a raw-callable job for the dedicated raw worker thread.
-        ``fn(*args)`` runs on the raw worker — used by ExpertState to
-        offload its binary LFCL/LFSY writes (including ``os.fsync``) so
-        they don't block the training thread.
-
-        No WriteRecord is returned; the raw path is fire-and-forget.
-        Exceptions are logged to stdout but do not propagate.
-        """
-        if self._shutdown_sent:
-            raise RuntimeError("AsyncWriter.submit_raw() called after shutdown()")
-        self._queue_raw.put((fn, args, tag))
-        with self._lock:
-            self._submissions_raw += 1
-            depth = self._queue_raw.qsize()
-            if depth > self._max_queue_depth_raw:
-                self._max_queue_depth_raw = depth
-
-    def _run_raw(self) -> None:
-        while True:
-            item = self._queue_raw.get()
-            try:
-                if item is self._SENTINEL:
-                    return
-                fn, args, tag = item
+                fn, args = item
                 try:
                     fn(*args)
                 except Exception as exc:
-                    print(f"[async_writer] raw job '{tag}' failed: "
-                          f"{type(exc).__name__}: {exc}", flush=True)
+                    print(
+                        f"[async_writer] {self._name}: task failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 with self._lock:
-                    self._completions_raw += 1
+                    self._completions += 1
             finally:
-                self._queue_raw.task_done()
-
-    # ------------------------------------------------------------------
-    def drain(self) -> None:
-        """Block until every submitted work item (torch + raw) has been
-        processed."""
-        self._queue.join()
-        self._queue_raw.join()
-
-    def drain_torch(self) -> None:
-        """Block until the torch.save queue is empty. The raw queue is
-        independent and is NOT waited on — used by FCManager to ensure a
-        prior torch.save has finished reading its pinned CPU payload buffer
-        before the main thread overwrites that buffer for the next FC."""
-        self._queue.join()
-
-    def shutdown(self) -> None:
-        """Drain both queues, stop both worker threads. Idempotent."""
-        if self._shutdown_sent:
-            return
-        self._shutdown_sent = True
-        self.drain()
-        self._queue.put(self._SENTINEL)
-        self._queue_raw.put(self._SENTINEL)
-        self._thread.join()
-        self._thread_raw.join()
-
-    # ------------------------------------------------------------------
-    @property
-    def submissions(self) -> int:
-        with self._lock:
-            return self._submissions
-
-    @property
-    def completions(self) -> int:
-        with self._lock:
-            return self._completions
-
-    @property
-    def pending(self) -> int:
-        with self._lock:
-            return self._submissions - self._completions
-
-    @property
-    def max_queue_depth(self) -> int:
-        with self._lock:
-            return self._max_queue_depth
-
-    @property
-    def total_write_ms(self) -> float:
-        with self._lock:
-            return self._total_write_ms
-
-    @property
-    def total_file_bytes(self) -> int:
-        with self._lock:
-            return self._total_file_bytes
+                self._queue.task_done()
 
     def summary(self) -> dict:
         with self._lock:
             return {
+                "name": self._name,
                 "submissions": self._submissions,
                 "completions": self._completions,
                 "pending": self._submissions - self._completions,
                 "max_queue_depth": self._max_queue_depth,
-                "submissions_raw": self._submissions_raw,
-                "completions_raw": self._completions_raw,
-                "pending_raw": self._submissions_raw - self._completions_raw,
-                "max_queue_depth_raw": self._max_queue_depth_raw,
-                "total_write_ms": self._total_write_ms,
-                "total_file_bytes": self._total_file_bytes,
             }
+
+
+class AsyncWriter:
+    """Owner of the two domain workers.
+
+    Usage::
+
+        writer = AsyncWriter(device=0)
+        writer.submit_non_expert(do_ne_fc, ne_task)
+        writer.submit_expert(do_ex_fc, ex_task)
+        writer.drain()           # both queues empty
+        writer.shutdown()
+    """
+
+    def __init__(
+        self,
+        device: Optional[int] = None,
+        non_expert_queue_size: int = 8,
+        expert_queue_size: int = 32,
+    ) -> None:
+        if device is None and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+        self.non_expert = _DomainWorker(
+            "host_writer_non_expert", device, non_expert_queue_size,
+        )
+        self.expert = _DomainWorker(
+            "host_writer_expert", device, expert_queue_size,
+        )
+
+    def submit_non_expert(self, fn: Callable[..., None], *args: Any) -> None:
+        self.non_expert.submit(fn, *args)
+
+    def submit_expert(self, fn: Callable[..., None], *args: Any) -> None:
+        self.expert.submit(fn, *args)
+
+    def drain_non_expert(self) -> None:
+        self.non_expert.drain()
+
+    def drain_expert(self) -> None:
+        self.expert.drain()
+
+    def drain(self) -> None:
+        self.non_expert.drain()
+        self.expert.drain()
+
+    def shutdown(self) -> None:
+        self.non_expert.shutdown()
+        self.expert.shutdown()
+
+    def summary(self) -> dict:
+        return {
+            "non_expert": self.non_expert.summary(),
+            "expert": self.expert.summary(),
+        }

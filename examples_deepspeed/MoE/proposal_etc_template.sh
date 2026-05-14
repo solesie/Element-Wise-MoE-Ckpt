@@ -35,7 +35,7 @@ LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-50}
 INIT_STD=0.014
 MLC=0.01
 
-VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch|proposal_hutch_k4pct|proposal_hutch_k4pct_finite_diff|proposal_hutch_k1pct_finite_diff_F1|proposal_hutch_k4pct_finite_diff_nofreeze|proposal_hutch_k3pct|proposal_hutch_k2pct|proposal_hutch_k10pct|proposal_ema_hutch|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4}
+VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|moc_dram_d6|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch|proposal_hutch_k4pct|proposal_hutch_k4pct_finite_diff|proposal_hutch_k1pct_finite_diff_F1|proposal_hutch_k4pct_finite_diff_nofreeze|proposal_hutch_k3pct|proposal_hutch_k2pct|proposal_hutch_k10pct|proposal_ema_hutch|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4}
 OUTPUT_BASEPATH=${OUTPUT_BASEPATH:?must set OUTPUT_BASEPATH}
 TAG="${VARIANT}_seed${SEED}"
 FAULT_INTERVAL=${FAULT_INTERVAL:-100}
@@ -53,10 +53,6 @@ else
 fi
 mkdir -p "${CP_DIR}/non_expert" "${CP_DIR}/expert"
 rm -f "${FAULT_LOG}"
-
-# DC retention: default max(D, W). Expert FC supersedes older expert
-# sparse DC, non-expert FC supersedes older non-expert dense DC.
-DC_RETENTION=0  # 0 = use default max(D, W) in cp_hooks
 
 PROPOSAL_FLAGS=""
 case "$VARIANT" in
@@ -88,6 +84,39 @@ case "$VARIANT" in
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
         ;;
+    moc_dram_d6)
+        # MoC sequential baseline aligned for direct comparison vs the
+        # proposal (proposal_hutch_k1pct_finite_diff_F1) at matched
+        # non-expert protection. Only difference from proposal is the
+        # expert side: layer-RR lossless FC every D=6 iter (one MoE
+        # layer at a time) — no element-wise lossy FC, no importance
+        # tracker, no Hessian.
+        #
+        # Knobs (overridable via env to mirror the proposal sweeps):
+        #   EXPERT_FC_D       per-layer interval                (default 6)
+        #   NONEXPERT_FC_W    non-expert FC interval            (default 10)
+        # Non-expert path = identical to proposal: DC every iter +
+        # lossless FC every W iter. Recovery uses DRAM ExpertState so
+        # the fault recover_s should match the proposal's ~1.2 s.
+        #
+        # Selection knobs are pinned to ``v_hat`` / refresh=0 because
+        # sequential mode never reads any importance score — those
+        # flags exist only to suppress training-loop Hessian refreshes
+        # that would otherwise run on every refresh_every iter for
+        # nothing (lazy Hessian buffers in the tracker stay
+        # unallocated, but the FD recompute itself still runs).
+        PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
+            --proposal-cp-mode sequential \
+            --proposal-cp-target ${CP_TARGET:-dram} \
+            --proposal-selection-mode v_hat \
+            --proposal-hessian-refresh-every 0 \
+            --proposal-expert-fc-D ${EXPERT_FC_D:-6} \
+            --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-10} \
+            --proposal-async-queue 5 \
+            --proposal-fault-interval ${FAULT_INTERVAL} \
+            --proposal-fault-warmup ${FAULT_WARMUP} \
+            --proposal-fault-log ${FAULT_LOG}"
+        ;;
     proposal_s4_k01)
         # ETC-2: S=4 (D = 4 × num_slots), K=0.5% lossy-FC every iter.
         # W=10: non-expert FC every 10 iters. Rolling lossy-FC state in CPU RAM.
@@ -103,7 +132,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.005 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${DC_RETENTION} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -116,7 +144,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -135,7 +162,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -155,7 +181,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -176,7 +201,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.02 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -192,7 +216,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.03 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -208,7 +231,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.10 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -229,7 +251,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -250,7 +271,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -305,7 +325,6 @@ case "$VARIANT" in
             --proposal-expert-fc-D ${EXPERT_FC_D:-999999} \
             --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-10} \
             --proposal-async-queue 5 \
-            --proposal-dc-retention 20 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -326,7 +345,6 @@ case "$VARIANT" in
             --proposal-topk-ratio 0.04 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
@@ -403,8 +421,7 @@ case "$VARIANT" in
             --proposal-selection-mode v_hat \
             --proposal-topk-ratio 0.0015 \
             --proposal-nonexpert-fc-W 10 \
-            --proposal-async-queue 5 \
-            --proposal-dc-retention ${TRAIN_ITERS}"
+            --proposal-async-queue 5"
         ;;
     exp3_run1)
         # Exp3 Run 1 — proposed system, K_top=1%, D=1, F=0.5%
@@ -523,6 +540,11 @@ deepspeed_options=" \
     --pipeline-model-parallel-size 1 --no-pipeline-parallel \
     --create-moe-param-group"
 
-run_cmd="deepspeed --num_gpus 1 --master_port 29500 ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
+if [ -n "${NSYS_PROFILE}" ]; then
+    NSYS_PREFIX="nsys profile -o ${NSYS_OUT:-/tmp/nsys_run} --force-overwrite true --trace=cuda -s none"
+else
+    NSYS_PREFIX=""
+fi
+run_cmd="${NSYS_PREFIX} deepspeed --num_gpus 1 --master_port 29500 ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
 echo "[etc] TAG=${TAG} NUM_SLOTS=${NUM_SLOTS} LOG=${LOG_FILE}"
 eval ${run_cmd} 2>&1 | tee "${LOG_FILE}"

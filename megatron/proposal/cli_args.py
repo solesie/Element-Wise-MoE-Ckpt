@@ -97,11 +97,6 @@ def add_proposal_args(parser):
                             "fires. Per CLAUDE.md default 2.0 → 1 expert per "
                             "fire for 48-expert model → 200-iter cycle.")
     group.add_argument("--proposal-nonexpert-fc-W", type=int, default=10)
-    group.add_argument("--proposal-dc-retention", type=int, default=20,
-                       help="Number of recent non-expert DC dense-grad "
-                            "snapshots to keep. Floored by max(W+2, 3) so "
-                            "at least one FC supersedes the oldest DC. "
-                            "Default 20.")
     group.add_argument("--proposal-async-queue", type=int, default=5)
     group.add_argument("--proposal-cp-mode", type=str, default="proposal",
                        choices=["proposal", "sequential"],
