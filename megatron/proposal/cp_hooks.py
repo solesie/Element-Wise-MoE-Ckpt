@@ -345,10 +345,19 @@ def init_proposal(
             # data. Steady-state alloc cost is small (pinned caching
             # allocator recycles freed buffers).
             # named_params=None: the callee lazily builds it ONLY on cache
-            # miss. Steady-state (cache hit) skips the
-            # ``dict(model.named_parameters())`` walk.
+            # miss.
+            # header_block_bytes / chunk_pad_bytes / preserve_order:
+            # reserve the 4 KiB LFCL header at the front of the pinned
+            # buffer, pad the alloc up to the SSD-passthrough chunk so
+            # the C++ writer can submit chunk-aligned, and write p|m|v
+            # in schema (caller) order so the on-disk byte layout
+            # matches what recovery expects.
+            from .binary_io import HEADER_BLOCK_BYTES as _HB, PIN_CHUNK_BYTES as _CB
             return _fc._collect_param_payload(
                 tnames, None, private=True,
+                header_block_bytes=_HB,
+                chunk_pad_bytes=_CB,
+                preserve_order=True,
             )
         _expert_lossless_fc = ExpertLosslessFC(
             model=inner_model,

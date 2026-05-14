@@ -43,8 +43,10 @@ concatenation overhead that plagued the earlier log-structured design:
 * Pre-allocate a single numpy structured-dtype array per expert per iter.
 * Fill columns directly from ``tensor.numpy()`` (zero-copy for CPU
   contiguous fp32/int32 tensors).
-* Single ``os.writev`` syscall bundles the (count, step) prefix with the
-  array payload — no intermediate bytes object is allocated.
+* Single ``os.write`` syscall flushes the (count, step) prefix and the
+  AoS records — both assembled directly into a pinned host buffer so
+  the future C++ SSD-passthrough writer can submit the same buffer
+  with io_uring + O_DIRECT without any extra copy.
 
 This keeps training-thread overhead in the write path to roughly one
 numpy allocation per expert per iter, plus a single syscall.
@@ -63,11 +65,13 @@ import numpy as np
 import torch
 
 from .binary_io import (
-    append_lossy_log,
+    HEADER_BLOCK_BYTES as _BIN_HEADER_BLOCK_BYTES,
+    alloc_pinned_uint8_sector_aligned,
+    append_lossy_log_from_pinned,
     close_fd,
     fsync_fd,
     open_lossy_log_for_append,
-    write_lossless_payload_atomic,
+    write_lossless_from_pinned,
 )
 
 
@@ -77,7 +81,10 @@ ExpertId = Tuple[int, int]  # (layer, expert_idx)
 MAGIC_LFCL = b"LFCL"  # lossless FC
 MAGIC_LFSY = b"LFSY"  # lossy FC append log
 FORMAT_VERSION: int = 1
-HEADER_BLOCK_BYTES: int = 4096
+# Reuse the file-format header block size from binary_io so PRPTENS,
+# LFCL, and LFSY all share a single sector convention. 64 KiB is the
+# current value (sized to fit the largest header — non-expert FC).
+HEADER_BLOCK_BYTES: int = _BIN_HEADER_BLOCK_BYTES
 RECORD_BYTES: int = 16  # int32 idx + fp32 p + fp32 m + fp32 v
 BLOCK_PREFIX_BYTES: int = 8  # count u32 + step u32
 
@@ -272,34 +279,25 @@ class ExpertState:
                                        Optional[torch.Tensor],
                                        Optional[torch.Tensor]]],
         cuda_event: Optional["torch.cuda.Event"] = None,
+        pinned_info: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Write full (param, m, v) snapshot for ``expert_id`` and reset
         its lossy FC log.
 
-        **Training-thread work**: just build the immutable header bytes
-        and dispatch. The (cuda_event.synchronize + tobytes() copy) is
-        delegated to the worker so the training thread is NEVER blocked
-        on D2H completion or the ~50 ms host memcpy. CRITICAL: matches
-        the no-blocking-on-main-stream contract — without this, the
-        per-source D2H from ExpertLosslessFC may still be in-flight on
-        d2h_stream when ``tobytes()`` reads pinned memory, producing
-        stale checkpoint bytes.
+        Training-thread work is limited to building the 4 KiB header
+        bytes + dispatching. The worker thread syncs on ``cuda_event``,
+        stamps the header into the pinned buffer, and emits one
+        ``os.write`` of [header | p|m|v] straight from pinned to the
+        tmp file before fsync + atomic rename.
 
-        **Background-thread work** (in ``_do_lossless_fc``):
-          1. ``cuda_event.synchronize()`` — wait for d2h_stream to
-             finish writing the pinned tensor views captured here.
-          2. for each tensor: ``_to_fp32_numpy(p).tobytes()`` (memcpy
-             from pinned host RAM to a heap bytes object that the
-             writev call below borrows; freed after fsync).
-          3. open temp fd, writev header + payload, fsync, atomic
-             rename, unlink the previous lossy log, open a fresh lossy
-             fd. Because the I/O thread is a single FIFO consumer,
-             later lossy_fc_append jobs for the same expert are
-             guaranteed to see the fresh fd.
+        ``pinned_info`` is mandatory and carries the pinned buffer +
+        size produced by ``fc_manager._collect_param_payload(...,
+        header_block_bytes=HEADER_BLOCK_BYTES, ...)``.
         """
         ent = self._entries.get(expert_id)
         if ent is None:
             return
+        del initial_state  # no longer needed — pinned_info owns the data
 
         header_meta = {
             "expert_id": [int(ent.expert_id[0]), int(ent.expert_id[1])],
@@ -314,17 +312,10 @@ class ExpertState:
         }
         header = _pack_header(MAGIC_LFCL, header_meta)
 
-        # Capture the per-tensor schema and the (still-pinned) initial_state
-        # tensor refs in a closure. Worker syncs on cuda_event before
-        # touching the bytes — no training-thread block.
-        schema_snapshot = list(ent.tensor_schema)
-        initial_state_snapshot = dict(initial_state)
-
-        # Dispatch to AsyncWriter's raw thread (or run sync if no writer).
         L, E = ent.expert_id
         self._dispatch(
             self._do_lossless_fc, ent, int(step), header,
-            schema_snapshot, initial_state_snapshot, cuda_event,
+            cuda_event, pinned_info,
             tag=f"lossless_L{L:02d}_E{E:02d}",
         )
 
@@ -336,11 +327,8 @@ class ExpertState:
         ent: "_ExpertEntry",
         step: int,
         header: bytes,
-        schema_snapshot: List[Tuple[str, "torch.Size", int]],
-        initial_state_snapshot: Dict[str, Tuple[torch.Tensor,
-                                                Optional[torch.Tensor],
-                                                Optional[torch.Tensor]]],
         cuda_event: Optional["torch.cuda.Event"],
+        pinned_info: Optional[Dict[str, Any]] = None,
     ) -> None:
         # 0) Wait for the d2h_stream copies that produced our pinned
         # source tensors. Done on this worker thread so the training
@@ -351,53 +339,53 @@ class ExpertState:
             except Exception:
                 pass
 
-        # 1) Build (param/m/v) bytes from the now-stable pinned views.
-        tensor_bytes: List[Tuple[str, bytes, bytes, bytes]] = []
-        for (tname, _shape, numel) in schema_snapshot:
-            triple = initial_state_snapshot.get(tname)
-            if triple is None:
-                zero_np = np.zeros(int(numel), dtype=np.float32)
-                tensor_bytes.append(
-                    (tname, zero_np.tobytes(), zero_np.tobytes(), zero_np.tobytes())
-                )
-                continue
-            p, m, v = triple
-            p_np = _to_fp32_numpy(p, int(numel))
-            m_np = (
-                _to_fp32_numpy(m, int(numel)) if m is not None
-                else np.zeros(int(numel), dtype=np.float32)
-            )
-            v_np = (
-                _to_fp32_numpy(v, int(numel)) if v is not None
-                else np.zeros(int(numel), dtype=np.float32)
-            )
-            tensor_bytes.append(
-                (tname, p_np.tobytes(), m_np.tobytes(), v_np.tobytes())
-            )
-
-        # 2) Close the current lossy fd (we own fd lifecycle here).
+        # 1) Close the current lossy fd (we own fd lifecycle here).
         if ent.lossy_fd is not None:
             close_fd(ent.lossy_fd)
             ent.lossy_fd = None
 
-        # 3) Serialise new lossless FC to <path>.tmp → atomic rename via
-        # the centralised binary_io helper (single home for write syscalls).
-        write_lossless_payload_atomic(
+        # 2) Write the new LFCL file via the single pinned-inline path.
+        # The collect helper reserved HEADER_BLOCK_BYTES at the front of
+        # the pinned buffer and laid the payload (p|m|v per tensor in
+        # schema order) right after it. We stamp the header in-place
+        # and ship the whole region in one os.write to the tmp file
+        # (atomic rename via the centralised helper).
+        if pinned_info is None:
+            raise RuntimeError(
+                "lossless_fc: pinned_info is required — collect helper must "
+                "be called with header_block_bytes=HEADER_BLOCK_BYTES"
+            )
+        pinned_tensor = pinned_info["pinned"]
+        payload_bytes = int(pinned_info["payload_bytes"])
+        if int(pinned_info.get("header_block_bytes", 0)) != _BIN_HEADER_BLOCK_BYTES:
+            raise RuntimeError(
+                "lossless_fc: pinned_info.header_block_bytes mismatch — "
+                f"expected {_BIN_HEADER_BLOCK_BYTES}, got "
+                f"{pinned_info.get('header_block_bytes')}"
+            )
+        pinned_mv = memoryview(pinned_tensor.numpy().view(np.uint8))
+        L_id, E_id = ent.expert_id
+        write_lossless_from_pinned(
             ent.lossless_path,
+            pinned_mv,
             header_bytes=header,
-            tensor_bytes=tensor_bytes,
+            payload_bytes=payload_bytes,
+            layer=int(L_id),
+            expert=int(E_id),
+            step=int(step),
         )
+
         ent.lossless_step = int(step)
         ent.step = int(step)
 
-        # 4) Unlink previous lossy log (if any).
+        # 3) Unlink previous lossy log (if any).
         if ent.lossy_path.exists():
             try:
                 ent.lossy_path.unlink()
             except OSError:
                 pass
 
-        # 5) Pre-create fresh lossy FC file with its header for upcoming
+        # 4) Pre-create fresh lossy FC file with its header for upcoming
         # appends. _open_fresh_lossy runs on this BG thread, which owns
         # all fd mutations.
         self._open_fresh_lossy(ent, step=int(step))
@@ -420,9 +408,9 @@ class ExpertState:
         contiguous inputs.
 
         **Background-thread work** (in ``_do_lossy_fc_assemble_and_write``):
-        build the structured-dtype record array and ``os.writev`` it
-        with a (count, step) prefix into the per-expert lossy FC log,
-        lazily opening the fd if needed.
+        assemble the pinned (count, step, records) blob and emit a
+        single ``os.write`` into the per-expert lossy FC log, lazily
+        opening the fd if needed.
         """
         ent = self._entries.get(expert_id)
         if ent is None:
@@ -466,22 +454,36 @@ class ExpertState:
         filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         total_n: int,
     ) -> None:
-        """Writer-thread assembly + writev. Builds the structured-dtype
-        record array (interleaved idx/p/m/v fields) here so the training
-        thread never pays the per-iter numpy memcpy cost."""
-        arr = np.empty(total_n, dtype=_RECORD_DTYPE)
+        """Writer-thread assembly + single ``os.write`` from a pinned
+        AoS blob. Builds ``[prefix(8B) | records(N×16B)]`` directly
+        into pinned memory so the C++ SSD-passthrough writer can later
+        replace the ``os.write`` with a chunk-aligned io_uring submit
+        without any extra copy. The blob is allocated 4 KiB-aligned
+        (size padded up to next sector) so the data_ptr is O_DIRECT
+        compatible regardless of total_n."""
+        blob_bytes = BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
+        blob = alloc_pinned_uint8_sector_aligned(blob_bytes)
+        blob_np = blob.numpy()
+        struct.pack_into("<II", blob_np, 0, int(total_n), int(step))
+        rec_view = blob_np[
+            BLOCK_PREFIX_BYTES:BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
+        ].view(_RECORD_DTYPE)
         cursor = 0
         for (offset, idx_local, p, m, v) in filtered:
             n_i = int(idx_local.numel())
             idx_np = _to_i32_numpy(idx_local, n_i)
-            arr["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
-            arr["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
-            arr["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
-            arr["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
+            rec_view["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
+            rec_view["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
+            rec_view["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
+            rec_view["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
             cursor += n_i
         if ent.lossy_fd is None:
             self._open_fresh_lossy(ent, step=int(step))
-        append_lossy_log(ent.lossy_fd, int(arr.shape[0]), int(step), memoryview(arr))
+        L_id, E_id = ent.expert_id
+        append_lossy_log_from_pinned(
+            ent.lossy_fd, memoryview(blob_np), blob_bytes,
+            layer=int(L_id), expert=int(E_id), step=int(step),
+        )
 
     def lossy_fc_append_batch(
         self,
@@ -551,7 +553,8 @@ class ExpertState:
         gpu_refs: Optional[List[torch.Tensor]] = None,
     ) -> None:
         """Writer-thread handler for the batched variant — performs the
-        per-expert numpy assembly + writev sequentially.
+        per-expert SoA→AoS interleave into a pinned packed buffer +
+        single ``os.write`` sequentially.
 
         Synchronises on ``h2d_event`` first (when present) so we read
         the pinned tensors only after the d2h_stream copies that filled
@@ -567,19 +570,42 @@ class ExpertState:
         if gpu_refs is not None:
             gpu_refs.clear()
         for (ent, total_n, filtered) in prepared:
-            arr = np.empty(total_n, dtype=_RECORD_DTYPE)
+            # Per-expert pinned blob: [prefix(8B) | records(N×16B)].
+            # Allocated as a fresh pinned uint8 tensor so the C++
+            # writer (future SSD passthrough) can submit the entire
+            # blob in one chunk-aligned io_uring write. Torch's pinned
+            # caching allocator recycles freed buffers so per-iter
+            # alloc cost is small. Use sector-aligned helper so the
+            # blob's data_ptr is 4 KiB-aligned (small uint8 allocs from
+            # torch's caching pinned allocator may otherwise return
+            # non-page-aligned pointers — incompatible with O_DIRECT).
+            blob_bytes = BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
+            blob = alloc_pinned_uint8_sector_aligned(blob_bytes)
+            blob_np = blob.numpy()
+            # Pack (count, step) prefix at the head of the pinned blob.
+            struct.pack_into(
+                "<II", blob_np, 0, int(total_n), int(step),
+            )
+            # Interleave SoA planar → AoS packed directly into pinned.
+            rec_view = blob_np[
+                BLOCK_PREFIX_BYTES:BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
+            ].view(_RECORD_DTYPE)
             cursor = 0
             for (offset, idx_local, p, m, v) in filtered:
                 n_i = int(idx_local.numel())
                 idx_np = _to_i32_numpy(idx_local, n_i)
-                arr["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
-                arr["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
-                arr["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
-                arr["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
+                rec_view["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
+                rec_view["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
+                rec_view["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
+                rec_view["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
                 cursor += n_i
             if ent.lossy_fd is None:
                 self._open_fresh_lossy(ent, step=int(step))
-            append_lossy_log(ent.lossy_fd, int(arr.shape[0]), int(step), memoryview(arr))
+            L_id, E_id = ent.expert_id
+            append_lossy_log_from_pinned(
+                ent.lossy_fd, memoryview(blob_np), blob_bytes,
+                layer=int(L_id), expert=int(E_id), step=int(step),
+            )
 
     # ------------------------------------------------------------------
     # Teardown

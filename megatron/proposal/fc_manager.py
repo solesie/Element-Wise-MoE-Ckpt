@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import torch
 
 import math
 
 from .async_writer import AsyncWriter, WriteRecord
-from .binary_io import save_binary
+from . import binary_io
 from ._ds_state import get_mapper
 from .expert_state import ExpertState
 
@@ -351,6 +352,9 @@ class FCManager:
         names: List[str],
         named_params: Optional[Dict[str, torch.nn.Parameter]] = None,
         *, private: bool = False,
+        header_block_bytes: int = 0,
+        chunk_pad_bytes: int = 0,
+        preserve_order: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """Snapshot FP32 master + FP32 Adam state for each param.
 
@@ -370,7 +374,35 @@ class FCManager:
         payload yet, so reusing the cached buffer would corrupt it. Torch's
         caching pinned allocator recycles freed buffers, so steady-state
         cost is small.
+
+        ``header_block_bytes`` (≥ 0, multiple of 4): reserve a leading
+        region inside the pinned buffer for a file-format header. D2H
+        copies land at byte offset ``header_block_bytes``, leaving the
+        front of the buffer untouched for the caller to stamp the header
+        later (writer thread, after the d2h event). Must be a multiple of
+        4 because the pinned buffer dtype is fp32.
+
+        ``chunk_pad_bytes`` (≥ 0): if non-zero, round the pinned alloc
+        up to a multiple of this byte count. Used to pre-shape pinned
+        buffers for SSD passthrough (io_uring + O_DIRECT) — the C++
+        writer manages LBA in chunk-sized blocks, so emitting an
+        already-padded buffer lets it submit a single chunk-aligned
+        write. The on-disk file is still written at actual size only.
+
+        Pinned info for the caller is stashed on
+        ``self._last_collect_pinned_info`` as a dict with keys
+        ``pinned``, ``header_block_bytes``, ``payload_offset_bytes``,
+        ``payload_bytes``, ``total_pinned_bytes``.
         """
+        if header_block_bytes < 0 or (header_block_bytes & 3):
+            raise ValueError(
+                f"header_block_bytes must be a non-negative multiple of 4, "
+                f"got {header_block_bytes}"
+            )
+        if chunk_pad_bytes < 0:
+            raise ValueError(
+                f"chunk_pad_bytes must be non-negative, got {chunk_pad_bytes}"
+            )
         # Optimization B: cache the per-name (FP32 master view) entries
         # + plan + total_numel. Each iter's enum loop calls
         # ``_fp32_param`` and ``_fp32_opt_state`` on 130 params × 3 keys
@@ -381,7 +413,11 @@ class FCManager:
         # tuple identity + ``private`` (private path uses fresh pinned
         # so the dst/payload caches must differ).
         _t_enum0 = time.perf_counter()
-        cache_key = (id(names), private, len(names))
+        cache_key = (
+            id(names), private, len(names),
+            int(header_block_bytes), int(chunk_pad_bytes),
+            bool(preserve_order),
+        )
         # Multi-key cache: non-expert FC (private=False) and expert FC
         # (private=True) hit this function with DIFFERENT cache_keys.
         # A single-entry cache thrashed between them so every call paid
@@ -391,7 +427,18 @@ class FCManager:
         # total across all callers.
         if not hasattr(self, "_collect_enum_cache_by_key"):
             self._collect_enum_cache_by_key: Dict[Any, Dict[str, Any]] = {}
-        cached = self._collect_enum_cache_by_key.get(cache_key)
+        # ``preserve_order=True`` (LFCL path): bypass the cache entirely.
+        # Reason: an expert that has not yet received any token has no
+        # Adam state (exp_avg/exp_avg_sq are None). We substitute a zero
+        # placeholder so the on-disk layout always matches the schema,
+        # but on a later iter that same expert may have real Adam state
+        # — caching the zero placeholder would then silently write
+        # zeros forever. LFCL collects are tiny (~few MB / expert) so
+        # the per-call enum + plan rebuild is sub-millisecond.
+        cached = (
+            None if preserve_order
+            else self._collect_enum_cache_by_key.get(cache_key)
+        )
         if cached is not None:
             entries = cached["entries"]
             plan = cached["plan"]
@@ -409,6 +456,18 @@ class FCManager:
                 for key in ("exp_avg", "exp_avg_sq"):
                     v = _fp32_opt_state(self.optimizer, p, key)
                     if v is None:
+                        if preserve_order:
+                            # LFCL path: reserve the slot with a GPU
+                            # zero placeholder so the on-disk byte
+                            # layout is param|m|v per schema. Without
+                            # this, the file would be shorter than the
+                            # header claims (recovery would over-read).
+                            v = torch.zeros(
+                                int(p.numel()), dtype=torch.float32,
+                                device=src.device,
+                            )
+                            entries.append((f"{name}:{key}", v))
+                        # Non-LFCL path: skip the entry as before.
                         continue
                     entries.append((f"{name}:{key}", v.detach()))
             if not entries:
@@ -420,13 +479,20 @@ class FCManager:
             # contiguous offsets become adjacent → enables the merged
             # cudaMemcpyAsync path below. Stable sort preserves
             # within-storage ordering when offsets coincide.
+            #
+            # ``preserve_order=True`` (LFCL path): skip the sort so that
+            # the on-disk byte order matches the caller-provided ``names``
+            # iteration order (p|m|v per name). Trade-off: more
+            # D2H launches per expert (typically a handful), no
+            # measurable cost since expert collects are tiny.
             def _sort_key(it):
                 _k, t = it
                 try:
                     return (t.untyped_storage().data_ptr(), t.storage_offset())
                 except Exception:
                     return (0, 0)
-            entries = sorted(entries, key=_sort_key)
+            if not preserve_order:
+                entries = sorted(entries, key=_sort_key)
             plan: List[Tuple[str, int, int, torch.Size]] = []
             offset = 0
             for key, t in entries:
@@ -435,13 +501,14 @@ class FCManager:
                 offset += n
             total_numel = offset
             device = entries[0][1].device
-            with self._collect_cache_lock:
-                self._collect_enum_cache_by_key[cache_key] = {
-                    "entries": entries,
-                    "plan": plan,
-                    "total_numel": total_numel,
-                    "device": device,
-                }
+            if not preserve_order:
+                with self._collect_cache_lock:
+                    self._collect_enum_cache_by_key[cache_key] = {
+                        "entries": entries,
+                        "plan": plan,
+                        "total_numel": total_numel,
+                        "device": device,
+                    }
         _enum_ms = (time.perf_counter() - _t_enum0) * 1000.0
         if not entries:
             self._last_collect_sub_ms = {"enum_ms": _enum_ms, "copy_ms": 0.0, "xfer_ms": 0.0, "wait_ms": 0.0, "nentries": 0}
@@ -461,6 +528,26 @@ class FCManager:
         # queue and deadlock.
         _wait_ms = 0.0
 
+        # SSD-passthrough pinned layout: optional 4-KiB-aligned header
+        # region at the front, payload contiguous after it, optional
+        # chunk-pad at the tail. All sizes are in fp32 elements internally
+        # but exposed back to the caller as bytes via
+        # ``_last_collect_pinned_info``.
+        header_numel = int(header_block_bytes) // 4
+        payload_bytes = int(total_numel) * 4
+        total_with_header_bytes = int(header_block_bytes) + payload_bytes
+        if chunk_pad_bytes > 0:
+            padded_bytes = (
+                (total_with_header_bytes + int(chunk_pad_bytes) - 1)
+                // int(chunk_pad_bytes)
+            ) * int(chunk_pad_bytes)
+        else:
+            padded_bytes = total_with_header_bytes
+        if padded_bytes & 3:
+            # All allocs are in fp32 elements — must be 4-byte multiple.
+            padded_bytes = (padded_bytes + 3) & ~3
+        pinned_numel = padded_bytes // 4
+
         if private:
             # Fresh pinned buffer for THIS call only — caller (typically
             # ExpertLosslessFC) hands the resulting payload views to the
@@ -468,29 +555,40 @@ class FCManager:
             # consumption. Torch's pinned caching allocator recycles
             # freed buffers, so steady-state alloc cost is small.
             pinned = torch.empty(
-                total_numel, dtype=torch.float32, pin_memory=True,
+                pinned_numel, dtype=torch.float32, pin_memory=True,
             )
         else:
             pinned = self._collect_pinned_cpu
-            if pinned is None or pinned.numel() < total_numel:
+            if pinned is None or pinned.numel() < pinned_numel:
                 # Grow-only pinned allocation. Cost is paid once (or very
                 # rarely) per training run.
                 self._collect_pinned_cpu = torch.empty(
-                    total_numel, dtype=torch.float32, pin_memory=True,
+                    pinned_numel, dtype=torch.float32, pin_memory=True,
                 )
                 pinned = self._collect_pinned_cpu
 
         _t_xfer0 = time.perf_counter()
-        flat_cpu = pinned.narrow(0, 0, total_numel)
+        # ``flat_cpu`` is the payload region only — D2H lands here. The
+        # header region (pinned[:header_numel]) is left untouched for
+        # the caller to stamp later on the writer thread.
+        flat_cpu = pinned.narrow(0, header_numel, total_numel)
 
         # Optimization B (continued): cache dsts + srcs_resolved (already
         # cast to FP32 if needed) + payload_template. All stable while
         # ``pinned`` and ``entries`` don't rebuild. Per-iter dtype check
         # eliminated by capturing the resolved srcs in cache.
-        xfer_cache_key = (cache_key, pinned.data_ptr(), total_numel)
+        xfer_cache_key = (
+            cache_key, pinned.data_ptr(), total_numel, header_numel,
+        )
         if not hasattr(self, "_collect_xfer_cache_by_key"):
             self._collect_xfer_cache_by_key: Dict[Any, Dict[str, Any]] = {}
-        xfer_cached = self._collect_xfer_cache_by_key.get(xfer_cache_key)
+        # Same rationale as the enum cache: bypass for preserve_order
+        # (LFCL path) so a placeholder zero src never gets cached and
+        # later misused once Adam state exists for that expert.
+        xfer_cached = (
+            None if preserve_order
+            else self._collect_xfer_cache_by_key.get(xfer_cache_key)
+        )
         if xfer_cached is not None:
             dsts = xfer_cached["dsts"]
             srcs_resolved = xfer_cached["srcs_resolved"]
@@ -587,14 +685,15 @@ class FCManager:
                       flush=True)
             except Exception:
                 pass
-            with self._collect_cache_lock:
-                self._collect_xfer_cache_by_key[xfer_cache_key] = {
-                    "dsts": dsts,
-                    "srcs_resolved": srcs_resolved,
-                    "payload_template": payload_template,
-                    "merged_dsts": merged_dsts,
-                    "merged_srcs": merged_srcs,
-                }
+            if not preserve_order:
+                with self._collect_cache_lock:
+                    self._collect_xfer_cache_by_key[xfer_cache_key] = {
+                        "dsts": dsts,
+                        "srcs_resolved": srcs_resolved,
+                        "payload_template": payload_template,
+                        "merged_dsts": merged_dsts,
+                        "merged_srcs": merged_srcs,
+                    }
 
         cuda_event: Optional["torch.cuda.Event"] = None
         if torch.cuda.is_available():
@@ -618,7 +717,26 @@ class FCManager:
             "xfer_ms": _xfer_ms, "wait_ms": _wait_ms,
             "nentries": len(entries),
         }
-        # Stash the event for the immediate caller's submit().
+        # Stash the event + pinned info for the immediate caller's
+        # submit(). Stashed in a thread-local because the non-expert
+        # worker (private=False) and the expert worker (private=True)
+        # can both enter this method concurrently — a single-slot
+        # ``self.`` attribute would race between them.
+        if not hasattr(self, "_collect_tls"):
+            self._collect_tls = threading.local()
+        self._collect_tls.cuda_event = cuda_event
+        self._collect_tls.pinned_info = {
+            "pinned": pinned,
+            "header_block_bytes": int(header_block_bytes),
+            "payload_offset_bytes": int(header_block_bytes),
+            "payload_bytes": int(payload_bytes),
+            "total_pinned_bytes": int(padded_bytes),
+            "plan": list(plan),
+        }
+        # Back-compat alias for callers that still read the single-slot
+        # ``self._last_collect_cuda_event``. Safe under sequential
+        # access from a SINGLE worker thread; concurrent calls from
+        # both workers should read the thread-local instead.
         self._last_collect_cuda_event = cuda_event
         return payload, total_bytes
 
@@ -627,7 +745,22 @@ class FCManager:
         # named_params=None: the callee will lazily build it ONLY if the
         # enum cache misses. Steady-state (cache hit) skips the
         # ~few-ms dict(model.named_parameters()) walk.
-        return self._collect_param_payload(self._non_expert_names, None)
+        return self._collect_param_payload(
+            self._non_expert_names, None,
+            header_block_bytes=binary_io.HEADER_BLOCK_BYTES,
+            chunk_pad_bytes=binary_io.PIN_CHUNK_BYTES,
+        )
+
+    def _last_collect_pinned_info(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent ``_collect_param_payload`` pinned info
+        for THIS thread (set by the call inside the same worker). The
+        caller reads this immediately after the collect to drive a
+        single-write emit from pinned. Returns None if no collect has
+        run on this thread."""
+        tls = getattr(self, "_collect_tls", None)
+        if tls is None:
+            return None
+        return getattr(tls, "pinned_info", None)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -662,23 +795,41 @@ class FCManager:
             async_mode=self._async_writer is not None,
         )
 
-        def _save_binary(payload, p):
-            save_binary(p, payload)
-
         cuda_event = getattr(self, "_last_collect_cuda_event", None)
+        pinned_info = self._last_collect_pinned_info()
+        if pinned_info is None:
+            raise RuntimeError(
+                "non-expert FC: pinned_info missing — collect did not stash "
+                "the pinned buffer metadata (thread-local lost?)"
+            )
+        # Pre-build the header bytes on the training/owner thread — small
+        # CPU work (~tens of µs). The writer thread does the stamp +
+        # single os.write after syncing on cuda_event.
+        header_bytes = binary_io.build_prptens_header_block(
+            pinned_info["plan"],
+            scalars={"step": int(step)},
+        )
         rec = WriteRecord(tag="fc", path=path, submit_time=time.perf_counter())
 
         def _do_save(
-            _payload=payload, _path=path, _save_fn=_save_binary,
+            _path=path, _pinned_info=pinned_info, _header=header_bytes,
             _cuda_event=cuda_event, _on_complete=_unlink, _rec=rec,
-            _stats=stats,
+            _stats=stats, _step=int(step),
         ) -> None:
             t0 = time.perf_counter()
             _rec.queue_delay_ms = (t0 - _rec.submit_time) * 1000.0
             try:
                 if _cuda_event is not None:
                     _cuda_event.synchronize()
-                _save_fn(_payload, _path)
+                pinned_tensor = _pinned_info["pinned"]
+                payload_bytes_local = _pinned_info["payload_bytes"]
+                pinned_mv = memoryview(
+                    pinned_tensor.numpy().view(np.uint8)
+                )
+                binary_io.write_prptens_from_pinned(
+                    _path, pinned_mv, _header, payload_bytes_local,
+                    step=_step,
+                )
                 try:
                     _rec.file_bytes = int(_path.stat().st_size)
                 except FileNotFoundError:

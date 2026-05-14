@@ -1123,80 +1123,26 @@ class ImportanceTracker:
                   flush=True)
 
     @torch.no_grad()
-    def _dispatch_pending_payload(
-        self, optimizer: torch.optim.Optimizer,
-        current_iter_excluded: Optional[set] = None,
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _walk_thresholds(
+        self, pending: Dict[str, Any], prev_step: int, g_blk: int,
     ) -> None:
-        """B2: Dispatch the previous iter's tracker work — runs at the
-        START of the next iter's tracker.step. By then the tracker_stream
-        GPU work is finished (forward+backward+optimizer of the new iter
-        run in parallel on main_stream), so the host-blocking sync here
-        is short.
+        """Compute per-element score thresholds for THIS iter's
+        lossy-FC selection and write them into kernel state
+        (``self._g_fast_prev_threshold_t``, ``self._outlier_prev_th``,
+        ``self._outlier_prev_floor``, ``self._prev_s_max_g``,
+        ``self._outlier_prev_smax``).
 
-        Operations:
-          1. event_tracker.synchronize()  — wait for prev tracker GPU work
-          2. seg_bounds.cpu()             — small sync (n_names+1 longs)
-          3. for each name: index_select p, m, v + delta_g reset + H2D
-          4. lossy_fc_append per expert (async writer queue push)
+        Three branches based on group quantisation g_blk and the
+        outlier-promotion flag:
+          1. g_blk == 1                            : single-pool walk on group hist
+          2. g_blk >= 2 and not outlier_promote    : group-pool only walk
+          3. outlier_promote and elem_hist present : unified two-pool walk
 
-        ``current_iter_excluded`` (CLAUDE.md correctness): experts that
-        FIRED a lossless FC on the CURRENT iter (T) must be excluded
-        from this dispatch even though pending was stashed at T-1 with
-        T-1's excluded set. Reason: at T-1 the about-to-fire experts had
-        non-zero score and may have ended up in top_idx_sorted; at T,
-        ``ExpertLosslessFC.fire_if_due`` already enqueued a lossless
-        write for them on the same raw-queue (FIFO). If we still append
-        T-1's lossy data here, the worker would scatter T-1's stale
-        values *on top of* the just-written T LFCL — a recovery
-        regression. Skipping them here keeps T's LFCL authoritative.
-        """
-        import time as _time_dsp
-        import os as _os_dsp
-        _dsp_dbg = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP", "") in ("1",)
-        # Narrow peak-memory window for dispatch only — set
-        # PROPOSAL_OUTLIER_DBG_DSP_PEAK=1 to log dispatch's GPU
-        # transient contribution (in addition to the iter-level peak
-        # in cp_hooks). Reset at entry, read at exit; isolates dispatch
-        # from forward/backward/optimizer's own transient peaks.
-        _dsp_peak = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP_PEAK", "") in ("1",)
-        _t_dsp_entry = _time_dsp.perf_counter() if _dsp_dbg else 0.0
-        if _dsp_peak and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            _dsp_alloc_at_entry = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-        pending = self._pending_dispatch
-        if pending is None:
-            return
-        ev = self._pending_tracker_event
-        if ev is not None:
-            try:
-                ev.synchronize()
-            except Exception:
-                pass
-            self._pending_tracker_event = None
-        _t_after_evsync = _time_dsp.perf_counter() if _dsp_dbg else 0.0
-
-        seg_bounds = pending["seg_bounds"]
-        top_idx_sorted = pending["top_idx_sorted"]
-        name_list = pending["name_list"]
-        offsets_cpu = pending["offsets_cpu"]
-        # Union T-1's stashed excluded set with T's fired set so any
-        # expert that started a lossless FC at T is skipped from T-1's
-        # pending lossy append. Without this, T-1 stale lossy values
-        # would land on the fresh LFCL/dense buffer (recovery bug).
-        excluded_eids = set(pending["excluded_eids"])
-        if current_iter_excluded:
-            excluded_eids |= set(current_iter_excluded)
-        prev_step = pending["step"]
-
-        seg_bounds_cpu = seg_bounds.cpu()
-        _t_after_segcpu = _time_dsp.perf_counter() if _dsp_dbg else 0.0
-        device = next(self.model.parameters()).device
-        g_blk = max(1, int(self.block_quant_g))
-        arange_g = self._g_fast_arange_g
-        mapper = get_mapper()
-        stream = self._tracker_stream
-
+        See the inline comments in each branch for detailed
+        rationale (K-budget arithmetic, FLOOR_MULT, prev_smax
+        adaptation, multi-GPU semantics)."""
         # === Unified two-pool top-K: merged-walk on two histograms ===
         # === under a single K-budget.                              ===
         # Role: produce ONE element-axis threshold (and its group-axis
@@ -1539,6 +1485,82 @@ class ImportanceTracker:
                     f"sum={elem_above + group_above_elem_units}/{K_total}",
                     flush=True,
                 )
+
+    def _dispatch_pending_payload(
+        self, optimizer: torch.optim.Optimizer,
+        current_iter_excluded: Optional[set] = None,
+    ) -> None:
+        """B2: Dispatch the previous iter's tracker work — runs at the
+        START of the next iter's tracker.step. By then the tracker_stream
+        GPU work is finished (forward+backward+optimizer of the new iter
+        run in parallel on main_stream), so the host-blocking sync here
+        is short.
+
+        Operations:
+          1. event_tracker.synchronize()  — wait for prev tracker GPU work
+          2. seg_bounds.cpu()             — small sync (n_names+1 longs)
+          3. for each name: index_select p, m, v + delta_g reset + H2D
+          4. lossy_fc_append per expert (async writer queue push)
+
+        ``current_iter_excluded`` (CLAUDE.md correctness): experts that
+        FIRED a lossless FC on the CURRENT iter (T) must be excluded
+        from this dispatch even though pending was stashed at T-1 with
+        T-1's excluded set. Reason: at T-1 the about-to-fire experts had
+        non-zero score and may have ended up in top_idx_sorted; at T,
+        ``ExpertLosslessFC.fire_if_due`` already enqueued a lossless
+        write for them on the same raw-queue (FIFO). If we still append
+        T-1's lossy data here, the worker would scatter T-1's stale
+        values *on top of* the just-written T LFCL — a recovery
+        regression. Skipping them here keeps T's LFCL authoritative.
+        """
+        import time as _time_dsp
+        import os as _os_dsp
+        _dsp_dbg = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP", "") in ("1",)
+        # Narrow peak-memory window for dispatch only — set
+        # PROPOSAL_OUTLIER_DBG_DSP_PEAK=1 to log dispatch's GPU
+        # transient contribution (in addition to the iter-level peak
+        # in cp_hooks). Reset at entry, read at exit; isolates dispatch
+        # from forward/backward/optimizer's own transient peaks.
+        _dsp_peak = _os_dsp.environ.get("PROPOSAL_OUTLIER_DBG_DSP_PEAK", "") in ("1",)
+        _t_dsp_entry = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+        if _dsp_peak and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _dsp_alloc_at_entry = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+        pending = self._pending_dispatch
+        if pending is None:
+            return
+        ev = self._pending_tracker_event
+        if ev is not None:
+            try:
+                ev.synchronize()
+            except Exception:
+                pass
+            self._pending_tracker_event = None
+        _t_after_evsync = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+
+        seg_bounds = pending["seg_bounds"]
+        top_idx_sorted = pending["top_idx_sorted"]
+        name_list = pending["name_list"]
+        offsets_cpu = pending["offsets_cpu"]
+        # Union T-1's stashed excluded set with T's fired set so any
+        # expert that started a lossless FC at T is skipped from T-1's
+        # pending lossy append. Without this, T-1 stale lossy values
+        # would land on the fresh LFCL/dense buffer (recovery bug).
+        excluded_eids = set(pending["excluded_eids"])
+        if current_iter_excluded:
+            excluded_eids |= set(current_iter_excluded)
+        prev_step = pending["step"]
+
+        seg_bounds_cpu = seg_bounds.cpu()
+        _t_after_segcpu = _time_dsp.perf_counter() if _dsp_dbg else 0.0
+        device = next(self.model.parameters()).device
+        g_blk = max(1, int(self.block_quant_g))
+        arange_g = self._g_fast_arange_g
+        mapper = get_mapper()
+        stream = self._tracker_stream
+
+        self._walk_thresholds(pending, prev_step, g_blk)
 
         # Outlier-promotion: derive elem_idx from the GPU snapshot
         # stashed at prev iter's tracker.step. ev.synchronize() above

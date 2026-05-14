@@ -178,6 +178,7 @@ class DramExpertState:
                                        Optional[torch.Tensor],
                                        Optional[torch.Tensor]]],
         cuda_event: Optional["torch.cuda.Event"] = None,
+        pinned_info: Optional[Any] = None,  # noqa: ARG002 — disk path only
     ) -> None:
         """Replace dense (param, m, v) buffer with the supplied triples.
 

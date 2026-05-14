@@ -32,7 +32,6 @@ from typing import (
 import torch
 
 from .async_writer import AsyncWriter, WriteRecord
-from .binary_io import save_binary
 from .expert_state import ExpertState
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx) — same shape as fc_manager
@@ -226,6 +225,16 @@ class ExpertLosslessFC:
             getattr(self._event_owner, "_last_collect_cuda_event", None)
             if self._event_owner is not None else None
         )
+        # Pinned info for SSD-passthrough prep: the LFCL writer emits a
+        # single os.write of (header + payload) from this pinned buffer
+        # (header reserved at the front by _collect_param_payload). Read
+        # via the thread-local helper to stay race-safe across the two
+        # domain workers.
+        pinned_info = None
+        if self._event_owner is not None:
+            _get = getattr(self._event_owner, "_last_collect_pinned_info", None)
+            if callable(_get):
+                pinned_info = _get()
         _col_ms = (time.perf_counter() - _t_col0) * 1000.0
 
         # 2. Submit to ExpertState (disk or DRAM). Both implementations
@@ -255,6 +264,7 @@ class ExpertLosslessFC:
                     step=int(step),
                     initial_state=initial_state,
                     cuda_event=collect_event,
+                    pinned_info=pinned_info,
                 )
         _dp_ms = (time.perf_counter() - _t_dp0) * 1000.0
 
