@@ -48,7 +48,6 @@ rm -f "${FAULT_LOG}"
 PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
     --proposal-cp-mode proposal \
     --proposal-selection-mode hessian \
-    --proposal-hessian-estimator hutchinson \
     --proposal-hessian-refresh-every 40 \
     --proposal-hessian-num-samples 4 \
     --proposal-topk-ratio 0.04 \

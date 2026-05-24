@@ -233,7 +233,7 @@ def _load_fc_payload_into(
         data = read_expert_state(payload_path, layer=expert_id[0],
                                   expert=expert_id[1])
     else:
-        from .binary_io import is_binary_format, load_binary
+        from .proposal_io import is_binary_format, load_binary
         if is_binary_format(payload_path):
             tensor_dict, _scalars = load_binary(payload_path)
             data = tensor_dict

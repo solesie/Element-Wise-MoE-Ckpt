@@ -59,10 +59,21 @@ checkpoint mode is similarly unaffected (still file-based).
 """
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
+
+from .expert_state import (
+    BLOCK_PREFIX_BYTES, RECORD_BYTES, _RECORD_DTYPE,
+)
+from . import gpu_aos as _gpu_aos
+from .proposal_io import (
+    SECTOR_BYTES as _BIN_SECTOR_BYTES,
+    alloc_pinned_uint8_sector_aligned,
+)
 
 # Tuple alias matches expert_state.ExpertId so callers can pass either
 # class through the same expert-id-keyed maps without conversion.
@@ -109,6 +120,36 @@ class DramExpertState:
         self._lossless_step: Dict[ExpertId, int] = {}
         self._last_step: Dict[ExpertId, int] = {}
 
+        # Phase 5: pre-allocate pinned_aos at half the total expert state
+        # bytes. Same sizing rule as ExpertState (see comment there); the
+        # buffer is overwritten every iter per DRAM mode's "fixed region,
+        # repeated overwrite" semantics.
+        _total_param_numel = sum(
+            int(numel)
+            for schema in expert_tensor_map.values()
+            for (_tname, _shape, numel) in schema
+        )
+        _total_state_bytes = _total_param_numel * 12  # p + m + v, fp32
+        _pinned_aos_bytes = _total_state_bytes // 2
+        _sect = int(_BIN_SECTOR_BYTES)
+        _pinned_aos_bytes = (
+            (_pinned_aos_bytes + _sect - 1) // _sect
+        ) * _sect
+        if _pinned_aos_bytes <= 0:
+            _pinned_aos_bytes = _sect
+        self._pinned_aos: torch.Tensor = alloc_pinned_uint8_sector_aligned(
+            _pinned_aos_bytes
+        )
+        print(
+            f"[proposal] DramExpertState pinned_aos pre-alloc: "
+            f"{_pinned_aos_bytes / 1e9:.2f} GB "
+            f"(half of {_total_state_bytes / 1e9:.2f} GB total expert state)",
+            flush=True,
+        )
+        self._aos_pipeline: _gpu_aos.LossyAosPipeline = _gpu_aos.LossyAosPipeline(
+            pinned_aos=self._pinned_aos,
+        )
+
         # Phase 1: compute total flat size (3 × Σ numel for p/m/v).
         total_numel = 0
         for eid, schema in expert_tensor_map.items():
@@ -141,6 +182,19 @@ class DramExpertState:
             f"flat-buffer offset accounting mismatch: "
             f"used {offset} of {total_numel}"
         )
+
+    # ------------------------------------------------------------------
+    # Dispatch helper — mirrors ExpertState._dispatch so the same submit
+    # path is used in both modes. Routes commit work to the AsyncWriter's
+    # raw worker; falls back to inline only when no writer is attached
+    # (offline / unit-test path).
+    # ------------------------------------------------------------------
+    def _dispatch(self, fn: "Callable[..., None]", *args: Any, tag: str) -> None:
+        del tag
+        if self._async_writer is not None:
+            self._async_writer.submit_raw(fn, *args)
+        else:
+            fn(*args)
 
     # ------------------------------------------------------------------
     # Introspection — mirror ExpertState's API surface.
@@ -229,10 +283,11 @@ class DramExpertState:
                 else:
                     buf["v"].zero_()
 
-        # Caller (ExpertLosslessFC._fire_one) already runs on the
-        # host_writer_expert worker — inline avoids self-recursive
-        # enqueueing into the same FIFO.
-        _do_lossless_fc()
+        # Route to raw worker (same FIFO as lossy_fc_append_batch) so
+        # host_writer_expert returns immediately. FIFO ordering on raw
+        # guarantees this lossless write completes before any subsequent
+        # lossy scatter on the same expert.
+        self._dispatch(_do_lossless_fc, tag=f"lossless_fc_eid{expert_id}")
 
     # ------------------------------------------------------------------
     # Lossy FC (per-iter sparse updates → scatter into dense buffer)
@@ -284,106 +339,143 @@ class DramExpertState:
     def lossy_fc_append_batch(
         self,
         step: int,
-        per_expert_updates: Dict[ExpertId, List[Tuple[str, torch.Tensor,
-                                                       torch.Tensor, torch.Tensor,
-                                                       torch.Tensor]]],
-        h2d_event: Optional[Any] = None,
+        per_expert_updates: Dict[ExpertId, List[Tuple[str, int, int, int]]],
+        tracker_event: Optional[Any] = None,
         gpu_refs: Optional[List[torch.Tensor]] = None,
+        bf16_groups: Optional[List[Any]] = None,
+        lossy_state: Optional[Any] = None,
+        per_expert_outlier_n: Optional[Dict[ExpertId, Dict[str, int]]] = None,
     ) -> int:
-        """Batch variant: package all per-expert scatter ops and submit
-        ONE writer-thread job. Avoids ~80 per-iter ``submit_raw`` lock
-        round-trips that the training thread paid in the per-call form,
-        and moves the actual scatter compute off the training thread.
+        import os as _os_trace
+        _msg = f"[DRAM_LOSSY_ENTRY] step={step} n_experts={len(per_expert_updates)}\n"
+        _os_trace.write(2, _msg.encode())
+        """Phase 4 — DRAM mode uses the SAME GPU AOS pipeline as the disk
+        path (``ExpertState``); the only differences are:
 
-        ``h2d_event``: optional cuda.Event recorded after the d2h_stream
-        copies that populated the pinned-host tensors in
-        ``per_expert_updates``. Writer thread synchronises on it before
-        running the scatter — keeps the H2D off the training-thread
-        critical path while guaranteeing read-after-write ordering.
+        * **Overwrite semantics**: the per-iter pinned_aos buffer is the
+          ONLY fixed staging area. It is overwritten every iter — no
+          disk log accumulates. ``self._buffers`` (the dense host
+          mirror) is updated incrementally by scattering each iter's
+          records onto it via numpy fancy indexing.
+        * **No ``::write``** to disk — the per-expert finalisation just
+          updates ``self._buffers[eid][tname]`` in place.
 
-        ``gpu_refs``: optional list of GPU tensors that were the *source*
-        of the H2D copies into ``per_expert_updates``'s pinned tensors.
-        The training thread hands ownership to the writer thread; the
-        writer releases (clears the list) only AFTER ``h2d_event``
-        synchronises, guaranteeing the GPU memory cannot be reclaimed
-        by the caching allocator before the H2D completes. Replaces the
-        prior ``record_stream`` patch with explicit ownership transfer
-        — see Phase B in ``_dispatch_pending_payload``."""
-        import os as _os
-        if _os.environ.get("PROPOSAL_SKIP_EXPERT_WRITES", "") in ("1", "true", "True"):
-            grand = 0
-            for eid, tensor_updates in per_expert_updates.items():
-                n = sum(int(idx.numel()) for (_, idx, _, _, _) in tensor_updates)
-                if n > 0:
-                    self._last_step[eid] = int(step)
-                grand += n
-            return grand
-
-        # Training-thread: light validation + package. The actual
-        # scatter (CPU memcpy with random indices) happens in the
-        # writer thread.
-        prepared: List[Tuple[ExpertId,
-                             List[Tuple[Dict[str, Any], torch.Tensor,
-                                        torch.Tensor, torch.Tensor,
-                                        torch.Tensor]]]] = []
+        Lazy single-allocation: pinned_aos and segment_pipeline staging
+        are allocated on the first call sized with 1.5× headroom; later
+        iters MUST fit.
+        """
+        prepared: List[Tuple[ExpertId, int,
+                             List[Tuple[str, int, int, int, int]]]] = []
+        outlier_n_per_expert_entry: List[List[int]] = []
         grand_total = 0
         for eid, tensor_updates in per_expert_updates.items():
             tensor_buffers = self._buffers.get(eid)
             if tensor_buffers is None:
                 continue
-            per_expert: List[Tuple[Dict[str, Any], torch.Tensor,
-                                    torch.Tensor, torch.Tensor,
-                                    torch.Tensor]] = []
-            n_eid = 0
-            for (tname, idx_local, p, m, v) in tensor_updates:
-                buf = tensor_buffers.get(tname)
-                if buf is None:
+            total_n = 0
+            filtered: List[Tuple[str, int, int, int, int]] = []
+            outlier_ns_for_expert: List[int] = []
+            outlier_map_for_expert = (
+                per_expert_outlier_n.get(eid, {}) if per_expert_outlier_n else {}
+            )
+            # global_offsets are not stored on DramExpertState; recompute
+            # tname → flat offset within the expert's (p|m|v) layout on
+            # the fly. Same convention as expert_state._ExpertEntry.
+            tname_offsets: Dict[str, int] = {}
+            cursor = 0
+            for tname, buf in tensor_buffers.items():
+                tname_offsets[tname] = cursor
+                cursor += int(buf["numel"])
+            for (tname, bf16_group_idx, src_off, n_recs) in tensor_updates:
+                if tname not in tname_offsets:
                     continue
-                n_i = int(idx_local.numel())
-                if n_i == 0:
+                n_outlier_for_entry = int(outlier_map_for_expert.get(tname, 0))
+                n_total_recs = int(n_recs) + n_outlier_for_entry
+                if n_total_recs <= 0:
                     continue
-                per_expert.append((buf, idx_local, p, m, v))
-                n_eid += n_i
-            if n_eid > 0:
-                self._last_step[eid] = int(step)
-                prepared.append((eid, per_expert))
-                grand_total += n_eid
+                filtered.append((
+                    tname, tname_offsets[tname],
+                    int(bf16_group_idx), int(src_off), n_total_recs,
+                ))
+                outlier_ns_for_expert.append(n_outlier_for_entry)
+                total_n += n_total_recs
+            if total_n == 0:
+                continue
+            self._last_step[eid] = int(step)
+            prepared.append((eid, total_n, filtered))
+            outlier_n_per_expert_entry.append(outlier_ns_for_expert)
+            grand_total += total_n
         if not prepared:
+            if gpu_refs is not None:
+                gpu_refs.clear()
             return 0
-        # Caller (ImportanceTracker._dispatch_pending_payload) already
-        # runs on the host_writer_expert worker — inline avoids a
-        # self-recursive submit into the same FIFO.
-        self._do_dram_lossy_batch(prepared, h2d_event, gpu_refs)
+        self._dispatch(
+            self._do_lossy_fc_dram_aos,
+            int(step), prepared, tracker_event, gpu_refs, bf16_groups,
+            lossy_state, outlier_n_per_expert_entry,
+            tag=f"dram_lossy_batch_iter{int(step)}",
+        )
         return grand_total
 
-    @torch.no_grad()
-    def _do_dram_lossy_batch(
+    def _do_lossy_fc_dram_aos(
         self,
-        prepared: List[Tuple[ExpertId,
-                             List[Tuple[Dict[str, Any], torch.Tensor,
-                                        torch.Tensor, torch.Tensor,
-                                        torch.Tensor]]]],
-        h2d_event: Optional[Any] = None,
-        gpu_refs: Optional[List[torch.Tensor]] = None,
+        step: int,
+        prepared: List[Tuple[ExpertId, int,
+                              List[Tuple[str, int, int, int, int]]]],
+        tracker_event,
+        gpu_refs,
+        bf16_groups,
+        lossy_state: Optional[Any] = None,
+        outlier_n_per_expert_entry: Optional[List[List[int]]] = None,
     ) -> None:
-        """Writer-thread handler — synchronises on ``h2d_event`` (if any)
-        then runs the scatter ops sequentially. Releases ``gpu_refs``
-        (Phase A staging tensors) AFTER the event sync so the caching
-        allocator can safely reuse their memory — at which point the
-        H2D is provably complete."""
-        if h2d_event is not None:
-            try:
-                h2d_event.synchronize()
-            except Exception:
-                pass
-        if gpu_refs is not None:
-            gpu_refs.clear()
-        for (eid, per_expert) in prepared:
-            for (buf, idx_local, p, m, v) in per_expert:
-                idx_long = idx_local.to(torch.long, copy=False)
-                buf["p"].scatter_(0, idx_long, p.to(torch.float32))
-                buf["m"].scatter_(0, idx_long, m.to(torch.float32))
-                buf["v"].scatter_(0, idx_long, v.to(torch.float32))
+        """Writer-thread DRAM finalisation: drive the shared GPU AOS
+        pipeline, then numpy-scatter each expert's records onto its
+        dense ``self._buffers`` slot. No disk ``::write``.
+        """
+        class _DramEntShim:
+            __slots__ = ("expert_id",)
+            def __init__(self, eid): self.expert_id = eid
+        prepared_for_pipeline = [
+            (_DramEntShim(eid), total_n, filtered)
+            for (eid, total_n, filtered) in prepared
+        ]
+        expert_specs, total_aos = self._aos_pipeline.run(
+            step=int(step),
+            prepared=prepared_for_pipeline,
+            tracker_event=tracker_event,
+            gpu_refs=gpu_refs,
+            bf16_groups=bf16_groups,
+            lossy_state=lossy_state,
+            outlier_n_per_expert_entry=outlier_n_per_expert_entry,
+        )
+        if total_aos == 0:
+            return
+        pinned_aos_np = self._aos_pipeline.pinned_aos.numpy()
+        for spec, (eid, _total_n, filtered) in zip(expert_specs, prepared):
+            blob = pinned_aos_np[
+                spec.aos_byte_off:spec.aos_byte_off + spec.blob_padded_bytes
+            ]
+            n_recs_total = int(spec.n_records)
+            if n_recs_total == 0:
+                continue
+            recs = blob[BLOCK_PREFIX_BYTES:
+                        BLOCK_PREFIX_BYTES + n_recs_total * RECORD_BYTES
+                        ].view(_RECORD_DTYPE)
+            tensor_buffers = self._buffers.get(eid)
+            if tensor_buffers is None:
+                continue
+            cursor = 0
+            for (tname, t_off, _bf16_g, _src_off, n_recs) in filtered:
+                buf = tensor_buffers.get(tname)
+                if buf is None:
+                    cursor += n_recs
+                    continue
+                seg = recs[cursor:cursor + n_recs]
+                cursor += n_recs
+                idx_local = (seg["idx"] - np.int64(t_off)).astype(np.intp)
+                buf["p"].numpy()[idx_local] = seg["p"]
+                buf["m"].numpy()[idx_local] = seg["m"]
+                buf["v"].numpy()[idx_local] = seg["v"]
 
     # ------------------------------------------------------------------
     # Bookkeeping no-ops (kept for API compatibility with ExpertState).
@@ -394,7 +486,7 @@ class DramExpertState:
         del only_eids
         if self._async_writer is not None:
             try:
-                self._async_writer.drain_expert()
+                self._async_writer.drain_raw()
             except Exception:
                 pass
 

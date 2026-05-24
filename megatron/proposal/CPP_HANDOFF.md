@@ -42,6 +42,8 @@ Python (Megatron-DeepSpeed proposal CP) ↔ C++ (io_uring + O_DIRECT NVMe writer
 
 C++ 는 **in-process** (shared library, ctypes/pybind11 로 load) 로 동작하는 것이 기본. Torch 가 pinned 를 관리하므로 in-process 가 단순. (별도 프로세스 격리가 필요하다면 pinned allocator 자체를 별도 구현해야 함...)
 
+대충 지금 python thread는 non-expert worker thread, expert worker thread 있는데, uring 쓸때 c쪽에서 더 생성해도 된다고 봄.
+
 ---
 
 ## 2. 세 가지 파일 종류
@@ -99,8 +101,10 @@ C++ 는 **in-process** (shared library, ctypes/pybind11 로 load) 로 동작하�
 0                                          BLOCK_PREFIX_BYTES + N×RECORD_BYTES
 ├─ count u32 LE  — 이 block 의 record 수
 ├─ step  u32 LE  — 이 record 들을 만든 iteration
-├─ records[0..N] — 각 (idx i32, p f32, m f32, v f32) packed = 16 byte
+├─ records[0..N] — 각 (idx i64, p f32, m f32, v f32) packed = 20 byte
 ```
+
+`idx` 는 per-expert combined offset (`tname_base + idx_local`). i32 는 per-expert (param+m+v) numel 이 ~2.1 B 를 넘는 큰 MoE 에서 silently overflow 하므로 i64 로 고정.
 
 복구는 block 의 `count` 를 사용해 다음 block boundary 를 찾으며 순차 walk. `step` 은 rolling-step marker (informational + 진단 로그 용도) — record 적용에는 사용되지 않음 (file 순서 = chronological 순서).
 
@@ -260,37 +264,7 @@ Submit ring 은 2 개 (NE + Expert, Python 의 두 worker domain 과 매칭) —
 
 ---
 
-## 6. LFSY chunk-buffer 메커니즘
-
-LFSY 는 per-append 크기가 4 KiB-align 되지 않는 유일한 종류. Per-blob pinned alignment 는 helper 가 alloc 을 4 KiB padding 해서 해결했지만 **file offset** 이 매 append 후 미정렬이라 곧바로 O_DIRECT append 는 실패.
-
-**Per-expert chunk buffer** (권장, C++ 측):
-
-```
-+──────────────────────────────────────────────────+
-│ aligned chunk buffer (예: 64 MiB, mmap)          │  ← 4 KiB-aligned base
-+──────────────────────────────────────────────────+
-│ ◄── write cursor (시작에서 B 바이트)              │
-│                                                  │
-│ ┌──────────────────────────────────────────────┐ │
-│ │ 누적된 append block 들                       │ │
-│ │ [count,step,recs][count,step,recs]...        │ │
-│ └──────────────────────────────────────────────┘ │
-│                                                  │
-+──────────────────────────────────────────────────+
-```
-
-각 LFSY append `(layer, expert, step, blob, total_bytes)` 에 대해:
-1. 해당 expert 의 chunk buffer 를 lookup.
-2. `memcpy(chunk + cursor, blob, total_bytes)` 수행. (작은 1 회 복사 — 대안: C++ 가 "다음 write slot" 을 Python 에 미리 publish 하여 memcpy 제거. 우선은 단순화 위해 후순위.)
-3. cursor 갱신.
-4. cursor 가 4 KiB boundary 를 넘으면 완료된 sector 범위를 flush submit (선택). cursor 가 CHUNK_SIZE 도달 시 chunk 전체 write submit + 새 chunk 시작.
-
-Chunk buffer 의 base 주소는 4 KiB-aligned (mmap 또는 `cudaHostAlloc`). io_uring write 는 그 안에서 4 KiB 배수 범위만 submit. tail byte (마지막 4 KiB boundary 와 cursor 사이) 는 다음 boundary 까지 또는 강제 flush 시까지 메모리에 보유 (예: 해당 expert 의 LFCL fire 가 파일을 리셋할 때).
-
----
-
-## 7. Read 경로 (recovery)
+## 6. Read 경로 (recovery)
 
 현재 Python 아직 그대로 file system 유지:
 - `recovery.recover()` 가 `os.pread` + `np.frombuffer` + `ThreadPoolExecutor(max_workers=8)` 로 per-expert 병렬 로드.
@@ -308,7 +282,7 @@ C++ 가 `IORING_OP_READ` 로 Python alloc 한 pinned destination 에 직접 read
 
 ---
 
-## 8. 볼만한 파일
+## 7. 볼만한 파일
 
 | 파일 | 봐야 할 것 |
 |---|---|

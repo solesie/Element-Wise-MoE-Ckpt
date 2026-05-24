@@ -18,7 +18,7 @@ import torch
 import math
 
 from .async_writer import AsyncWriter, WriteRecord
-from . import binary_io
+from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
 from ._ds_state import get_mapper
 from .expert_state import ExpertState
 
@@ -558,14 +558,24 @@ class FCManager:
                 pinned_numel, dtype=torch.float32, pin_memory=True,
             )
         else:
+            # Phase 5: NE-FC pinned is allocated ONCE on first call with
+            # 1.5× headroom over that first iter's footprint. Subsequent
+            # iters MUST fit (we raise if not — the FP32 master + Adam
+            # state is fixed at init, so first-iter sizing is exact).
             pinned = self._collect_pinned_cpu
-            if pinned is None or pinned.numel() < pinned_numel:
-                # Grow-only pinned allocation. Cost is paid once (or very
-                # rarely) per training run.
+            if pinned is None:
+                init_numel = int(pinned_numel * 1.5)
                 self._collect_pinned_cpu = torch.empty(
-                    pinned_numel, dtype=torch.float32, pin_memory=True,
+                    init_numel, dtype=torch.float32, pin_memory=True,
                 )
                 pinned = self._collect_pinned_cpu
+            elif pinned.numel() < pinned_numel:
+                raise RuntimeError(
+                    f"_collect_pinned_cpu: pre-allocated capacity "
+                    f"{pinned.numel()} < required {pinned_numel}. NE-FC "
+                    f"payload size grew after first iter — should not "
+                    f"happen with fixed FP32 master + Adam layout."
+                )
 
         _t_xfer0 = time.perf_counter()
         # ``flat_cpu`` is the payload region only — D2H lands here. The
@@ -780,10 +790,7 @@ class FCManager:
 
         def _unlink(paths: List[Path] = to_unlink) -> None:
             for p in paths:
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
+                binary_io.unlink_path(p)
 
         stats = FCEventStats(
             kind="nonexpert",
@@ -823,13 +830,18 @@ class FCManager:
                     _cuda_event.synchronize()
                 pinned_tensor = _pinned_info["pinned"]
                 payload_bytes_local = _pinned_info["payload_bytes"]
-                pinned_mv = memoryview(
-                    pinned_tensor.numpy().view(np.uint8)
-                )
-                binary_io.write_prptens_from_pinned(
-                    _path, pinned_mv, _header, payload_bytes_local,
-                    step=_step,
-                )
+                # Ablation knob: PROPOSAL_DISK_SKIP_WRITE=1 skips the
+                # NE-FC ::write (the 1.2 GB pinned → pagecache memcpy
+                # that CLAUDE.md +355 ms diagnosis identified as the
+                # dominant L3 polluter). 측정 전용 — 복구 데이터 안 만듦.
+                import os as _os_skip
+                _skip_write = _os_skip.environ.get(
+                    "PROPOSAL_DISK_SKIP_WRITE", "") in ("1", "true", "True")
+                if not _skip_write:
+                    binary_io.write_prptens_from_pinned(
+                        _path, pinned_tensor, _header, payload_bytes_local,
+                        step=_step,
+                    )
                 try:
                     _rec.file_bytes = int(_path.stat().st_size)
                 except FileNotFoundError:
@@ -904,16 +916,10 @@ class FCManager:
     def cleanup(self) -> None:
         for history in self._expert_fc_files.values():
             for path, _rec in history:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+                binary_io.unlink_path(path)
         self._expert_fc_files.clear()
         for path, _rec in self._nonexpert_fc_files:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            binary_io.unlink_path(path)
         self._nonexpert_fc_files.clear()
         try:
             self.output_dir.rmdir()

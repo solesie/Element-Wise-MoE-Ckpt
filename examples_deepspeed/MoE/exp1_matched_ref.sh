@@ -1,6 +1,6 @@
 #!/bin/bash
 # Isolation test: match proposal_hutch_seed2024 (reference fast run) model config,
-# new proposal code (cp_mode=proposal, D=1, F=2%, hessian+hutchinson).
+# new proposal code (cp_mode=proposal, D=1, F=2%).
 #
 # Purpose: compare TFLOPs with the reference log's ~25 TFLOPs steady state to
 # isolate code-path overhead from model-config overhead.
@@ -53,11 +53,10 @@ fi
 mkdir -p "${CP_DIR}/non_expert" "${CP_DIR}/expert"
 rm -f "${FAULT_LOG}" "${SCORE_DIAG_LOG}"
 
-# NEW proposal config, matched Hutchinson intensity to reference.
+# NEW proposal config, matched FD intensity to reference.
 PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
     --proposal-cp-mode proposal \
     --proposal-selection-mode hessian \
-    --proposal-hessian-estimator hutchinson \
     --proposal-hessian-refresh-every 40 \
     --proposal-hessian-num-samples 4 \
     --proposal-topk-ratio 0.04 \

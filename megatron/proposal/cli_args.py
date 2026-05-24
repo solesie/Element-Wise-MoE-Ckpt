@@ -21,12 +21,11 @@ def add_proposal_args(parser):
     group.add_argument("--proposal-topk-ratio", type=float, default=0.05,
                        help="Fraction of expert elements to snapshot per lossy-FC "
                             "(score-based top-K). Default 5%%.")
-    group.add_argument("--proposal-block-quant-g", type=int, default=1,
-                       help="Block quantization group size for selection. Default 1 "
-                            "(no block quant). When g>1, contiguous g-element groups "
-                            "share a group score (sum of element scores) and are "
-                            "selected as a unit. Saves use element-level values "
-                            "(Option B): K-element budget preserved.")
+    group.add_argument("--proposal-block-quant-g", type=int, default=8,
+                       help="Block quantization group size for selection. Default 8 "
+                            "(CLAUDE.md production). When g>1, contiguous g-element "
+                            "groups share a group score and are selected as a unit. "
+                            "Saves use element-level values: K-element budget preserved.")
     # FD multi-K diagnostic (per-refresh K_x vs K_max comparison).
     group.add_argument("--proposal-fd-multi-k-track", action="store_true",
                        help="Track FD H estimates at multiple K values (per refresh). "
@@ -51,16 +50,6 @@ def add_proposal_args(parser):
                             "Default None → 1e-3 (validated on production exp_etc, "
                             "BF16 + MoE). Override via this flag or PROPOSAL_FD_EPS "
                             "env if a very different scale ever proves the default unsafe.")
-    group.add_argument("--proposal-finite-diff-cross-check", action="store_true",
-                       help="ALSO run Hutchinson on the same param state (CRN batch) "
-                            "at refresh and log Pearson/Jaccard via "
-                            "compare_hessian_estimators. Production refresh is "
-                            "FD-only; this flag is the ONLY surviving Hutchinson "
-                            "path, kept for FD-vs-Hutch validation runs.")
-    group.add_argument("--proposal-finite-diff-cross-check-log", type=str, default=None,
-                       help="JSONL output path for the FD-vs-Hutch cross-check "
-                            "(populated when --proposal-finite-diff-cross-check is "
-                            "set). When None, results print to stdout only.")
     group.add_argument("--proposal-finite-diff-flip-cutoff", type=float,
                        default=100.0,
                        help="Outlier protection: per-tensor Hz mean-abs is "
@@ -68,18 +57,14 @@ def add_proposal_args(parser):
                             "exceeding cutoff*median are skipped from the H "
                             "update (residual flip protection beyond routing "
                             "freeze). Default 100.")
-    group.add_argument("--proposal-hessian-refresh-every", type=int, default=40,
+    group.add_argument("--proposal-hessian-refresh-every", type=int, default=100,
                        help="With --proposal-selection-mode=hessian: re-estimate "
                             "|H_diag| every N iters and overwrite the cached H. "
-                            "Default 40. Set 0 to disable.")
-    group.add_argument("--proposal-hessian-num-samples", type=int, default=4,
-                       help="Label draws averaged per Hessian refresh. Default 4.")
-    group.add_argument("--proposal-hutchinson-at-end", action="store_true",
-                       help="At end of training, run one Hutchinson probe and write "
-                            "a JSONL log (post-hoc cross-check; production refresh is "
-                            "always FD).")
-    group.add_argument("--proposal-hutchinson-k-samples", type=int, default=4)
-    group.add_argument("--proposal-hutchinson-log", type=str, default=None)
+                            "Default 100 (prodsim verified: 50-iter staleness has "
+                            "zero rank-quality impact). Set 0 to disable.")
+    group.add_argument("--proposal-hessian-num-samples", type=int, default=1,
+                       help="Label draws averaged per Hessian refresh. Default 1 "
+                            "(prodsim verified: K=1 quantile-equivalent to K=32 truth).")
     # DEBUG: disable the ExpertState lossy FC writer (skip both lossy-FC
     # and lossless-FC of experts). Used to isolate expert-side write cost
     # when profiling. Legacy flag name preserved for compat.
@@ -96,7 +81,9 @@ def add_proposal_args(parser):
                             "lossless FC snapshot each time the D-interval "
                             "fires. Per CLAUDE.md default 2.0 → 1 expert per "
                             "fire for 48-expert model → 200-iter cycle.")
-    group.add_argument("--proposal-nonexpert-fc-W", type=int, default=10)
+    group.add_argument("--proposal-nonexpert-fc-W", type=int, default=1,
+                       help="Non-expert lossless FC interval (iters). Default 1 "
+                            "(CLAUDE.md spec: W=1, lossless FC every iter; DC removed).")
     group.add_argument("--proposal-async-queue", type=int, default=5)
     group.add_argument("--proposal-cp-mode", type=str, default="proposal",
                        choices=["proposal", "sequential"],
@@ -144,4 +131,28 @@ def add_proposal_args(parser):
                             "these iters (using current Adam v_t over expert "
                             "params only — ZeRO-aware via Fp32StateMapper). "
                             "Dumps JSON list next to fault log.")
+    # FD Hessian noise probe (diagnostic — no effect on production refresh)
+    group.add_argument("--proposal-fd-noise-probe-iters", type=int, nargs="+",
+                       default=None,
+                       help="Iters at which to run the FD Hessian noise probe. "
+                            "Each fire captures ref_n_batches batches and "
+                            "computes a K=ref_k reference + case A/B + "
+                            "sigma_z + sigma_batch comparisons against the "
+                            "reference top-1%% indices. Logs JSONL to "
+                            "--proposal-fd-noise-probe-log. No effect on "
+                            "tracker._H_g — production refresh runs normally.")
+    group.add_argument("--proposal-fd-noise-probe-log", type=str, default=None,
+                       help="Path to append JSONL noise-probe records.")
+    group.add_argument("--proposal-fd-noise-probe-ref-k", type=int, default=32,
+                       help="Reference K (number of K=1 FD calls averaged). "
+                            "Default 32.")
+    group.add_argument("--proposal-fd-noise-probe-ref-n-batches", type=int, default=20,
+                       help="Distinct minibatches captured + cycled through "
+                            "the reference K calls. Default 20.")
+    group.add_argument("--proposal-fd-noise-probe-g-blk", type=int, default=1,
+                       help="Group-quantisation block size for the probe's "
+                            "FD calls (AdaHessian spatial-averaging analogue). "
+                            "g=1 = element-level. g=8 averages 8 contiguous "
+                            "elements per group → 8× variance reduction. "
+                            "Default 1.")
     return parser

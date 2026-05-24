@@ -21,7 +21,6 @@
 # preserves any bind-mount subdirectories under ${CP_DIR_SHARED}.
 #
 # Wall-clock estimate (per CLAUDE.md pilot data):
-#   Run 1, 2 (with Hutchinson refresh_every=40 K=4): ~19 hr each
 #   Run 3 (MoC): ~18 hr
 #   Run 4 (baseline): ~18 hr
 #   Total: ~74 hr (~3 days)
@@ -29,13 +28,10 @@
 set -e
 DIR=$(cd "$(dirname "$0")" && pwd)
 
-# Pinned + expandable allocator combats fragmentation OOM during Hutchinson
 # 2nd-order autograd. Required per pilot debugging.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# Hutchinson defaults (CLAUDE.md § 실험 3 Hutchinson 설정):
 #   K=4 samples, refresh_every=40, EMA α=0.9, mode=ema, persist=off.
-#   CPU offload default ON (HUTCHINSON_NO_CPU_OFFLOAD not set).
 
 OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-${PWD}/results/exp_3}
 TRAIN_ITERS=${TRAIN_ITERS:-6700}

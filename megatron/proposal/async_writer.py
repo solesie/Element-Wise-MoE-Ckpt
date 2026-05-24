@@ -83,22 +83,38 @@ class _DomainWorker:
         device: Optional[int],
         max_queue_size: int,
     ) -> None:
+        import os as _os_ab
+        self._inline = _os_ab.environ.get("PROPOSAL_ABLATION_INLINE", "") in ("1", "true", "True")
         self._name = name
         self._device = device
         self._queue: queue.Queue = queue.Queue(maxsize=int(max_queue_size))
-        self._thread = threading.Thread(
-            target=self._run, name=name, daemon=True,
-        )
         self._submissions = 0
         self._completions = 0
         self._max_queue_depth = 0
         self._lock = threading.Lock()
         self._shutdown_sent = False
-        self._thread.start()
+        if self._inline:
+            self._thread = None
+        else:
+            self._thread = threading.Thread(
+                target=self._run, name=name, daemon=True,
+            )
+            self._thread.start()
 
     def submit(self, fn: Callable[..., None], *args: Any) -> None:
         if self._shutdown_sent:
             raise RuntimeError(f"{self._name}.submit() after shutdown()")
+        if self._inline:
+            try:
+                fn(*args)
+            except Exception as exc:
+                import traceback as _tb
+                print(f"[async_writer-INLINE] {self._name}: task failed: "
+                      f"{type(exc).__name__}: {exc}\n{_tb.format_exc()}", flush=True)
+            with self._lock:
+                self._submissions += 1
+                self._completions += 1
+            return
         self._queue.put((fn, args))
         with self._lock:
             self._submissions += 1
@@ -107,12 +123,16 @@ class _DomainWorker:
                 self._max_queue_depth = depth
 
     def drain(self) -> None:
+        if self._inline:
+            return
         self._queue.join()
 
     def shutdown(self) -> None:
         if self._shutdown_sent:
             return
         self._shutdown_sent = True
+        if self._inline:
+            return
         self._queue.join()
         self._queue.put(self._SENTINEL)
         self._thread.join()
@@ -139,9 +159,11 @@ class _DomainWorker:
                 try:
                     fn(*args)
                 except Exception as exc:
+                    import traceback as _tb
                     print(
                         f"[async_writer] {self._name}: task failed: "
-                        f"{type(exc).__name__}: {exc}",
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"{_tb.format_exc()}",
                         flush=True,
                     )
                 with self._lock:
@@ -161,15 +183,20 @@ class _DomainWorker:
 
 
 class AsyncWriter:
-    """Owner of the two domain workers.
+    """Three domain workers, each with a single clear responsibility.
 
-    Usage::
-
-        writer = AsyncWriter(device=0)
-        writer.submit_non_expert(do_ne_fc, ne_task)
-        writer.submit_expert(do_ex_fc, ex_task)
-        writer.drain()           # both queues empty
-        writer.shutdown()
+    * ``ne_writer`` — non-expert lossless FC. Directly handles GPU→pinned
+      D2H + numpy scatter + file write (in disk mode) or DRAM commit
+      (in dram mode). ``submit_non_expert`` routes here.
+    * ``expert_launcher`` — expert GPU work launcher. Does NOT write to
+      storage. Issues tracker_stream score compute, d2h_stream dispatch,
+      and ExpertLosslessFC GPU collect launches, then immediately
+      returns so the next iter's score can be launched on time. The
+      heavy commit work is forwarded to ``expert_writer`` via _dispatch.
+      ``submit_expert`` routes here.
+    * ``expert_writer`` — expert storage commit. Performs the actual
+      lossy log append and per-expert lossless FC file write (disk mode)
+      or DRAM buffer scatter (dram mode). ``submit_raw`` routes here.
     """
 
     def __init__(
@@ -177,14 +204,18 @@ class AsyncWriter:
         device: Optional[int] = None,
         non_expert_queue_size: int = 8,
         expert_queue_size: int = 32,
+        raw_queue_size: int = 32,
     ) -> None:
         if device is None and torch.cuda.is_available():
             device = torch.cuda.current_device()
         self.non_expert = _DomainWorker(
-            "host_writer_non_expert", device, non_expert_queue_size,
+            "ne_writer", device, non_expert_queue_size,
         )
         self.expert = _DomainWorker(
-            "host_writer_expert", device, expert_queue_size,
+            "expert_launcher", device, expert_queue_size,
+        )
+        self.raw = _DomainWorker(
+            "expert_writer", device, raw_queue_size,
         )
 
     def submit_non_expert(self, fn: Callable[..., None], *args: Any) -> None:
@@ -193,19 +224,27 @@ class AsyncWriter:
     def submit_expert(self, fn: Callable[..., None], *args: Any) -> None:
         self.expert.submit(fn, *args)
 
+    def submit_raw(self, fn: Callable[..., None], *args: Any) -> None:
+        self.raw.submit(fn, *args)
+
     def drain_non_expert(self) -> None:
         self.non_expert.drain()
 
     def drain_expert(self) -> None:
         self.expert.drain()
 
+    def drain_raw(self) -> None:
+        self.raw.drain()
+
     def drain(self) -> None:
         self.non_expert.drain()
         self.expert.drain()
+        self.raw.drain()
 
     def shutdown(self) -> None:
         self.non_expert.shutdown()
         self.expert.shutdown()
+        self.raw.shutdown()
 
     def summary(self) -> dict:
         return {

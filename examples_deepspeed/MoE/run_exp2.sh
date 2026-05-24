@@ -18,7 +18,6 @@ set -e
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 # Use PyTorch's expandable-segments allocator to combat fragmentation —
-# the 2nd-order Hutchinson Hv path repeatedly allocates/frees mid-sized
 # tensors, which in the default allocator can leave the reserved pool
 # fragmented enough to OOM on a 160 MB allocation even with GBs "free".
 # expandable_segments:True backs the allocator with virtual memory +

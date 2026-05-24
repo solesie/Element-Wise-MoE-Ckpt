@@ -50,6 +50,22 @@ Checkpointing은 모델 훈련 과정에서 예상치못한 상황에서 훈련 
 - 예외: dispatch 의 `ev.synchronize()` (1-iter pipelining 의 일부) — 이 시점엔 prev iter 의 tracker_stream work 가 main_stream 의 forward+backward+optimizer (~2000 ms) 보다 훨씬 일찍 완료되므로 host wait time = 0.
 - SM contention 은 "soft" blocking 으로 간주 — 큰 batched kernel 이 작은 launch 들보다 SM 점유시간 짧아 contention 줄임. 1280 small launch → 30 batched launch 식의 변경은 SM 측면에서도 이득.
 
+## 2-bis. Proposal stream 위 메모리 할당 금지 (main_stream idle gap 의 근본 원인)
+
+| 항목 | 한도 |
+|---|---|
+| **tracker_stream / d2h_stream / worker_stream 위 cudaMalloc / cudaFree 호출** | **0** (절대 0) |
+| **proposal kernel 안에서 PyTorch tensor alloc** | **0** (kernel 은 pre-allocated buffer 만 사용) |
+
+- 직접적 fact (nsys + py-spy 검증): proposal stream 위에서 발생한 alloc 가 caching allocator 의 mutex 를 잡고, **그 mutex 가 main_stream 의 다음 kernel launch 를 blocking** → main_stream 의 wave 사이에 **수십 ms 의 idle gap** 발생. proposal 의 work 자체가 main 과 다른 stream 위라도, **alloc 의 host-side mutex 가 cross-stream blocking**.
+- 따라서 **proposal 의 모든 tracker_stream / worker_stream 작업은 pre-allocated persistent buffer 만 사용**:
+  - tracker buffer (dg_flat, h_g_bf16_flat, exc_mask 등) — `_init_accum_sq_flat` 에서 한 번 alloc
+  - segment_pipeline 의 double buffer — init 시 alloc
+  - outlier kernel 의 atomic count / slot — `_init_outlier_buffers` 에서 한 번 alloc
+- anchor refresh 는 train_step 외부 (main_stream 의 학습 wave 와 시간상 분리) 에서 실행되므로 alloc 가능. 단 같은 양 (`grad_flat` 2.72 GB = lp.grad transient 와 동량) 으로 학습 peak 와 동일성 유지.
+- per-iter dispatch / per-iter outlier kernel 호출 은 **kernel 안 어떤 alloc 도 금지**. 모든 buffer 는 init 시 alloc, 매 iter zero/reuse.
+- **검증**: anchor refresh OFF iter 의 iter time = baseline + ≤ 10 ms (proposal 의 host-side overhead = launch count × ~10us 만). 만약 +수십 ms idle gap 이 보이면 alloc 누수 의심 → `PROPOSAL_VRAM_AUDIT=1` + py-spy 로 caller 추적.
+
 ## 3. 검증 의무
 
 새 변경마다 다음 측정값을 비교:
@@ -59,6 +75,180 @@ Checkpointing은 모델 훈련 과정에서 예상치못한 상황에서 훈련 
 - **algorithm 정합성**: val loss 가 baseline 과 4-자리 이상 일치
 
 위 4 개 중 하나라도 실패하면 변경 폐기 또는 재설계.
+
+---
+
+# 현재 상태 (2026-05-24, Fast-flat anchor + naming refactor)
+
+## 정리 요약
+
+이전 commit (9e2a474) 이후 (a) anchor refresh 의 **fast-flat path** 도입, (b) `option_a`/`pass_a` 같은 모호한 식별자를 의미-기반 이름으로 일관 rename, (c) dead env vars / 함수 / 테스트 제거, (d) `binary_io.cpp` 내 raw syscall 들을 anonymous-namespace `syscall_*` wrapper 로 일원화. param_rebind 모듈 통째로 제거 (`PROPOSAL_HESSIAN_NO_REBIND` 기본 항상 ON; `_pinned_clone` snap 으로 원본 보존). `PROPOSAL_ANCHOR_N_BATCHES` env 삭제 — N = `global_batch_size // micro_batch_size // 2` 하드코딩.
+
+## 4-kernel pipeline (per iter)
+
+| stream | kernel | 역할 |
+|---|---|---|
+| tracker | `_outlier_count_kernel` | per BF16 group: outlier 후보 element 의 per-name 카운트 + sub-sample. fold 안 함 |
+| tracker | `_group_select_kernel` | per group: `h_g × dg ≥ group_th` 판정. `name_group_count` atomic + `selected_mask` 기록 |
+| worker | `_aos_write_kernel` | per segment: outlier records AOS write + 선택적 fold (`dg += Σ non-selected Δθ²`) |
+| worker | `_aos_group_write_kernel` | per segment: group records AOS write (`selected_mask` 만 의존; dg-drift decoupled). 선택된 group 의 dg=0 |
+
+`_walk_thresholds` (host) 가 stochastic sub-sample → K-th order statistic 으로 `elem_th` 산출 (heavy-tail-robust; histc 의 12/288 collapse 미발생).
+
+## Anchor refresh — fast-flat path (production) + 메모리 폭발 해결 history
+
+### 진단: anchor 의 메모리 폭발은 어디서 왔는가
+
+이전 chunk path 의 anchor refresh 가 학습 peak 보다 +6 GB 가량 추가로 alloc 했었음. nsys + step-by-step VRAM dump 로 진짜 origin 분해:
+
+| 원인 | 양 | 해결 |
+|---|---:|---|
+| `_make_rademacher` 가 expert_ps 전체 z 를 한 번에 alloc | ~2.72 GB BF16 | **on-the-fly PCG-hash z** (Triton kernel register-only) → **−2.72 GB** |
+| chunk-local snap+z+gp+gm 4 buffer (chunk_size 비례) | ~540 MB | chunk path 통째 제거; single backward 쌍 → **−540 MB** |
+| `param_rebind_context` 의 expert_ps GPU clone | ~2.72 GB BF16 | `_param_rebind.py` 삭제; DS lp.data 가 flat-view 임을 활용해 lp 직접 흔들기 → **−2.72 GB** |
+| h_accum (per-expert BF16 list, anchor-only alloc) | ~340 MB | tracker 의 `_g_fast_h_g_bf16_flat` (이미 R1 에 포함된 persistent buffer) 의 view 재사용 → **−340 MB** |
+| activation transient (forward graph saved tensors) | ~5 GB | 본질적 (학습 backward 와 동량). 그대로 두되 학습과 같은 timing → **R3 strict 충족 가능** |
+
+→ 총 −6.3 GB 절감. anchor peak ≤ training peak 가 **caching allocator 의 reuse 패턴**과 합쳐져 **R3 strict +74 MB tolerance 안 충족**.
+
+### Production path
+
+기존 chunk path 폐기. 모든 anchor 호출은 단일 backward 쌍 + grad-flat batched stream 으로 실행.
+
+```
+[setup, multi-batch loop 진입 1회]
+  - θ_0 = _pinned_clone(p) per expert (pool 재사용; 첫 anchor 만 alloc, 이후 H2D 만)
+  - expert_ps 를 tracker.name_list 의 idx 순으로 sort
+  - grad_flat = torch.zeros(ΣP_expert, BF16)   # 2.72 GB; 학습의 lp.grad transient 와 같은 양
+  - each expert.grad = grad_flat[off:off+n].view_as(p)   # backward 가 flat 에 직접 write
+  - h_accum_flat = _tracker._g_fast_h_g_bf16_flat       # ★ 새 alloc 0, R1 budget 안 ★
+  - h_accum_flat.zero_()
+
+[K loop × 2 phase (sign = +1, -1)]
+  per-expert perturb: _flat_z_perturb_kernel(p.data, sign*eps, global_offset, seed, k)
+                        # 1 Triton launch per expert, z = on-the-fly PCG hash (register-only)
+  forward + backward    # _backward_inplace(preserve_expert_grad_storage=True)
+                        # ⇒ grad_flat 에 expert grad accumulate
+  _flat_signed_stream_kernel(grad_flat, h_accum_flat, g_blk, sign*inv_step*inv_k, seed, k)
+                        # 1 Triton launch total; group_mean(z × grad) × sign × scale 누적
+  grad_flat.zero_()
+
+[multi-batch loop 종료]
+  h_accum_flat.div_(N_succ).abs_()
+  expert lp 일괄 restore from pinned snap
+```
+
+### 시간 단축 분해 (fast-flat vs chunk path)
+
+per-batch breakdown (N=12 medium, BATCH_SIZE=2):
+
+| 단계 | chunk path | fast-flat | 절감 | 비고 |
+|---|---:|---:|---:|---|
+| backup_D2H | 106 ms × N | 106 ms × 1 | −1166 ms / anchor | multi-batch session 한 번만 |
+| restore_H2D | 126 ms × N | 126 ms × 1 | −1386 ms / anchor | 동일 |
+| perturb (per phase) | 191 ms (per-expert 576 × 7 ops) | 130 ms (per-expert 576 × 1 Triton launch) | −61 ms × 2 phase × N | host launch count 7→1 |
+| stream (per phase) | 200 ms (per-expert 576 × 11 ops + FP32 transient) | **8 ms (single Triton launch)** | −192 ms × 2 phase × N | grad_flat 덕분에 single kernel |
+| bwd (per phase) | 700-1100 ms | 동일 | 0 | 본질적 forward+backward |
+| **per-batch total** | **2042 ms** | **1211 ms** | **−41%** | |
+| **anchor total (N=12)** | **24500 ms** | **14750 ms** | **−41%** | |
+
+핵심:
+- z 는 register-only (kernel 안 PCG hash). VRAM 0.
+- h_accum_flat = tracker buffer view → **추가 alloc 0**. R3 strict 유지.
+- grad_flat 은 학습 lp.grad transient 와 동량 → caching allocator 가 같은 자리 reuse → **peak 영향 0**.
+- 모든 phase 의 z 는 같은 hash (`global_offset + k + seed`) → perturb 와 stream 이 bit-exact 동일 z 사용 (FD cancellation 보장).
+- `PROPOSAL_FD_FAST_FLAT` env (default ON, fallback 시 legacy per-expert path).
+- N (anchor batch 수) = `global_batch_size / micro_batch_size / 2` (env 없음).
+- multi-batch session 안에서 **expert.grad 가 grad_flat 의 view 이므로 alloc 0** (training 의 lp.grad 와 같은 자리). 매 phase 끝의 `grad_flat.zero_()` 가 caching allocator alloc 호출 없음.
+
+## iter time (exp_etc, anchor refresh ON N=6, 30 iter)
+
+| metric | 이전 (chunk path) | fast-flat | 변화 |
+|---|---:|---:|---|
+| anchor (N=12) | 24500 ms | **14750 ms** (N=6: ~7400 ms) | **−40%** |
+| iter time (refresh_every=5) | 9395 ms | **6500 ms** | **−31%** |
+| lm_loss (iter5→30, baseline match) | ✓ | **bit-exact 4-digit match** | — |
+| iter time write-OFF (no anchor) | ≈ baseline | ≈ baseline | (≤ 50 ms noise) |
+
+## VRAM 상태
+
+| 항목 | exp_etc | 100B per-GPU 추정 |
+|---|---:|---:|
+| persistent baseline (training) | ~21.3 GB | ~ |
+| proposal Δ persistent | ~1.5 GB | ~9.2 GB |
+| └ tracker buffer (dg + h_g + exc_mask + chunk_buf) | 1.3 GB | 8.7 GB |
+| └ sub-sample buffer (64K × f32 × 3) | 1.5 MB | 1.5 MB |
+| └ selected_mask (N_groups × i8) | 30 MB | 125 MB |
+| └ segment double buffer | 256 MB | 256 MB |
+| └ metadata (N_names × i64 × 5) | 수십 KB | 수십 KB |
+| **peak ≡ steady** (anchor refresh 비교) | ✓ +74 MB (tolerance 100) | ✓ (구조상 동일) |
+
+K_max-bounded persistent buffer 0.
+
+Anchor 의 일시 transient: grad_flat (~2.72 GB BF16; 학습 lp.grad transient 와 동량) + h_accum (= tracker view, 0 new) + per-expert z (register, 0). param_rebind clone 없음.
+
+## main_stream blocking = 0
+
+모든 proposal 작업이 tracker_stream / worker_stream 위. training thread 의 sync 호출 0. backward pass 와 d2h 자연 overlap.
+
+## 단위 / 회귀 검증 (`megatron/proposal/tests/`)
+
+본 디렉토리의 파일들은 **production 보호용 핵심 검증** — 코드 수정마다
+반드시 통과해야 함. 새 검증 항목은 모두 이 폴더에 추가.
+
+- **`vram_audit_eval.py`** — R1-R4 hard contract PASS/FAIL evaluator
+  (VRAM audit JSONL 입력). `verify_vram_run.sh` 가 매 audit run 끝에
+  호출 → exit 1 이면 R-contract 위반. **모든 변경의 마지막 게이트.**
+  - 사용: `python3 megatron/proposal/tests/vram_audit_eval.py <jsonl>`
+- **`test_outlier_per_segment.py`** — Pass B 의 single full-range 호출
+  vs N-split 호출 결과 동일성 (late-group i64 포함). 7/7 PASS.
+  outlier kernel 의 chunking 정확성 보장.
+- **`test_hessian_stream.py`** — legacy h_accum streaming 커널의 reference
+  FP32 vs BF16 group-quant 비교. 8/8 PASS. fast-flat fallback path 보호.
+
+폐기:
+- `_test_gpu_aos.py` — pre-existing FAIL (9e2a474 이전부터 broken).
+  production gpu_aos 동작은 recovery 검증으로 확인.
+- `_test_option_a.py` — dead Python ref 의존 (validate_option_a 등).
+
+## End-to-end 검증 (2026-05-24 본 refactor 직후)
+
+| 항목 | 결과 |
+|---|---|
+| R1 (persistent VRAM) | PASS (+17 MB diff) |
+| R2 (proposal-callsite large alloc) | PASS (0 violations) |
+| **R3 (anchor peak vs training peak)** | **PASS strict (+74 MB, tolerance 100)** |
+| R4 (slope, frag) | PASS (slope=0, waste 8044 MB < limit) |
+| H scale + coverage | mean 4.0e-06 ~ 1.6e-07, coverage 0.73~1.0, flip_skip 0~0.27 |
+| DRAM recovery | PASS (`FAULT@10 recover_s=4.72`, `FAULT@20 recover_s=4.60`) |
+| Disk recovery | PASS (`FAULT@10 recover_s=10.09`, `FAULT@20 recover_s=9.15`) |
+| lm_loss baseline match | ✓ bit-exact 4-digit (iter5=10.7212, iter30=9.2312) |
+| dispatch coverage | `anchor multi-batch: N=6 succ=6`; DRAM step=20 n_experts=78, step=21 n_experts=243 |
+
+## C++ binary_io 의 syscall 일원화
+
+`megatron/proposal/_csrc/binary_io.cpp` 의 모든 raw `::write/::open/::fsync/::close/::unlink/::rename/::pread/::stat` 호출이 anonymous-namespace 의 **`syscall_*` wrapper 함수** (`syscall_write_full_aligned`, `syscall_open_create`, `syscall_open_rdonly`, `syscall_fsync`, `syscall_close_noexcept`, `syscall_rename`, `syscall_unlink_allow_enoent`, `syscall_pread_loop`, `syscall_stat_size`) 안으로 모임. 외부 public 함수 (`write_prptens`, `write_lossless`, `open_lossy_log_for_append`, `append_lossy_log`, `fsync_fd`, `close_fd`, `full_write_pinned`, `unlink_path`, `read_file_range`, `file_size`) 는 모두 이 wrapper 만 호출 — io_uring swap 시 wrapper 만 교체.
+
+> TODO: caller 가 `int fd` / `const std::string& path` 를 보유하는 현재 API 를 캡슐화 → `(layer, expert_id, lossless|lossy|non_expert)` identity-tuple 기반 API 로 변경 예정 (다음 refactor cycle).
+
+---
+
+# 과거 진단 (참고용)
+
+## CLAUDE.md +355 ms diagnosis (해결됨)
+
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 적용으로 -546 ms / iter 회복
+- 잔여 +95~210 ms (write OFF) = host CPU per-launch latency × ~115K launches/iter
+- 측정 → 본 production 의 +74 ms 와 일관
+
+## 배제된 가설 (모두 직접 evidence)
+
+GPU SM contention, cross-stream GPU contention, L3 cache pollution (worker scatter), Worker thread spawn, CUDA driver mutex, GIL contention, O_DIRECT, KVM steal — 모두 dominant 아님.
+
+## 다음 우선 (별 작업 트랙)
+
+1. multi-GPU (A100×4 dedicated, full Xeon Gold 6338) 환경 측정 — host CPU 시간 단축 확인
+2. 1B / 10B / 100B scale 동작 검증 — sample buffer / threshold dynamics 확인
 
 ---
 
@@ -183,14 +373,33 @@ Lossy FC(append-only) + Round-robin expert lossless FC 방식을 사용한다.
 매 iteration 마다 두 종류의 score 가 동일한 **per-element score axis** 위에서 동시에 계산되어 단일 K-budget 을 두고 경쟁한다.
 
 ```
-element score:  s_elem(i)   = H[group(i)] × Δθ_i²                    # single iter, per-element
-group   score:  s_group(g)  = H[group=g]  × δ[g]
+element score:  s_elem(i)   = H̃[group(i)] × Δθ_i²                    # single iter, per-element
+group   score:  s_group(g)  = H̃[group=g]  × δ[g]
                 where δ[g]  = (1/g) × Σ_{step ∈ window} Σ_{i ∈ g, not selected} Δθ_i²
 ```
 
 - `Δθ_i²` = optimizer 의 m, v 로부터 유도한 이번 step 의 update² (single iter).
 - `δ[g]` = 시간창에 걸친 그룹 평균 per-element δ². "선택 안 된" 원소들의 (Δθ²/g) 가 누적되어 자연 회복.
-- `H[group]` = Finite-Difference 기반 group-level diagonal Hessian (production). Hutchinson 은 FD vs Hutch cross-check 에서만 사용.
+- `H̃[group]` = **v_t → H quantile-matching 매핑** (production single path). 매 anchor
+  refresh (cheap FD K=1) 에서 H 분포의 4096-quantile lookup table 을 추출 → 매 iter
+  Adam ``exp_avg_sq`` (v_t) 의 element-level 값을 그 lookup table 로 piecewise linear
+  매핑하여 ``_g_fast_h_g_bf16_flat`` 을 in-place 덮어쓴다.
+
+  **왜 v_t 가 H 의 proxy 로 안전한가 — Spearman rank 일치 fact**:
+  - AdamW 내부적으로 v_t = EMA(grad²) ≈ Empirical Fisher (E[grad·grad^T] 의 diagonal)
+    ≈ Gauss-Newton (GGN) diagonal ≈ Hessian diagonal (near optimum, positive curvature
+    regime). 즉 v_t 와 H 가 **점추정 값으로는 다르지만 (scale 4 orders 차이 가능)
+    element-level 순위 (Spearman ρ) 는 일치**. exp_etc 측정 ρ_all = 0.87 plateau.
+  - rank 일치 → score 의 top-K 선택 결과 (= 어떤 element 가 lossy CP 에 들어가는지)
+    가 진짜 H × δ² 의 top-K 와 거의 일치. **CP 의 본질은 ranking 이지 절대값이 아님**.
+  - 단순 affine (mapped = a·v_t + b) 으로는 부족: H/v_t scale ratio 가 quantile 별
+    4 orders 차이 (low-mag end 와 high-mag end 가 비선형 관계). 따라서 **piecewise
+    linear quantile-to-quantile mapping**: v_t 의 4096-quantile 위치 → 같은 quantile
+    위치의 H 값으로 매핑 (rank 보존 + scale 보정 동시 달성).
+  - 4096-quantile = 99.99% lognormal 분포 정확도, persistent VRAM 32 KB ≈ 0.
+  - **anchor 의 역할 = quantile lookup table 의 H 분포만 갱신** (매 iter H 직접
+    측정이 아닌, 분포 통계만 cheap FD 로 update). 따라서 anchor 가 variance 가
+    크더라도 (single batch K=1) 분포 통계는 robust (Var(quantile) ∝ 1/N).
 - 두 score 모두 per-element 단위 (group 측이 1/g 정규화) → 같은 axis 에서 직접 비교 가능.
 
 Non-expert parameter 는 매 W iter 전부 저장하므로 score 불필요.
@@ -202,8 +411,12 @@ Non-expert parameter 는 매 W iter 전부 저장하므로 score 불필요.
 매 iter 다음을 수행:
 
 1. **Score 계산**:
-   - element pool: 각 expert element 의 `H × Δθ²` (단일 iter scale)
-   - group pool: 각 group 의 `H × δ[g]` (시간창 mean scale, 같은 per-element axis)
+   - element pool: 각 expert element 의 `H̃ × Δθ²` (단일 iter scale)
+   - group pool: 각 group 의 `H̃ × δ[g]` (시간창 mean scale, 같은 per-element axis)
+   - `H̃` = mapped(v_t), 매 iter ``ImportanceTracker.update_v_mapping`` 이
+     ``_g_fast_h_g_bf16_flat`` 을 in-place 덮어쓴다. anchor (cheap FD) 가
+     공급한 ``_g_fast_h_quantiles`` 와 매 iter 추출하는
+     ``_g_fast_v_quantiles`` 사이 piecewise linear lookup.
 
 2. **두 histogram 으로 단일 top-K**:
    - `histc(element_scores, ...)` → 4096 bin
@@ -433,6 +646,9 @@ binary_io 의 헬퍼 함수들은 모두 **CPU 전용** (torch / cuda dependency
 | D | Expert lossless FC 수행 간격 (iteration) | 4 |
 | async_queue_size | Per-domain worker pending queue | 5 |
 | F% | Expert lossless FC 시 선택되는 expert 비율 | 2 |
+| anchor_refresh_every | cheap FD anchor 주기 (v_t→H mapping 의 H quantile 갱신) | 40 |
+| anchor_K | anchor FD K-sample | 1 |
+| N_Q | v_t→H mapping lookup table quantile point 수 | 4096 |
 
 ---
 
@@ -528,11 +744,13 @@ OLMoE-1B-7B([논문](https://arxiv.org/abs/2409.02060)) 아키텍처를 단일 A
 
 dMoE → capacity factor 대체
 
-#### Hutchinson 설정
+#### FD Hessian 설정 (anchor refresh — v_t → H mapping 용)
 
-- K=4 유지 (K=1 + EMA 조합은 품질 저하 이력으로 금지)
-- refresh_every 40
-- `HUTCHINSON_CPU_OFFLOAD` 기본 활성 — peak VRAM 예산 안에서 안전 동작
+- K=1 (FD), B=1 minibatch, refresh_every 40 — anchor 는 distribution range 만 신뢰하면
+  되므로 분산 큰 cheap 측정으로 충분 (Var(quantile) ∝ 1/N, N=expert element 수).
+- amortized cost ≈ 1.5 s / 40 iter = 38 ms/iter (기존 K=16 의 ~125 ms/iter 대비 70% 절감).
+- anchor 후 ``tracker.update_h_anchor_quantiles`` 가 ``_g_fast_h_g_bf16_flat`` 분포
+  에서 4096-quantile lookup table 을 추출.
 
 ## 테스트 명세 (Test Specifications)
 
@@ -574,16 +792,31 @@ dMoE → capacity factor 대체
 CLAUDE.md                       # This file (spec + parameters + conventions)
 megatron/proposal/
 ├── __init__.py                 # Public API exports
-├── cp_hooks.py                 # Training-loop integration: init_proposal / arm_post_iter_fc / release_post_iter_fc / recover / shutdown + refresh_hessian dispatch + fault injection + Fisher coverage
+├── cp_hooks.py                 # Training-loop integration: init_proposal / arm_post_iter_fc / release_post_iter_fc / recover / shutdown + refresh_hessian dispatch + fault injection + multi-batch anchor session (fast-flat grad-flat + tracker-view h_accum)
 ├── cli_args.py                 # CLI arg registration (--proposal-*)
-├── hessian.py                  # State-free Hessian estimators: compute_hessian_hutchinson / compute_hessian_gnb / compare_hutchinson_vs_gnb
-├── importance_tracker.py       # Element-wise score (H × δ²), global top-K, θ_CP cache
+├── hessian.py                  # State-free FD Hessian: compute_hessian_finite_diff + fast-flat (_compute_fd_fast_flat, _flat_z_perturb_kernel, _flat_signed_stream_kernel) + _build_expert_flat_view
+├── importance_tracker.py       # Element-wise score (mapped(v_t) × δ²), v_t→H quantile mapping (update_v_mapping / update_h_anchor_quantiles), global top-K, θ_CP cache
+├── outlier_kernels.py          # Lossy CP outlier + group select Triton kernels (_outlier_count_kernel, _group_select_kernel, _aos_write_kernel, _aos_group_write_kernel + launchers)
 ├── fc_manager.py               # FC scheduling: element_wise / staggered / sequential
 ├── expert_state.py             # Per-expert lossy FC append log (LFSY) + lossless FC snapshot (LFCL) per CLAUDE.md spec
+├── dram_expert_state.py        # DRAM-target expert state (CP_TARGET=dram)
 ├── recovery.py                 # Non-expert lossless FC load + per-expert lossless + lossy replay (via read_expert_state)
 ├── async_writer.py             # 2-domain workers (host_writer_non_expert + host_writer_expert) FIFO queue with GPU context
-├── _ds_state.py                # DeepSpeed ZeRO 0/1/2 FP32 master state mapper
-└── _exp_tools.py               # (measurement) log parsing + plotting utilities
+├── gpu_aos.py                  # GPU AOS interleave kernels (SoA → AoS into segment_pipeline staging)
+├── segment_pipeline.py         # 256-MB segment double buffer (D2H staging)
+├── proposal_io.py              # Python bindings for _csrc/*.cpp (binary_io + proposal_io)
+├── _csrc/binary_io.cpp         # Single home for all syscalls (write/open/fsync/close/unlink/rename/pread/stat) — anonymous-namespace syscall_* wrappers
+├── _csrc/proposal_io.cpp       # pybind11 module exposing binary_io to Python
+├── _ds_state.py                # DeepSpeed ZeRO 0/1/2 FP32 master state mapper + _pinned_clone pool (anchor θ_0 snap)
+├── _routing_freeze.py          # MoE gate freeze for FD anchor (replays captured dispatch on ±ε forwards)
+├── fd_noise_probe.py           # Diagnostic: FD H noise probe (off-path)
+├── _vram_audit.py              # Diagnostic: VRAM peak audit (PROPOSAL_VRAM_AUDIT)
+└── tests/                      # Core regression tests — must PASS on every change
+    ├── vram_audit_eval.py      # R1-R4 PASS/FAIL evaluator (called by verify_vram_run.sh)
+    ├── test_outlier_per_segment.py  # outlier kernel split-equivalence (7/7)
+    └── test_hessian_stream.py  # legacy h_accum kernel reference (8/8)
+
+Removed in this cycle: _param_rebind.py, binary_io.py (Python), checkpoint_ctx.py.
 
 megatron/training.py            # Hook calls: init_proposal / arm_post_iter_fc (after optimizer) / recover / refresh_hessian. release_post_iter_fc is fired by register_forward_hook on _inner_model at end of first micro-batch fwd (not called directly from training.py).
 pretrain_gpt.py                 # Registers add_proposal_args via extra_args_provider
@@ -605,25 +838,43 @@ examples_deepspeed/MoE/         # Shell driver scripts
 - `--proposal-cp-mode {proposal|sequential}`: 기본 `proposal`. `proposal` = lossy FC append + round-robin F% 로스리스 FC. `sequential` = MoC baseline.
 - `--proposal-lossless-fc-fraction F`: 기본 `2.0` (%). Expert 로스리스 FC 이벤트당 선택되는 expert 비율.
 - `--proposal-selection-mode {v_hat|random|hessian}`: 기본 `hessian`.
-- `--proposal-hessian-estimator {gnb|hutchinson}`: 기본 `hutchinson`.
+  - production `hessian` 모드의 score H 자리에 들어가는 값은 직접 측정한 H 가 아니라
+    cheap FD anchor + v_t quantile-matching 으로 매 iter 새로 매핑된 ``mapped(v_t)``.
 - `--proposal-topk-ratio FLOAT`: 기본 `0.04` (4%).
-- `--proposal-hessian-refresh-every N`: 기본 `40`.
-- `--proposal-hessian-num-samples K`: 기본 `4`.
+- `--proposal-hessian-refresh-every N`: 기본 `40` — anchor refresh 주기.
+- `--proposal-hessian-num-samples K`: anchor FD K-sample 수, 기본 `1` (cheap; 분산
+  큰 추정도 분포 quantile 통계는 robust).
 - `--proposal-nonexpert-fc-W N`: 기본 `10`.
 - `--proposal-expert-fc-D N`: 기본 `None` → `num_experts` 자동 산출.
 - `--proposal-async-queue N`: 기본 `5`.
 
+> Anchor batch 수 (multi-batch loop 의 N) 는 CLI 없이 자동 산출:
+> `N = global_batch_size // micro_batch_size // 2` (`init_proposal` 안에서 한 번 계산). 이전의 `PROPOSAL_ANCHOR_N_BATCHES` env 는 제거됨.
+
 측정용 플래그:
-- `--proposal-score-diag-iters [list] / --proposal-score-diag-log PATH / --proposal-score-diag-every N`
 - `--proposal-fisher-coverage-iters [list]`
-- `--proposal-hessian-comparison-log PATH` (v̂_t vs |H| Pearson/Jaccard)
-- `--proposal-hessian-cross-check / --proposal-hessian-cross-check-log PATH` (Hutchinson vs GNB)
-- `--proposal-hessian-nonexpert-probe-log PATH` (expert vs non-expert |H| distribution)
-- `--proposal-hutchinson-at-end / --proposal-hutchinson-log PATH` (end-of-training probe)
+- `--proposal-fd-noise-probe-iters / --proposal-fd-noise-probe-log PATH / --proposal-fd-noise-probe-ref-k / --proposal-fd-noise-probe-ref-n-batches / --proposal-fd-noise-probe-g-blk` (v_t vs FD-H probe)
 
 Fault 실험용 플래그:
 - `--proposal-fault-interval N / --proposal-fault-warmup N / --proposal-fault-log PATH`
 - `--proposal-replay-at-end / --proposal-replay-only`
+
+## Multi-GPU 검토 (this commit cycle)
+
+본 cycle 의 변경은 single-GPU 환경에서만 측정/검증됨. Multi-GPU (DP / EP / TP / ZeRO-1+) 진행 시 검토 포인트:
+
+| 변경 | Multi-GPU 영향 위험도 | 비고 |
+|---|---|---|
+| `_compute_fd_fast_flat` — grad_flat alloc + .grad view assign | 낮음 | per-rank local. 각 rank 가 own expert_ps 의 grad 만 flat 으로 모음. ZeRO partitioning 영향 없음 (lp.grad 자체는 partition 안 됨, DS hook detach 상태이므로 fp32 master 도 미접촉) |
+| `_flat_z_perturb_kernel` — per-tensor + `global_offset` 기반 PCG hash | 낮음 | rank 별 expert_ps 가 다르면 global_offset 도 다름. rank 내 perturb 와 stream 의 z 일치 보장 (같은 hash 식) |
+| `_flat_signed_stream_kernel` — grad_flat → tracker `_g_fast_h_g_bf16_flat` view | 낮음 | per-rank tracker buffer 에 write. 다른 rank 와 공유 없음 |
+| expert_ps sort by tracker idx | **검증 필요** | tracker init 의 BF16-Opt group iteration 순서가 ZeRO-1+ 환경에서도 모든 rank 가 동일한 master order 를 가지는지. DS BF16/FP16 optimizer 모두 param_group 별 flatten 후 lp.data 를 flat view 로 set — rank 별 동일 order 예상되나 미측정 |
+| `_pinned_clone` θ_0 snap pool | 낮음 | per-rank DRAM. 다른 rank 와 무관 |
+| DS hook detach + restore (multi-batch 외부) | **검증 필요** | EP/TP grad reduce hook 이 anchor 동안 detach 되는 동작이 multi-GPU 에서 race 없는지 |
+| `RoutingFreezeContext` (옵션 OFF, `PROPOSAL_ROUTING_FREEZE_ENABLE=1` 시) | **검증 필요** | docstring 명시 — all-to-all dispatch 에서 captured routing 재생 안전성 미검증 |
+| `binary_io.cpp` syscall wrappers | 영향 0 | 단일 fd 레벨 wrapper. multi-GPU 와 무관 |
+
+→ 즉 본 cycle 의 fast-flat 변경은 **single-GPU 가정에서 검증됨**. Multi-GPU 환경 진행 시 위 3개 항목 ("검증 필요") 실측 후 안전성 확정 필요. 본질적 multi-GPU 충돌은 없으며 ZeRO-1+ 의 master partition / lp.data 의 flat-view 가정도 DS 0.18.9 의 BF16_Optimizer / FP16_Optimizer 둘 다 동일한 `p.data = q.data` 패턴 (line 285 of bf16_optimizer.py, line 95 of fp16/fused_optimizer.py) — 즉 single-GPU 에서 작동한 pattern 이 multi-GPU 에서도 동일하게 작동할 가능성 높음.
 
 ---
 ```

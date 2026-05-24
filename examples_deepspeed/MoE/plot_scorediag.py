@@ -259,7 +259,7 @@ def plot_gnb_cdf(recs, out_path):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), squeeze=False)
     colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(len(recs_h), 1)))
     for ax, key, title in [
-        (axes[0, 0], "H_diag", "|H_diag| CDF (GNB / Hutchinson estimate)"),
+        (axes[0, 0], "H_diag", "|H_diag| CDF (FD estimate)"),
         (axes[0, 1], "score_h", "score_H = |H|·δ² CDF (GNB-based score)"),
     ]:
         for i, r in enumerate(recs_h):

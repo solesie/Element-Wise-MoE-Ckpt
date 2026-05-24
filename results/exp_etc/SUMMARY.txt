@@ -4,3 +4,4 @@
 [etc] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_etc
 [etc] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_etc
 [etc] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_etc
+[etc] OUTPUT_BASEPATH=/home/asdf1234/Megatron-DeepSpeed/results/exp_etc

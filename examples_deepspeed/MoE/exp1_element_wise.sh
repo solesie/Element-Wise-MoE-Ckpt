@@ -9,7 +9,7 @@
 #
 # Proposal config (uses current defaults — CLAUDE.md aligned):
 #   - cp_mode = element_wise
-#   - selection_mode = hessian, estimator = hutchinson
+#   - selection_mode = hessian
 #   - topk_ratio = 0.05 (K = 5%)
 #   - W = 10, D = 4 (via --proposal-expert-fc-D if used; element_wise skips per-expert FC)
 #   - warmup = 300, fault_interval = 100, iterations = 2000
@@ -25,7 +25,6 @@ HIDDEN_SIZE=768
 NUM_ATTN_HEADS=12
 GLOBAL_BATCH_SIZE=24
 # BATCH_SIZE lowered from the 8 used in proposal_etc_template.sh to fit
-# Hutchinson's 2nd-order-grad activation cost at 48 experts × 12 layers
 # uniform (CLAUDE.md Exp 1 strictly; grad-accumulation steps rise 3 → 6).
 BATCH_SIZE=4
 EXPERT_INTERVAL=1           # every layer is MoE → 12 MoE layers
@@ -61,11 +60,10 @@ fi
 mkdir -p "${CP_DIR}/non_expert" "${CP_DIR}/expert"
 rm -f "${FAULT_LOG}" "${SCORE_DIAG_LOG}"
 
-# element_wise proposal flags (defaults: hessian score via Hutchinson, K=5%).
+# element_wise proposal flags (defaults: hessian score, K=5%).
 PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
     --proposal-cp-mode proposal \
     --proposal-selection-mode hessian \
-    --proposal-hessian-estimator hutchinson \
     --proposal-hessian-refresh-every 10 \
     --proposal-hessian-num-samples 1 \
     --proposal-topk-ratio 0.05 \

@@ -342,24 +342,41 @@ def forward_backward_no_pipelining(*,
 
     model_type = get_model_type(model)
 
+    # NVTX phase markers (for nsys mb-level analysis). Cost: ~us per range
+    # — only adds CUDA driver overhead, no GPU work. Gated to no-op if
+    # nvtx pkg not installed.
+    try:
+        import nvtx as _nvtx
+        _has_nvtx = True
+    except ImportError:
+        _has_nvtx = False
+
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
+            if _has_nvtx: _rng = _nvtx.start_range(f"mb{i}_fwd")
             output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                          input_tensor, forward_data_store, config, collect_non_loss_data)
+            if _has_nvtx: _nvtx.end_range(_rng)
             if not forward_only:
+                if _has_nvtx: _rng = _nvtx.start_range(f"mb{i}_bwd")
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
+                if _has_nvtx: _nvtx.end_range(_rng)
     if args.deepspeed:
         model.set_gradient_accumulation_boundary(True)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
+    if _has_nvtx: _rng = _nvtx.start_range(f"mb{num_microbatches-1}_fwd")
     output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                  input_tensor, forward_data_store, config, collect_non_loss_data)
+    if _has_nvtx: _nvtx.end_range(_rng)
 
     if not forward_only:
+        if _has_nvtx: _rng = _nvtx.start_range(f"mb{num_microbatches-1}_bwd")
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
+        if _has_nvtx: _nvtx.end_range(_rng)
 
     return forward_data_store
 

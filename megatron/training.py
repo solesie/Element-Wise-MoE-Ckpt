@@ -56,7 +56,7 @@ from megatron.proposal.cp_hooks import (
     proposal_arm_post_iter_fc,
     proposal_fence_before_optimizer,
     proposal_recover, proposal_inject_fault, proposal_record_iter_loss,
-    proposal_shutdown, proposal_hutchinson_probe,
+    proposal_shutdown,
     proposal_refresh_hessian, set_hessian_valid_iter,
 )
 
@@ -280,17 +280,6 @@ def pretrain(train_valid_test_dataset_provider,
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
-
-    # Hutchinson H_diag vs v_t comparison on the live-trained state (option C smoke).
-    # Runs BEFORE replay so v_t is the one populated by normal Adam steps.
-    if getattr(args, 'proposal_enable', False) and getattr(args, 'proposal_hutchinson_at_end', False):
-        _, h_valid_iter, _ = build_train_valid_test_data_iterators(
-            train_valid_test_dataset_provider)
-        proposal_hutchinson_probe(
-            model, optimizer, forward_step_func, h_valid_iter, iteration,
-            k_samples=getattr(args, 'proposal_hutchinson_k_samples', 4),
-            out_path=getattr(args, 'proposal_hutchinson_log', None),
-        )
 
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
@@ -731,6 +720,14 @@ def train_step(forward_step_func, data_iterator,
                 partition.zero_grad_buffer()
         optimizer.zero_grad()
 
+    # NVTX iter-phase markers for nsys analysis.
+    try:
+        import nvtx as _nvtx_t
+        _has_nvtx_t = True
+    except ImportError:
+        _has_nvtx_t = False
+    _rng_iter = _nvtx_t.start_range(f"iter{args.iteration+1}_fwdbwd") if _has_nvtx_t else None
+
     # Forward pass.
     timers('forward-backward', log_level=1).start(
         barrier=args.barrier_with_L1_time)
@@ -785,8 +782,11 @@ def train_step(forward_step_func, data_iterator,
     # any in-flight d2h on d2h_stream that is reading the master.
     # No-op in practice (d2h finishes ~1.6 s before this point), kept
     # as belt-and-suspenders guard against worker pickup / PCIe stalls.
+    if _has_nvtx_t and _rng_iter is not None:
+        _nvtx_t.end_range(_rng_iter)
     if getattr(args, 'proposal_enable', False):
         proposal_fence_before_optimizer()
+    _rng_opt = _nvtx_t.start_range(f"iter{args.iteration+1}_optimizer") if _has_nvtx_t else None
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
         increment = get_num_microbatches() * \
@@ -805,6 +805,8 @@ def train_step(forward_step_func, data_iterator,
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
+    if _has_nvtx_t and _rng_opt is not None:
+        _nvtx_t.end_range(_rng_opt)
 
     # Gather params.
     if not args.deepspeed and update_successful:

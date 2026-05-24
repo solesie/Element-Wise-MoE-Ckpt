@@ -64,8 +64,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from .binary_io import (
+from .proposal_io import (
     HEADER_BLOCK_BYTES as _BIN_HEADER_BLOCK_BYTES,
+    SECTOR_BYTES as _BIN_SECTOR_BYTES,
     alloc_pinned_uint8_sector_aligned,
     append_lossy_log_from_pinned,
     close_fd,
@@ -73,6 +74,8 @@ from .binary_io import (
     open_lossy_log_for_append,
     write_lossless_from_pinned,
 )
+from . import gpu_aos as _gpu_aos
+from .segment_pipeline import SegmentPipeline, DEFAULT_SEGMENT_BYTES
 
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
@@ -85,16 +88,18 @@ FORMAT_VERSION: int = 1
 # LFCL, and LFSY all share a single sector convention. 64 KiB is the
 # current value (sized to fit the largest header — non-expert FC).
 HEADER_BLOCK_BYTES: int = _BIN_HEADER_BLOCK_BYTES
-RECORD_BYTES: int = 16  # int32 idx + fp32 p + fp32 m + fp32 v
+RECORD_BYTES: int = 20  # int64 idx + fp32 p + fp32 m + fp32 v
 BLOCK_PREFIX_BYTES: int = 8  # count u32 + step u32
 
 # Filename conventions.
 _LOSSLESS_RE = re.compile(r"^fc_expert_L(\d+)_E(\d+)\.bin$")
 _LOSSY_RE = re.compile(r"^lossy_expert_L(\d+)_E(\d+)\.bin$")
 
-# Per-record numpy structured dtype (little-endian, packed to 16B).
+# Per-record numpy structured dtype (little-endian, packed to 20B).
+# idx is int64: per-expert combined offset = tname_base_offset + idx_local
+# overflows int32 once per-expert (param+m+v) elements exceed ~2.1B.
 _RECORD_DTYPE = np.dtype([
-    ("idx", "<i4"),
+    ("idx", "<i8"),
     ("p", "<f4"),
     ("m", "<f4"),
     ("v", "<f4"),
@@ -200,6 +205,43 @@ class ExpertState:
         self._entries: Dict[ExpertId, _ExpertEntry] = {}
         self._async_writer = async_writer
 
+        # Phase 5: pre-allocate pinned_aos at half the total expert state
+        # bytes (Σ per-expert numel × 3 fields × 4 bytes). This bounds
+        # the per-iter AOS payload regardless of topk_ratio / outlier
+        # spikes; raises if exceeded. Sized once, reused across iters.
+        _total_param_numel = sum(
+            int(numel)
+            for schema in expert_tensor_map.values()
+            for (_tname, _shape, numel) in schema
+        )
+        _total_state_bytes = _total_param_numel * 12  # p + m + v, fp32
+        _pinned_aos_bytes = _total_state_bytes // 2
+        _sect = int(_BIN_SECTOR_BYTES)
+        _pinned_aos_bytes = (
+            (_pinned_aos_bytes + _sect - 1) // _sect
+        ) * _sect
+        if _pinned_aos_bytes <= 0:
+            # Empty expert map (defensive). Allocate a single sector so
+            # the pipeline's size check stays well-defined.
+            _pinned_aos_bytes = _sect
+        self._pinned_aos: torch.Tensor = alloc_pinned_uint8_sector_aligned(
+            _pinned_aos_bytes
+        )
+        print(
+            f"[proposal] ExpertState pinned_aos pre-alloc: "
+            f"{_pinned_aos_bytes / 1e9:.2f} GB "
+            f"(half of {_total_state_bytes / 1e9:.2f} GB total expert state)",
+            flush=True,
+        )
+
+        # GPU AOS pipeline shares ``self._pinned_aos`` — no internal
+        # allocation, no lazy growth. The segment_pipeline staging
+        # (256 MiB GPU) is lazy-created on first ``run()`` once the
+        # worker thread's CUDA context is up.
+        self._aos_pipeline: _gpu_aos.LossyAosPipeline = _gpu_aos.LossyAosPipeline(
+            pinned_aos=self._pinned_aos,
+        )
+
         for eid, schema in expert_tensor_map.items():
             L, E = eid
             # Compute global flat offsets within the expert's
@@ -218,12 +260,9 @@ class ExpertState:
                 lossy_path=self._output_dir / _lossy_name(L, E),
             )
             if fresh:
+                from .proposal_io import unlink_path as _unlink
                 for p in (entry.lossless_path, entry.lossy_path):
-                    if p.exists():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
+                    _unlink(p)
             self._entries[eid] = entry
 
     # ------------------------------------------------------------------
@@ -231,13 +270,18 @@ class ExpertState:
     # else execute synchronously (test / offline path).
     # ------------------------------------------------------------------
     def _dispatch(self, fn: "Callable[..., None]", *args: Any, tag: str) -> None:
-        # Always run inline. In the new arch every caller of ExpertState
-        # (ExpertLosslessFC, ImportanceTracker.dispatch) already lives on
-        # the host_writer_expert worker, so submitting back to that same
-        # queue here would simply enqueue extra steps without parallelism
-        # — and would self-join inside any later drain_expert.
+        # Route commit work to the AsyncWriter's raw worker so the caller
+        # (host_writer_expert, which is in the middle of tracker.step) can
+        # return immediately to launch this iter's score on tracker_stream.
+        # Per-iter commits land on raw's FIFO in the order issued — FIFO is
+        # the only ordering guarantee callers need (lossless before any
+        # subsequent lossy on the same expert, which the caller already
+        # serialises within host_writer_expert).
         del tag
-        fn(*args)
+        if self._async_writer is not None:
+            self._async_writer.submit_raw(fn, *args)
+        else:
+            fn(*args)
 
     # ------------------------------------------------------------------
     # Introspection
@@ -363,11 +407,10 @@ class ExpertState:
                 f"expected {_BIN_HEADER_BLOCK_BYTES}, got "
                 f"{pinned_info.get('header_block_bytes')}"
             )
-        pinned_mv = memoryview(pinned_tensor.numpy().view(np.uint8))
         L_id, E_id = ent.expert_id
         write_lossless_from_pinned(
             ent.lossless_path,
-            pinned_mv,
+            pinned_tensor,
             header_bytes=header,
             payload_bytes=payload_bytes,
             layer=int(L_id),
@@ -379,11 +422,8 @@ class ExpertState:
         ent.step = int(step)
 
         # 3) Unlink previous lossy log (if any).
-        if ent.lossy_path.exists():
-            try:
-                ent.lossy_path.unlink()
-            except OSError:
-                pass
+        from .proposal_io import unlink_path as _unlink
+        _unlink(ent.lossy_path)
 
         # 4) Pre-create fresh lossy FC file with its header for upcoming
         # appends. _open_fresh_lossy runs on this BG thread, which owns
@@ -393,218 +433,128 @@ class ExpertState:
     # ------------------------------------------------------------------
     # Lossy FC (append-only per iter)
     # ------------------------------------------------------------------
-    @torch.no_grad()
-    def lossy_fc_append(
-        self,
-        expert_id: ExpertId,
-        step: int,
-        tensor_updates: List[Tuple[str, torch.Tensor, torch.Tensor,
-                                   torch.Tensor, torch.Tensor]],
-    ) -> int:
-        """Append one per-iter block for ``expert_id``.
-
-        **Training-thread work**: build the per-iter numpy structured
-        array from already-CPU input tensors. Zero-copy for fp32/int32
-        contiguous inputs.
-
-        **Background-thread work** (in ``_do_lossy_fc_assemble_and_write``):
-        assemble the pinned (count, step, records) blob and emit a
-        single ``os.write`` into the per-expert lossy FC log, lazily
-        opening the fd if needed.
-        """
-        ent = self._entries.get(expert_id)
-        if ent is None:
-            return 0
-        # Tally filtered total (skip unknown tensor names / empty
-        # selections). All filtering work here is fast; the heavy
-        # numpy structured-array assembly is moved to the writer
-        # thread (see _do_lossy_fc_assemble_and_write) so the
-        # training thread doesn't pay ~100-200 ms of CPU memcpy
-        # per iter for ~9 M selected elements.
-        total_n = 0
-        filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for (tname, idx_local, p, m, v) in tensor_updates:
-            if tname not in ent.global_offsets:
-                continue
-            n_i = int(idx_local.numel())
-            if n_i == 0:
-                continue
-            filtered.append((ent.global_offsets[tname], idx_local, p, m, v))
-            total_n += n_i
-        if total_n == 0:
-            ent.step = int(step)
-            return 0
-
-        ent.step = int(step)
-        # The CPU tensors in ``filtered`` were freshly produced by the
-        # tracker dispatch (not aliased to any ongoing GPU buffer), so
-        # ownership transfer to the writer thread is safe.
-        L, E = ent.expert_id
-        self._dispatch(
-            self._do_lossy_fc_assemble_and_write,
-            ent, int(step), filtered, int(total_n),
-            tag=f"lossy_L{L:02d}_E{E:02d}",
-        )
-        return total_n
-
-    def _do_lossy_fc_assemble_and_write(
-        self,
-        ent: "_ExpertEntry",
-        step: int,
-        filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
-        total_n: int,
-    ) -> None:
-        """Writer-thread assembly + single ``os.write`` from a pinned
-        AoS blob. Builds ``[prefix(8B) | records(N×16B)]`` directly
-        into pinned memory so the C++ SSD-passthrough writer can later
-        replace the ``os.write`` with a chunk-aligned io_uring submit
-        without any extra copy. The blob is allocated 4 KiB-aligned
-        (size padded up to next sector) so the data_ptr is O_DIRECT
-        compatible regardless of total_n."""
-        blob_bytes = BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
-        blob = alloc_pinned_uint8_sector_aligned(blob_bytes)
-        blob_np = blob.numpy()
-        struct.pack_into("<II", blob_np, 0, int(total_n), int(step))
-        rec_view = blob_np[
-            BLOCK_PREFIX_BYTES:BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
-        ].view(_RECORD_DTYPE)
-        cursor = 0
-        for (offset, idx_local, p, m, v) in filtered:
-            n_i = int(idx_local.numel())
-            idx_np = _to_i32_numpy(idx_local, n_i)
-            rec_view["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
-            rec_view["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
-            rec_view["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
-            rec_view["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
-            cursor += n_i
-        if ent.lossy_fd is None:
-            self._open_fresh_lossy(ent, step=int(step))
-        L_id, E_id = ent.expert_id
-        append_lossy_log_from_pinned(
-            ent.lossy_fd, memoryview(blob_np), blob_bytes,
-            layer=int(L_id), expert=int(E_id), step=int(step),
-        )
+    # Singular ``lossy_fc_append`` (CPU SoA → numpy AoS assembly per
+    # expert) removed in Phase 3 — the legacy path was bypassable only
+    # for tests; production callers use ``lossy_fc_append_batch`` which
+    # now drives the GPU AOS pipeline.
+    # ------------------------------------------------------------------
 
     def lossy_fc_append_batch(
         self,
         step: int,
-        per_expert_updates: Dict[ExpertId, List[Tuple[str, torch.Tensor,
-                                                       torch.Tensor, torch.Tensor,
-                                                       torch.Tensor]]],
-        h2d_event: Optional[Any] = None,
+        per_expert_updates: Dict[ExpertId, List[Tuple[str, int, int, int]]],
+        tracker_event: Optional[Any] = None,
         gpu_refs: Optional[List[torch.Tensor]] = None,
+        bf16_groups: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor,
+                                                   torch.Tensor, torch.Tensor]]]] = None,
+        lossy_state: Optional[Any] = None,
+        per_expert_outlier_n: Optional[Dict[ExpertId, Dict[str, int]]] = None,
     ) -> int:
-        """Batch variant of ``lossy_fc_append``: takes ALL per-expert
-        updates for one iter and submits a SINGLE writer-thread job that
-        handles every expert in sequence. Avoids ~80 per-iter
-        submit_raw calls (each costs ~1-2 ms training-thread time
-        from queue lock + counter increment), so the training-thread
-        overhead drops to one submission. Heavy numpy assembly + writev
-        still runs on the writer thread.
+        """GPU AOS batch submit (Phase 3). See ``LossyAosPipeline``.
 
-        ``h2d_event``: optional cuda.Event recorded after the d2h_stream
-        copies that populate the pinned tensor data. The writer thread
-        synchronises on this event before reading the pinned tensors —
-        keeps the H2D off the training thread's critical path while
-        guaranteeing the writer sees consistent data."""
-        # Build a list of (entry, total_n, filtered) on training thread.
-        # All work here is fast (filtering numel checks + dict lookups);
-        # the heavy numpy memcpy is deferred to the writer thread.
-        prepared: List[Tuple[_ExpertEntry, int, List[Tuple[int, torch.Tensor,
-                                                            torch.Tensor, torch.Tensor,
-                                                            torch.Tensor]]]] = []
+        ``per_expert_updates[eid]`` is a list of
+        ``(tname, bf16_group_idx, src_off, n_records)`` tuples — pure
+        descriptors, no CPU tensors. In Option A replace mode, the
+        ``n_records`` here is GROUP records only. Outlier records are
+        added on top via ``per_expert_outlier_n[eid][tname]`` and Pass B
+        writes them within the segment producer.
+        """
+        prepared: List[Tuple[_ExpertEntry, int,
+                             List[Tuple[str, int, int, int, int]]]] = []
+        outlier_n_per_expert_entry: List[List[int]] = []
         grand_total = 0
         for eid, tensor_updates in per_expert_updates.items():
             ent = self._entries.get(eid)
             if ent is None:
                 continue
             total_n = 0
-            filtered: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor,
-                                 torch.Tensor]] = []
-            for (tname, idx_local, p, m, v) in tensor_updates:
+            filtered: List[Tuple[str, int, int, int, int]] = []
+            outlier_ns_for_expert: List[int] = []
+            outlier_map_for_expert = (
+                per_expert_outlier_n.get(eid, {}) if per_expert_outlier_n else {}
+            )
+            for (tname, bf16_group_idx, src_off, n_recs) in tensor_updates:
                 if tname not in ent.global_offsets:
                     continue
-                n_i = int(idx_local.numel())
-                if n_i == 0:
+                n_outlier_for_entry = int(outlier_map_for_expert.get(tname, 0))
+                # n_recs from importance_tracker is GROUP records count.
+                # The entry's TOTAL records = group + outlier.
+                n_total_recs = int(n_recs) + n_outlier_for_entry
+                if n_total_recs <= 0:
                     continue
-                filtered.append((ent.global_offsets[tname], idx_local, p, m, v))
-                total_n += n_i
+                filtered.append((
+                    tname,
+                    ent.global_offsets[tname],
+                    int(bf16_group_idx),
+                    int(src_off),
+                    n_total_recs,
+                ))
+                outlier_ns_for_expert.append(n_outlier_for_entry)
+                total_n += n_total_recs
             ent.step = int(step)
             if total_n == 0:
                 continue
             prepared.append((ent, total_n, filtered))
+            outlier_n_per_expert_entry.append(outlier_ns_for_expert)
             grand_total += total_n
         if not prepared:
+            if gpu_refs is not None:
+                gpu_refs.clear()
             return 0
+        # Pass lossy_state + outlier_n_per_expert_entry through to the
+        # worker task. Only used when lossy_state is not None.
         self._dispatch(
-            self._do_lossy_fc_batch_write,
-            int(step), prepared, h2d_event, gpu_refs,
+            self._do_lossy_fc_gpu_aos,
+            int(step), prepared, tracker_event, gpu_refs, bf16_groups,
+            lossy_state, outlier_n_per_expert_entry,
             tag=f"lossy_batch_iter{int(step)}",
         )
         return grand_total
 
-    def _do_lossy_fc_batch_write(
+    def _do_lossy_fc_gpu_aos(
         self,
         step: int,
-        prepared: List[Tuple["_ExpertEntry", int, List[Tuple[int, torch.Tensor,
-                                                              torch.Tensor, torch.Tensor,
-                                                              torch.Tensor]]]],
-        h2d_event: Optional[Any] = None,
-        gpu_refs: Optional[List[torch.Tensor]] = None,
+        prepared,
+        tracker_event,
+        gpu_refs,
+        bf16_groups,
+        lossy_state: Optional[Any] = None,
+        outlier_n_per_expert_entry: Optional[List[List[int]]] = None,
     ) -> None:
-        """Writer-thread handler for the batched variant — performs the
-        per-expert SoA→AoS interleave into a pinned packed buffer +
-        single ``os.write`` sequentially.
-
-        Synchronises on ``h2d_event`` first (when present) so we read
-        the pinned tensors only after the d2h_stream copies that filled
-        them have completed."""
-        if h2d_event is not None:
-            try:
-                h2d_event.synchronize()
-            except Exception:
-                pass
-        # H2D provably done → release Phase A GPU staging tensors so the
-        # caching allocator can reuse their memory (was held alive by
-        # the training thread to avoid cross-stream UB).
-        if gpu_refs is not None:
-            gpu_refs.clear()
-        for (ent, total_n, filtered) in prepared:
-            # Per-expert pinned blob: [prefix(8B) | records(N×16B)].
-            # Allocated as a fresh pinned uint8 tensor so the C++
-            # writer (future SSD passthrough) can submit the entire
-            # blob in one chunk-aligned io_uring write. Torch's pinned
-            # caching allocator recycles freed buffers so per-iter
-            # alloc cost is small. Use sector-aligned helper so the
-            # blob's data_ptr is 4 KiB-aligned (small uint8 allocs from
-            # torch's caching pinned allocator may otherwise return
-            # non-page-aligned pointers — incompatible with O_DIRECT).
-            blob_bytes = BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
-            blob = alloc_pinned_uint8_sector_aligned(blob_bytes)
-            blob_np = blob.numpy()
-            # Pack (count, step) prefix at the head of the pinned blob.
-            struct.pack_into(
-                "<II", blob_np, 0, int(total_n), int(step),
-            )
-            # Interleave SoA planar → AoS packed directly into pinned.
-            rec_view = blob_np[
-                BLOCK_PREFIX_BYTES:BLOCK_PREFIX_BYTES + total_n * RECORD_BYTES
-            ].view(_RECORD_DTYPE)
-            cursor = 0
-            for (offset, idx_local, p, m, v) in filtered:
-                n_i = int(idx_local.numel())
-                idx_np = _to_i32_numpy(idx_local, n_i)
-                rec_view["idx"][cursor:cursor + n_i] = idx_np + np.int32(offset)
-                rec_view["p"][cursor:cursor + n_i] = _to_fp32_numpy(p, n_i)
-                rec_view["m"][cursor:cursor + n_i] = _to_fp32_numpy(m, n_i)
-                rec_view["v"][cursor:cursor + n_i] = _to_fp32_numpy(v, n_i)
-                cursor += n_i
+        """Disk-mode worker (Phase 3). Drives the shared GPU AOS pipeline
+        then ``::write``s each expert's 4 KiB-padded blob to its lossy fd.
+        """
+        expert_specs, total_aos = self._aos_pipeline.run(
+            step=int(step),
+            prepared=prepared,
+            tracker_event=tracker_event,
+            gpu_refs=gpu_refs,
+            bf16_groups=bf16_groups,
+            lossy_state=lossy_state,
+            outlier_n_per_expert_entry=outlier_n_per_expert_entry,
+        )
+        if total_aos == 0:
+            return
+        pinned_aos = self._aos_pipeline.pinned_aos
+        # Ablation knob: PROPOSAL_DISK_SKIP_WRITE=1 exercises the full
+        # GPU AOS + D2H to pinned_aos but skips the per-expert ::write
+        # syscall. Used to isolate whether the kernel ``copy_from_user``
+        # of ::write is the residual L3 polluter (cf. CLAUDE.md +355 ms
+        # diagnosis). 학습 / 복구가 깨지므로 측정 전용.
+        import os as _os_skip
+        _skip_write = _os_skip.environ.get(
+            "PROPOSAL_DISK_SKIP_WRITE", "") in ("1", "true", "True")
+        for spec, (ent, _total_n, _filtered) in zip(expert_specs, prepared):
             if ent.lossy_fd is None:
                 self._open_fresh_lossy(ent, step=int(step))
-            L_id, E_id = ent.expert_id
+            blob = pinned_aos.narrow(0, spec.aos_byte_off,
+                                     spec.blob_padded_bytes)
+            L, E = ent.expert_id
+            if _skip_write:
+                continue
             append_lossy_log_from_pinned(
-                ent.lossy_fd, memoryview(blob_np), blob_bytes,
-                layer=int(L_id), expert=int(E_id), step=int(step),
+                int(ent.lossy_fd), blob, int(spec.blob_padded_bytes),
+                layer=int(L), expert=int(E), step=int(step),
             )
 
     # ------------------------------------------------------------------
@@ -621,11 +571,11 @@ class ExpertState:
         rename on the AsyncWriter raw worker), so this method only needs
         to cover the lossy append fds.
         """
-        # Drain AsyncWriter queues first so pending writes land before
+        # Drain AsyncWriter raw queue first so pending writes land before
         # we fsync.
         if self._async_writer is not None:
             try:
-                self._async_writer.drain_expert()
+                self._async_writer.drain_raw()
             except Exception:
                 pass
         target = set(only_eids) if only_eids is not None else None
@@ -640,7 +590,7 @@ class ExpertState:
                 )
         if self._async_writer is not None:
             try:
-                self._async_writer.drain_expert()
+                self._async_writer.drain_raw()
             except Exception:
                 pass
 
@@ -681,49 +631,9 @@ class ExpertState:
         ent.lossy_start_step = int(step)
 
 
-# ----------------------------------------------------------------------------
-# Tensor → numpy helpers (zero-copy for CPU contiguous tensors)
-# ----------------------------------------------------------------------------
-def _to_fp32_numpy(t: torch.Tensor, expected_n: int) -> np.ndarray:
-    """Return a 1-D fp32 numpy view of ``t`` with exactly ``expected_n``
-    elements. Copies only if dtype/device/contiguity requires it."""
-    t = t.detach()
-    if t.device.type != "cpu":
-        t = t.to("cpu")
-    if t.dtype != torch.float32:
-        t = t.to(torch.float32)
-    if not t.is_contiguous():
-        t = t.contiguous()
-    arr = t.numpy().reshape(-1)
-    if arr.size != expected_n:
-        # Caller passed a wrong-size tensor; trim or pad to expected_n to
-        # avoid hard failures (defensive: normal path has size match).
-        if arr.size > expected_n:
-            arr = arr[:expected_n]
-        else:
-            padded = np.zeros(expected_n, dtype=np.float32)
-            padded[:arr.size] = arr
-            arr = padded
-    return arr
-
-
-def _to_i32_numpy(t: torch.Tensor, expected_n: int) -> np.ndarray:
-    t = t.detach()
-    if t.device.type != "cpu":
-        t = t.to("cpu")
-    if t.dtype != torch.int32:
-        t = t.to(torch.int32)
-    if not t.is_contiguous():
-        t = t.contiguous()
-    arr = t.numpy().reshape(-1)
-    if arr.size != expected_n:
-        if arr.size > expected_n:
-            arr = arr[:expected_n]
-        else:
-            padded = np.zeros(expected_n, dtype=np.int32)
-            padded[:arr.size] = arr
-            arr = padded
-    return arr
+# Phase 3 removed the per-tensor numpy helpers (``_to_fp32_numpy`` /
+# ``_to_i64_numpy``) that supported the CPU SoA → AoS interleave path.
+# The GPU AOS kernel reads directly from the per-BF16-group GPU SoA.
 
 
 # ----------------------------------------------------------------------------
@@ -756,10 +666,12 @@ def read_expert_state(
 
     # ------------------------------------------------------------------
     # 1) Lossless FC → dense (param, m, v) flat buffers.
+    # All file IO goes through proposal_io.read_file_range (binary_io.cpp).
     # ------------------------------------------------------------------
-    if lossless_path.exists():
-        with open(lossless_path, "rb") as f:
-            header_block = f.read(HEADER_BLOCK_BYTES)
+    from .proposal_io import read_file_range as _pread, file_size as _fsize
+    lossless_size = _fsize(lossless_path)
+    if lossless_size >= 0:
+        header_block = _pread(lossless_path, 0, HEADER_BLOCK_BYTES)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFCL:
             raise ValueError(f"expected LFCL in {lossless_path}, got {magic!r}")
@@ -768,27 +680,22 @@ def read_expert_state(
         p_flat = np.zeros(total_numel, dtype=np.float32)
         m_flat = np.zeros(total_numel, dtype=np.float32)
         v_flat = np.zeros(total_numel, dtype=np.float32)
-        fd = os.open(str(lossless_path), os.O_RDONLY)
-        try:
-            cursor = 0
-            file_off = HEADER_BLOCK_BYTES
-            for entry in tensors_meta:
-                numel = int(entry["numel"])
-                # Read param / m / v for this tensor from disk.
-                for buf in (p_flat, m_flat, v_flat):
-                    raw = os.pread(fd, numel * 4, file_off)
-                    buf[cursor:cursor + numel] = np.frombuffer(raw, dtype=np.float32)
-                    file_off += numel * 4
-                cursor += numel
-        finally:
-            os.close(fd)
+        cursor = 0
+        file_off = HEADER_BLOCK_BYTES
+        for entry in tensors_meta:
+            numel = int(entry["numel"])
+            for buf in (p_flat, m_flat, v_flat):
+                raw = _pread(lossless_path, file_off, numel * 4)
+                buf[cursor:cursor + numel] = np.frombuffer(raw, dtype=np.float32)
+                file_off += numel * 4
+            cursor += numel
         base_step = int(meta.get("step", 0))
     else:
         # No lossless FC yet — read schema from lossy FC header only.
-        if not lossy_path.exists():
+        lossy_size_probe = _fsize(lossy_path)
+        if lossy_size_probe < 0:
             return {"_rolling_step": 0}
-        with open(lossy_path, "rb") as f:
-            header_block = f.read(HEADER_BLOCK_BYTES)
+        header_block = _pread(lossy_path, 0, HEADER_BLOCK_BYTES)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
             return {"_rolling_step": 0}
@@ -802,46 +709,44 @@ def read_expert_state(
     # ------------------------------------------------------------------
     # 2) Replay lossy FC append log (if present).
     #
-    # Per CLAUDE.md § 복구 성능 주의사항: the lossy log accumulates
-    # duplicate element_index entries as the same "important" elements
-    # get re-selected each iter. Naive per-block scatter would touch
-    # every record (including duplicates). Optimised path: read every
-    # block into a single concatenated ndarray, dedupe by idx keeping
-    # the LAST occurrence, then apply one scatter per field. This keeps
-    # the scatter cost proportional to the unique-index count, not the
-    # total record count.
+    # Per CLAUDE.md § 복구 성능 주의사항: dedupe by idx keeping the LAST
+    # occurrence, then one scatter per field.
     # ------------------------------------------------------------------
     max_step = base_step
-    if lossy_path.exists():
+    lossy_size = _fsize(lossy_path)
+    if lossy_size >= 0:
         block_arrays: List[np.ndarray] = []
-        fd = os.open(str(lossy_path), os.O_RDONLY)
-        try:
-            size = os.fstat(fd).st_size
-            header_block = os.pread(fd, HEADER_BLOCK_BYTES, 0)
-            magic, _ver, _meta = _unpack_header(header_block)
-            if magic != MAGIC_LFSY:
-                return {"_rolling_step": int(max_step)}
-            offset = HEADER_BLOCK_BYTES
-            while offset + BLOCK_PREFIX_BYTES <= size:
-                prefix_bytes = os.pread(fd, BLOCK_PREFIX_BYTES, offset)
-                if len(prefix_bytes) < BLOCK_PREFIX_BYTES:
-                    break
-                count, step = struct.unpack("<II", prefix_bytes)
-                offset += BLOCK_PREFIX_BYTES
-                if count == 0:
-                    continue
-                payload_bytes = count * RECORD_BYTES
-                if offset + payload_bytes > size:
-                    break  # truncated / corrupt tail
-                raw = os.pread(fd, payload_bytes, offset)
-                offset += payload_bytes
-                if step > max_step:
-                    max_step = int(step)
-                block_arrays.append(
-                    np.frombuffer(raw, dtype=_RECORD_DTYPE).copy()
-                )
-        finally:
-            os.close(fd)
+        header_block = _pread(lossy_path, 0, HEADER_BLOCK_BYTES)
+        magic, _ver, _meta = _unpack_header(header_block)
+        if magic != MAGIC_LFSY:
+            return {"_rolling_step": int(max_step)}
+        # write path (append_lossy_log_from_pinned) pads every block to
+        # SECTOR_BYTES (4 KiB) for O_DIRECT/io_uring-compatible writes,
+        # so each block starts on a sector boundary. Walk by sector.
+        from .proposal_io import SECTOR_BYTES, _round_up_sector
+        offset = HEADER_BLOCK_BYTES
+        while offset + BLOCK_PREFIX_BYTES <= lossy_size:
+            prefix_bytes = _pread(lossy_path, offset, BLOCK_PREFIX_BYTES)
+            if len(prefix_bytes) < BLOCK_PREFIX_BYTES:
+                break
+            count, step = struct.unpack("<II", prefix_bytes)
+            if count == 0:
+                # empty / padding block — advance to next sector
+                offset += SECTOR_BYTES
+                continue
+            payload_bytes = count * RECORD_BYTES
+            data_off = offset + BLOCK_PREFIX_BYTES
+            if data_off + payload_bytes > lossy_size:
+                break  # truncated / corrupt tail
+            raw = _pread(lossy_path, data_off, payload_bytes)
+            if step > max_step:
+                max_step = int(step)
+            block_arrays.append(
+                np.frombuffer(raw, dtype=_RECORD_DTYPE).copy()
+            )
+            # Advance to next sector boundary — block is padded to
+            # SECTOR_BYTES by the writer.
+            offset = _round_up_sector(data_off + payload_bytes)
 
         if block_arrays:
             # Concatenate blocks in file order (oldest → newest).

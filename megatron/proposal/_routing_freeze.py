@@ -33,8 +33,7 @@ Edge cases handled
   autograd cannot back-prop through the captured value and CUDA
   doesn't free the memory mid-replay.
 * Auxiliary load-balance loss (``l_aux``) is zeroed in the captured
-  output so finite-diff sees only the task-loss component (matches
-  Hutchinson which also runs only on the language-model loss).
+  output so finite-diff sees only the task-loss component.
 * EP > 1 not exercised — caller blocks at cp_hooks.py:120-124. We
   comment that here for future-proofing.
 """
@@ -93,7 +92,7 @@ def identify_gate_modules(
     nn.Module. We unwrap once via the same pattern cp_hooks uses.
 
     Returns ``([], {})`` if no gates are found — caller should warn and
-    fall back to no-freeze (or to Hutchinson).
+    fall back to no-freeze.
     """
     inner = _unwrap_to_inner(model)
     # Build name → parent map for parent-class-name lookups.

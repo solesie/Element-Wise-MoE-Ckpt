@@ -73,7 +73,6 @@ MEGATRON_OPTS="--override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95
     --proposal-enable --proposal-cp-dir ${CP_DIR} \
     --proposal-cp-mode proposal \
     --proposal-selection-mode hessian \
-    --proposal-hessian-estimator hutchinson \
     --proposal-hessian-refresh-every 40 \
     --proposal-hessian-num-samples 4 \
     --proposal-hessian-ema-alpha 0.9 \
