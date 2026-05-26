@@ -329,14 +329,42 @@ def init_proposal(
         async_writer=_writer,
         block_quant_g=int(getattr(args, "proposal_block_quant_g", 1)),
     )
-    # Eager-allocate the per-BF16-group flat buffers (dg, h_g, exc, sel
-    # scratch) so the iter-1 Hessian refresh has valid target views to
-    # write into. With the new arch the first tracker.step runs on the
-    # host_writer_expert worker AFTER iter 1's H refresh on the training
-    # thread; if we left this lazy, ``_fold_h`` would silently skip every
-    # tensor (no view yet) and ``_g_fast_h_g_bf16_flat`` would stay zero
-    # for the full first refresh cycle.
+    # Eager-allocate the per-BF16-group flat buffers (dg, exc, sel
+    # scratch + anchor sample buf). Required so iter-1 Hessian refresh
+    # has valid target buffers. With the new arch the first
+    # tracker.step runs on the host_writer_expert worker AFTER iter 1's
+    # H refresh on the training thread.
     _tracker._init_accum_sq_flat(inner_opt)
+
+    # ---- NCCL process group for proposal global-threshold allgather ----
+    # Per-rank score sub-sample buffer is allgathered each iter so all
+    # ranks compute the same global K-th order statistic (algorithm
+    # correctness: K-budget is inherently global). A dedicated communicator
+    # (separate from main DP / EP allreduce) avoids stream-ordering
+    # conflicts. Single-GPU runs leave `_proposal_pg = None` — walk runs
+    # on local sample_buf with no collective.
+    _proposal_pg = None
+    _proposal_world_size = 1
+    try:
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            _proposal_world_size = int(torch.distributed.get_world_size())
+            if _proposal_world_size > 1:
+                _proposal_pg = torch.distributed.new_group(
+                    ranks=list(range(_proposal_world_size)),
+                )
+                if _should_write():
+                    print(f"[proposal] NCCL proposal_pg created "
+                          f"(world_size={_proposal_world_size})",
+                          flush=True)
+    except Exception as _exc:
+        _proposal_pg = None
+        _proposal_world_size = 1
+        if _should_write():
+            print(f"[proposal] proposal_pg init failed (single-GPU fallback): "
+                  f"{_exc}", flush=True)
+    _tracker._proposal_pg = _proposal_pg
+    _tracker._proposal_world_size = _proposal_world_size
 
     # CP layout: split non-expert + expert into separate subdirectories
     # so they can be mounted on different devices.
@@ -1663,40 +1691,15 @@ def _fold_h(names: List[str], h_new_list: List[torch.Tensor],
             # redundant.
             n_skipped += 1
             continue
-        # Reduce h_new to per-group mean (BF16) — drop element-level.
-        # Write IN-PLACE into _g_fast_h_g_bf16_flat's per-name view; the
-        # dict ``_tracker._H_g`` holds that same view (storage shared,
-        # no extra alloc).
-        view_idx_map = getattr(_tracker, "_g_fast_name_to_idx", None)
-        if view_idx_map is None and hasattr(_tracker, "_g_fast_name_list"):
-            view_idx_map = {nm: idx for idx, nm
-                            in enumerate(_tracker._g_fast_name_list)}
-            _tracker._g_fast_name_to_idx = view_idx_map
-        if view_idx_map is None or name not in view_idx_map:
-            continue
-        view = _tracker._g_fast_h_g_views[view_idx_map[name]]
-        # Detect the FD per-group-BF16 fast path: h_new is already shaped
-        # ``(numel_view,)`` with dtype BF16 (compute_hessian_finite_diff
-        # has folded element→group inline). In that case copy directly.
-        if (h_new.dtype == torch.bfloat16
-                and h_new.numel() == view.numel()):
-            view.copy_(h_new.detach().reshape(-1))
-            _tracker._H_g[name] = view
-            continue
-        # Element-level path (multi-K diagnostic).
-        h_flat = h_new.detach().reshape(-1).to(torch.float32)
-        nt = h_flat.numel()
-        nt_a = (nt // g_blk) * g_blk
-        if nt_a == 0:
-            continue
-        h_g_new = h_flat[:nt_a].reshape(-1, g_blk).mean(dim=1)
-        del h_flat
-        view.copy_(h_g_new.to(torch.bfloat16))
-        _tracker._H_g[name] = view
-        del h_g_new
+        # h_g_flat removed — anchor writes go directly into
+        # ``_g_fast_h_anchor_sample_buf`` via _flat_signed_stream_kernel
+        # (stride-sampled per-element FD H). No per-name view copy here.
+        # _fold_h kept only for coverage / flip_skip diagnostics.
+        _tracker._H_g[name] = h_new  # opaque ref for downstream diags
     # Anchor 시점 lookup-table 갱신: _g_fast_h_quantiles ← quantile of
-    # _g_fast_h_g_bf16_flat (just written above). update_v_mapping uses
-    # this every iter to overwrite the same buffer with mapped(v_t).
+    # _g_fast_h_anchor_sample_buf (written by fast-flat anchor session
+    # via _flat_signed_stream_kernel). h_quantiles drives the per-element
+    # bsearch inside outlier kernels each iter.
     try:
         _tracker.update_h_anchor_quantiles()
     except Exception as _exc:
@@ -2044,32 +2047,17 @@ def proposal_refresh_finite_diff(
                                        if _n in _name_to_idx])
                 _is_contig = (_expert_idxs == list(range(min(_expert_idxs),
                                                          max(_expert_idxs)+1)))
-                # Check group-level (BF16) buffer contiguity
-                _views = [_tracker._g_fast_h_g_views[_name_to_idx[_n]]
-                          for _n in _expert_names if _n in _name_to_idx]
-                _v0 = _views[0]
-                _storage_ptr = _v0.untyped_storage().data_ptr()
-                _bpe = _v0.element_size()
-                _expected = _v0.storage_offset() * _bpe
-                _gv_contig = True
-                _total_groups = 0
-                for _v in _views:
-                    if (_v.untyped_storage().data_ptr() != _storage_ptr
-                            or _v.storage_offset() * _bpe != _expected):
-                        _gv_contig = False
-                        break
-                    _expected += _v.numel() * _bpe
-                    _total_groups += _v.numel()
+                # h_g_views removed — only report idx contig + anchor sample buf size.
+                _sample_buf = _tracker._g_fast_h_anchor_sample_buf
                 print(f"[fast-flat-dbg] tracker buffer: n_total_names={_total_names} "
                       f"n_experts={len(_expert_idxs)} "
                       f"expert_idx_range=[{min(_expert_idxs)},{max(_expert_idxs)}] "
                       f"idx_contig={_is_contig}",
                       flush=True)
-                print(f"[fast-flat-dbg] expert group-views: "
-                      f"storage_contig={_gv_contig} "
-                      f"n_groups_in_expert_region={_total_groups} "
-                      f"buf_total_numel={_tracker._g_fast_h_g_bf16_flat.numel()} "
-                      f"buf_dtype={_tracker._g_fast_h_g_bf16_flat.dtype}",
+                print(f"[fast-flat-dbg] anchor sample buf: "
+                      f"numel={_sample_buf.numel()} "
+                      f"dtype={_sample_buf.dtype} "
+                      f"stride={_tracker._g_fast_h_anchor_stride}",
                       flush=True)
             except Exception as _e:
                 print(f"[fast-flat-dbg] tracker dump err: {_e}", flush=True)
@@ -2162,12 +2150,15 @@ def proposal_refresh_finite_diff(
                 _total_groups = _total_n // _g_blk_int
                 _grad_flat = torch.zeros(_total_n, dtype=_p0.dtype,
                                          device=_p0.device)
-                # h_accum_flat = tracker buffer directly (NO new alloc)
-                _h_accum_flat = _tracker._g_fast_h_g_bf16_flat
-                if int(_h_accum_flat.numel()) != int(_total_groups):
-                    raise RuntimeError(
-                        f"tracker buffer numel {int(_h_accum_flat.numel())} "
-                        f"!= expected expert groups {int(_total_groups)}")
+                # Anchor sample buf = tracker persistent FP32 buffer.
+                # _flat_signed_stream_kernel writes per-element FD H samples
+                # here at deterministic stride positions (NO group reduce,
+                # NO new alloc). Stride = total_n // ANCHOR_SAMPLE_SIZE.
+                _h_accum_flat = _tracker._g_fast_h_anchor_sample_buf
+                _anchor_sample_size = int(_h_accum_flat.numel())
+                # Refresh stride based on this anchor's element count.
+                _anchor_stride = max(1, int(_total_n) // _anchor_sample_size)
+                _tracker._g_fast_h_anchor_stride = _anchor_stride
                 # Assign each expert.grad = view of grad_flat
                 for _i, _p in enumerate(_expert_ps_sorted):
                     _off = _grad_offsets[_i]
@@ -2176,7 +2167,8 @@ def proposal_refresh_finite_diff(
                 if _should_write():
                     print(f"[proposal] anchor fast-flat ON "
                           f"(n_elem={_total_n} grad_flat={_total_n*2/1e9:.2f}GB "
-                          f"h_accum=tracker_view {_total_groups*2/1e6:.0f}MB no-alloc)",
+                          f"h_sample={_anchor_sample_size*4/1e6:.0f}MB FP32 "
+                          f"stride={_anchor_stride})",
                           flush=True)
             except Exception as _e:
                 _grad_flat = None
@@ -2242,25 +2234,14 @@ def proposal_refresh_finite_diff(
                         for _hi, _h in enumerate(_ret):
                             fd_ret[_hi].add_(_h)
                         del _ret
-            # Fast-flat: build fd_ret from accumulated h_accum_flat
-            # (div by success count + abs + per-expert view). fd_ret order
-            # follows _names_sorted (tracker idx order).
+            # Fast-flat: kernel wrote per-element FD H samples directly
+            # into _h_accum_flat (= _g_fast_h_anchor_sample_buf, FP32).
+            # Apply div-by-N + abs in place; quantile extraction picks
+            # this buffer up via update_h_anchor_quantiles below.
+            # fd_ret = [] (no per-name returns needed; h_g_flat removed).
             if _grad_flat is not None and _n_succ > 0:
                 _h_accum_flat.div_(float(_n_succ)).abs_()
                 fd_ret = []
-                _g_int = max(1, int(_g_blk_for_fd))
-                for _i, _p in enumerate(_expert_ps_sorted):
-                    _off = _grad_offsets[_i]
-                    _ne_p = _p.numel()
-                    _ng = _ne_p // _g_int
-                    if _ng == 0:
-                        fd_ret.append(torch.zeros(0, dtype=torch.bfloat16,
-                                                  device=_h_accum_flat.device))
-                        continue
-                    _gv = _h_accum_flat[_off // _g_int : _off // _g_int + _ng]
-                    # detach + clone so subsequent fast-path callers don't
-                    # mutate the result while _fold_h is still reading.
-                    fd_ret.append(_gv.detach().clone())
         finally:
             # Drop expert grad views (so del _grad_flat actually frees).
             if _grad_view_set:
@@ -2365,21 +2346,23 @@ def proposal_refresh_finite_diff(
             print(f"[proposal] finite_diff failed @iter{iteration}", flush=True)
         return _finalize(None)
 
-    # Capture H scale BEFORE fold (which overwrites _g_fast_h_g_bf16_flat
-    # with new anchor distribution). Ratio is used by tracker.step to
-    # rescale prev_threshold (computed on OLD H scale) onto the NEW H scale,
-    # preventing all-scores-below-threshold pass2 dead-iter.
+    # Capture H scale BEFORE fold (anchor sample buf summary). Ratio is
+    # used by tracker.step to rescale prev_threshold across the new H
+    # scale, preventing all-scores-below-threshold pass2 dead-iter.
     try:
-        _h_pre_fold = float(_tracker._g_fast_h_g_bf16_flat.abs().sum().item())
+        _h_pre_fold = float(
+            _tracker._g_fast_h_anchor_sample_buf.abs().sum().item()
+        )
     except Exception:
         _h_pre_fold = None
-    # Fold into H cache with outlier protection. Names follow the order
-    # used to build h_fd: fast-flat re-sorted to tracker idx; legacy path
-    # keeps original tracked order (names == _names_sorted in that case).
+    # Fold (now just runs update_h_anchor_quantiles + diagnostics; the
+    # actual H data already lives in _g_fast_h_anchor_sample_buf).
     _fold_diag = _fold_h(_names_sorted, h_fd,
                          flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
     try:
-        _h_post_fold = float(_tracker._g_fast_h_g_bf16_flat.abs().sum().item())
+        _h_post_fold = float(
+            _tracker._g_fast_h_anchor_sample_buf.abs().sum().item()
+        )
     except Exception:
         _h_post_fold = None
     if _h_pre_fold is not None and _h_post_fold is not None and _h_pre_fold > 0:

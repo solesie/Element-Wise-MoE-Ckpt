@@ -19,7 +19,7 @@ def _round_up(n, m):
     return ((n + m - 1) // m) * m
 
 
-def setup_problem(N_NAMES, NAME_SIZE, G=8):
+def setup_problem(N_NAMES, NAME_SIZE, G=8, N_Q=1024):
     torch.manual_seed(2025)
     N_TOTAL = N_NAMES * NAME_SIZE
     N_GROUPS = N_TOTAL // G
@@ -27,16 +27,19 @@ def setup_problem(N_NAMES, NAME_SIZE, G=8):
     m_flat = torch.randn(N_TOTAL, device=dev, dtype=torch.float32) * 0.01
     v_flat = torch.rand(N_TOTAL, device=dev, dtype=torch.float32) * 0.001 + 1e-6
     p_flat = torch.randn(N_TOTAL, device=dev, dtype=torch.float32) * 0.1
-    h_g = torch.rand(N_GROUPS, device=dev, dtype=torch.float32) * 0.5 + 0.5
+    # Build monotone v_q / h_q quantile tables (FP32, N_Q each).
+    # Test uses random monotone arrays — kernel just does bsearch + lerp.
+    v_q = torch.linspace(0.0, 1e-3, N_Q, device=dev, dtype=torch.float32)
+    h_q = torch.linspace(0.5, 1.0, N_Q, device=dev, dtype=torch.float32)
     dg_init = torch.rand(N_GROUPS, device=dev, dtype=torch.float32) * 0.001
     ofs_elem = torch.tensor(
         [i * NAME_SIZE for i in range(N_NAMES + 1)],
         device=dev, dtype=torch.int64,
     )
-    return dev, m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem, N_TOTAL, N_GROUPS
+    return dev, m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem, N_TOTAL, N_GROUPS
 
 
-def run_full_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
+def run_full_aos_write(m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem,
                     N_TOTAL, N_GROUPS, name_offset_bytes, name_t_off,
                     name_count, prev_th, group_th, dev, g_blk):
     """Reference: one Pass B call over the whole range."""
@@ -49,12 +52,15 @@ def run_full_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
     dg_after = dg_init.clone()
     prev_th_t = torch.tensor(prev_th, device=dev, dtype=torch.float32)
     group_th_t = torch.tensor(group_th, device=dev, dtype=torch.float32)
+    N_Q = int(v_q.numel())
+    LOG_N_Q = N_Q.bit_length() - 1
 
     # Full Pass B
     GPB = 8
     n_progs = (N_GROUPS + GPB - 1) // GPB
     _aos_write_kernel[(n_progs,)](
-        m_flat, v_flat, p_flat, dg_after, h_g,
+        m_flat, v_flat, p_flat, dg_after,
+        v_q, h_q,
         ofs_elem, name_offset_bytes, name_t_off, name_slot,
         aos_buf,
         prev_th_t, group_th_t,
@@ -62,11 +68,12 @@ def run_full_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
         0,                                       # master_off_elem
         1e-3, 1.0, 1e-8,
         G=g_blk, GROUPS_PER_BLOCK=GPB,
+        N_Q=N_Q, LOG_N_Q=LOG_N_Q,
     )
     return aos_buf, name_slot, dg_after
 
 
-def run_split_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
+def run_split_aos_write(m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem,
                      N_TOTAL, N_GROUPS, name_offset_bytes, name_t_off,
                      name_count, prev_th, group_th, dev, g_blk,
                      n_splits):
@@ -83,6 +90,7 @@ def run_split_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
     dg_after = dg_init.clone()
     prev_th_t = torch.tensor(prev_th, device=dev, dtype=torch.float32)
     group_th_t = torch.tensor(group_th, device=dev, dtype=torch.float32)
+    N_Q = int(v_q.numel())
 
     n_names = len(name_count)
     chunk = max(1, n_names // n_splits)
@@ -100,11 +108,11 @@ def run_split_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
         v_view = v_flat.narrow(0, elem_lo, elem_hi - elem_lo)
         p_view = p_flat.narrow(0, elem_lo, elem_hi - elem_lo)
         accum_view = dg_after.narrow(0, grp_lo, grp_hi - grp_lo)
-        h_g_view = h_g.narrow(0, grp_lo, grp_hi - grp_lo)
 
         launch_aos_write_for_subrange(
             m_view=m_view, v_view=v_view, p_view=p_view,
-            accum_view=accum_view, h_g_view=h_g_view,
+            accum_view=accum_view,
+            v_q=v_q, h_q=h_q,
             ofs_elem_full=ofs_elem,
             name_offset_bytes=name_offset_bytes, name_t_off=name_t_off,
             name_slot=name_slot,
@@ -114,6 +122,7 @@ def run_split_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
             g_blk=g_blk,
             lr_over_bc1=1e-3, sqrt_bc2_inv=1.0, eps=1e-8,
             n_names=n_names,
+            n_q=N_Q,
         )
         name_lo = name_hi
 
@@ -121,25 +130,28 @@ def run_split_aos_write(m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
 
 
 def test_one(label, N_NAMES, NAME_SIZE, G, n_splits, prev_th=1e-7, group_th=1e-5):
-    dev, m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem, N_TOTAL, N_GROUPS = setup_problem(
+    dev, m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem, N_TOTAL, N_GROUPS = setup_problem(
         N_NAMES, NAME_SIZE, G,
     )
     # First run Pass A to get name_count.
-    elem_hist = torch.zeros(64, dtype=torch.int32, device=dev)
     name_count = torch.zeros(N_NAMES, dtype=torch.int64, device=dev)
     prev_th_t = torch.tensor(prev_th, device=dev, dtype=torch.float32)
     floor_t = torch.tensor(1e-8, device=dev, dtype=torch.float32)
     group_th_t = torch.tensor(group_th, device=dev, dtype=torch.float32)
     GPB = 8
     n_progs = (N_GROUPS + GPB - 1) // GPB
+    N_Q = int(v_q.numel())
+    LOG_N_Q = N_Q.bit_length() - 1
     _outlier_count_kernel[(n_progs,)](
-        m_flat, v_flat, dg_init.clone(), h_g,
+        m_flat, v_flat, dg_init.clone(),
+        v_q, h_q,
         name_count, ofs_elem,
         prev_th_t, floor_t, group_th_t,
         N_GROUPS, N_NAMES,
         0, 1e-3, 1.0, 1e-8,
         name_count, 0, 0,  # dummy sample (stride=0 → skip)
         G=G, GROUPS_PER_BLOCK=GPB,
+        N_Q=N_Q, LOG_N_Q=LOG_N_Q,
     )
 
     name_count_host = name_count.cpu().tolist()
@@ -155,14 +167,14 @@ def test_one(label, N_NAMES, NAME_SIZE, G, n_splits, prev_th=1e-7, group_th=1e-5
 
     # Reference: full Pass B
     aos_full, slot_full, dg_full = run_full_aos_write(
-        m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
+        m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem,
         N_TOTAL, N_GROUPS, name_offset_bytes, name_t_off,
         name_count_host, prev_th, group_th, dev, G,
     )
 
     # Split
     aos_split, slot_split, dg_split = run_split_aos_write(
-        m_flat, v_flat, p_flat, h_g, dg_init, ofs_elem,
+        m_flat, v_flat, p_flat, v_q, h_q, dg_init, ofs_elem,
         N_TOTAL, N_GROUPS, name_offset_bytes, name_t_off,
         name_count_host, prev_th, group_th, dev, G,
         n_splits=n_splits,

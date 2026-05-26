@@ -178,8 +178,12 @@ class LossyDispatchState:
         group records share each entry's blob without overlap.
 
     Required fields:
-      * ``bf16_groups_mvph``: list of (m_flat, v_flat, p_flat, h_g_buf,
-        dg_buf, master_off_elem) per BF16 group.
+      * ``bf16_groups_mvph``: list of (m_flat, v_flat, p_flat,
+        dg_buf, master_off_elem) per BF16 group. h_g_buf dropped —
+        H is computed inline in kernels via bsearch in v_q/h_q.
+      * ``v_q``, ``h_q``: global FP32 quantile tables [N_Q] for inline
+        H lookup. Persistent (set by caller in init).
+      * ``n_q``: quantile table size.
       * ``ofs_elem_full``: global element-space offsets (i64, N+1).
       * ``name_outlier_count_host``: per-name outlier count (int list,
         from Pass A's ``_outlier_name_count.cpu()``). Length = N_names.
@@ -197,8 +201,11 @@ class LossyDispatchState:
     """
     bf16_groups_mvph: List[Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, int,
+        torch.Tensor, int,
     ]]
+    v_q: torch.Tensor
+    h_q: torch.Tensor
+    n_q: int
     ofs_elem_full: torch.Tensor
     name_list: List[str]
     name_outlier_count_host: List[int]
@@ -904,10 +911,11 @@ def run_segment_producer(
                 mvph = lossy_state.bf16_groups_mvph[g_idx]
                 if mvph is None:
                     continue
-                m_view, v_view, p_view, h_g_view, dg_view, master_off_elem = mvph
+                m_view, v_view, p_view, dg_view, master_off_elem = mvph
                 launch_aos_write_for_subrange(
                     m_view=m_view, v_view=v_view, p_view=p_view,
-                    accum_view=dg_view, h_g_view=h_g_view,
+                    accum_view=dg_view,
+                    v_q=lossy_state.v_q, h_q=lossy_state.h_q,
                     ofs_elem_full=lossy_state.ofs_elem_full,
                     name_offset_bytes=nob_seg_view,
                     name_t_off=lossy_state.name_t_off,
@@ -921,6 +929,7 @@ def run_segment_producer(
                     sqrt_bc2_inv=lossy_state.sqrt_bc2_inv,
                     eps=lossy_state.eps,
                     n_names=n_names_total,
+                    n_q=lossy_state.n_q,
                     do_fold=True,  # Pass B does the selective fold (Pass A leaves dg unchanged).
                 )
 
@@ -954,9 +963,9 @@ def run_segment_producer(
                 mvph = lossy_state.bf16_groups_mvph[g_idx]
                 if mvph is None:
                     continue
-                m_view, v_view, p_view, h_g_view, dg_view, master_off_elem = mvph
+                m_view, v_view, p_view, dg_view, master_off_elem = mvph
                 master_off_g_groups = int(master_off_elem) // int(lossy_state.g_blk)
-                n_groups_in_bf16 = int(h_g_view.numel())
+                n_groups_in_bf16 = int(dg_view.numel())
                 launch_aos_group_write(
                     out_i32=seg_i32,
                     m_flat=m_view,

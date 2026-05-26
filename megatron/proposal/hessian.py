@@ -380,23 +380,27 @@ def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
 if _HAS_TRITON_HESSIAN:
     @triton.jit
     def _flat_signed_stream_kernel(
-        grad_ptr,        # *bf16, n_groups * G
-        h_accum_ptr,     # *bf16, n_groups
-        n_groups,
-        sign_scale,      # sign × inv_step × inv_k (float)
+        grad_ptr,            # *bf16, n_total_elements (master flat)
+        sample_buf_ptr,      # *fp32, anchor_sample_size (per-element samples)
+        n_total_elements,
+        sign_scale,          # sign × inv_step × inv_k (float)
         rng_seed_lo, rng_seed_hi,
         k_lo, k_hi,
-        G: tl.constexpr,
-        GROUPS_PER_BLOCK: tl.constexpr,
+        anchor_stride,       # i64 scalar — element global_off // stride = sample pos
+        anchor_sample_size,  # i32 scalar — upper bound for sample_pos
+        BLOCK: tl.constexpr,
     ):
-        """h_accum[g] += sign_scale × group_mean_G(z(offset) × grad[offset]).
-        Signed (no abs). z generated on-the-fly via element-wise hash —
-        SAME hash as _flat_z_perturb_kernel so FD cancellation is bit-exact."""
-        BLOCK: tl.constexpr = G * GROUPS_PER_BLOCK
+        """sample_buf[sample_pos] += sign_scale × z(offset) × grad[offset]
+        at deterministic per-element sample positions
+        (offset % stride == 0). Per-element samples — NO group reduce.
+
+        Phase 1 (sign=+) and Phase 2 (sign=-) cancel symmetrically via
+        SAME hash (rng_seed + k_lo) so |sample_buf| after abs_() = FD H
+        estimate per sampled element. No persistent h_g_flat needed.
+        """
         pid = tl.program_id(0)
-        gid_start = pid * GROUPS_PER_BLOCK
-        elem_off = gid_start * G + tl.arange(0, BLOCK)
-        elem_mask = elem_off < n_groups * G
+        elem_off = pid * BLOCK + tl.arange(0, BLOCK)
+        elem_mask = elem_off < n_total_elements
         grad = tl.load(grad_ptr + elem_off, mask=elem_mask,
                        other=0.0).to(tl.float32)
         x = elem_off.to(tl.uint32) * tl.full((), 0x9E3779B9, tl.uint32)
@@ -407,50 +411,63 @@ if _HAS_TRITON_HESSIAN:
         x = x * tl.full((), 0x27D4EB2D, tl.uint32)
         x = x ^ (x >> 16)
         z = tl.where((x & tl.full((), 1, tl.uint32)) == 0, 1.0, -1.0)
-        contrib = z * grad * sign_scale
-        contrib_2d = tl.reshape(contrib, (GROUPS_PER_BLOCK, G))
-        group_sum = tl.sum(contrib_2d, axis=1) / G
-        gid_off = gid_start + tl.arange(0, GROUPS_PER_BLOCK)
-        gid_mask = gid_off < n_groups
-        h_old = tl.load(h_accum_ptr + gid_off, mask=gid_mask,
-                        other=0.0).to(tl.float32)
-        tl.store(h_accum_ptr + gid_off,
-                 (h_old + group_sum).to(tl.bfloat16), mask=gid_mask)
+        contrib = z * grad * sign_scale  # FP32 per-element
+
+        # Deterministic sample positions: offsets that are multiples of
+        # anchor_stride write to sample_buf[offset // stride]. Unique
+        # mapping (1:1) → no atomic, no contention.
+        elem_off_i64 = elem_off.to(tl.int64)
+        sample_pos = elem_off_i64 // anchor_stride
+        sample_residual = elem_off_i64 - sample_pos * anchor_stride
+        sample_write = (
+            (sample_residual == 0) & elem_mask
+            & (sample_pos < anchor_sample_size.to(tl.int64))
+        )
+        prev = tl.load(sample_buf_ptr + sample_pos, mask=sample_write,
+                       other=0.0)
+        tl.store(sample_buf_ptr + sample_pos, prev + contrib,
+                 mask=sample_write)
 
 
 def _flat_signed_stream(grad_flat: torch.Tensor, h_accum_flat: torch.Tensor,
                         g_blk: int, sign_scale: float,
-                        rng_seed: int, k: int) -> None:
-    """Launch ``_flat_signed_stream_kernel``. n_groups = h_accum_flat.numel()."""
-    n_groups = int(h_accum_flat.numel())
-    if n_groups == 0:
+                        rng_seed: int, k: int,
+                        anchor_stride: int = 1,
+                        anchor_sample_size: Optional[int] = None) -> None:
+    """Launch ``_flat_signed_stream_kernel``. h_accum_flat is now the
+    per-element sample buffer (FP32, anchor_sample_size). n_total_elements
+    is derived from grad_flat.numel(). The g_blk param is retained for
+    API compatibility but unused (sampling is per-element)."""
+    n_total = int(grad_flat.numel())
+    if n_total == 0:
         return
+    if anchor_sample_size is None:
+        anchor_sample_size = int(h_accum_flat.numel())
     if not _HAS_TRITON_HESSIAN:
-        # Fallback (slow): PyTorch ops on flat. Same hash semantics via fast path.
-        n = n_groups * int(g_blk)
+        # Fallback (slow): per-element sample on host. Same hash semantics.
         gen = torch.Generator(device=grad_flat.device).manual_seed(int(rng_seed) ^ int(k))
-        z = (torch.randint(0, 2, (n,), generator=gen,
+        z = (torch.randint(0, 2, (n_total,), generator=gen,
                            device=grad_flat.device,
                            dtype=torch.bfloat16) * 2 - 1)
-        g32 = grad_flat[:n].to(torch.float32).mul_(z.to(torch.float32))
-        group = g32.reshape(-1, int(g_blk)).mean(dim=1).mul_(float(sign_scale))
-        h_accum_flat.add_(group.to(torch.bfloat16))
+        contrib = (grad_flat.to(torch.float32) * z.to(torch.float32)
+                   * float(sign_scale))
+        # Stride sample
+        stride = max(1, int(anchor_stride))
+        idx = torch.arange(0, n_total, stride, device=grad_flat.device)
+        idx = idx[:anchor_sample_size]
+        h_accum_flat[:idx.numel()].add_(contrib[idx])
         return
-    target_block = 256
-    gpb = max(1, target_block // max(1, int(g_blk)))
-    p = 1
-    while p < gpb:
-        p *= 2
-    gpb = p
-    n_progs = (n_groups + gpb - 1) // gpb
+    BLOCK = 1024
+    n_progs = (n_total + BLOCK - 1) // BLOCK
     seed64 = int(rng_seed) & ((1 << 64) - 1)
     k64 = int(k) & ((1 << 64) - 1)
     _flat_signed_stream_kernel[(n_progs,)](
         grad_flat, h_accum_flat,
-        n_groups, float(sign_scale),
+        n_total, float(sign_scale),
         seed64 & 0xFFFFFFFF, (seed64 >> 32) & 0xFFFFFFFF,
         k64 & 0xFFFFFFFF, (k64 >> 32) & 0xFFFFFFFF,
-        G=int(g_blk), GROUPS_PER_BLOCK=gpb,
+        int(anchor_stride), int(anchor_sample_size),
+        BLOCK=BLOCK,
     )
 
 
@@ -596,11 +613,20 @@ def _compute_fd_fast_flat(
                                               preserve_expert_grad_storage=True):
                         return None
                     _sync(); _t2 = _time.perf_counter()
+                    # h_accum_flat is now the per-element anchor sample buf
+                    # (FP32). Stride = total_elems // sample_size, computed
+                    # from grad_flat.numel() and h_accum_flat.numel().
+                    _anchor_sample_size = int(h_accum_flat.numel())
+                    _anchor_stride = max(
+                        1, int(grad_flat.numel()) // _anchor_sample_size,
+                    )
                     _flat_signed_stream(
                         grad_flat, h_accum_flat,
                         g_blk=g,
                         sign_scale=sign * inv_step * inv_k,
                         rng_seed=int(rng_seed), k=int(k),
+                        anchor_stride=_anchor_stride,
+                        anchor_sample_size=_anchor_sample_size,
                     )
                     _sync(); _t3 = _time.perf_counter()
                     grad_flat.zero_()

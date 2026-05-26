@@ -90,66 +90,9 @@ try:
         prev = tl.load(accum_ptr + gid_off, mask=gid_mask, other=0.0)
         tl.store(accum_ptr + gid_off, prev + block_sums, mask=gid_mask)
 
-    @triton.jit
-    def _vmap_kernel(
-        v_ptr,                       # v_t FP32 element-level
-        h_g_ptr,                     # BF16 group-level output
-        v_q_ptr, h_q_ptr,            # FP32 lookup tables [N_Q]
-        n_groups,
-        master_off_group,
-        eps,
-        G: tl.constexpr,
-        GROUPS_PER_BLOCK: tl.constexpr,
-        N_Q: tl.constexpr,
-        LOG_N_Q: tl.constexpr,
-    ):
-        """v_t element → H quantile lookup → group-mean reduce → BF16 store.
-
-        Single fused launch per BF16-Opt bucket: each program handles
-        G * GROUPS_PER_BLOCK contiguous v_t elements, runs an unrolled
-        log2(N_Q)-step binary search against ``v_q``, lerps ``h_q``, then
-        reduces groups (sum / G) and stores BF16 into ``h_g_ptr`` at
-        ``master_off_group + gid_start``.
-
-        Mirrors ``_accum_with_outlier_kernel`` layout: same elem_off /
-        gid_off math, same group-mean reduction via tl.reshape + tl.sum.
-        v_q / h_q are 16 KB each → resident in L2 across all programs.
-        """
-        BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
-        pid = tl.program_id(axis=0)
-        gid_start = pid * GROUPS_PER_BLOCK
-        elem_off = gid_start * G + tl.arange(0, BLOCK_SIZE)
-        elem_mask = elem_off < n_groups * G
-        v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0).to(tl.float32)
-
-        # Unrolled binary search (lower_bound) in v_q[0..N_Q-1].
-        # After LOG_N_Q steps, ``bin`` is the largest index with v_q[bin] <= v.
-        bin_idx = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
-        for i in tl.static_range(LOG_N_Q):
-            step = N_Q >> (i + 1)
-            mid = bin_idx + step
-            mid_clamped = tl.minimum(mid, N_Q - 1)
-            q_mid = tl.load(v_q_ptr + mid_clamped)
-            bin_idx = tl.where(v >= q_mid, mid, bin_idx)
-        bin_idx = tl.maximum(tl.minimum(bin_idx, N_Q - 2), 0)
-
-        v_lo = tl.load(v_q_ptr + bin_idx)
-        v_hi = tl.load(v_q_ptr + bin_idx + 1)
-        h_lo = tl.load(h_q_ptr + bin_idx)
-        h_hi = tl.load(h_q_ptr + bin_idx + 1)
-        alpha = (v - v_lo) / (v_hi - v_lo + eps)
-        mapped = h_lo + alpha * (h_hi - h_lo)
-
-        mapped_2d = tl.reshape(mapped, (GROUPS_PER_BLOCK, G))
-        grp_avg = tl.sum(mapped_2d, axis=1) / G
-
-        gid_local = gid_start + tl.arange(0, GROUPS_PER_BLOCK)
-        gid_mask = gid_local < n_groups
-        tl.store(
-            h_g_ptr + master_off_group + gid_local,
-            grp_avg.to(tl.bfloat16),
-            mask=gid_mask,
-        )
+    # _vmap_kernel removed — outlier kernels do inline v_t → H lookup
+    # (bsearch in v_q + lerp h_q + group-mean reduce). No persistent
+    # h_g_flat cache to populate per iter.
 
 except Exception:
     _HAS_TRITON = False
@@ -597,13 +540,15 @@ class ImportanceTracker:
 
     @torch.no_grad()
     def update_h_anchor_quantiles(self) -> None:
-        """Anchor (cheap FD refresh) just wrote H_FD into
-        ``_g_fast_h_g_bf16_flat``; extract the N_Q-point quantile lookup
-        table now so subsequent ``update_v_mapping`` calls can map v_t
-        onto this H distribution."""
-        q = self._quantile_table_from_flat(
-            self._g_fast_h_g_bf16_flat, drop_nonpositive=True,
-        )
+        """Anchor (cheap FD refresh) just wrote per-element FD H samples
+        into ``_g_fast_h_anchor_sample_buf``; extract the N_Q-point
+        quantile lookup table now so subsequent outlier kernel
+        invocations can map v_t (per-element) onto this H distribution.
+        """
+        src = getattr(self, "_g_fast_h_anchor_sample_buf", None)
+        if src is None:
+            return
+        q = self._quantile_table_from_flat(src, drop_nonpositive=True)
         if q is None:
             return
         self._g_fast_h_quantiles.copy_(q)
@@ -759,29 +704,11 @@ class ImportanceTracker:
             _qe_ev1.record()
             _qk_ev0.record()
 
-        # Single fused Triton kernel launch per bucket. GROUPS_PER_BLOCK
-        # bounds BLOCK_SIZE = G × GPB; production g=256 with GPB=256
-        # produced BLOCK_SIZE=65536 → 17-30 s JIT compile + register spill.
-        # GPB=32 keeps BLOCK_SIZE ≤ 8192 (g=256 → 8192, g=8 → 256), inside
-        # Triton's effective sweet spot (≤ 16K) — JIT 3-5 s, grid 4-8× larger
-        # but per-program register footprint drops below A100's 255 / thread.
-        GROUPS_PER_BLOCK = 32
-        LOG_N_Q = int(self._N_Q).bit_length() - 1   # log2(N_Q), N_Q is a power of 2
-        for group_dict in self._groups:
-            v_flat = group_dict["v_flat"]
-            master_off = int(group_dict["master_off"])
-            n = int(v_flat.numel())
-            n_groups = n // g
-            if n_groups == 0:
-                continue
-            grid = ((n_groups + GROUPS_PER_BLOCK - 1) // GROUPS_PER_BLOCK,)
-            _vmap_kernel[grid](
-                v_flat, self._g_fast_h_g_bf16_flat,
-                self._g_fast_v_quantiles, self._g_fast_h_quantiles,
-                n_groups, master_off, 1e-30,
-                G=g, GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
-                N_Q=self._N_Q, LOG_N_Q=LOG_N_Q,
-            )
+        # Per-iter per-element H mapping is no longer materialised into a
+        # persistent buffer (h_g_flat removed). Outlier kernels do the
+        # bsearch + lerp inline. update_v_mapping just refreshes the
+        # v_quantile lookup table (done above) and lets _g_fast_h_quantiles
+        # remain anchor-driven (see update_h_anchor_quantiles).
 
         if _qk_ev1 is not None:
             _qk_ev1.record()
@@ -845,7 +772,7 @@ class ImportanceTracker:
         groups = getattr(self, "_groups", None) or []
         grp_sz = 0.0
         for grp in groups:
-            for key in ("m_flat", "v_flat", "p_flat", "dg_buf", "h_g_buf"):
+            for key in ("m_flat", "v_flat", "p_flat", "dg_buf"):
                 t = grp.get(key) if isinstance(grp, dict) else None
                 if isinstance(t, torch.Tensor) and t.is_cuda:
                     # These are VIEWS into other tracked buffers — don't
@@ -967,11 +894,9 @@ class ImportanceTracker:
         self._g_fast_dg_flat = torch.zeros(
             total_groups, dtype=torch.float32, device=device,
         )
-        # h_g_flat: BF16 cache (was FP32). Memory halved. mul with FP32
-        # dg auto-promotes to FP32 in chunk_buf.
-        self._g_fast_h_g_bf16_flat = torch.zeros(
-            total_groups, dtype=torch.bfloat16, device=device,
-        )
+        # h_g_flat REMOVED — outlier kernels compute per-element H inline
+        # via bsearch in v_quantiles + lerp in h_quantiles. Anchor writes
+        # to _g_fast_h_anchor_sample_buf instead (allocated below).
         # Exclusion mask (bool, 1 byte/element). Was FP32 (4 bytes) → 1/4.
         # False = excluded. mul-with-bool requires cast at use site.
         self._g_fast_exc_mask = torch.ones(
@@ -1025,10 +950,9 @@ class ImportanceTracker:
         # Per-name views into the same flat buffer (in master order).
         self._g_fast_name_list: List[str] = []
         self._g_fast_offsets_cpu: List[int] = [0]
-        # Note: only h_g_views / exc_views are still used (h_g rebuild /
-        # exc mask updates). dg_views / sg_views are no longer needed in
-        # the chunked X-C path.
-        self._g_fast_h_g_views: List[torch.Tensor] = []
+        # Only exc_views are still used (per-bucket exc-mask updates).
+        # h_g_views removed (no h_g_flat). dg_views / sg_views unused
+        # in the chunked X-C path.
         self._g_fast_exc_views: List[torch.Tensor] = []
 
         all_zero_copy = True
@@ -1045,9 +969,7 @@ class ImportanceTracker:
             group_groups = group_total // g
             master_off = cur_off  # start of this group's region in flat
             master_dg = self._g_fast_dg_flat.narrow(0, cur_off, group_groups)
-            master_h_g = self._g_fast_h_g_bf16_flat.narrow(
-                0, cur_off, group_groups,
-            )
+            # h_g views removed — outlier kernels do inline H lookup.
 
             # Track this BF16 group's name range in the global name_list
             # — used by the Option-B dispatch path to slice top_idx_sorted
@@ -1061,9 +983,6 @@ class ImportanceTracker:
                     continue
                 self._delta_g_accum[n] = self._g_fast_dg_flat.narrow(
                     0, cur_off, n_g,
-                )
-                self._g_fast_h_g_views.append(
-                    self._g_fast_h_g_bf16_flat.narrow(0, cur_off, n_g),
                 )
                 self._g_fast_exc_views.append(
                     self._g_fast_exc_mask.narrow(0, cur_off, n_g),
@@ -1114,8 +1033,7 @@ class ImportanceTracker:
                 "v_flat": v_flat,
                 "p_flat": p_flat,
                 "dg_buf": master_dg,  # master-region view into dg_flat
-                "h_g_buf": master_h_g,  # master-region view into h_g_bf16_flat
-                "master_off": master_off,  # global flat offset (= dg/h_g start)
+                "master_off": master_off,  # global flat offset (= dg start)
                 "start_name_in_grp": start_name_in_grp,
                 "end_name_in_grp": end_name_in_grp,
                 "zero_copy": zc,
@@ -1126,21 +1044,34 @@ class ImportanceTracker:
         self._zero_copy = all_zero_copy
 
         # ---- v_t → H quantile-matching lookup tables ----
-        # CDF matching: anchor refresh (cheap FD) populates
-        # _g_fast_h_quantiles from the freshly written _g_fast_h_g_bf16_flat;
-        # every iter ``update_v_mapping`` resamples v_t's quantile and
-        # overwrites _g_fast_h_g_bf16_flat with mapped(v_t). Tables are
-        # ``_N_Q``-point piecewise linear (256 ≈ 99.6% accuracy on the
-        # lognormal H distribution, log2 step = 8 — keeps binary-search
-        # latency well inside the per-element memory-load cycle).
-        # Persistent VRAM = 2 × 256 × FP32 = 2 KB (≈ 0 vs the GB-scale
-        # flat buffers above).
-        self._N_Q = 256
+        # CDF matching: anchor refresh writes per-element FD H samples
+        # into ``_g_fast_h_anchor_sample_buf`` (stride-sampled, FP32).
+        # ``update_h_anchor_quantiles`` extracts N_Q-point quantile
+        # table from that buffer. Every iter ``update_v_mapping``
+        # resamples v_t's quantile into ``_g_fast_v_quantiles``.
+        # Outlier kernels do bsearch in v_q + lerp h_q INLINE per element
+        # (no persistent group-H cache).
+        # N_Q=1024 for safer heavy-tail quantile precision (was 256;
+        # 4 KB each, persistent VRAM impact ≈ 0).
+        self._N_Q = 1024
         self._g_fast_v_quantiles = torch.zeros(
             self._N_Q, dtype=torch.float32, device=device,
         )
         self._g_fast_h_quantiles = torch.zeros(
             self._N_Q, dtype=torch.float32, device=device,
+        )
+        # Anchor per-element FD H sample buffer (stride-sampled across
+        # the master flat). Size = 1 M FP32 = 4 MB. Replaces the prior
+        # 340 MB BF16 h_g_flat. Stride is computed at first anchor:
+        # ``stride = max(1, total_expert_elements // ANCHOR_SAMPLE_SIZE)``.
+        self._ANCHOR_SAMPLE_SIZE = 1 * 1024 * 1024
+        self._g_fast_h_anchor_sample_buf = torch.zeros(
+            self._ANCHOR_SAMPLE_SIZE, dtype=torch.float32, device=device,
+        )
+        # Stride from total expert element count. Updated at first use
+        # (anchor session) when total_elems is known.
+        self._g_fast_h_anchor_stride = max(
+            1, int(total_elems) // self._ANCHOR_SAMPLE_SIZE,
         )
         self._h_anchor_initialised = False
 
@@ -1201,7 +1132,7 @@ class ImportanceTracker:
             # results, full_kmax, chunk_arange are allocated per-iter and
             # the cuda allocator pools them — they don't persist).
             mem_dg = total_groups * 4 / 1e6
-            mem_h_g = total_groups * 2 / 1e6
+            mem_h_anchor = self._g_fast_h_anchor_sample_buf.numel() * 4 / 1e6
             mem_exc = total_groups * 1 / 1e6
             mem_chunk = chunk_size * 4 / 1e6
             mem_hist = self._g_fast_n_bins * 4 / 1e6
@@ -1213,7 +1144,7 @@ class ImportanceTracker:
             avg_per_bin = max(1, total_groups // self._g_fast_n_bins)
             K_max_est = K_groups_est + 5 * avg_per_bin
             mem_sel = (K_max_est + 1) * 8 / 1e6
-            mem_total = (mem_dg + mem_h_g + mem_exc + mem_chunk
+            mem_total = (mem_dg + mem_h_anchor + mem_exc + mem_chunk
                          + mem_hist + mem_sel)
             ideal_mb = total_groups * 4 / 1e6  # dg_flat alone
             print(f"[proposal] accum_sq init: {mode_str}, "
@@ -1223,7 +1154,7 @@ class ImportanceTracker:
                   f"chunk_size={chunk_size}",
                   flush=True)
             print(f"[proposal] accum_sq mem persistent: "
-                  f"dg_flat={mem_dg:.1f}MB h_g_bf16={mem_h_g:.1f}MB "
+                  f"dg_flat={mem_dg:.1f}MB h_anchor_sample={mem_h_anchor:.1f}MB "
                   f"exc_bool={mem_exc:.1f}MB chunk_buf={mem_chunk:.1f}MB "
                   f"sel_buf~={mem_sel:.1f}MB hist={mem_hist:.3f}MB → "
                   f"total={mem_total:.1f}MB "
@@ -1394,7 +1325,8 @@ class ImportanceTracker:
                     m_flat=grp["m_flat"],
                     v_flat=grp["v_flat"],
                     accum=grp["dg_buf"],
-                    h_g=grp["h_g_buf"],
+                    v_q=self._g_fast_v_quantiles,
+                    h_q=self._g_fast_h_quantiles,
                     name_count=self._outlier_name_count,
                     ofs_elem_full=self._outlier_elem_offsets,
                     prev_th_t=self._outlier_prev_th,
@@ -1406,6 +1338,7 @@ class ImportanceTracker:
                     sqrt_bc2_inv=float(sqrt_bc2_inv),
                     eps=float(eps_adam),
                     n_names=int(self._outlier_elem_offsets.numel() - 1),
+                    n_q=int(self._N_Q),
                     sample_buf=self._g_fast_score_sample_buf,
                     sample_stride=self._g_fast_score_sample_stride,
                     sample_size=self._g_fast_score_sample_buf.numel(),
@@ -1688,113 +1621,133 @@ class ImportanceTracker:
                 )
         elif (self._outlier_promote
                 and getattr(self, "_flat_layout_done", False)):
-            # Stochastic sub-sampling on PER-ELEMENT axis.
+            # GPU walk + (multi-GPU) NCCL allgather for GLOBAL threshold.
             # Pass A kernel writes every Sth element's score to
-            # ``_g_fast_score_sample_buf`` at deterministic positions
-            # (no atomic). Sort + pick K-th order statistic gives the
-            # accurate per-element threshold under heavy-tail without
-            # linear-bin histc's over-selection failure mode.
-            #
-            # group_th = elem_th × g_blk (group score is sum-of-g_blk-
-            # elements in code units → axis match).
-            #
-            # Memory: ~1.5 MB persistent (sample + sorted + indices),
-            # FIXED size independent of model scale (100B / 1000B both
-            # fit identically). No alloc/free per iter.
-            #
-            # Multi-GPU (EP/TP partition): each GPU samples LOCAL
-            # element scores. Future: allgather ~8K samples per GPU
-            # for unified threshold (~32 KB send per iter @ W=64).
+            # ``_g_fast_score_sample_buf`` (deterministic stride). All
+            # ranks allgather their samples → identical sorted view →
+            # bit-exact same K-th order statistic threshold. Single-GPU
+            # path runs the walk on the local sample buf only.
+            # All sync is via cuda.Event — no .item()/.cpu() in any path.
             sample_buf = getattr(self, "_g_fast_score_sample_buf", None)
-            sorted_buf = getattr(self, "_g_fast_score_sample_sorted_buf", None)
-            indices_buf = getattr(self, "_g_fast_score_sample_indices_buf", None)
             sample_total = int(getattr(
                 self, "_g_fast_score_sample_total", 0,
             ))
             sample_stride = int(getattr(
                 self, "_g_fast_score_sample_stride", 0,
             ))
-            total_groups_outlier = self._g_fast_dg_flat.numel()
-            total_elems_outlier = total_groups_outlier * g_blk
-            K_total = max(1, int(self.topk_ratio * total_elems_outlier))
-            FLOOR_MULT = 5
-
-            if (sample_buf is None or sorted_buf is None
-                    or indices_buf is None
-                    or sample_total <= 0 or sample_stride <= 0):
-                # Cold start (iter 0): no samples → open the gate.
-                elem_th_val = 0.0
-                group_th_val = 0.0
-                elem_floor_val = 0.0
+            world = int(getattr(self, "_proposal_world_size", 1))
+            pg = getattr(self, "_proposal_pg", None)
+            if (sample_buf is None or sample_total <= 0
+                    or sample_stride <= 0):
+                self._outlier_prev_th.fill_(0.0)
+                self._outlier_prev_floor.fill_(0.0)
+                self._g_fast_prev_threshold_t.fill_(0.0)
             else:
-                # Number of sample positions filled = ceil(sample_total / sample_stride),
-                # capped by SAMPLE_SIZE.
-                n_filled = min(
+                local_n_filled = min(
                     sample_buf.numel(),
                     (sample_total + sample_stride - 1) // sample_stride,
                 )
-                if n_filled <= 0:
-                    elem_th_val = float("inf")
-                    group_th_val = float("inf")
-                    elem_floor_val = float("inf")
+                if local_n_filled <= 0:
+                    self._outlier_prev_th.fill_(float("inf"))
+                    self._outlier_prev_floor.fill_(float("inf"))
+                    self._g_fast_prev_threshold_t.fill_(float("inf"))
                 else:
-                    sample_view = sample_buf[:n_filled]
-                    sorted_view = sorted_buf[:n_filled]
-                    indices_view = indices_buf[:n_filled]
-                    # Ascending sort via out= (no per-iter alloc).
-                    torch.sort(sample_view, out=(sorted_view, indices_view))
-                    # Detect cold/zero distribution: at iter 0 m, v ≈ 0
-                    # → all scores ≈ 0. top-K of zeros = 0 → would let
-                    # everything pass. Guard: if max sample ≈ 0, keep
-                    # threshold at +inf (= 0 selected this iter; converges
-                    # by iter 2-3 once Adam state has signal).
-                    _top_sample = float(sorted_view[n_filled - 1].item())
-                    if _top_sample <= 1e-20:
-                        elem_th_val = float("inf")
-                        group_th_val = float("inf")
-                        elem_floor_val = float("inf")
+                    local_view = sample_buf[:local_n_filled]
+                    if world > 1 and pg is not None:
+                        # Allgather sample buffers across ranks.
+                        gathered = getattr(
+                            self, "_g_fast_sample_gathered", None,
+                        )
+                        sorted_g = getattr(
+                            self, "_g_fast_sample_sorted_global", None,
+                        )
+                        idx_g = getattr(
+                            self, "_g_fast_sample_indices_global", None,
+                        )
+                        need_alloc = (
+                            gathered is None
+                            or gathered.numel() != sample_buf.numel() * world
+                        )
+                        if need_alloc:
+                            cap = int(sample_buf.numel() * world)
+                            dev = sample_buf.device
+                            self._g_fast_sample_gathered = torch.empty(
+                                cap, dtype=torch.float32, device=dev,
+                            )
+                            self._g_fast_sample_sorted_global = torch.empty(
+                                cap, dtype=torch.float32, device=dev,
+                            )
+                            self._g_fast_sample_indices_global = torch.empty(
+                                cap, dtype=torch.int64, device=dev,
+                            )
+                            gathered = self._g_fast_sample_gathered
+                            sorted_g = self._g_fast_sample_sorted_global
+                            idx_g = self._g_fast_sample_indices_global
+                        torch.distributed.all_gather_into_tensor(
+                            gathered, sample_buf, group=pg,
+                        )
+                        global_total = int(sample_total) * world
+                        n_filled_global = min(
+                            gathered.numel(),
+                            (global_total + sample_stride - 1) // sample_stride,
+                        )
+                        sort_view = gathered[:n_filled_global]
+                        sorted_view = sorted_g[:n_filled_global]
+                        idx_view = idx_g[:n_filled_global]
                     else:
-                        # K-th order statistic from top.
-                        K_in_sample = max(
-                            1, (K_total * n_filled) // max(1, sample_total),
+                        # Single-GPU: walk on local sample only.
+                        sorted_g = getattr(
+                            self, "_g_fast_score_sample_sorted_buf", None,
                         )
-                        K_in_sample = min(K_in_sample, n_filled)
-                        idx_th = n_filled - K_in_sample
-                        idx_th = max(0, min(idx_th, n_filled - 1))
-                        elem_th_val = float(sorted_view[idx_th].item())
-                        # Cold-start mitigation: if the K-th value is
-                        # very small (= sample has many zero/near-zero
-                        # scores from cold gradients), enforce a floor
-                        # at half of sample max to prevent over-selection.
-                        # As scores fill in, this clamp self-disengages.
-                        _half_max = _top_sample * 0.5
-                        if elem_th_val < _half_max:
-                            elem_th_val = _half_max
-                        # Floor = top (K_in_sample × FLOOR_MULT)-th.
-                        K_in_sample_floor = min(
-                            n_filled, K_in_sample * FLOOR_MULT,
+                        idx_g = getattr(
+                            self, "_g_fast_score_sample_indices_buf", None,
                         )
-                        idx_floor = n_filled - K_in_sample_floor
-                        idx_floor = max(0, min(idx_floor, n_filled - 1))
-                        elem_floor_val = float(sorted_view[idx_floor].item())
-                        if elem_floor_val < _half_max * 0.5:
-                            elem_floor_val = _half_max * 0.5
-                        # group score (code sum units) >= group_th if mean
-                        # per element ≥ elem_th → sum ≥ elem_th × g_blk.
-                        group_th_val = elem_th_val * g_blk
-                    # Update prev_smax for diagnostics.
-                    self._outlier_prev_smax = max(_top_sample, 1e-30)
-                    self._prev_s_max_g = max(_top_sample * g_blk, 1e-30)
+                        sort_view = local_view
+                        sorted_view = sorted_g[:local_n_filled]
+                        idx_view = idx_g[:local_n_filled]
+                        n_filled_global = local_n_filled
+                        global_total = sample_total
 
-            self._outlier_prev_th.fill_(elem_th_val)
-            self._outlier_prev_floor.fill_(elem_floor_val)
-            self._g_fast_prev_threshold_t.fill_(group_th_val)
-            # Debug: print threshold every iter (until thrott).
-            if prev_step <= 10:
-                _top_dbg = float(sorted_buf[(sample_buf.numel()) - 1].item()) if (sample_buf is not None and sample_buf.numel() > 0) else -1.0
-                _min_dbg = float(sorted_buf[0].item()) if (sample_buf is not None and sample_buf.numel() > 0) else -1.0
-                print(f"[PHASE_B] @iter{prev_step} elem_th={elem_th_val:.3e} group_th={group_th_val:.3e} sample_max={_top_dbg:.3e} sample_min={_min_dbg:.3e}",
-                      flush=True)
+                    torch.sort(sort_view, out=(sorted_view, idx_view))
+                    # K-th order statistic computed entirely on GPU.
+                    total_groups_outlier = self._g_fast_dg_flat.numel()
+                    total_elems_outlier_global = (
+                        total_groups_outlier * g_blk * world
+                    )
+                    K_total = max(
+                        1, int(self.topk_ratio * total_elems_outlier_global),
+                    )
+                    K_in_sample = max(
+                        1, (K_total * n_filled_global) // max(1, global_total),
+                    )
+                    K_in_sample = min(K_in_sample, n_filled_global)
+                    idx_th = max(0, min(
+                        n_filled_global - K_in_sample, n_filled_global - 1,
+                    ))
+                    FLOOR_MULT = 5
+                    K_in_sample_floor = min(
+                        n_filled_global, K_in_sample * FLOOR_MULT,
+                    )
+                    idx_floor = max(0, min(
+                        n_filled_global - K_in_sample_floor,
+                        n_filled_global - 1,
+                    ))
+                    # GPU-only scalar extraction via narrow (no .item()).
+                    th_view = sorted_view.narrow(0, idx_th, 1)
+                    top_view = sorted_view.narrow(
+                        0, n_filled_global - 1, 1,
+                    )
+                    floor_view = sorted_view.narrow(0, idx_floor, 1)
+                    # Cold-start guard: if top ≈ 0, set thresholds to inf.
+                    # Implemented as GPU max with half-top floor.
+                    half_top = top_view * 0.5
+                    th_eff = torch.maximum(th_view, half_top)
+                    floor_eff = torch.maximum(floor_view, half_top * 0.5)
+                    self._outlier_prev_th.copy_(th_eff.squeeze())
+                    self._outlier_prev_floor.copy_(floor_eff.squeeze())
+                    self._g_fast_prev_threshold_t.copy_(
+                        (th_eff * g_blk).squeeze(),
+                    )
 
     def _dispatch_pending_payload(
         self, optimizer: torch.optim.Optimizer,
@@ -2139,7 +2092,7 @@ class ImportanceTracker:
                         # First slot is a dummy (kernel ignores src_idx in
                         # Phase B path; persistent buffer for lifetime).
                         per_grp_gpu[gi] = (
-                            self._g_fast_h_g_bf16_flat,  # dummy persistent ref
+                            self._g_fast_dg_flat,  # dummy persistent ref
                             p_flat_g, m_flat_g, v_flat_g,
                         )
 
@@ -2236,11 +2189,12 @@ class ImportanceTracker:
                         continue
                     _per_expert_outlier_n.setdefault(eid_nm, {})[nm] = n_o
 
-                # LossyDispatchState: collect per-BF16-group m/v/p/h_g/dg flats
-                # + master_off_elem in element coords.
+                # LossyDispatchState: collect per-BF16-group m/v/p/dg flats
+                # + master_off_elem in element coords. h_g_buf dropped
+                # — H is computed inline in kernels via bsearch in v_q.
                 _mvph: List[Optional[Tuple[
                     torch.Tensor, torch.Tensor, torch.Tensor,
-                    torch.Tensor, torch.Tensor, int,
+                    torch.Tensor, int,
                 ]]] = []
                 for grp in self._groups:
                     if not grp.get("zero_copy", False):
@@ -2255,7 +2209,7 @@ class ImportanceTracker:
                         continue
                     _mvph.append((
                         grp["m_flat"], grp["v_flat"], p_flat_g,
-                        grp["h_g_buf"], grp["dg_buf"],
+                        grp["dg_buf"],
                         int(grp["master_off"]) * g_blk,
                     ))
 
@@ -2333,6 +2287,9 @@ class ImportanceTracker:
 
                 _lossy_state = LossyDispatchState(
                     bf16_groups_mvph=_mvph,
+                    v_q=self._g_fast_v_quantiles,
+                    h_q=self._g_fast_h_quantiles,
+                    n_q=int(self._N_Q),
                     ofs_elem_full=self._outlier_elem_offsets,
                     name_list=list(name_list),  # tracker's authoritative name ordering
                     name_outlier_count_host=list(_outlier_name_count_host),
@@ -2412,8 +2369,7 @@ class ImportanceTracker:
                 f"+loop={_ms(_t_after_olsort, _t_after_loop):.1f} "
                 f"+streamsync={_ms(_t_after_loop, _t_after_streamsync):.1f} "
                 f"+batchbuild={_ms(_t_after_streamsync, _t_after_batchbuild):.1f} "
-                f"+lossy_submit={_ms(_t_after_batchbuild, _t_dsp_end):.1f} "
-                f"lossy={'OFF' if _t_lossy_skip else 'ON'}"
+                f"+lossy_submit={_ms(_t_after_batchbuild, _t_dsp_end):.1f}"
                 f"{_peak_str}",
                 flush=True,
             )
@@ -2603,7 +2559,6 @@ class ImportanceTracker:
         offsets_t = self._g_fast_offsets_t
         arange_g = self._g_fast_arange_g
         dg_flat = self._g_fast_dg_flat
-        h_g_flat = self._g_fast_h_g_bf16_flat
         exc_mask = self._g_fast_exc_mask
         chunk_buf = self._g_fast_chunk_buf
         chunk_size = self._g_fast_chunk_size
@@ -2722,18 +2677,33 @@ class ImportanceTracker:
             "PROPOSAL_BENCH_NO_PASS2", "") in ("1", "true", "TRUE")
         if not _bench_no_pass2_local:
             from .outlier_kernels import launch_group_select
-            launch_group_select(
-                h_g_flat=h_g_flat,
-                dg_flat=dg_flat,
-                exc_mask=exc_mask,
-                offsets_t=offsets_t,
-                name_group_count=self._g_fast_name_group_count,
-                selected_mask=self._g_fast_selected_mask,
-                threshold_t=threshold_t,
-                n_groups_total=total_groups,
-                n_names=n_names_full,
-                chunk_size=chunk_size,
-            )
+            # Per-bucket launch: each bucket has its own v_flat (FP32
+            # Adam v_t). Kernel computes inline H from v_t (bsearch in
+            # v_quantiles + lerp h_quantiles) — no master h_g_flat read.
+            for grp in self._groups:
+                v_flat = grp.get("v_flat")
+                if v_flat is None:
+                    continue
+                master_off_g = int(grp["master_off"])
+                n_groups_in_bucket = grp["total_aligned"] // g_blk
+                if n_groups_in_bucket <= 0:
+                    continue
+                launch_group_select(
+                    v_flat=v_flat,
+                    v_q=self._g_fast_v_quantiles,
+                    h_q=self._g_fast_h_quantiles,
+                    dg_flat=dg_flat,
+                    exc_mask=exc_mask,
+                    offsets_t=offsets_t,
+                    name_group_count=self._g_fast_name_group_count,
+                    selected_mask=self._g_fast_selected_mask,
+                    threshold_t=threshold_t,
+                    master_off_g=master_off_g,
+                    n_groups_in_bucket=n_groups_in_bucket,
+                    n_names=n_names_full,
+                    g_blk=g_blk,
+                    n_q=int(self._N_Q),
+                )
         if getattr(self, "_prev_s_max_g", None) is None:
             self._prev_s_max_g = float(s_max)
         if _ev1 is not None:

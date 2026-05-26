@@ -349,13 +349,14 @@ _PINNED_POOL: Dict[Any, torch.Tensor] = {}
 
 # Tracker fields that own GPU state (not views) — preserved across offload.
 _TRACKER_STATE_ATTRS = (
-    "_g_fast_dg_flat", "_g_fast_h_g_bf16_flat", "_g_fast_exc_mask",
+    "_g_fast_dg_flat", "_g_fast_exc_mask",
+    "_g_fast_h_anchor_sample_buf",
 )
 # Extended tracker buffers offloaded only during anchor refresh
 # (not used by the FD compute path — chunk_buf is scoring scratch,
 # selected_mask is dispatch output, name_group_count is dispatch output,
 # v_sample buffers are scoring inputs, _outlier_* are dispatch
-# metadata). _g_fast_h_g_bf16_flat is EXCLUDED — anchor writes to it.
+# metadata). _g_fast_h_anchor_sample_buf is EXCLUDED — anchor writes to it.
 _TRACKER_STATE_ATTRS_ANCHOR_EXTRA = (
     "_g_fast_chunk_buf", "_g_fast_selected_mask",
     "_g_fast_name_group_count", "_g_fast_offsets_t",
@@ -621,13 +622,13 @@ def anchor_offload_context(model: Any, tracker: Any,
          selected_mask, name_group_count, sub-sample, _outlier_*).
       3. (optional) offload segment_pipeline._gpu_bufs (2 × 128 MiB).
       4. (optional) ``offload_adam_state_to_cpu(tracker)`` — FP32 master
-         + Adam (m, v) + the 3 core tracker buffers (dg_flat, h_g_bf16,
-         exc_mask).
+         + Adam (m, v) + the 3 core tracker buffers (dg_flat,
+         h_anchor_sample_buf, exc_mask).
       5. ``torch.cuda.empty_cache()`` — release allocator pool pages.
       6. Snapshot ``pre_anchor_alloc`` for leak check.
 
-    Yield — anchor's FD compute runs here. ``_g_fast_h_g_bf16_flat`` stays
-    on GPU because anchor writes to it.
+    Yield — anchor's FD compute runs here. ``_g_fast_h_anchor_sample_buf``
+    stays on GPU because anchor writes to it.
 
     Post-anchor:
       1. ``torch.cuda.synchronize()`` (drain anchor's streams).
