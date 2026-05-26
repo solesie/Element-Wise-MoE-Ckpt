@@ -2156,6 +2156,15 @@ def proposal_refresh_finite_diff(
                 # NO new alloc). Stride = total_n // ANCHOR_SAMPLE_SIZE.
                 _h_accum_flat = _tracker._g_fast_h_anchor_sample_buf
                 _anchor_sample_size = int(_h_accum_flat.numel())
+                # Capture PREV anchor's |H| sum BEFORE the multi-batch loop
+                # zero_()s the buffer. Used by _anchor_h_ratio so the new
+                # threshold scales correctly across the H-distribution shift.
+                try:
+                    _config["_anchor_h_pre_sum"] = float(
+                        _h_accum_flat.abs().sum().item()
+                    )
+                except Exception:
+                    _config["_anchor_h_pre_sum"] = None
                 # Refresh stride based on this anchor's element count.
                 _anchor_stride = max(1, int(_total_n) // _anchor_sample_size)
                 _tracker._g_fast_h_anchor_stride = _anchor_stride
@@ -2346,17 +2355,17 @@ def proposal_refresh_finite_diff(
             print(f"[proposal] finite_diff failed @iter{iteration}", flush=True)
         return _finalize(None)
 
-    # Capture H scale BEFORE fold (anchor sample buf summary). Ratio is
-    # used by tracker.step to rescale prev_threshold across the new H
-    # scale, preventing all-scores-below-threshold pass2 dead-iter.
-    try:
-        _h_pre_fold = float(
-            _tracker._g_fast_h_anchor_sample_buf.abs().sum().item()
-        )
-    except Exception:
-        _h_pre_fold = None
-    # Fold (now just runs update_h_anchor_quantiles + diagnostics; the
-    # actual H data already lives in _g_fast_h_anchor_sample_buf).
+    # H-scale ratio across this anchor. _h_pre_fold = PREV anchor's |H|
+    # sum (captured at start of this anchor session, BEFORE multi-batch
+    # zero_() overwrote the buffer). _h_post_fold = THIS anchor's |H|
+    # sum (= current buffer state). Ratio is used by tracker.step to
+    # rescale prev_threshold across the H-distribution shift, preventing
+    # all-scores-below-threshold pass2 dead-iter at every refresh.
+    _h_pre_fold = _config.get("_anchor_h_pre_sum")
+    _config.pop("_anchor_h_pre_sum", None)
+    # _fold_h is now mainly diagnostic (update_h_anchor_quantiles +
+    # coverage stats); actual H data already lives in
+    # _g_fast_h_anchor_sample_buf.
     _fold_diag = _fold_h(_names_sorted, h_fd,
                          flip_cutoff=_config.get("_finite_diff_flip_cutoff"))
     try:
