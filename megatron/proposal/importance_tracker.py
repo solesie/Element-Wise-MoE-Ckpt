@@ -1738,8 +1738,14 @@ class ImportanceTracker:
                         0, n_filled_global - 1, 1,
                     )
                     floor_view = sorted_view.narrow(0, idx_floor, 1)
-                    # Cold-start guard: if top ≈ 0, set thresholds to inf.
-                    # Implemented as GPU max with half-top floor.
+                    # half_top floor: heavy-tail K-th bias guard. Sample
+                    # K-th systematically under-estimates true 96th
+                    # percentile (~0.4x in measured exp_etc). Without a
+                    # floor, selection over-shoots ~90%. half_top is a
+                    # conservative cap that prevents both cold-start
+                    # all-pass AND steady-state over-select.
+                    # (Future work: replace with size-N adaptive
+                    # estimator e.g. Hill EVT once N >> bias factor.)
                     half_top = top_view * 0.5
                     th_eff = torch.maximum(th_view, half_top)
                     floor_eff = torch.maximum(floor_view, half_top * 0.5)
@@ -2493,8 +2499,15 @@ class ImportanceTracker:
             ratio = float(getattr(self, "_anchor_h_ratio", 1.0))
             if (getattr(self, "_g_fast_prev_threshold_t", None) is not None
                     and ratio > 0 and abs(ratio - 1.0) > 1e-6):
+                # Scale BOTH group AND element thresholds (was group-only).
+                # H scale shifts after anchor — both pools' thresholds must
+                # follow to preserve K-budget across the refresh.
                 self._g_fast_prev_threshold_t.mul_(ratio)
-                print(f"[ANCHOR_FIX] @iter{global_step} threshold scaled by ratio={ratio:.4f}",
+                if getattr(self, "_outlier_prev_th", None) is not None:
+                    self._outlier_prev_th.mul_(ratio)
+                if getattr(self, "_outlier_prev_floor", None) is not None:
+                    self._outlier_prev_floor.mul_(ratio)
+                print(f"[ANCHOR_FIX] @iter{global_step} threshold scaled by ratio={ratio:.4f} (elem+group+floor)",
                       flush=True)
 
         # update_delta_accum (m, v read + dg write) — same stream as score.

@@ -2359,8 +2359,8 @@ def proposal_refresh_finite_diff(
     # sum (captured at start of this anchor session, BEFORE multi-batch
     # zero_() overwrote the buffer). _h_post_fold = THIS anchor's |H|
     # sum (= current buffer state). Ratio is used by tracker.step to
-    # rescale prev_threshold across the H-distribution shift, preventing
-    # all-scores-below-threshold pass2 dead-iter at every refresh.
+    # rescale prev_threshold (elem+group+floor) across the H-shift,
+    # preventing all-scores-below-threshold pass2 dead-iter.
     _h_pre_fold = _config.get("_anchor_h_pre_sum")
     _config.pop("_anchor_h_pre_sum", None)
     # _fold_h is now mainly diagnostic (update_h_anchor_quantiles +
