@@ -744,20 +744,14 @@ class CutoffOrchestrationMixin:
             and not bool(getattr(self, "test_expert_selection_only", False))
         )
 
-        force_cold_start = (
-            int(getattr(self, "_force_cold_start_cutoff_step", -1))
-            == int(global_step)
-        )
-        cutoff_decision = (
-            CutoffDecision(True, None, "h_refresh_cold_start")
-            if force_cold_start else
-            self._adaptive_cutoff.decide(step=int(global_step))
-        )
+        cutoff_decision = self._adaptive_cutoff.decide(step=int(global_step))
         tau_center = self._initial_cutoff_center(cutoff_decision)
         exact_reason = str(getattr(cutoff_decision, "reason", ""))
-        use_cold_start_hist = bool(getattr(cutoff_decision, "use_exact", False)) and (
-            bool(force_cold_start)
-            or not bool(getattr(self, "_cold_start_cutoff_ready", False))
+        initial_cold_start = int(global_step) <= 1
+        use_cold_start_hist = (
+            bool(getattr(cutoff_decision, "use_exact", False))
+            and bool(initial_cold_start)
+            and not bool(getattr(self, "_cold_start_cutoff_ready", False))
         )
         if use_cold_start_hist:
             cold_start = self._cold_start_cutoff_bootstrap(
@@ -846,8 +840,6 @@ class CutoffOrchestrationMixin:
                 stream=stream,
             )
         t_after_telemetry = time.perf_counter() if profile else 0.0
-        if force_cold_start:
-            self._force_cold_start_cutoff_step = -1
         self._selection_total_th_host = float(tau_center)
         ev = self._acquire_ring_event("selection_count")
         ev.record(stream if stream is not None else torch.cuda.current_stream())

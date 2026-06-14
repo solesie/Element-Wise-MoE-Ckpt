@@ -197,13 +197,8 @@ class RefreshOrchestrationMixin:
                 scale=bridge_scale,
                 reason="h_refresh",
                 refresh_step=refresh_step,
-                apply=False,
+                apply=True,
             )
-            forget = getattr(self._adaptive_cutoff, "forget_tau_model", None)
-            if forget is not None:
-                forget()
-            if refresh_step is not None:
-                self._force_cold_start_cutoff_step = int(refresh_step)
 
     def update_v_mapping(self, global_step: Optional[int] = None) -> None:
         """Refresh the runtime v quantile table with log-bin histograms.

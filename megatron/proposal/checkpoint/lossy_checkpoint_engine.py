@@ -140,14 +140,11 @@ class LossyCheckpointPipeline(
                 f"selection_mode must be 'v_hat'|'random'|'hessian', got {selection_mode!r}."
             )
         self.selection_mode = selection_mode
-        # Production reads H through the quantile table.
-        # When ``selection_mode == 'hessian'``, the score is:
-        #     score_elem(i)  = |H_g(group(i))| × Δθ_i²        # single-iter
-        #     score_group(g) = |H_g(g)|        × δ_g[g]       # time-window
-        # Both pools live on the same per-element axis and compete in the
-        # unified_topk walk under a single K-budget. H quantile refresh
-        # overwrites the runtime H table directly; there is no EMA or disk
-        # persist path. Post-fault recovery relies on the next refresh.
+        # Production reads H through the quantile table. In hessian mode the
+        # single hot-path score is:
+        #     score(i) = H(v_i) * age2bit_i^2 * delta_eff_i^2
+        # Probe and direct emission must use the same helper; group-dg and
+        # outlier-priority scoring are not production selection paths.
 
         self._selection_total_th: Optional[torch.Tensor] = None    # () fp32
         self._selection_total_th_host: float = 1.0

@@ -1,8 +1,9 @@
-"""Cold-start score histogram for initial cutoff scale bootstrap.
+"""Cold-start score histogram for the first cutoff scale bootstrap.
 
 This module is not a steady-state validation path. It runs only while the
-adaptive controller lacks a usable tau scale, then the normal approx probe and
-direct emission path take over.
+adaptive controller lacks an initial tau scale, before age2bit state has
+diverged from all-zero.  After that, refresh and steady-state cutoff must use
+the normal approx probe and direct emission score helper.
 """
 
 from __future__ import annotations
