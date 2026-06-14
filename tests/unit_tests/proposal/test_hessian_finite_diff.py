@@ -1,31 +1,27 @@
-"""Unit tests for the finite-difference Hessian estimator.
+"""Unit tests for the H-quantile anchor finite-difference helpers.
 
-Exercises the state-free pieces of ``megatron.proposal.hessian`` and
-``megatron.proposal._routing_freeze`` without requiring DeepSpeed,
+Exercises the state-free pieces of ``megatron.proposal.refresh.hessian_refresh`` and
+``megatron.proposal.refresh.routing_freeze`` without requiring DeepSpeed,
 distributed init, or the Megatron training stack:
 
-  * synthetic 3-point eps sweep correctness (highest Pearson is picked)
-  * exact param restore after the +/- eps perturbations
+  * the FD core requires theta_snap_ref + grad_offsets + grad_accum_views
+  * CUDA/Triton FP32 grad accumulation matches a quadratic Hessian diagonal
   * routing freeze hook captures and replays gate outputs
-  * graceful None-return when forward fails
 """
 from __future__ import annotations
 
-import math
-from typing import Any, List, Tuple
+from typing import Tuple
 
 import pytest
 import torch
 
-from megatron.proposal.hessian import (
+from megatron.proposal.refresh.hessian_refresh import (
+    _HAS_TRITON_HESSIAN,
     compute_hessian_finite_diff_core,
-    compare_hessian_estimators,
-    _pearson_two_tensor_lists,
 )
-from megatron.proposal._routing_freeze import (
+from megatron.proposal.refresh.routing_freeze import (
     RoutingFreezeContext,
     identify_gate_modules,
-    _set_force_empty,
 )
 
 
@@ -40,10 +36,7 @@ def _make_quadratic(n: int = 16, seed: int = 0) -> Tuple[torch.nn.Parameter, tor
     return theta, a
 
 
-def test_param_restore_exact():
-    """After compute_hessian_finite_diff_core, params must be byte-identical
-    to before the call (the restore correctness gate that prevents drift).
-    """
+def test_grad_flat_inputs_are_required():
     theta, a = _make_quadratic(n=32)
     saved = theta.data.clone()
 
@@ -52,54 +45,70 @@ def test_param_restore_exact():
         loss = 0.5 * (a * theta * theta).sum()
         return loss, {}
 
-    h = compute_hessian_finite_diff_core(
-        forward_loss_fn=_forward,
-        expert_ps=[theta],
-        k_samples=2,
-        eps=1e-2,
-        gates_for_freeze=None,
+    # Missing theta_snap_ref / grad_offsets / grad_accum_views → the core
+    # refuses (no partial run) and leaves θ untouched.
+    with pytest.raises(RuntimeError):
+        compute_hessian_finite_diff_core(
+            forward_loss_fn=_forward,
+            expert_ps=[theta],
+            k_samples=1,
+            eps=1e-2,
+            gates_for_freeze=None,
+        )
+    assert torch.equal(theta.data, saved)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_TRITON_HESSIAN,
+    reason="grad-flat anchor path requires CUDA and Triton",
+)
+def test_grad_flat_quadratic_signal_matches_diagonal():
+    torch.manual_seed(123)
+    n = 64
+    a = torch.linspace(1.0, 4.0, n, device="cuda", dtype=torch.float32)
+    theta = torch.nn.Parameter(
+        (torch.randn(n, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
     )
-    assert h is not None, "central-diff returned None unexpectedly"
-    # Param restore — exact-byte recovery within float64 promotion of norm.
-    diff = (theta.data - saved).abs().max().item()
-    assert diff < 1e-6, f"param drift after estimator: max abs diff = {diff:.3e}"
-
-
-def test_quadratic_recovers_diag():
-    """For L = 0.5 Σ a_i θ_i², central-diff |H_diag| ≈ a. K-sample Rademacher
-    averaging means a single noise-free run should still recover ranks
-    correctly even at modest K.
-    """
-    torch.manual_seed(0)
-    theta, a = _make_quadratic(n=32, seed=42)
+    theta_snap = [theta.data.detach().clone()]
+    # Live FD path accumulates z·(g₊−g₋)/(2εK) into an FP32 per-expert view.
+    grad_accum = [torch.zeros(n, device="cuda", dtype=torch.float32)]
 
     def _forward():
-        loss = 0.5 * (a * theta * theta).sum()
+        loss = 0.5 * (a * theta.float() * theta.float()).sum()
         return loss, {}
 
-    h = compute_hessian_finite_diff_core(
+    ret = compute_hessian_finite_diff_core(
         forward_loss_fn=_forward,
         expert_ps=[theta],
-        k_samples=8,
-        eps=1e-3,
+        k_samples=1,
+        eps=1e-2,
         gates_for_freeze=None,
+        theta_snap_ref=theta_snap,
+        grad_offsets=[0],
+        grad_accum_views=grad_accum,
     )
-    assert h is not None
-    h_est = h[0]
-    # Pearson correlation of estimate vs truth on a 32-element diagonal.
+    torch.cuda.synchronize()
+    try:
+        assert ret == []
+        h64 = grad_accum[0].abs().to(torch.float64)
+    finally:
+        theta.data.copy_(theta_snap[0])
+
     a64 = a.to(torch.float64)
-    h64 = h_est.to(torch.float64)
     pa = a64 - a64.mean()
     pb = h64 - h64.mean()
     pearson = (pa * pb).sum() / (pa.norm() * pb.norm() + 1e-12)
-    assert pearson.item() > 0.85, f"low pearson on quadratic test: {pearson.item():.3f}"
+    assert pearson.item() > 0.8
 
 
-def test_graceful_none_on_forward_failure():
-    """If the forward closure raises, the estimator returns None (no leaked
-    param mutation, no exception propagated)."""
-    theta = torch.nn.Parameter(torch.randn(8))
-    saved = theta.data.clone()
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_TRITON_HESSIAN,
+    reason="grad-flat anchor path requires CUDA and Triton",
+)
+def test_grad_flat_forward_failure_returns_none_and_caller_restores():
+    theta = torch.nn.Parameter(torch.randn(8, device="cuda", dtype=torch.bfloat16))
+    snap = [theta.data.detach().clone()]
+    grad_accum = [torch.zeros(theta.numel(), device="cuda", dtype=torch.float32)]
 
     def _broken_forward():
         raise RuntimeError("synthetic forward failure")
@@ -110,11 +119,13 @@ def test_graceful_none_on_forward_failure():
         k_samples=2,
         eps=1e-3,
         gates_for_freeze=None,
+        theta_snap_ref=snap,
+        grad_offsets=[0],
+        grad_accum_views=grad_accum,
     )
     assert h is None
-    # Param restored even though we never hit the cleanup path explicitly.
-    diff = (theta.data - saved).abs().max().item()
-    assert diff < 1e-6, f"param drifted on failed estimator path: {diff:.3e}"
+    theta.data.copy_(snap[0])
+    assert torch.equal(theta.data, snap[0])
 
 
 # ---------------------------------------------------------------------------
@@ -188,47 +199,3 @@ def test_routing_freeze_restores_original_forward():
     # After exit, original forward is back.
     model.gate(torch.randn(2, 4))
     assert model.gate.calls > orig_calls + 1, "original gate forward not restored"
-
-
-def test_identify_gate_modules_safe_force_empty():
-    """The test-injection flag forces identify_gate_modules_safe to return
-    empty even on a model that has gates — used to simulate the
-    gate-id-failure code path."""
-    from megatron.proposal._routing_freeze import identify_gate_modules_safe
-    model = _ToyMoEModel()
-    gates_normal, _ = identify_gate_modules_safe(model)
-    assert len(gates_normal) == 1
-    _set_force_empty(True)
-    try:
-        gates_empty, _ = identify_gate_modules_safe(model)
-        assert gates_empty == []
-    finally:
-        _set_force_empty(False)
-
-
-
-def test_compare_hessian_estimators_label_propagation():
-    """When called with custom labels, the output keys reflect them."""
-    n = 16
-    p = torch.nn.Parameter(torch.randn(n))
-    h_a = torch.randn(n).abs().to(torch.float32)
-    h_b = torch.randn(n).abs().to(torch.float32)
-    tracked = [("x", p)]
-    res = compare_hessian_estimators(0, tracked, [h_a], [h_b], {},
-                                      label_a="hutch", label_b="finite_diff")
-    assert "pearson_hutch_finite_diff_bare" in res
-    assert "pearson_hutch_finite_diff_score" in res
-    assert res["label_a"] == "hutch"
-    assert res["label_b"] == "finite_diff"
-
-
-
-def test_pearson_two_tensor_lists_constant():
-    """Pearson on identical lists is 1.0; Pearson on flat-zero is 0.0."""
-    a = [torch.tensor([1.0, 2.0, 3.0])]
-    b = [torch.tensor([2.0, 4.0, 6.0])]
-    r = _pearson_two_tensor_lists(a, b)
-    assert r > 0.99
-    z = [torch.zeros(8)]
-    r0 = _pearson_two_tensor_lists(z, z)
-    assert r0 == 0.0

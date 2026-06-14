@@ -2,11 +2,11 @@
 checkpointing pipeline.
 
 Registered via ``pretrain_gpt.py``'s ``extra_args_provider``. Defaults
-track CLAUDE.md: cp_mode=element_wise, selection_mode=hessian,
-hessian_estimator=finite_diff (default), topk_ratio=0.05, W=10, async_queue=5.
+track AGENTS.md: selection_mode=hessian, topk_ratio=0.04,
+W=1, async_queue=5.
 
-Kept as a separate module (vs. inline in cp_hooks.py) so the argparse
-wiring can be imported without triggering the heavier cp_hooks module
+Kept as a separate module so the argparse wiring can be imported without
+triggering proposal runtime initialization
 — useful for tooling that inspects flags without initialising the
 checkpoint pipeline.
 """
@@ -18,141 +18,127 @@ def add_proposal_args(parser):
     group = parser.add_argument_group(title="proposal")
     group.add_argument("--proposal-enable", action="store_true",
                        help="Enable element-wise importance MoE checkpointing.")
-    group.add_argument("--proposal-topk-ratio", type=float, default=0.05,
+    group.add_argument("--proposal-topk-ratio", type=float, default=0.04,
                        help="Fraction of expert elements to snapshot per lossy-FC "
-                            "(score-based top-K). Default 5%%.")
+                            "(score-based top-K). Default 4%%.")
     group.add_argument("--proposal-block-quant-g", type=int, default=8,
-                       help="Block quantization group size for selection. Default 8 "
-                            "(CLAUDE.md production). When g>1, contiguous g-element "
-                            "groups share a group score and are selected as a unit. "
-                            "Saves use element-level values: K-element budget preserved.")
-    # FD multi-K diagnostic (per-refresh K_x vs K_max comparison).
-    group.add_argument("--proposal-fd-multi-k-track", action="store_true",
-                       help="Track FD H estimates at multiple K values (per refresh). "
-                            "Snapshots accumulated h_sum / k_done at each requested K "
-                            "boundary; pearson(K_x, K_max) and pearson(prev_K_max, "
-                            "current_K_max) logged.")
-    group.add_argument("--proposal-fd-multi-k-values", type=int, nargs="+",
-                       default=[1, 2, 4, 8, 16, 32],
-                       help="K boundary values for multi-K tracking. Last value used "
-                            "as truth for cross-K pearson. Refresh runs k_samples = "
-                            "max(values).")
-    group.add_argument("--proposal-fd-multi-k-log", type=str, default=None,
-                       help="JSONL output path for multi-K pearson records.")
+                       help="Block quantization group size for descriptor traversal. "
+                            "Default 8. Production selection is element-wise; this "
+                            "value controls contiguous descriptor grouping, not a "
+                            "separate group-score pool.")
     group.add_argument("--proposal-selection-mode", type=str, default="hessian",
                        choices=["v_hat", "random", "hessian"],
                        help="Score metric for element selection: "
                             "'v_hat' = Adam bias-corrected v̂_t × δ² ; "
                             "'hessian' = |H_diag| × δ² (Finite-Difference) ; "
                             "'random' = uniform random (ablation). Default 'hessian'.")
+    group.add_argument("--proposal-n-bins-cutoff", type=int, default=4096,
+                       help="Selection cutoff-search histogram bins. Default 4096.")
+    group.add_argument("--proposal-cutoff-k-tolerance", type=float, default=0.04,
+                       help="Allowed relative K-budget tolerance for cutoff "
+                            "search. Default 0.04.")
+    group.add_argument("--proposal-pinned-aos-capacity-tolerance", type=float,
+                       default=0.25,
+                       help="Host pinned AOS slab capacity margin over "
+                            "--proposal-topk-ratio. This is a buffer-capacity "
+                            "contract, not a cutoff accuracy tolerance. "
+                            "Default 0.25.")
+    group.add_argument("--proposal-adaptive-cutoff-window", type=int, default=16,
+                       help="Sliding-window length for adaptive cutoff selected-ratio "
+                            "control. Default 16.")
+    group.add_argument("--proposal-adaptive-cutoff-min-observations", type=int, default=8,
+                       help="Minimum window observations before adaptive cutoff may "
+                            "predict tau. Default 8.")
+    group.add_argument("--proposal-adaptive-cutoff-warmup-iters", type=int, default=0,
+                       help="Initial proposal iterations treated as the warmup/limit "
+                            "region for adaptive cutoff exact histogram. Default 0; "
+                            "LR warmup only suppresses stable-skip candidate-count "
+                            "elision.")
+    group.add_argument("--proposal-adaptive-cutoff-retry-tolerance", type=float, default=0.04,
+                       help="Relative selected-ratio slack used by adaptive cutoff "
+                            "certification and guards. Default 0.04.")
+    group.add_argument("--proposal-n-q", type=int, default=4096,
+                       help="Number of v/h quantile points. Default 4096.")
+    group.add_argument("--proposal-h-lookup-lut-bins", type=int, default=8192,
+                       help="Number of log(v)->H lookup LUT bins. Default 8192.")
     group.add_argument("--proposal-finite-diff-eps", type=float, default=None,
                        help="Absolute eps for finite-difference Hz (2-point central). "
                             "Default None → 1e-3 (validated on production exp_etc, "
                             "BF16 + MoE). Override via this flag or PROPOSAL_FD_EPS "
                             "env if a very different scale ever proves the default unsafe.")
-    group.add_argument("--proposal-finite-diff-flip-cutoff", type=float,
-                       default=100.0,
-                       help="Outlier protection: per-tensor Hz mean-abs is "
-                            "compared to the median across tensors; tensors "
-                            "exceeding cutoff*median are skipped from the H "
-                            "update (residual flip protection beyond routing "
-                            "freeze). Default 100.")
     group.add_argument("--proposal-hessian-refresh-every", type=int, default=100,
                        help="With --proposal-selection-mode=hessian: re-estimate "
                             "|H_diag| every N iters and overwrite the cached H. "
                             "Default 100 (prodsim verified: 50-iter staleness has "
                             "zero rank-quality impact). Set 0 to disable.")
-    group.add_argument("--proposal-hessian-num-samples", type=int, default=1,
-                       help="Label draws averaged per Hessian refresh. Default 1 "
-                            "(prodsim verified: K=1 quantile-equivalent to K=32 truth).")
-    # DEBUG: disable the ExpertState lossy FC writer (skip both lossy-FC
-    # and lossless-FC of experts). Used to isolate expert-side write cost
-    # when profiling. Legacy flag name preserved for compat.
-    group.add_argument("--proposal-disable-rolling", action="store_true",
-                       help="Debug: skip tracker.set_expert_state() so expert "
-                            "lossy-FC is disabled entirely.")
-    # D: expert lossless FC interval. Per CLAUDE.md Key Parameters, default 4.
-    # Per-expert lossless FC cycle = D × ⌈100/F⌉ iters.
-    group.add_argument("--proposal-expert-fc-D", type=int, default=None,
-                       help="Expert lossless FC interval in iterations "
-                            "(default: 4 for proposal mode, 1 for sequential).")
-    group.add_argument("--proposal-lossless-fc-fraction", type=float, default=2.0,
-                       help="F%% — fraction of total experts that receive a "
-                            "lossless FC snapshot each time the D-interval "
-                            "fires. Per CLAUDE.md default 2.0 → 1 expert per "
-                            "fire for 48-expert model → 200-iter cycle.")
+    group.add_argument("--proposal-test-skip-expert-commit", action="store_true",
+                       help="Test/profiling only: run expert selection, AOS "
+                            "materialization, and D2H, then skip CPU dense "
+                            "scatter, LFSY file writes, and LFCL commit.")
+    group.add_argument("--proposal-test-skip-expert-d2h", action="store_true",
+                       help="Test/profiling only: with "
+                            "--proposal-test-skip-expert-commit, run expert "
+                            "selection and AOS materialization but skip AOS "
+                            "GPU-to-host copy. This isolates non-D2H proposal "
+                            "overhead and is invalid for recovery/durability.")
+    group.add_argument("--proposal-test-expert-selection-only", action="store_true",
+                       help="Test/profiling only: with "
+                            "--proposal-test-skip-expert-d2h, run expert "
+                            "selection/count and host layout only, then skip "
+                            "GPU record emission. This isolates expert "
+                            "selection/cutoff overhead and is invalid for "
+                            "recovery/durability.")
+    group.add_argument("--proposal-test-skip-nonexpert-commit", action="store_true",
+                       help="Test/profiling only: run non-expert FC D2H, then "
+                            "skip PRPTENS file write/fsync/retention cleanup. "
+                            "Use with --proposal-test-skip-expert-commit to "
+                            "measure write-excluded proposal overhead.")
+    group.add_argument("--proposal-test-skip-nonexpert-d2h", action="store_true",
+                       help="Test/profiling only: with "
+                            "--proposal-test-skip-nonexpert-commit, skip "
+                            "non-expert FC GPU-to-host copy as well. This "
+                            "isolates non-D2H proposal overhead and is invalid "
+                            "for recovery/durability.")
+    group.add_argument("--proposal-lfcl-plan-policy", type=str,
+                       default="round_robin",
+                       choices=["round_robin", "lossy_log_size"],
+                       help="Expert LFCL compaction planner. round_robin is "
+                            "the V2 default; lossy_log_size compacts experts "
+                            "with the largest current LFSY files.")
     group.add_argument("--proposal-nonexpert-fc-W", type=int, default=1,
                        help="Non-expert lossless FC interval (iters). Default 1 "
-                            "(CLAUDE.md spec: W=1, lossless FC every iter; DC removed).")
+                            "(V2 spec: W=1, lossless non-expert FC every iter; DC removed).")
     group.add_argument("--proposal-async-queue", type=int, default=5)
     group.add_argument("--proposal-cp-mode", type=str, default="proposal",
                        choices=["proposal", "sequential"],
                        help="Expert checkpoint strategy. "
                             "'proposal' (default): Lossy FC (append-only log, "
-                            "top-K%% elements each iter) + round-robin F%% "
-                            "expert lossless FC every D iter. "
+                            "top-K%% elements each iter) + 1%% expert LFCL "
+                            "compaction every iter. "
                             "'sequential': MoC-System baseline (layer-wise "
-                            "round-robin lossless FC, no element-wise lossy).")
+                            "round-robin dense expert checkpoint, no element-wise lossy).")
     group.add_argument("--proposal-cp-target", type=str, default="disk",
-                       choices=["disk", "dram"],
+                       choices=["disk", "test_dram"],
                        help="Where to persist expert checkpoints. "
-                            "'disk' (default): write lossless/lossy FC files "
+                            "'disk' (default): write LFCL/LFSY expert files "
                             "to --proposal-cp-dir on storage; recovery reads "
                             "files back. SSD 4KB write granularity forces the "
                             "log format. "
-                            "'dram': proposal mode keeps a per-expert "
-                            "sparse-dense FP32 buffer in host RAM (no log, no "
-                            "file I/O). Lossy FC scatters new (idx, p, m, v) "
-                            "directly into the buffer; recovery reads the "
-                            "buffer in O(expert_size) regardless of how many "
-                            "lossy appends accumulated. Use for fast "
-                            "validation-loss experiments where storage "
-                            "cost/recovery time is not the variable under "
-                            "study. Sequential (MoC) mode currently still "
-                            "uses disk regardless of this flag — set "
-                            "CP_DIR_OVERRIDE to a tmpfs path (e.g. /dev/shm) "
-                            "for that mode if you want RAM-speed I/O.")
+                            "'test_dram': test-only target that keeps the "
+                            "latest non-expert FC and expert LFCL/LFSY "
+                            "recovery image in host RAM, skipping filesystem "
+                            "durability.")
     group.add_argument("--proposal-cp-dir", type=str, default="./proposal_cp",
                        help="Directory for proposal checkpoint files.")
     group.add_argument("--proposal-fault-interval", type=int, default=0,
-                       help="Exp 2 fault injection: every N iters, call "
+                       help="Synthetic recovery check: every N iters, call "
                             "proposal_recover() in the middle of training and continue "
                             "from the reconstructed state. 0 disables.")
     group.add_argument("--proposal-fault-warmup", type=int, default=0,
-                       help="Exp 2: skip fault injection for the first N iters "
+                       help="Skip synthetic recovery checks for the first N iters "
                             "(warm-up). First fault fires at iter ≥ N (and == multiple "
                             "of --proposal-fault-interval).")
     group.add_argument("--proposal-fault-log", type=str, default=None,
                        help="Path to append JSON-per-line fault records "
                             "(iter, pre_fault_loss, post_fault_loss, recover_time_s).")
-    group.add_argument("--proposal-fisher-coverage-iters", type=int, nargs="+",
-                       default=None,
-                       help="Measure Fisher mass concentration C(K) at each of "
-                            "these iters (using current Adam v_t over expert "
-                            "params only — ZeRO-aware via Fp32StateMapper). "
-                            "Dumps JSON list next to fault log.")
-    # FD Hessian noise probe (diagnostic — no effect on production refresh)
-    group.add_argument("--proposal-fd-noise-probe-iters", type=int, nargs="+",
-                       default=None,
-                       help="Iters at which to run the FD Hessian noise probe. "
-                            "Each fire captures ref_n_batches batches and "
-                            "computes a K=ref_k reference + case A/B + "
-                            "sigma_z + sigma_batch comparisons against the "
-                            "reference top-1%% indices. Logs JSONL to "
-                            "--proposal-fd-noise-probe-log. No effect on "
-                            "tracker._H_g — production refresh runs normally.")
-    group.add_argument("--proposal-fd-noise-probe-log", type=str, default=None,
-                       help="Path to append JSONL noise-probe records.")
-    group.add_argument("--proposal-fd-noise-probe-ref-k", type=int, default=32,
-                       help="Reference K (number of K=1 FD calls averaged). "
-                            "Default 32.")
-    group.add_argument("--proposal-fd-noise-probe-ref-n-batches", type=int, default=20,
-                       help="Distinct minibatches captured + cycled through "
-                            "the reference K calls. Default 20.")
-    group.add_argument("--proposal-fd-noise-probe-g-blk", type=int, default=1,
-                       help="Group-quantisation block size for the probe's "
-                            "FD calls (AdaHessian spatial-averaging analogue). "
-                            "g=1 = element-level. g=8 averages 8 contiguous "
-                            "elements per group → 8× variance reduction. "
-                            "Default 1.")
     return parser

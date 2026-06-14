@@ -189,27 +189,34 @@ size_t write_prptens(const std::string& final_path,
     return static_cast<size_t>(total_padded_bytes);
 }
 
-size_t write_lossless(const std::string& final_path,
-                      int64_t pinned_addr,
-                      const std::string& header,
-                      int64_t total_padded_bytes,
-                      int mode) {
+int write_prptens_keep_open(const std::string& final_path,
+                            int64_t pinned_addr,
+                            const std::string& header,
+                            int64_t total_padded_bytes,
+                            int mode) {
+    return write_header_payload_keep_open(
+        final_path, pinned_addr, header, total_padded_bytes, mode);
+}
+
+int write_header_payload_keep_open(const std::string& final_path,
+                                   int64_t pinned_addr,
+                                   const std::string& header,
+                                   int64_t total_padded_bytes,
+                                   int mode) {
     stamp_header_into_pinned(pinned_addr, header);
-    const std::string tmp_path = final_path + ".tmp";
-    int fd = syscall_open_create(tmp_path, /*extra_flags=*/0, mode,
-                                 "write_lossless");
+    int fd = syscall_open_create(final_path, /*extra_flags=*/0, mode,
+                                 "write_header_payload_keep_open");
     try {
-        syscall_write_full_aligned(fd, reinterpret_cast<void*>(pinned_addr),
-                                   static_cast<size_t>(total_padded_bytes),
-                                   "write_lossless");
-        syscall_fsync(fd, "write_lossless");
+        syscall_write_full_aligned(
+            fd,
+            reinterpret_cast<void*>(pinned_addr),
+            static_cast<size_t>(total_padded_bytes),
+            "write_header_payload_keep_open");
     } catch (...) {
         syscall_close_noexcept(fd);
         throw;
     }
-    syscall_close_noexcept(fd);
-    syscall_rename(tmp_path, final_path, "write_lossless");
-    return static_cast<size_t>(total_padded_bytes);
+    return fd;
 }
 
 int open_lossy_log_for_append(const std::string& path,
@@ -247,22 +254,11 @@ size_t append_lossy_log(int fd,
 
 void fsync_fd(int fd) {
     if (fd < 0) return;
-    try { syscall_fsync(fd, "fsync_fd"); } catch (...) { /* best-effort */ }
+    syscall_fsync(fd, "fsync_fd");
 }
 
 void close_fd(int fd) {
     syscall_close_noexcept(fd);
-}
-
-size_t full_write_pinned(int fd,
-                         int64_t pinned_addr,
-                         int64_t total_padded_bytes) {
-    if (fd < 0) throw std::invalid_argument("full_write_pinned: bad fd");
-    if (total_padded_bytes <= 0) return 0;
-    syscall_write_full_aligned(fd, reinterpret_cast<void*>(pinned_addr),
-                               static_cast<size_t>(total_padded_bytes),
-                               "full_write_pinned");
-    return static_cast<size_t>(total_padded_bytes);
 }
 
 void unlink_path(const std::string& path) {

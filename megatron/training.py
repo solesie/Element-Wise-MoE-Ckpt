@@ -5,6 +5,7 @@
 
 from datetime import datetime
 import math
+import os
 import sys
 import time
 import json
@@ -51,13 +52,14 @@ from megatron.utils import report_memory, throughput_calculator, checkpoint_thro
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
-from megatron.proposal.cp_hooks import (
+from megatron.proposal.hooks import (
     init_proposal,
-    proposal_arm_post_iter_fc,
-    proposal_fence_before_optimizer,
-    proposal_recover, proposal_inject_fault, proposal_record_iter_loss,
+    proposal_dispatch_post_iter,
+    proposal_wait_d2h_before_optimizer,
+    proposal_recover, proposal_simulate_fault, proposal_record_loss,
     proposal_shutdown,
-    proposal_refresh_hessian, set_hessian_valid_iter,
+    proposal_refresh_h_quantile, proposal_set_anchor_data_iter,
+    proposal_vram_audit_iter_begin, proposal_vram_audit_iter_end,
 )
 
 import deepspeed
@@ -243,8 +245,8 @@ def pretrain(train_valid_test_dataset_provider,
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
-            # When hessian-based selection is active, build a DEDICATED
-            # valid iterator that refresh_hessian consumes — keeps the
+            # When H-quantile selection is active, build a DEDICATED
+            # valid iterator that refresh_h_quantile consumes — keeps the
             # shared valid_data_iterator untouched so evaluate_and_print_results
             # draws the same val sample across (hessian | v_hat | baseline).
             if (
@@ -254,7 +256,7 @@ def pretrain(train_valid_test_dataset_provider,
                 _, _hessian_valid_iter, _ = build_train_valid_test_data_iterators(
                     train_valid_test_dataset_provider
                 )
-                set_hessian_valid_iter(_hessian_valid_iter)
+                proposal_set_anchor_data_iter(_hessian_valid_iter)
 
             iteration = train(forward_step_func,
                             model, optimizer, opt_param_scheduler,
@@ -742,11 +744,8 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
-    # The previous iter's armed proposal CP work is released at the END
-    # of the first micro-batch's forward by a forward hook registered
-    # inside ``init_proposal`` (so d2h overlaps with backward rather
-    # than forward, avoiding PCIe copy-engine contention with
-    # PyTorch's `tensor.to('cuda')` sync inside forward).
+    # V2 proposal work for the previous optimizer step is dispatched
+    # explicitly before this forward; no arm/release forward hook exists.
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -784,8 +783,14 @@ def train_step(forward_step_func, data_iterator,
     # as belt-and-suspenders guard against worker pickup / PCIe stalls.
     if _has_nvtx_t and _rng_iter is not None:
         _nvtx_t.end_range(_rng_iter)
+    if (
+        getattr(args, 'proposal_enable', False)
+        and os.environ.get("PROPOSAL_DISPATCH_AT_OPT_FENCE", "") in ("1", "true", "True")
+        and getattr(args, "iteration", 0) > 0
+    ):
+        proposal_dispatch_post_iter(model, iter_T=args.iteration)
     if getattr(args, 'proposal_enable', False):
-        proposal_fence_before_optimizer()
+        proposal_wait_d2h_before_optimizer()
     _rng_opt = _nvtx_t.start_range(f"iter{args.iteration+1}_optimizer") if _has_nvtx_t else None
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
@@ -793,14 +798,6 @@ def train_step(forward_step_func, data_iterator,
                     args.micro_batch_size * \
                     args.data_parallel_size
         model[0].step(lr_kwargs={'increment': increment})
-        if getattr(args, 'proposal_enable', False):
-            # Record iter T's optimizer.step completion event and stash
-            # the post-iter FC descriptor. The forward_hook registered
-            # on _inner_model (init_proposal) consumes this descriptor
-            # at the END of the first micro-batch's forward in iter
-            # T+1, submitting it to the two domain workers. Training
-            # thread does no CP work itself beyond this arm.
-            proposal_arm_post_iter_fc(model, iter_T=args.iteration + 1)
         update_successful = model[0].was_step_applied()
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
@@ -1304,9 +1301,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
-        
+
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        if getattr(args, 'proposal_enable', False):
+            proposal_vram_audit_iter_begin(iteration + 1)
         trigger(on_step_begin)
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
@@ -1324,6 +1323,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
+        if (
+            getattr(args, 'proposal_enable', False)
+            and iteration > 0
+            and os.environ.get("PROPOSAL_DISPATCH_AT_OPT_FENCE", "") not in ("1", "true", "True")
+        ):
+            proposal_dispatch_post_iter(model, iter_T=iteration)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -1342,21 +1347,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             except Exception:
                 cur_loss_value = None
         if getattr(args, 'proposal_enable', False):
-            proposal_record_iter_loss(step=iteration, loss_value=cur_loss_value)
+            proposal_record_loss(step=iteration, loss=cur_loss_value)
 
         # H cache refresh for selection_mode='hessian'. Uses valid data so
         # it does not consume/advance the training data iterator. The first
-        # refresh happens at iter=1 so tracker has a populated cache by post_step.
+        # refresh happens at iter=1 so lossy selection has a populated H cache.
         h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
         if (
             getattr(args, 'proposal_enable', False)
             and h_refresh_every > 0
             and (iteration == 1 or iteration % h_refresh_every == 0)
         ):
-            proposal_refresh_hessian(
+            proposal_refresh_h_quantile(
                 model, forward_step_func, valid_data_iterator, iteration,
-                k_samples=int(getattr(args, 'proposal_hessian_num_samples', 1)),
             )
+        if getattr(args, 'proposal_enable', False):
+            proposal_vram_audit_iter_end(iteration)
 
         # Exp 2 fault injection: every N iter (after warmup), reconstruct state from CP and continue.
         fault_interval = int(getattr(args, 'proposal_fault_interval', 0) or 0)
@@ -1368,8 +1374,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             and iteration % fault_interval == 0
             and iteration < args.train_iters
         ):
-            rec = proposal_inject_fault(model, optimizer, step=iteration,
-                                        args=args, pre_fault_loss=cur_loss_value)
+            rec = proposal_simulate_fault(model, optimizer, step=iteration,
+                                          args=args, pre_fault_loss=cur_loss_value)
             print_rank_0(
                 f"[proposal] FAULT@{iteration}: recover_s={rec.get('recover_time_s',0):.2f} "
                 f"ne_fc={rec.get('nonexpert_fc_iter')} "
@@ -1440,6 +1446,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
+                if getattr(args, 'proposal_enable', False):
+                    proposal_shutdown()
                 sys.exit()
 
         if args.save and args.save_interval and \
@@ -1461,6 +1469,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
+                if getattr(args, 'proposal_enable', False):
+                    proposal_shutdown()
                 sys.exit()
 
         # Exiting based on iterations
@@ -1470,6 +1480,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
+            if getattr(args, 'proposal_enable', False):
+                proposal_shutdown()
             sys.exit()
         trigger(on_step_end)
 
@@ -1481,6 +1493,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             torch.distributed.barrier()
             print_datetime(f"Detected kill switch at {args.kill_switch_file}, "
                            f"iteration={iteration}. Exiting")
+            if getattr(args, 'proposal_enable', False):
+                proposal_shutdown()
             sys.exit()
 
     return iteration

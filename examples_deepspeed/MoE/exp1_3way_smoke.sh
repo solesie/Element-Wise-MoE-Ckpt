@@ -51,8 +51,6 @@ if [ "$VARIANT" != "baseline" ]; then
         --proposal-selection-mode v_hat \
         --proposal-hessian-refresh-every 0 \
         --proposal-topk-ratio 0.04 \
-        --proposal-expert-fc-D 1 \
-        --proposal-lossless-fc-fraction 2.0 \
         --proposal-nonexpert-fc-W 10 \
         --proposal-async-queue 5"
 fi

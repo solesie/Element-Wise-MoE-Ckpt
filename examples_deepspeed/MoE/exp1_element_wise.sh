@@ -11,7 +11,7 @@
 #   - cp_mode = element_wise
 #   - selection_mode = hessian
 #   - topk_ratio = 0.05 (K = 5%)
-#   - W = 10, D = 4 (via --proposal-expert-fc-D if used; element_wise skips per-expert FC)
+#   - W = 10; proposal LFCL defaults are fixed in code.
 #   - warmup = 300, fault_interval = 100, iterations = 2000
 #   - Dataset = SlimPajama 6B
 set -e
@@ -65,10 +65,7 @@ PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
     --proposal-cp-mode proposal \
     --proposal-selection-mode hessian \
     --proposal-hessian-refresh-every 10 \
-    --proposal-hessian-num-samples 1 \
     --proposal-topk-ratio 0.05 \
-    --proposal-expert-fc-D 1 \
-    --proposal-lossless-fc-fraction 2.0 \
     --proposal-nonexpert-fc-W 10 \
     --proposal-async-queue 5 \
     --proposal-fault-interval ${FAULT_INTERVAL} \

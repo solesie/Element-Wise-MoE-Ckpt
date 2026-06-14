@@ -3,11 +3,11 @@
 Reads ``$PROPOSAL_VRAM_AUDIT_LOG`` and emits PASS/FAIL line per
 requirement. ``exit 1`` if any FAIL.
 
-Requirements (from CLAUDE.md hard contract + user mental model):
+Requirements (from AGENTS.md V2 hard contract + user mental model):
 
-  R1 — persistent VRAM ≈ baseline + tracker_buffer + (histc 조금) +
+  R1 — persistent VRAM ≈ baseline + lossy checkpoint buffers +
        segment_double_buf. Expected value computed analytically from
-       the first ``post_init`` record's ``tracker_items``.
+       steady-state audit records.
   R2 — no per-iter alloc/free on proposal streams. Verified via
        ``alloc_count`` delta between iter_end records (steady state
        iter 30-130) AND alloc_trace_summary entries.
@@ -23,7 +23,7 @@ import sys
 from typing import Any, Dict, List, Tuple
 
 
-R1_TOLERANCE_MB = 50.0        # tracker + segment + small metadata, allow slack
+R1_TOLERANCE_MB = 50.0        # lossy checkpoint + segment + small metadata
 R2_LARGE_ALLOC_MB = 1.0       # any per-iter alloc > 1 MB is a violation
 R2_LARGE_ALLOC_COUNT = 10     # if it happens > 10 times in trace window (= many iter)
 R3_TOLERANCE_MB = 100.0
@@ -74,13 +74,11 @@ def _baseline_alloc(records: List[Dict[str, Any]]) -> float:
 
 
 def eval_r1(records: List[Dict[str, Any]]) -> Tuple[bool, str]:
-    """Steady-state iter_end alloc Δ vs sum(tracker_items + segment).
+    """Steady-state iter_end alloc delta vs proposal-owned buffers.
 
-    post_init is too early — lazy tracker buffers (chunk_buf, dg_flat,
-    h_g_bf16, exc_mask, selected_mask, etc.) appear on first tracker.step.
+    post_init can be too early in older logs. Lazy lossy checkpoint buffers
+    such as age2bit state and descriptor scratch appear on the first proposal step.
     Use a steady-state iter_end (median of STEADY_LO..STEADY_HI) instead.
-    Expected = tracker_total (auto-enum incl. selected_mask, etc.) +
-               segment double-buf (256 MB) + small extras (≤ R1_TOLERANCE_MB).
     """
     baseline = _baseline_alloc(records)
     iter_ends = _by_label_in_iter_range(records, "iter_end", STEADY_LO, STEADY_HI)
@@ -89,23 +87,25 @@ def eval_r1(records: List[Dict[str, Any]]) -> Tuple[bool, str]:
     # Use middle record to skip edge effects.
     rec = iter_ends[len(iter_ends) // 2]
     actual_delta = float(rec.get("alloc_mb", 0.0)) - baseline
-    # ``tracked_total_mb`` is cp_hooks' combined view: tracker (auto-
-    # enum of tracker.__dict__) + segment_pipeline._gpu_bufs +
+    # ``tracked_total_mb`` is the proposal pipeline's combined view: lossy
+    # checkpoint tensors + SegmentD2H._gpu_bufs +
     # fc/expert_state/elfc GPU buffers. If skip-write env disables some
     # subsystems (e.g., lossy_fc), their bufs are absent — tracked_total
     # naturally drops too, so expected stays accurate without manual
     # adjustments.
-    tracker_total = float(rec.get("tracker_total_mb", 0.0))
+    lossy_cp_total = float(
+        rec.get("lossy_cp_total_mb", rec.get("tracker_total_mb", 0.0))
+    )
     tracked_total = float(rec.get("tracked_total_mb", 0.0))
     if tracked_total <= 0:
-        tracked_total = tracker_total
+        tracked_total = lossy_cp_total
     expected = tracked_total
     diff = actual_delta - expected
     ok = abs(diff) <= R1_TOLERANCE_MB
     return ok, (
         f"R1: {'PASS' if ok else 'FAIL'} — "
         f"actual=+{actual_delta:.1f}MB, expected=+{expected:.1f}MB "
-        f"(tracked_total incl. tracker+seg+fc), "
+        f"(tracked_total incl. lossy_cp+seg+fc), "
         f"diff={diff:+.1f}MB (tolerance ±{R1_TOLERANCE_MB:.0f}MB)"
     )
 

@@ -7,11 +7,12 @@
 #   moc_m2          — MoC-System baseline, M=2 (1 expert FC every 2 iter)
 #   proposal_s4_k01 — ETC-2: Proposal FC every 4 iter + lossy K=0.1%
 #   proposal_nofc   — ETC-1: Proposal iter-1 burst only + lossy K=0.15%
-set -e
+set -euo pipefail
 DIR=$(cd "$(dirname "$0")" && pwd)
-export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH}
-# Caching allocator: stream-aware metadata 의 contention 회피.
-# 측정: -546 ms / iter (proposal 4-stream env 에서 dominant origin 해결)
+REPO_ROOT=$(cd "$DIR/../.." && pwd)
+export LD_LIBRARY_PATH=$(python3 -c 'import os,torch;print(os.path.join(os.path.dirname(torch.__file__),"lib"))' 2>/dev/null):${LD_LIBRARY_PATH:-}
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:${PATH}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # Default config = exp1 (125M PR-MoE, 12 layers, 40 experts). Override via
@@ -37,7 +38,7 @@ LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-50}
 INIT_STD=0.014
 MLC=0.01
 
-VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|moc_dram_d6|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch_k1pct_finite_diff_F1|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4}
+VARIANT=${VARIANT:?must set VARIANT=baseline|moc_m2|moc_d18|moc_test_dram_d6|proposal_s4_k01|element_wise|proposal_gnb|proposal_hutch_k1pct_finite_diff_F1|proposal_exp2_k2|proposal_exp2_k4|proposal_nofc|exp3_run1|exp3_run2|exp3_run3_moc_d4|verify_vram|iter_time_debug|proposal_fd_kpct}
 OUTPUT_BASEPATH=${OUTPUT_BASEPATH:?must set OUTPUT_BASEPATH}
 TAG="${VARIANT}_seed${SEED}"
 FAULT_INTERVAL=${FAULT_INTERVAL:-100}
@@ -60,6 +61,9 @@ PROPOSAL_FLAGS=""
 case "$VARIANT" in
     baseline)
         PROPOSAL_FLAGS=""  # no CP
+        # Baseline must remain a hard no-proposal run even if the parent
+        # shell has leftover profiling/test proposal flags.
+        EXTRA_PROPOSAL_FLAGS=""
         ;;
     moc_m2)
         # MoC-System M=2: 1 expert FC every 2 iter (round_robin with D=2).
@@ -67,7 +71,6 @@ case "$VARIANT" in
         # No DC (sequential mode skips ckpt.record). DC retention irrelevant.
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode sequential \
-            --proposal-expert-fc-D 2 \
             --proposal-nonexpert-fc-W 1 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -79,27 +82,25 @@ case "$VARIANT" in
         # one layer every 18 iter. Full cycle = 18 × num_MoE_layers.
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode sequential \
-            --proposal-expert-fc-D 18 \
             --proposal-nonexpert-fc-W 1 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
         ;;
-    moc_dram_d6)
+    moc_test_dram_d6)
         # MoC sequential baseline aligned for direct comparison vs the
         # proposal (proposal_hutch_k1pct_finite_diff_F1) at matched
         # non-expert protection. Only difference from proposal is the
-        # expert side: layer-RR lossless FC every D=6 iter (one MoE
+        # expert side: layer-RR dense checkpoint every D=6 iter (one MoE
         # layer at a time) — no element-wise lossy FC, no importance
         # tracker, no Hessian.
         #
-        # Knobs (overridable via env to mirror the proposal sweeps):
-        #   EXPERT_FC_D       per-layer interval                (default 6)
+        # Knobs:
         #   NONEXPERT_FC_W    non-expert FC interval            (default 10)
         # Non-expert path = identical to proposal: DC every iter +
-        # lossless FC every W iter. Recovery uses DRAM ExpertState so
-        # the fault recover_s should match the proposal's ~1.2 s.
+        # non-expert FC every W iter. Recovery uses test_dram ExpertState
+        # so the fault recover_s should match the proposal's ~1.2 s.
         #
         # Selection knobs are pinned to ``v_hat`` / refresh=0 because
         # sequential mode never reads any importance score — those
@@ -109,10 +110,9 @@ case "$VARIANT" in
         # unallocated, but the FD recompute itself still runs).
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode sequential \
-            --proposal-cp-target ${CP_TARGET:-dram} \
+            --proposal-cp-target ${CP_TARGET:-test_dram} \
             --proposal-selection-mode v_hat \
             --proposal-hessian-refresh-every 0 \
-            --proposal-expert-fc-D ${EXPERT_FC_D:-6} \
             --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-10} \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -130,7 +130,6 @@ case "$VARIANT" in
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
             --proposal-cp-mode staggered \
             --proposal-selection-mode v_hat \
-            --proposal-expert-fc-D ${FC_D} \
             --proposal-topk-ratio 0.005 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
@@ -160,7 +159,6 @@ case "$VARIANT" in
             --proposal-cp-mode element_wise \
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every 10 \
-            --proposal-hessian-num-samples 1 \
             --proposal-topk-ratio 0.01 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
@@ -168,16 +166,17 @@ case "$VARIANT" in
             --proposal-fault-warmup ${FAULT_WARMUP} \
             --proposal-fault-log ${FAULT_LOG}"
         ;;
-    proposal_hutch_k1pct_finite_diff_F1)
+    proposal_hutch_k1pct_finite_diff_F1|verify_vram|iter_time_debug|proposal_fd_kpct)
         # Production settings (prodsim verified 2026-05-15):
-        #   • g=8 (CLAUDE.md production)
+        #   • g=8 (AGENTS.md production)
         #   • refresh_every=100 (50-iter staleness → zero rank impact)
         #   • K=1 anchor (K=1 quantile-equivalent to K=32 truth)
-        #   • W=1 non-expert lossless FC every iter (CLAUDE.md spec)
-        # cp-target=disk (production). dram mode available via CP_TARGET=dram.
-        # Expert lossless FC DISABLED (D=999999): lossy_fc_append in disk
-        # mode appends to log file; lossless FC trigger reserved for
-        # future round-robin sweep.
+        #   • W=1 non-expert FC every iter (AGENTS.md spec)
+        # cp-target=disk (production). test_dram mode is available via
+        # CP_TARGET=test_dram for fast in-memory correctness/recovery checks.
+        # Expert LFCL compaction is enabled by default: every iter the
+        # selected plan targets 1% of expert slots and materializes live
+        # GPU p/m/v into the LFCL baseline used to bound LFSY replay cost.
         SCORE_DIAG_LOG="${OUTPUT_BASEPATH}/log/${TAG}.score_diag.jsonl"
         H_CMP_LOG="${OUTPUT_BASEPATH}/log/${TAG}.gnb_vs_vt.jsonl"
         PROPOSAL_FLAGS="--proposal-enable --proposal-cp-dir ${CP_DIR} \
@@ -186,10 +185,7 @@ case "$VARIANT" in
             --proposal-block-quant-g ${BLOCK_QUANT_G:-8} \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-100} \
-            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-1} \
             --proposal-topk-ratio ${PROPOSAL_TOPK:-0.04} \
-            --proposal-lossless-fc-fraction ${LOSSLESS_FC_FRACTION:-1.0} \
-            --proposal-expert-fc-D ${EXPERT_FC_D:-999999} \
             --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
             --proposal-async-queue ${ASYNC_QUEUE:-5} \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -206,10 +202,7 @@ case "$VARIANT" in
             --proposal-cp-mode proposal \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
-            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
             --proposal-topk-ratio 0.02 \
-            --proposal-expert-fc-D 1 \
-            --proposal-lossless-fc-fraction 1.0 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -223,10 +216,7 @@ case "$VARIANT" in
             --proposal-cp-mode proposal \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
-            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-2} \
             --proposal-topk-ratio 0.04 \
-            --proposal-expert-fc-D 1 \
-            --proposal-lossless-fc-fraction 1.0 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -254,10 +244,7 @@ case "$VARIANT" in
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
-            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
             --proposal-topk-ratio 0.01 \
-            --proposal-expert-fc-D 1 \
-            --proposal-lossless-fc-fraction 0.5 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -273,10 +260,7 @@ case "$VARIANT" in
             --proposal-cp-mode proposal \
             --proposal-selection-mode hessian \
             --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-40} \
-            --proposal-hessian-num-samples ${HESSIAN_NUM_SAMPLES:-4} \
             --proposal-topk-ratio 0.04 \
-            --proposal-expert-fc-D 1 \
-            --proposal-lossless-fc-fraction 1.0 \
             --proposal-nonexpert-fc-W 10 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -294,7 +278,6 @@ case "$VARIANT" in
             --proposal-cp-mode sequential \
             --proposal-selection-mode v_hat \
             --proposal-hessian-refresh-every 0 \
-            --proposal-expert-fc-D 4 \
             --proposal-nonexpert-fc-W 1 \
             --proposal-async-queue 5 \
             --proposal-fault-interval ${FAULT_INTERVAL} \
@@ -307,8 +290,12 @@ esac
 
 VOCAB_PATH=${DIR}/../rebase/gpt2-vocab.json
 MERGE_PATH=${DIR}/../rebase/gpt2-merges.txt
-DATA_PATH=${DATA_PATH:-/home/asdf1234/data/slimpajama_6b/slimpajama_6b_train_text_document}
-VALID_DATA_PATH=${VALID_DATA_PATH:-/home/asdf1234/data/slimpajama_6b/slimpajama_6b_valid_text_document}
+DEFAULT_DATA_ROOT="/home/elice/data/slimpajama_6b"
+if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
+    DEFAULT_DATA_ROOT="/home/asdf1234/data/slimpajama_6b"
+fi
+DATA_PATH=${DATA_PATH:-${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document}
+VALID_DATA_PATH=${VALID_DATA_PATH:-${DEFAULT_DATA_ROOT}/slimpajama_6b_valid_text_document}
 
 data_options=" \
     --vocab-file ${VOCAB_PATH} \
@@ -339,7 +326,8 @@ megatron_options=" \
     --seed ${SEED} \
     ${ACTIVATION_CHECKPOINT:+--checkpoint-activations --deepspeed-activation-checkpointing} \
     ${EXTRA_MEGATRON_FLAGS:-} \
-    ${PROPOSAL_FLAGS}"
+    ${PROPOSAL_FLAGS} \
+    ${EXTRA_PROPOSAL_FLAGS:-}"
 
 template_json="${DIR}/ds_config_gpt_TEMPLATE.json"
 config_json="${OUTPUT_BASEPATH}/ds_config_${TAG}.json"
@@ -360,12 +348,12 @@ deepspeed_options=" \
     --pipeline-model-parallel-size 1 --no-pipeline-parallel \
     --create-moe-param-group"
 
-if [ -n "${NSYS_PROFILE}" ]; then
+if [ -n "${NSYS_PROFILE:-}" ]; then
     NSYS_TRACE=${NSYS_TRACE:-cuda,osrt,nvtx}
-    NSYS_PREFIX="nsys profile -o ${NSYS_OUT:-/tmp/nsys_run} --force-overwrite true --trace=${NSYS_TRACE} -s none --cudabacktrace=none"
+    NSYS_PREFIX="nsys profile -o ${NSYS_OUT:-/tmp/nsys_run} --force-overwrite true --trace=${NSYS_TRACE} -s none --cudabacktrace=none ${NSYS_EXTRA_ARGS:-}"
 else
     NSYS_PREFIX=""
 fi
-run_cmd="${NSYS_PREFIX} deepspeed --num_gpus 1 --master_port 29500 ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
+run_cmd="${NSYS_PREFIX} deepspeed --num_gpus 1 --master_port ${MASTER_PORT:-29500} ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
 echo "[etc] TAG=${TAG} NUM_SLOTS=${NUM_SLOTS} LOG=${LOG_FILE}"
 eval ${run_cmd} 2>&1 | tee "${LOG_FILE}"

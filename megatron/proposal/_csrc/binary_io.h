@@ -49,12 +49,21 @@ size_t write_prptens(const std::string& final_path,
                      int mode,
                      bool do_fsync);
 
-// Atomic write to ``<final_path>.tmp`` + fsync + rename(final_path).
-size_t write_lossless(const std::string& final_path,
-                      int64_t pinned_addr,
-                      const std::string& header,
-                      int64_t total_padded_bytes,
-                      int mode);
+// Same write path as write_prptens, but leaves the fd open after the full
+// write and returns it to the caller. The caller must fsync_fd + close_fd.
+int write_prptens_keep_open(const std::string& final_path,
+                            int64_t pinned_addr,
+                            const std::string& header,
+                            int64_t total_padded_bytes,
+                            int mode);
+
+// Generic header+payload writer for LFCL-like files. Same aligned full-write
+// contract as PRPTENS, but the caller owns fsync/close/rename policy.
+int write_header_payload_keep_open(const std::string& final_path,
+                                   int64_t pinned_addr,
+                                   const std::string& header,
+                                   int64_t total_padded_bytes,
+                                   int mode);
 
 // Create (O_APPEND | O_CREAT | O_RDWR | O_TRUNC) + chunk-aligned write
 // of a HEADER_BLOCK_BYTES-sized header. ``header_pinned_addr`` is a
@@ -74,17 +83,9 @@ size_t append_lossy_log(int fd,
                         int64_t pinned_addr,
                         int64_t total_padded_bytes);
 
-// fsync(fd) / close(fd) wrappers; swallow errors for idempotent teardown.
+// fsync(fd) propagates errors; close(fd) remains idempotent/noexcept.
 void fsync_fd(int fd);
 void close_fd(int fd);
-
-// Full-write helper exposed so proposal_io.cpp's aos_write (which
-// builds the AoS blob in pinned memory itself) can emit its writes
-// through this single file. ``total_padded_bytes`` must be a
-// SECTOR_BYTES multiple.
-size_t full_write_pinned(int fd,
-                         int64_t pinned_addr,
-                         int64_t total_padded_bytes);
 
 // File deletion. Swallows ENOENT for idempotent caller paths.
 void unlink_path(const std::string& path);
