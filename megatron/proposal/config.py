@@ -19,6 +19,7 @@ class ProposalConfig:
     topk_ratio: float
     group_size: int
     selection_mode: str
+    score_policy: str
 
     # Selection cutoff search.
     n_bins_cutoff: int = 4096
@@ -69,6 +70,20 @@ class ProposalConfig:
             raise ValueError(
                 "proposal_selection_mode must be one of "
                 f"'hessian', 'v_hat', 'random'; got {selection_mode!r}"
+            )
+        score_policy = getattr(
+            args,
+            "proposal_score_policy",
+            "abs_h_taylor_first_and_second_order",
+        )
+        valid_score_policies = (
+            "abs_h_taylor_first_and_second_order",
+            "abs_h_taylor_only_second_order",
+        )
+        if score_policy not in valid_score_policies:
+            raise ValueError(
+                "proposal_score_policy must be one of "
+                f"{valid_score_policies}; got {score_policy!r}"
             )
         cp_mode = getattr(args, "proposal_cp_mode", "proposal")
         if cp_mode not in ("proposal", "sequential"):
@@ -122,6 +137,7 @@ class ProposalConfig:
             topk_ratio=topk_ratio,
             group_size=max(1, int(getattr(args, "proposal_block_quant_g", 8))),
             selection_mode=str(selection_mode),
+            score_policy=str(score_policy),
             n_bins_cutoff=int(getattr(args, "proposal_n_bins_cutoff", 4096)),
             cutoff_K_tolerance=float(
                 getattr(args, "proposal_cutoff_k_tolerance", 0.04)

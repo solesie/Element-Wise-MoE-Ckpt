@@ -17,7 +17,7 @@ import triton.language as tl
 # These bin a *flat* positive tensor — used at the anchor boundary for v_q
 # over v_t, the anchor Stage 3 h_q build over |grad_flat|, and as the building
 # block the recursive quantile/cutoff search reuses. Direct cutoff/emission
-# kernels consume the same age2bit/vbin element-wise score helper.
+# kernels consume the same rho/e_hat element-wise score helper.
 #
 # ``out_hist`` is **i64** (100B+ MoE / multi-GPU all-reduce overflow safety).
 # Non-positive values are dropped (Adam v_t ≥ 0; H assumed positive curvature).

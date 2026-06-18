@@ -380,8 +380,8 @@ def emit_segment_direct_from_plan(
                 random_mode=bool(lossy_state.random_mode),
                 random_salt=int(lossy_state.random_salt),
                 age2bit_words=lossy_state.age2bit_words,
-                age2bit_floor_mid=lossy_state.age2bit_floor_mid,
-                age2bit_floor_old=lossy_state.age2bit_floor_old,
+                ehat_geom_lut=lossy_state.ehat_geom_lut,
+                score_policy_id=int(lossy_state.score_policy_id),
                 step_device=lossy_state.step_device,
             )
             continue

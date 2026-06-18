@@ -19,26 +19,7 @@ except ImportError:
 
 
 if _HAS_TRITON:
-
-    @triton.jit
-    def _lookup_h_from_lut(
-        v_fp32,
-        h_lut_ptr,
-        log_v_min_ptr,
-        inv_log_v_width_ptr,
-        H_LUT_BINS: tl.constexpr,
-    ):
-        log_v_min = tl.load(log_v_min_ptr)
-        inv_width = tl.load(inv_log_v_width_ptr)
-        log_v = tl.log(tl.maximum(v_fp32, 1.0e-30))
-        pos = (log_v - log_v_min) * inv_width
-        pos = tl.maximum(tl.minimum(pos, H_LUT_BINS - 1.0), 0.0)
-        idx_lo = pos.to(tl.int32)
-        idx_hi = tl.minimum(idx_lo + 1, H_LUT_BINS - 1)
-        frac = pos - idx_lo.to(tl.float32)
-        h_lo = tl.load(h_lut_ptr + idx_lo)
-        h_hi = tl.load(h_lut_ptr + idx_hi)
-        return h_lo + frac * (h_hi - h_lo)
+    from ..score_policy import _proposal_element_score_from_lut
 
     @triton.jit
     def _hash_u32(x):
@@ -55,8 +36,16 @@ if _HAS_TRITON:
         return (mant.to(tl.float32) + 1.0) * (1.0 / 16777217.0)
 
     @triton.jit
+    def _age2_load_code(age_words_ptr, global_elem_idx):
+        word_idx = (global_elem_idx >> 4).to(tl.int64)
+        shift = ((global_elem_idx & 15) << 1).to(tl.int32)
+        word = tl.load(age_words_ptr + word_idx, mask=global_elem_idx >= 0, other=0)
+        return (word >> shift) & 3
+
+    @triton.jit
     def _score_block(
         m_ptr, v_ptr,
+        age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
         entry_group_start_ptr,
@@ -69,6 +58,7 @@ if _HAS_TRITON:
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
     ):
@@ -95,21 +85,30 @@ if _HAS_TRITON:
         m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
         v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
         v_fp32 = v.to(tl.float32)
-        denom = tl.sqrt(v) * sqrt_bc2_inv + eps
-        delta = lr_over_bc1 * m / denom
-        delta_sq = delta * delta
-        h_per_elem = _lookup_h_from_lut(
-            v_fp32, h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr, H_LUT_BINS,
+        global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
+        age_code = _age2_load_code(age_words_ptr, global_elem_idx)
+        score = _proposal_element_score_from_lut(
+            m,
+            v_fp32,
+            age_code,
+            h_lut_ptr,
+            log_v_min_ptr,
+            inv_log_v_width_ptr,
+            ehat_geom_lut_ptr,
+            lr_over_bc1,
+            sqrt_bc2_inv,
+            eps,
+            H_LUT_BINS,
+            SCORE_POLICY,
         )
-        score = h_per_elem * delta_sq
         if RANDOM_MODE:
-            global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
             score = _random_unit_from_index(global_elem_idx, RANDOM_SALT)
         return score, elem_mask
 
     @triton.jit
     def _reduce_score_minmax_entries_kernel(
         m_ptr, v_ptr,
+        age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
         entry_group_start_ptr,
@@ -124,6 +123,7 @@ if _HAS_TRITON:
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
     ):
@@ -132,6 +132,7 @@ if _HAS_TRITON:
             return
         score, mask = _score_block(
             m_ptr, v_ptr,
+            age_words_ptr, ehat_geom_lut_ptr,
             h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
             entry_elem_start_ptr,
             entry_group_start_ptr,
@@ -144,6 +145,7 @@ if _HAS_TRITON:
             G,
             GROUPS_PER_BLOCK,
             H_LUT_BINS,
+            SCORE_POLICY,
             RANDOM_MODE,
             RANDOM_SALT,
         )
@@ -156,6 +158,7 @@ if _HAS_TRITON:
     @triton.jit
     def _build_score_log_hist_entries_kernel(
         m_ptr, v_ptr,
+        age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
         entry_group_start_ptr,
@@ -172,6 +175,7 @@ if _HAS_TRITON:
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
     ):
@@ -180,6 +184,7 @@ if _HAS_TRITON:
             return
         score, mask = _score_block(
             m_ptr, v_ptr,
+            age_words_ptr, ehat_geom_lut_ptr,
             h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
             entry_elem_start_ptr,
             entry_group_start_ptr,
@@ -192,6 +197,7 @@ if _HAS_TRITON:
             G,
             GROUPS_PER_BLOCK,
             H_LUT_BINS,
+            SCORE_POLICY,
             RANDOM_MODE,
             RANDOM_SALT,
         )
@@ -219,6 +225,8 @@ def launch_reduce_score_minmax_for_group(
     *,
     m_flat: torch.Tensor,
     v_flat: torch.Tensor,
+    age2bit_words: torch.Tensor,
+    ehat_geom_lut: torch.Tensor,
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
@@ -234,6 +242,7 @@ def launch_reduce_score_minmax_for_group(
     lr_over_bc1: float,
     sqrt_bc2_inv: float,
     eps: float,
+    score_policy_id: int,
     random_mode: bool = False,
     random_salt: int = 0,
 ) -> None:
@@ -245,6 +254,8 @@ def launch_reduce_score_minmax_for_group(
     _reduce_score_minmax_entries_kernel[(n_entry_blocks,)](
         m_flat,
         v_flat,
+        age2bit_words,
+        ehat_geom_lut,
         h_lut_values,
         h_lut_log_v_min,
         h_lut_inv_log_v_width,
@@ -263,6 +274,7 @@ def launch_reduce_score_minmax_for_group(
         G=int(group_size),
         GROUPS_PER_BLOCK=_groups_per_program(group_size),
         H_LUT_BINS=int(h_lut_values.numel()),
+        SCORE_POLICY=int(score_policy_id),
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
     )
@@ -272,6 +284,8 @@ def launch_build_score_log_hist_for_group(
     *,
     m_flat: torch.Tensor,
     v_flat: torch.Tensor,
+    age2bit_words: torch.Tensor,
+    ehat_geom_lut: torch.Tensor,
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
@@ -288,6 +302,7 @@ def launch_build_score_log_hist_for_group(
     lr_over_bc1: float,
     sqrt_bc2_inv: float,
     eps: float,
+    score_policy_id: int,
     random_mode: bool = False,
     random_salt: int = 0,
 ) -> None:
@@ -299,6 +314,8 @@ def launch_build_score_log_hist_for_group(
     _build_score_log_hist_entries_kernel[(n_entry_blocks,)](
         m_flat,
         v_flat,
+        age2bit_words,
+        ehat_geom_lut,
         h_lut_values,
         h_lut_log_v_min,
         h_lut_inv_log_v_width,
@@ -319,6 +336,7 @@ def launch_build_score_log_hist_for_group(
         G=int(group_size),
         GROUPS_PER_BLOCK=_groups_per_program(group_size),
         H_LUT_BINS=int(h_lut_values.numel()),
+        SCORE_POLICY=int(score_policy_id),
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
     )

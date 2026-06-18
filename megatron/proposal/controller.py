@@ -64,6 +64,7 @@ class ProposalController:
         self._proposal_config = None                  # ProposalConfig
         self._h_anchor = None                         # HQuantileAnchor
         self._latest_post_step_checkpoint_task = None
+        self._last_dispatched_iter_T = -1
         self._config = {}
         self._pending_fault_record = None
         self._dispatch_ready_event = None
@@ -960,6 +961,9 @@ def proposal_dispatch_post_iter(model, iter_T: int) -> None:
 
     if not get_controller()._enabled:
         return
+    iter_T = int(iter_T)
+    if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
+        return
     import os as _os_probe_dispatch
     _probe = _os_probe_dispatch.environ.get(
         "PROPOSAL_MAIN_PROBE", "") in ("1", "true", "True")
@@ -970,7 +974,7 @@ def proposal_dispatch_post_iter(model, iter_T: int) -> None:
         event.record()
     task = PostStepCheckpointTask(
         cuda_event=event,
-        iter_T=int(iter_T),
+        iter_T=iter_T,
         non_expert_d2h_start_event=(
             torch.cuda.Event()
             if torch.cuda.is_available()
@@ -996,6 +1000,7 @@ def proposal_dispatch_post_iter(model, iter_T: int) -> None:
     )
     get_controller()._latest_post_step_checkpoint_task = task
     _submit_post_step_checkpoint_task(task)
+    get_controller()._last_dispatched_iter_T = iter_T
     if _probe:
         _t1 = _time_probe.perf_counter()
         if (_t1 - _t0) * 1000 > 0.5:
@@ -1103,6 +1108,13 @@ def _simulate_fault_impl(
 
     if not get_controller()._enabled:
         return {}
+    # The normal V2 cadence dispatches iter T at the beginning of iter T+1,
+    # before the next forward. Synthetic fault injection runs immediately
+    # after iter T's train step, before that next-loop dispatch point. Flush
+    # the current post-step state here so the fault experiment measures the
+    # same checkpoint visibility as old end-of-iter ETC runs.
+    if int(step) > int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
+        proposal_dispatch_post_iter(model, iter_T=int(step))
     if get_controller()._checkpoint_workers is not None:
         get_controller()._checkpoint_workers.drain()
 

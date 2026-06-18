@@ -57,8 +57,8 @@ class LossyCpState:
     index: ExpertParamIndex
     quantiles: "QuantileRefs"
     scratch: CutoffSearchScratch
-    age2bit: Optional["Age2BitFloorState"] = None
+    age2bit: Optional["Age2BitScoreState"] = None
 
 
 from .refresh.quantile import QuantileRefs  # noqa: E402  (typing cycle only)
-from .cutoff.age2bit import Age2BitFloorState  # noqa: E402  (typing cycle only)
+from .cutoff.age2bit import Age2BitScoreState  # noqa: E402  (typing cycle only)

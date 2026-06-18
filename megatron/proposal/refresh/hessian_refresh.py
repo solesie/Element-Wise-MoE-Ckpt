@@ -292,6 +292,8 @@ def _refresh_h_quantile_from_finite_diff(
         _use_freeze = (_os_off.environ.get("PROPOSAL_ROUTING_FREEZE_ENABLE", "1")
                        not in ("0", "false", "False"))
         fd_ret = None
+        _fold_diag = None
+        _h_scale_stats = None
         _n_succ = 0
         _mb_timing_on = (_os_off.environ.get("PROPOSAL_MB_TIMING", "0")
                          in ("1", "true", "TRUE"))
@@ -380,12 +382,38 @@ def _refresh_h_quantile_from_finite_diff(
             # place, then build h_q from the per-expert grad accumulation views.
             if _grad_accum_views and _n_succ > 0:
                 _inv_succ = 1.0 / float(_n_succ)
-                for _view in _grad_accum_views:
-                    _view.mul_(_inv_succ).abs_()
+                _curvature_telemetry = getattr(_lossy_cp, "_curvature_progress_telemetry", None)
+                if _curvature_telemetry is not None and getattr(_curvature_telemetry, "enabled", False):
+                    for _view in _grad_accum_views:
+                        _view.mul_(_inv_succ)
+                    _curvature_telemetry.record_signed_h_refresh(
+                        step=int(iteration),
+                        groups=getattr(_lossy_cp, "_groups", ()),
+                        group_size=int(_group_size_for_fd),
+                        names=_names_sorted,
+                        signed_h_views=_grad_accum_views,
+                        n_anchor_batches=int(_n_succ),
+                    )
+                    for _view in _grad_accum_views:
+                        _view.abs_()
+                else:
+                    for _view in _grad_accum_views:
+                        _view.mul_(_inv_succ).abs_()
                 _lossy_cp.update_h_anchor_quantiles(
                     _grad_accum_views,
                     refresh_step=int(iteration),
                 )
+                _fold_diag = _fold_h(_names_sorted, _grad_accum_views)
+                try:
+                    import statistics as _st
+                    _h_abs_means = [float(_h.mean().item()) for _h in _grad_accum_views]
+                    _h_abs_maxs = [float(_h.max().item()) for _h in _grad_accum_views]
+                    _h_scale_stats = (
+                        float(_st.mean(_h_abs_means)) if _h_abs_means else 0.0,
+                        float(max(_h_abs_maxs)) if _h_abs_maxs else 0.0,
+                    )
+                except Exception:
+                    _h_scale_stats = None
                 fd_ret = []
         finally:
             for _p in _expert_ps_sorted:
@@ -454,15 +482,14 @@ def _refresh_h_quantile_from_finite_diff(
         extra={"anchor_total_ms": (_time.perf_counter() - t0) * 1000.0},
     )
     t1 = _time.perf_counter()
-    h_fd = fd_ret
-
-    if h_fd is None:
+    if fd_ret is None:
         if _should_write():
             print(f"[proposal] finite_diff failed @iter{iteration}", flush=True)
         return _finalize(None)
 
     # _fold_h is now mainly diagnostic; h_q was built from grad_flat above.
-    _fold_diag = _fold_h(_names_sorted, h_fd)
+    if _fold_diag is None:
+        _fold_diag = _fold_h(_names_sorted, [])
 
     elapsed_ms = (t1 - t0) * 1000.0
     n_elem = sum(p.numel() for p in expert_ps)
@@ -483,19 +510,14 @@ def _refresh_h_quantile_from_finite_diff(
     # Magnitude log (|H| only — selection delta is computed inline during
     # cutoff/write and is not exposed at refresh time).
     if _should_write():
-        try:
-            import statistics as _st
-            h_abs_means = [float(h.mean().item()) for h in h_fd]
-            h_abs_maxs = [float(h.max().item()) for h in h_fd]
+        if _h_scale_stats is not None:
             print(
                 f"[proposal] scale @iter{iteration} (finite_diff): "
-                f"|H| mean={_st.mean(h_abs_means):.3e} max={max(h_abs_maxs):.3e}  "
+                f"|H| mean={_h_scale_stats[0]:.3e} max={_h_scale_stats[1]:.3e}  "
                 f"(eps={eps_actual:.3e}, coverage={_fold_diag['expert_coverage']:.3f}, "
                 f"skip_ratio={_fold_diag['skip_ratio']:.4f})",
                 flush=True,
             )
-        except Exception:
-            pass
 
     if _should_write():
         print(

@@ -15,6 +15,7 @@ except ImportError:
 
 
 if _HAS_TRITON:
+    from ..score_policy import _proposal_element_score_from_lut
 
     @triton.jit
     def _stage_candidate_taus_kernel(
@@ -44,46 +45,6 @@ if _HAS_TRITON:
         tl.store(candidate_tau_ptr + 13, v13, mask=n_candidates > 13)
         tl.store(candidate_tau_ptr + 14, v14, mask=n_candidates > 14)
         tl.store(candidate_tau_ptr + 15, v15, mask=n_candidates > 15)
-
-    @triton.jit
-    def _lookup_h_vbin_and_floors_from_lut(
-        v_fp32,
-        h_lut_ptr,
-        log_v_min_ptr,
-        inv_log_v_width_ptr,
-        floor_mid_ptr,
-        floor_old_ptr,
-        H_LUT_BINS: tl.constexpr,
-        N_VBINS: tl.constexpr,
-    ):
-        log_v_min = tl.load(log_v_min_ptr)
-        inv_width = tl.load(inv_log_v_width_ptr)
-        log_v = tl.log(tl.maximum(v_fp32, 1.0e-30))
-        pos = (log_v - log_v_min) * inv_width
-        pos = tl.maximum(tl.minimum(pos, H_LUT_BINS - 1.0), 0.0)
-        idx_lo = pos.to(tl.int32)
-        idx_hi = tl.minimum(idx_lo + 1, H_LUT_BINS - 1)
-        frac = pos - idx_lo.to(tl.float32)
-        h_lo = tl.load(h_lut_ptr + idx_lo)
-        h_hi = tl.load(h_lut_ptr + idx_hi)
-        h = h_lo + frac * (h_hi - h_lo)
-        vbin_pos = pos * (N_VBINS / (H_LUT_BINS - 1))
-        vbin = vbin_pos.to(tl.int32)
-        vbin = tl.maximum(tl.minimum(vbin, N_VBINS - 1), 0)
-        floor_pos = tl.maximum(tl.minimum(vbin_pos - 0.5, N_VBINS - 1.0), 0.0)
-        floor_lo_idx = floor_pos.to(tl.int32)
-        floor_hi_idx = tl.minimum(floor_lo_idx + 1, N_VBINS - 1)
-        floor_frac = floor_pos - floor_lo_idx.to(tl.float32)
-
-        mid_lo = tl.load(floor_mid_ptr + floor_lo_idx)
-        mid_hi = tl.load(floor_mid_ptr + floor_hi_idx)
-        old_lo = tl.load(floor_old_ptr + floor_lo_idx)
-        old_hi = tl.load(floor_old_ptr + floor_hi_idx)
-        mid_interp = mid_lo + floor_frac * (mid_hi - mid_lo)
-        old_interp = old_lo + floor_frac * (old_hi - old_lo)
-        mid = tl.where((mid_lo > 0.0) & (mid_hi > 0.0), mid_interp, tl.maximum(mid_lo, mid_hi))
-        old = tl.where((old_lo > 0.0) & (old_hi > 0.0), old_interp, tl.maximum(old_lo, old_hi))
-        return h, vbin, mid, old
 
     @triton.jit
     def _age2_load_code(age_words_ptr, global_elem_idx):
@@ -116,7 +77,7 @@ if _HAS_TRITON:
     @triton.jit
     def _generated_probe_entries_kernel(
         m_ptr, v_ptr,
-        age_words_ptr, floor_mid_ptr, floor_old_ptr, floor_hist_ptr,
+        age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
         entry_group_start_ptr,
@@ -139,8 +100,7 @@ if _HAS_TRITON:
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
-        N_VBINS: tl.constexpr,
-        N_FLOOR_BINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
         MAX_CANDIDATES: tl.constexpr,
         STRATUM_STRIDE: tl.constexpr,
         MAX_SAMPLES_PER_GROUP: tl.constexpr,
@@ -209,45 +169,25 @@ if _HAS_TRITON:
         m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
         v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
         v_fp32 = v.to(tl.float32)
-        denom = tl.sqrt(v) * sqrt_bc2_inv + eps
-        delta = lr_over_bc1 * m / denom
-        delta_sq = delta * delta
-        h_per_elem, vbin, floor_mid, floor_old = _lookup_h_vbin_and_floors_from_lut(
+        global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
+        age_code = _age2_load_code(age_words_ptr, global_elem_idx)
+        elem_score = _proposal_element_score_from_lut(
+            m,
             v_fp32,
+            age_code,
             h_lut_ptr,
             log_v_min_ptr,
             inv_log_v_width_ptr,
-            floor_mid_ptr,
-            floor_old_ptr,
+            ehat_geom_lut_ptr,
+            lr_over_bc1,
+            sqrt_bc2_inv,
+            eps,
             H_LUT_BINS,
-            N_VBINS,
+            SCORE_POLICY,
         )
-        global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
-        age_code = _age2_load_code(age_words_ptr, global_elem_idx)
-        age_sq = tl.where(
-            age_code == 0,
-            1.0,
-            tl.where(age_code == 1, 16.0, tl.where(age_code == 2, 256.0, 4096.0)),
-        )
-        floor = tl.where(
-            age_code == 2,
-            floor_mid,
-            tl.where(age_code == 3, floor_old, 0.0),
-        )
-        delta_eff_sq = tl.maximum(delta_sq, floor)
-        elem_score = h_per_elem * age_sq * delta_eff_sq
         force = (age_code == 3) & _age2_phase_hit(
             global_elem_idx, step_value, 128, 0x51ED270B,
         ) & elem_mask
-        log2_delta = tl.log(tl.maximum(delta_sq, 1.0e-45)) * 1.4426950408889634
-        floor_bin = ((log2_delta + 160.0) * (N_FLOOR_BINS / 192.0)).to(tl.int32)
-        floor_bin = tl.maximum(tl.minimum(floor_bin, N_FLOOR_BINS - 1), 0)
-        tl.atomic_add(
-            floor_hist_ptr + vbin * N_FLOOR_BINS + floor_bin,
-            1,
-            mask=elem_mask & (delta_sq > 0.0) & (delta_sq == delta_sq),
-            sem="relaxed",
-        )
         if RANDOM_MODE:
             elem_score = _random_unit_from_index(global_elem_idx, RANDOM_SALT)
             force = tl.full((BLOCK_SIZE,), False, tl.int1)
@@ -262,39 +202,6 @@ if _HAS_TRITON:
             tl.atomic_add(sum_q_ptr + off, q, mask=enabled, sem="relaxed")
             tl.atomic_add(sum_q2_ptr + off, q * q, mask=enabled, sem="relaxed")
             tl.atomic_add(n_blocks_ptr + off, 1, mask=enabled, sem="relaxed")
-
-    @triton.jit
-    def _extract_age2bit_floor_kernel(
-        floor_hist_ptr,
-        floor_mid_ptr,
-        floor_old_ptr,
-        N_FLOOR_BINS: tl.constexpr,
-        BLOCK_BINS: tl.constexpr,
-    ):
-        vbin = tl.program_id(0)
-        offs = tl.arange(0, BLOCK_BINS)
-        mask = offs < N_FLOOR_BINS
-        counts = tl.load(
-            floor_hist_ptr + vbin * N_FLOOR_BINS + offs,
-            mask=mask,
-            other=0,
-        ).to(tl.float32)
-        total = tl.sum(counts, axis=0)
-        csum = tl.cumsum(counts, axis=0)
-        target_mid = total * 0.75
-        target_old = total * 0.90
-        mid_cross = tl.min(tl.where((csum >= target_mid) & mask, offs, N_FLOOR_BINS), axis=0)
-        old_cross = tl.min(tl.where((csum >= target_old) & mask, offs, N_FLOOR_BINS), axis=0)
-        mid_cross = tl.minimum(mid_cross, N_FLOOR_BINS - 1)
-        old_cross = tl.minimum(old_cross, N_FLOOR_BINS - 1)
-        log2_mid = -160.0 + (mid_cross.to(tl.float32) + 0.5) * (192.0 / N_FLOOR_BINS)
-        log2_old = -160.0 + (old_cross.to(tl.float32) + 0.5) * (192.0 / N_FLOOR_BINS)
-        mid_value = tl.exp(log2_mid * 0.6931471805599453)
-        old_value = tl.exp(log2_old * 0.6931471805599453)
-        prev_mid = tl.load(floor_mid_ptr + vbin)
-        prev_old = tl.load(floor_old_ptr + vbin)
-        tl.store(floor_mid_ptr + vbin, tl.where(total > 0.0, mid_value, prev_mid))
-        tl.store(floor_old_ptr + vbin, tl.where(total > 0.0, old_value, prev_old))
 
     @triton.jit
     def _zero_probe_accumulators_if_code_kernel(
@@ -686,9 +593,7 @@ def launch_generated_block_probe_for_group(
     m_flat: torch.Tensor,
     v_flat: torch.Tensor,
     age2bit_words: torch.Tensor,
-    age2bit_floor_mid: torch.Tensor,
-    age2bit_floor_old: torch.Tensor,
-    age2bit_floor_hist: torch.Tensor,
+    ehat_geom_lut: torch.Tensor,
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
@@ -712,6 +617,7 @@ def launch_generated_block_probe_for_group(
     sqrt_bc2_inv: float,
     eps: float,
     step: int,
+    score_policy_id: int,
     random_mode: bool = False,
     random_salt: int = 0,
     decision_code_guard: Optional[torch.Tensor] = None,
@@ -731,9 +637,7 @@ def launch_generated_block_probe_for_group(
         m_flat,
         v_flat,
         age2bit_words,
-        age2bit_floor_mid,
-        age2bit_floor_old,
-        age2bit_floor_hist,
+        ehat_geom_lut,
         h_lut_values,
         h_lut_log_v_min,
         h_lut_inv_log_v_width,
@@ -760,8 +664,7 @@ def launch_generated_block_probe_for_group(
         G=int(group_size),
         GROUPS_PER_BLOCK=gpb,
         H_LUT_BINS=int(h_lut_values.numel()),
-        N_VBINS=int(age2bit_floor_mid.numel()),
-        N_FLOOR_BINS=int(age2bit_floor_hist.shape[1]),
+        SCORE_POLICY=int(score_policy_id),
         MAX_CANDIDATES=int(candidate_capacity),
         STRATUM_STRIDE=int(sum_q.shape[1]),
         MAX_SAMPLES_PER_GROUP=max_samples,
@@ -794,30 +697,6 @@ def launch_zero_probe_accumulators_if_code(
         int(n_total),
         RUN_IF_DECISION_CODE=int(run_if_decision_code),
         BLOCK=block,
-    )
-
-
-def launch_extract_age2bit_floors(
-    *,
-    floor_hist: torch.Tensor,
-    floor_mid: torch.Tensor,
-    floor_old: torch.Tensor,
-) -> None:
-    if not _HAS_TRITON:
-        return
-    if floor_hist.dim() != 2:
-        raise RuntimeError("floor_hist must be [n_vbins, n_bins]")
-    n_vbins = int(floor_hist.shape[0])
-    n_bins = int(floor_hist.shape[1])
-    if n_vbins <= 0 or n_bins <= 0:
-        return
-    block_bins = 1 << (n_bins - 1).bit_length()
-    _extract_age2bit_floor_kernel[(n_vbins,)](
-        floor_hist,
-        floor_mid,
-        floor_old,
-        N_FLOOR_BINS=int(n_bins),
-        BLOCK_BINS=int(block_bins),
     )
 
 
@@ -932,7 +811,6 @@ def launch_probe_decision(
 
 __all__ = [
     "launch_generated_block_probe_for_group",
-    "launch_extract_age2bit_floors",
     "launch_probe_decision",
     "launch_retry_candidates_if_code",
     "launch_stage_candidate_taus",

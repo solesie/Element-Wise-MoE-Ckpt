@@ -1,4 +1,4 @@
-"""Age2Bit selection policy constants and state allocation."""
+"""Packed 2-bit age state and score LUT allocation."""
 
 from __future__ import annotations
 
@@ -11,42 +11,34 @@ AGE2BIT_CODE_VALUES = (1.0, 4.0, 16.0, 64.0)
 AGE2BIT_WORD_BITS = 32
 AGE2BIT_CODE_BITS = 2
 AGE2BIT_CODES_PER_WORD = AGE2BIT_WORD_BITS // AGE2BIT_CODE_BITS
-AGE2BIT_VBINS = 16
-AGE2BIT_FLOOR_LOG_BINS = 256
 
 
 @dataclass
-class Age2BitFloorState:
-    """Persistent device state for the Age2Bit v-bin floor policy."""
+class Age2BitScoreState:
+    """Persistent device state for age-based Taylor score policies."""
 
     age_words: torch.Tensor
-    floor_mid: torch.Tensor
-    floor_old: torch.Tensor
-    floor_hist: torch.Tensor
+    ehat_geom_lut: torch.Tensor
 
 
-def allocate_age2bit_floor_state(
+def allocate_age2bit_score_state(
     *,
     n_elements: int,
     device: torch.device,
-    n_vbins: int = AGE2BIT_VBINS,
-) -> Age2BitFloorState:
-    """Allocate packed 2-bit age state and v-bin floor snapshots once."""
+    h_lut_bins: int,
+) -> Age2BitScoreState:
+    """Allocate packed 2-bit age state and e_hat geometry LUT once."""
 
     n_words = (int(n_elements) + AGE2BIT_CODES_PER_WORD - 1) // AGE2BIT_CODES_PER_WORD
     age_words = torch.zeros(n_words, dtype=torch.int32, device=device)
-    floor_mid = torch.zeros(int(n_vbins), dtype=torch.float32, device=device)
-    floor_old = torch.zeros(int(n_vbins), dtype=torch.float32, device=device)
-    floor_hist = torch.zeros(
-        (int(n_vbins), AGE2BIT_FLOOR_LOG_BINS),
-        dtype=torch.int32,
-        device=device,
-    )
-    return Age2BitFloorState(
+    ehat_geom_lut = torch.empty((4, int(h_lut_bins)), dtype=torch.float32, device=device)
+    ehat_geom_lut[0].fill_(1.0)
+    ehat_geom_lut[1].fill_(4.0)
+    ehat_geom_lut[2].fill_(16.0)
+    ehat_geom_lut[3].fill_(64.0)
+    return Age2BitScoreState(
         age_words=age_words,
-        floor_mid=floor_mid,
-        floor_old=floor_old,
-        floor_hist=floor_hist,
+        ehat_geom_lut=ehat_geom_lut,
     )
 
 
@@ -54,8 +46,6 @@ __all__ = [
     "AGE2BIT_CODE_VALUES",
     "AGE2BIT_CODE_BITS",
     "AGE2BIT_CODES_PER_WORD",
-    "AGE2BIT_VBINS",
-    "AGE2BIT_FLOOR_LOG_BINS",
-    "Age2BitFloorState",
-    "allocate_age2bit_floor_state",
+    "Age2BitScoreState",
+    "allocate_age2bit_score_state",
 ]

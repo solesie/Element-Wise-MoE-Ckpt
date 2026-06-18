@@ -183,12 +183,11 @@ class EmissionOrchestrationMixin:
 
         static_inputs = self._static_direct_write_inputs()
         gpu_refs_for_writer = list(static_inputs["gpu_refs"])
-        age2bit_state = getattr(self, "_age2bit_floor_state", None)
+        age2bit_state = getattr(self, "_age2bit_score_state", None)
         if age2bit_state is not None:
             gpu_refs_for_writer.extend((
                 age2bit_state.age_words,
-                age2bit_state.floor_mid,
-                age2bit_state.floor_old,
+                age2bit_state.ehat_geom_lut,
             ))
 
         if bool(getattr(self, "test_expert_selection_only", False)):
@@ -257,11 +256,11 @@ class EmissionOrchestrationMixin:
                 sample_grow_hold=self._approx_probe_sample_grow_hold,
                 ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
                 probe_diagnostics=self._approx_probe_diagnostics,
-                    probe_expected_selected_count=(
-                        self._approx_probe_expected_selected_count
-                    ),
-                    capacity_demand_hint=self._approx_probe_capacity_demand_hint,
-                    total_elems_global=int(total_elems_for_actual_k),
+                probe_expected_selected_count=(
+                    self._approx_probe_expected_selected_count
+                ),
+                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
+                total_elems_global=int(total_elems_for_actual_k),
                 allowed_probe_count_delta=max(1, int(allowed_probe_count_delta)),
                 sample_blocks_min=int(self._approx_probe_sample_blocks_min),
                 sample_blocks_cap=int(self._approx_probe_sample_blocks_cap),
@@ -271,12 +270,10 @@ class EmissionOrchestrationMixin:
                 age2bit_words=(
                     age2bit_state.age_words if age2bit_state is not None else None
                 ),
-                age2bit_floor_mid=(
-                    age2bit_state.floor_mid if age2bit_state is not None else None
+                ehat_geom_lut=(
+                    age2bit_state.ehat_geom_lut if age2bit_state is not None else None
                 ),
-                age2bit_floor_old=(
-                    age2bit_state.floor_old if age2bit_state is not None else None
-                ),
+                score_policy_id=int(getattr(self, "score_policy_id", 0)),
             )
 
             # Phase 3: compute_event = end-of-Phase-A + metadata handoff

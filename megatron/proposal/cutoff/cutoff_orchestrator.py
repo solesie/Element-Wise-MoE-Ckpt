@@ -135,16 +135,32 @@ class CutoffOrchestrationMixin:
             launch_build_score_log_hist_for_group,
             launch_reduce_score_minmax_for_group,
         )
+        from ..score_policy import launch_update_ehat_geom_lut
 
         hist = self._selection_hist
         smin = self._selection_smin
         smax = self._selection_smax
+        age2bit_state = getattr(runtime_state, "age2bit", None)
+        if age2bit_state is None:
+            raise RuntimeError("Age2Bit state is required for cold-start cutoff")
+        launch_update_ehat_geom_lut(
+            h_lut_values=runtime_state.quantiles.h_lut.values,
+            h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+            h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+            ehat_geom_lut=age2bit_state.ehat_geom_lut,
+            lr_over_bc1=float(hparams.lr_over_bc1),
+            sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+            eps=float(hparams.eps),
+            beta1=float(getattr(hparams, "beta1", 0.9)),
+        )
         smin.fill_(float("inf"))
         smax.zero_()
         for grp in self._groups:
             launch_reduce_score_minmax_for_group(
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
+                age2bit_words=age2bit_state.age_words,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
                 h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
                 h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
@@ -160,6 +176,7 @@ class CutoffOrchestrationMixin:
                 lr_over_bc1=float(hparams.lr_over_bc1),
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
+                score_policy_id=int(getattr(self, "score_policy_id", 0)),
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
@@ -176,6 +193,8 @@ class CutoffOrchestrationMixin:
             launch_build_score_log_hist_for_group(
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
+                age2bit_words=age2bit_state.age_words,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
                 h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
                 h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
@@ -192,6 +211,7 @@ class CutoffOrchestrationMixin:
                 lr_over_bc1=float(hparams.lr_over_bc1),
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
+                score_policy_id=int(getattr(self, "score_policy_id", 0)),
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
@@ -349,12 +369,12 @@ class CutoffOrchestrationMixin:
         random_salt: int,
     ) -> str:
         from ..cutoff.approx_probe_kernels import (
-            launch_extract_age2bit_floors,
             launch_generated_block_probe_for_group,
             launch_probe_decision,
             launch_retry_candidates_if_code,
             launch_zero_probe_accumulators_if_code,
         )
+        from ..score_policy import launch_update_ehat_geom_lut
 
         n_cand = max(0, int(n_candidates))
         if n_cand <= 0:
@@ -374,18 +394,16 @@ class CutoffOrchestrationMixin:
         self._approx_probe_capacity_demand_hint.zero_()
         self._approx_probe_reject.zero_()
         self._approx_probe_decision_code.zero_()
-        # Consume the previous iteration's sampled delta2 histogram before
-        # zeroing it.  The freshly extracted floor snapshot is then used by
-        # both this iteration's probe and direct emission, while this probe
-        # fills the histogram for the next iteration.  Updating floors after
-        # the probe would break probe/direct score identity for the current
-        # tau decision.
-        launch_extract_age2bit_floors(
-            floor_hist=age2bit_state.floor_hist,
-            floor_mid=age2bit_state.floor_mid,
-            floor_old=age2bit_state.floor_old,
+        launch_update_ehat_geom_lut(
+            h_lut_values=runtime_state.quantiles.h_lut.values,
+            h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+            h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+            ehat_geom_lut=age2bit_state.ehat_geom_lut,
+            lr_over_bc1=float(hparams.lr_over_bc1),
+            sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+            eps=float(hparams.eps),
+            beta1=float(getattr(hparams, "beta1", 0.9)),
         )
-        age2bit_state.floor_hist.zero_()
         t_after_zero = time.perf_counter() if profile else 0.0
         telemetry_sinks = [
             telemetry
@@ -417,9 +435,7 @@ class CutoffOrchestrationMixin:
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
                 age2bit_words=age2bit_state.age_words,
-                age2bit_floor_mid=age2bit_state.floor_mid,
-                age2bit_floor_old=age2bit_state.floor_old,
-                age2bit_floor_hist=age2bit_state.floor_hist,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
                 h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
                 h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
@@ -441,6 +457,7 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 step=int(global_step),
+                score_policy_id=int(getattr(self, "score_policy_id", 0)),
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
                 n_candidates=int(n_cand),
@@ -512,9 +529,7 @@ class CutoffOrchestrationMixin:
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
                 age2bit_words=age2bit_state.age_words,
-                age2bit_floor_mid=age2bit_state.floor_mid,
-                age2bit_floor_old=age2bit_state.floor_old,
-                age2bit_floor_hist=age2bit_state.floor_hist,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
                 h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
                 h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
@@ -536,6 +551,7 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 step=int(global_step),
+                score_policy_id=int(getattr(self, "score_policy_id", 0)),
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
                 n_candidates=int(retry_n_cand),
@@ -659,6 +675,7 @@ class CutoffOrchestrationMixin:
         self._adam_lr_over_bc1_for_selection = float(lr_over_bc1)
         self._adam_sqrt_bc2_inv_for_selection = float(sqrt_bc2_inv)
         self._adam_eps_for_selection = float(eps_adam)
+        self._adam_beta1_for_selection = float(beta1)
 
         selection_ready = all(grp["zero_copy"] for grp in self._groups) and _HAS_TRITON
         if not selection_ready:
@@ -731,6 +748,7 @@ class CutoffOrchestrationMixin:
             lr_over_bc1=float(lr_over_bc1),
             sqrt_bc2_inv=float(sqrt_bc2_inv),
             eps=float(eps_adam),
+            beta1=float(getattr(self, "_adam_beta1_for_selection", 0.9)),
         )
         random_mode = bool(self.selection_mode == "random")
         random_salt = (
@@ -838,6 +856,21 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 stream=stream,
+            )
+        curvature_telemetry = getattr(self, "_curvature_progress_telemetry", None)
+        if curvature_telemetry is not None and getattr(curvature_telemetry, "enabled", False):
+            curvature_telemetry.record_iteration(
+                step=int(global_step),
+                topk_ratio=float(self.topk_ratio),
+                groups=self._groups,
+                h_lut_values=runtime_state.quantiles.h_lut.values,
+                h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+                h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+                group_size=int(group_size),
+                lr_over_bc1=float(hparams.lr_over_bc1),
+                sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+                eps=float(hparams.eps),
+                beta1=float(hparams.beta1),
             )
         t_after_telemetry = time.perf_counter() if profile else 0.0
         self._selection_total_th_host = float(tau_center)

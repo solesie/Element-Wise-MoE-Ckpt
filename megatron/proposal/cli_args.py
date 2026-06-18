@@ -32,6 +32,15 @@ def add_proposal_args(parser):
                             "'v_hat' = Adam bias-corrected v̂_t × δ² ; "
                             "'hessian' = |H_diag| × δ² (Finite-Difference) ; "
                             "'random' = uniform random (ablation). Default 'hessian'.")
+    group.add_argument("--proposal-score-policy", type=str,
+                       default="abs_h_taylor_first_and_second_order",
+                       choices=[
+                           "abs_h_taylor_first_and_second_order",
+                           "abs_h_taylor_only_second_order",
+                       ],
+                       help="Production hessian score policy. Default uses "
+                            "max(0, -m*e_hat + 0.5*|H|*e_hat^2); the "
+                            "second-order ablation uses |H|*e_hat^2.")
     group.add_argument("--proposal-n-bins-cutoff", type=int, default=4096,
                        help="Selection cutoff-search histogram bins. Default 4096.")
     group.add_argument("--proposal-cutoff-k-tolerance", type=float, default=0.04,

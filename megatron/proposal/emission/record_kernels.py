@@ -50,6 +50,7 @@ class AdamHParams:
     lr_over_bc1: float
     sqrt_bc2_inv: float
     eps: float
+    beta1: float = 0.9
 
 
 @dataclass
@@ -90,8 +91,8 @@ class LossyRecordWriteInputs:
     aos_layout_header_device: Optional[torch.Tensor] = None
     aos_layout_header_words: int = 0
     age2bit_words: Optional[torch.Tensor] = None
-    age2bit_floor_mid: Optional[torch.Tensor] = None
-    age2bit_floor_old: Optional[torch.Tensor] = None
+    ehat_geom_lut: Optional[torch.Tensor] = None
+    score_policy_id: int = 0
 
 
 class LossyRecordWriter:
@@ -118,44 +119,7 @@ def _triton_random_salt(random_mode: bool, random_salt: int) -> int:
 # ---------------------------------------------------------------------------
 
 if _HAS_TRITON:
-
-    @triton.jit
-    def _lookup_h_and_floors_from_lut(
-        v_fp32,
-        h_lut_ptr,
-        log_v_min_ptr,
-        inv_log_v_width_ptr,
-        floor_mid_ptr,
-        floor_old_ptr,
-        H_LUT_BINS: tl.constexpr,
-        N_VBINS: tl.constexpr,
-    ):
-        log_v_min = tl.load(log_v_min_ptr)
-        inv_width = tl.load(inv_log_v_width_ptr)
-        log_v = tl.log(tl.maximum(v_fp32, 1.0e-30))
-        pos = (log_v - log_v_min) * inv_width
-        pos = tl.maximum(tl.minimum(pos, H_LUT_BINS - 1.0), 0.0)
-        idx_lo = pos.to(tl.int32)
-        idx_hi = tl.minimum(idx_lo + 1, H_LUT_BINS - 1)
-        frac = pos - idx_lo.to(tl.float32)
-        h_lo = tl.load(h_lut_ptr + idx_lo)
-        h_hi = tl.load(h_lut_ptr + idx_hi)
-        h = h_lo + frac * (h_hi - h_lo)
-        vbin_pos = pos * (N_VBINS / (H_LUT_BINS - 1))
-        floor_pos = tl.maximum(tl.minimum(vbin_pos - 0.5, N_VBINS - 1.0), 0.0)
-        floor_lo_idx = floor_pos.to(tl.int32)
-        floor_hi_idx = tl.minimum(floor_lo_idx + 1, N_VBINS - 1)
-        floor_frac = floor_pos - floor_lo_idx.to(tl.float32)
-
-        mid_lo = tl.load(floor_mid_ptr + floor_lo_idx)
-        mid_hi = tl.load(floor_mid_ptr + floor_hi_idx)
-        old_lo = tl.load(floor_old_ptr + floor_lo_idx)
-        old_hi = tl.load(floor_old_ptr + floor_hi_idx)
-        mid_interp = mid_lo + floor_frac * (mid_hi - mid_lo)
-        old_interp = old_lo + floor_frac * (old_hi - old_lo)
-        mid = tl.where((mid_lo > 0.0) & (mid_hi > 0.0), mid_interp, tl.maximum(mid_lo, mid_hi))
-        old = tl.where((old_lo > 0.0) & (old_hi > 0.0), old_interp, tl.maximum(old_lo, old_hi))
-        return h, mid, old
+    from ..score_policy import _proposal_element_score_from_lut
 
     @triton.jit
     def _age2_load_code(age_words_ptr, global_elem_idx):
@@ -255,7 +219,7 @@ if _HAS_TRITON:
     @triton.jit
     def _write_direct_records_segment_workqueue_kernel(
         m_ptr, v_ptr, p_ptr,
-        age_words_ptr, floor_mid_ptr, floor_old_ptr,
+        age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
         entry_group_start_ptr,
@@ -283,7 +247,7 @@ if _HAS_TRITON:
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
-        N_VBINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
         USE_ADAM_SCALAR_PTR: tl.constexpr,
@@ -351,35 +315,24 @@ if _HAS_TRITON:
                 lr_scalar = tl.load(adam_scalar_ptr + 0)
                 sqrt_bc2_scalar = tl.load(adam_scalar_ptr + 1)
                 eps_scalar = tl.load(adam_scalar_ptr + 2)
-            denom = tl.sqrt(v) * sqrt_bc2_scalar + eps_scalar
-            delta = lr_scalar * m / denom
-            delta_sq = delta * delta
-            h_per_elem, floor_mid, floor_old = _lookup_h_and_floors_from_lut(
-                v_fp32,
-                h_lut_ptr,
-                log_v_min_ptr,
-                inv_log_v_width_ptr,
-                floor_mid_ptr,
-                floor_old_ptr,
-                H_LUT_BINS,
-                N_VBINS,
-            )
             global_elem_idx_for_score = (
                 elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
             )
             age_code = _age2_load_code(age_words_ptr, global_elem_idx_for_score)
-            age_sq = tl.where(
-                age_code == 0,
-                1.0,
-                tl.where(age_code == 1, 16.0, tl.where(age_code == 2, 256.0, 4096.0)),
+            elem_score = _proposal_element_score_from_lut(
+                m,
+                v_fp32,
+                age_code,
+                h_lut_ptr,
+                log_v_min_ptr,
+                inv_log_v_width_ptr,
+                ehat_geom_lut_ptr,
+                lr_scalar,
+                sqrt_bc2_scalar,
+                eps_scalar,
+                H_LUT_BINS,
+                SCORE_POLICY,
             )
-            floor = tl.where(
-                age_code == 2,
-                floor_mid,
-                tl.where(age_code == 3, floor_old, 0.0),
-            )
-            delta_eff_sq = tl.maximum(delta_sq, floor)
-            elem_score = h_per_elem * age_sq * delta_eff_sq
             if RANDOM_MODE:
                 elem_score = _random_unit_from_index(
                     global_elem_idx_for_score, RANDOM_SALT,
@@ -577,8 +530,8 @@ def launch_direct_records_for_segment_entry_workqueue(
     random_mode: bool = False,
     random_salt: int = 0,
     age2bit_words: Optional[torch.Tensor] = None,
-    age2bit_floor_mid: Optional[torch.Tensor] = None,
-    age2bit_floor_old: Optional[torch.Tensor] = None,
+    ehat_geom_lut: Optional[torch.Tensor] = None,
+    score_policy_id: int = 0,
     step_device: Optional[torch.Tensor] = None,
 ) -> None:
     if not _HAS_TRITON:
@@ -593,7 +546,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         return
     if h_lut_values is None or total_th is None:
         raise RuntimeError("direct emission requires H LUT and total_th")
-    if age2bit_words is None or age2bit_floor_mid is None or age2bit_floor_old is None:
+    if age2bit_words is None or ehat_geom_lut is None:
         raise RuntimeError("direct emission requires Age2Bit state")
     if step_device is None:
         raise RuntimeError("direct emission requires step_device for Age2Bit aging")
@@ -615,8 +568,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         v_view,
         p_view,
         age2bit_words,
-        age2bit_floor_mid,
-        age2bit_floor_old,
+        ehat_geom_lut,
         h_lut_values,
         h_lut_log_v_min,
         h_lut_inv_log_v_width,
@@ -648,7 +600,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         G=int(group_size),
         GROUPS_PER_BLOCK=gpb,
         H_LUT_BINS=int(h_lut_values.numel()),
-        N_VBINS=int(age2bit_floor_mid.numel()),
+        SCORE_POLICY=int(score_policy_id),
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=_triton_random_salt(random_mode, random_salt),
         USE_ADAM_SCALAR_PTR=bool(use_adam_scalar_ptr),

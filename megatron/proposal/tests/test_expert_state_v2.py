@@ -18,7 +18,7 @@ from megatron.proposal.storage.expert_writer import (
 from megatron.proposal.emission.aos_layout import AOS_LAYOUT_HEADER_WORDS_FIXED
 from megatron.proposal.emission.record_kernels import LossyRecordWriteInputs
 from megatron.proposal.emission.record_kernels import AdamHParams
-from megatron.proposal.cutoff.age2bit import allocate_age2bit_floor_state
+from megatron.proposal.cutoff.age2bit import allocate_age2bit_score_state
 from megatron.proposal.storage.proposal_io import (
     SECTOR_BYTES,
     alloc_pinned_uint8_sector_aligned,
@@ -44,10 +44,14 @@ def _first_aos_prefix_offset(pinned_aos: torch.Tensor) -> int:
 
 
 def _attach_age2bit(lossy_state: LossyRecordWriteInputs, n_elem: int, device):
-    age = allocate_age2bit_floor_state(n_elements=n_elem, device=device)
+    h_bins = int(lossy_state.h_lut_values.numel())
+    age = allocate_age2bit_score_state(
+        n_elements=n_elem,
+        device=device,
+        h_lut_bins=h_bins,
+    )
     lossy_state.age2bit_words = age.age_words
-    lossy_state.age2bit_floor_mid = age.floor_mid
-    lossy_state.age2bit_floor_old = age.floor_old
+    lossy_state.ehat_geom_lut = age.ehat_geom_lut
     lossy_state.step_device = torch.zeros(1, dtype=torch.int32, device=device)
     return age
 
@@ -259,7 +263,7 @@ def test_direct_emission_cursor_cap_prevents_pinned_aos_overflow(tmp_path: Path)
             compute_event=None,
             gpu_refs=[
                 m, v, p, h_lut_values, total_th,
-                age.age_words, age.floor_mid, age.floor_old, lossy_state.step_device,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
             ],
             lossy_state=lossy_state,
         )
@@ -346,7 +350,7 @@ def test_direct_emission_count_matches_selection_predicate(tmp_path: Path):
             compute_event=None,
             gpu_refs=[
                 m, v, p, h_lut_values, total_th,
-                age.age_words, age.floor_mid, age.floor_old, lossy_state.step_device,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
             ],
             lossy_state=lossy_state,
         )
@@ -412,7 +416,7 @@ def test_direct_emission_resets_age_only_for_actual_written(tmp_path: Path):
             compute_event=None,
             gpu_refs=[
                 m, v, p, h_lut_values, total_th,
-                age.age_words, age.floor_mid, age.floor_old, lossy_state.step_device,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
             ],
             lossy_state=lossy_state,
         )

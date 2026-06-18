@@ -2,7 +2,7 @@
 
 The active path ranks elements with one score:
 
-    score(i) = H(v_i) * age2bit(i)^2 * delta_eff(i)^2
+    default score(i) = max(0, -m_i * e_hat_i + 0.5 * |H_i| * e_hat_i^2)
 
 ``LossyCpState`` holds the runtime views used by cutoff search and record
 write. ``LossyCheckpointPipeline`` owns one lossy checkpoint iteration.
@@ -130,6 +130,8 @@ class LossyCheckpointPipeline(
         self._sparse_cache_shadow_telemetry = SparseCacheShadowTelemetry.from_env()
         from ..telemetry.policy_shadow import PolicyShadowTelemetry
         self._policy_shadow_telemetry = PolicyShadowTelemetry.from_env()
+        from ..telemetry.curvature_progress import CurvatureProgressTelemetry
+        self._curvature_progress_telemetry = CurvatureProgressTelemetry.from_env()
         from ..cutoff.adaptive_controller import ApproxProbeRejectWarning
         self._approx_probe_reject_warning = ApproxProbeRejectWarning()
         self._checkpoint_workers = checkpoint_workers
@@ -140,11 +142,16 @@ class LossyCheckpointPipeline(
                 f"selection_mode must be 'v_hat'|'random'|'hessian', got {selection_mode!r}."
             )
         self.selection_mode = selection_mode
+        from ..score_policy import DEFAULT_SCORE_POLICY, score_policy_id
+        self.score_policy = str(
+            getattr(proposal_config, "score_policy", DEFAULT_SCORE_POLICY)
+            if proposal_config is not None else DEFAULT_SCORE_POLICY
+        )
+        self.score_policy_id = int(score_policy_id(self.score_policy))
         # Production reads H through the quantile table. In hessian mode the
-        # single hot-path score is:
-        #     score(i) = H(v_i) * age2bit_i^2 * delta_eff_i^2
-        # Probe and direct emission must use the same helper; group-dg and
-        # outlier-priority scoring are not production selection paths.
+        # single hot-path score is the configured abs-H Taylor policy.  Probe
+        # and direct emission must use the same helper/LUT snapshot; group-dg,
+        # vbin-floor, and outlier-priority scoring are not production paths.
 
         self._selection_total_th: Optional[torch.Tensor] = None    # () fp32
         self._selection_total_th_host: float = 1.0
@@ -498,12 +505,10 @@ class LossyCheckpointPipeline(
 
         for attr, t in vars(self).items():
             add_owned_tensor(attr, t)
-        age2bit_state = getattr(self, "_age2bit_floor_state", None)
+        age2bit_state = getattr(self, "_age2bit_score_state", None)
         if age2bit_state is not None:
             add_owned_tensor("age2bit.age_words", getattr(age2bit_state, "age_words", None))
-            add_owned_tensor("age2bit.floor_mid", getattr(age2bit_state, "floor_mid", None))
-            add_owned_tensor("age2bit.floor_old", getattr(age2bit_state, "floor_old", None))
-            add_owned_tensor("age2bit.floor_hist", getattr(age2bit_state, "floor_hist", None))
+            add_owned_tensor("age2bit.ehat_geom_lut", getattr(age2bit_state, "ehat_geom_lut", None))
         # Current dispatch carries no cross-iteration pending stash; current
         # lossy write inputs are local to ``step()``.
         # _v_mapping_v_flats and m/v/p group entries are flat views into
@@ -626,10 +631,11 @@ class LossyCheckpointPipeline(
                 f"cross tensor boundaries. Offenders: {sample}"
             )
 
-        from ..cutoff.age2bit import allocate_age2bit_floor_state
-        self._age2bit_floor_state = allocate_age2bit_floor_state(
+        from ..cutoff.age2bit import allocate_age2bit_score_state
+        self._age2bit_score_state = allocate_age2bit_score_state(
             n_elements=int(total_elems),
             device=device,
+            h_lut_bins=int(self.h_lookup_lut_bins),
         )
         # Selection/write kernels compute per-element H through the prebuilt
         # log(v)->H LUT.
@@ -869,20 +875,15 @@ class LossyCheckpointPipeline(
                 except Exception:
                     return float(int(tensor.numel()) * int(tensor.element_size())) / 1e6
 
-            age2bit_state = getattr(self, "_age2bit_floor_state", None)
+            age2bit_state = getattr(self, "_age2bit_score_state", None)
             mem_age2bit = _tensor_mb(
                 age2bit_state.age_words if age2bit_state is not None else None
             )
-            mem_age2bit_floor = sum(
-                _tensor_mb(t)
-                for t in (
-                    age2bit_state.floor_mid if age2bit_state is not None else None,
-                    age2bit_state.floor_old if age2bit_state is not None else None,
-                    age2bit_state.floor_hist if age2bit_state is not None else None,
-                )
+            mem_score_lut = _tensor_mb(
+                age2bit_state.ehat_geom_lut if age2bit_state is not None else None
             )
             mem_hist = self._n_bins_cutoff * 8 / 1e6
-            mem_total = mem_age2bit + mem_age2bit_floor + mem_hist
+            mem_total = mem_age2bit + mem_score_lut + mem_hist
             print(f"[proposal] lossy CP state init: ZERO-COPY all groups, "
                   f"optimizer_groups={len(self._groups)}, "
                   f"total={total_elems} elements, groups={total_groups}, "
@@ -890,7 +891,7 @@ class LossyCheckpointPipeline(
                   flush=True)
             print(f"[proposal] lossy CP mem persistent: "
                   f"age2bit={mem_age2bit:.1f}MB "
-                  f"age2bit_floor={mem_age2bit_floor:.3f}MB "
+                  f"score_lut={mem_score_lut:.3f}MB "
                   f"hist_i64={mem_hist:.3f}MB -> "
                   f"total={mem_total:.1f}MB",
                   flush=True)
@@ -1004,7 +1005,7 @@ class LossyCheckpointPipeline(
             index=index,
             quantiles=quantiles,
             scratch=scratch,
-            age2bit=getattr(self, "_age2bit_floor_state", None),
+            age2bit=getattr(self, "_age2bit_score_state", None),
         )
 
     @torch.no_grad()

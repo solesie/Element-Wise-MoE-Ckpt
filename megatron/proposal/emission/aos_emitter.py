@@ -326,7 +326,7 @@ class AosEmitter:
         layout after this call — caller does the per-expert
         finalisation (``::write`` or DRAM scatter).
 
-        ``lossy_state`` supplies live p/m/v, H LUT, τ, Age2Bit state, floor
+        ``lossy_state`` supplies live p/m/v, H LUT, τ, Age2Bit state, score LUT
         tables, and cursor-cap tensors. Selection and emit happen inside
         direct emission.
         """
@@ -410,11 +410,11 @@ class AosEmitter:
             sample_grow_hold=getattr(lossy_state, "sample_grow_hold", None),
             ci_shortfall_streak=getattr(lossy_state, "ci_shortfall_streak", None),
             probe_diagnostics=getattr(lossy_state, "probe_diagnostics", None),
-                probe_expected_selected_count=getattr(
-                    lossy_state, "probe_expected_selected_count", None,
-                ),
-                capacity_demand_hint=getattr(lossy_state, "capacity_demand_hint", None),
-                total_elems_global=int(getattr(lossy_state, "total_elems_global", 0)),
+            probe_expected_selected_count=getattr(
+                lossy_state, "probe_expected_selected_count", None,
+            ),
+            capacity_demand_hint=getattr(lossy_state, "capacity_demand_hint", None),
+            total_elems_global=int(getattr(lossy_state, "total_elems_global", 0)),
             allowed_probe_count_delta=int(
                 getattr(lossy_state, "allowed_probe_count_delta", 0)
             ),
