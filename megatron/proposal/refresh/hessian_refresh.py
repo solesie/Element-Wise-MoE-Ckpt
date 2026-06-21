@@ -142,6 +142,7 @@ def _refresh_h_quantile_from_finite_diff(
     dedicated = _config.get("_hessian_dedicated_valid_iter")
     if dedicated is not None:
         data_iterator = dedicated
+    m0 = model[0] if isinstance(model, (list, tuple)) else model
 
     # Anchor/H refresh is an explicit training halt (§0.2 exception). It
     # must not overlap with an older lossy-AOS task, because that task
@@ -160,13 +161,12 @@ def _refresh_h_quantile_from_finite_diff(
 
     _cpu_rng_state = torch.get_rng_state()
     _cuda_rng_state = (torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
-    if hasattr(model[0], "module"):
-        net = model[0].module
+    if hasattr(m0, "module"):
+        net = m0.module
     else:
-        net = model[0]
+        net = m0
     was_training = net.training
     net.train()
-    m0 = model[0] if isinstance(model, (list, tuple)) else model
     ds_engine = m0
     prev_flag = getattr(ds_engine, "_running_engine_backward", False)
     try: ds_engine._running_engine_backward = True
@@ -272,15 +272,27 @@ def _refresh_h_quantile_from_finite_diff(
                 except Exception:
                     pass
     _saved_grad_acc_hooks = None
+    _restore_grad_acc_hooks = False
+    _actual_pipeline_anchor = _is_pipeline_engine(m0)
     if _ds_engine_opt is not None and hasattr(_ds_engine_opt, "_grad_acc_hooks"):
         # BF16_Optimizer routes param grads into its own flat buffer via these
         # hooks; detach them so the anchor's FD hooks own the grads. FP16/ZeRO
         # optimizers have no such hooks (branch skipped).
-        _saved_grad_acc_hooks = _ds_engine_opt._grad_acc_hooks
-        for _h in _saved_grad_acc_hooks:
-            try: _h.remove()
-            except Exception: pass
-        _ds_engine_opt._grad_acc_hooks = []
+        # DeepSpeed PipelineEngine with BF16 commonly runs with
+        # immediate_grad_update=False and updates hp grads from the pipeline
+        # backward schedule instead of persistent per-param hooks. Recreating
+        # hooks in that mode installs the wrong contract and trips
+        # BF16_Optimizer.assert immediate_grad_update on the next train_batch.
+        _restore_grad_acc_hooks = (
+            (not _actual_pipeline_anchor)
+            or bool(getattr(_ds_engine_opt, "immediate_grad_update", True))
+        )
+        if _restore_grad_acc_hooks:
+            _saved_grad_acc_hooks = _ds_engine_opt._grad_acc_hooks
+            for _h in _saved_grad_acc_hooks:
+                try: _h.remove()
+                except Exception: pass
+            _ds_engine_opt._grad_acc_hooks = []
     try:
         # MULTI-BATCH ANCHOR: each batch's routing activates only ~67% of
         # experts; averaging over N batches (each with a different routing)
@@ -438,7 +450,11 @@ def _refresh_h_quantile_from_finite_diff(
         _config["_in_anchor_refresh"] = False
         # Re-register DS grad-acc hooks so next training iter's backward
         # accumulates into the flat buffer again (BF16_Optimizer only).
-        if _ds_engine_opt is not None and _saved_grad_acc_hooks is not None:
+        if (
+            _ds_engine_opt is not None
+            and _saved_grad_acc_hooks is not None
+            and _restore_grad_acc_hooks
+        ):
             try:
                 _ds_engine_opt.create_grad_acc_hooks()
             except Exception:
@@ -503,7 +519,8 @@ def _refresh_h_quantile_from_finite_diff(
         "expert_coverage": _fold_diag["expert_coverage"],
         "skip_ratio": _fold_diag["skip_ratio"],
         "eps": eps_actual,
-        "routing_freeze": True,
+        "routing_freeze": bool(_use_freeze and not _actual_pipeline_anchor),
+        "pipeline_fd_anchor": bool(_actual_pipeline_anchor),
     }
     _config["_h_diag_records"].append(diag_record)
 
@@ -803,6 +820,76 @@ def _accumulate_grad_to_fp32_with_pcg_z(
     return grad
 
 
+def _is_pipeline_engine(obj: Any) -> bool:
+    return obj.__class__.__name__ == "PipelineEngine"
+
+
+def _pipeline_cached_microbatches(engine: Any, data_iterator: Any) -> List[Any]:
+    """Read exactly one pipeline batch and keep it reusable for +/- FD passes."""
+
+    di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
+    n_micro = max(1, int(getattr(engine, "micro_batches", 1)))
+    return [next(di) for _ in range(n_micro)]
+
+
+def _pipeline_replay_iterator(cached: List[Any]):
+    for item in cached:
+        yield item
+
+
+def _pipeline_exec_batch(
+    engine: Any,
+    cached_microbatches: List[Any],
+    *,
+    backward: bool,
+) -> None:
+    """Run PipelineEngine schedule on cached microbatches.
+
+    Backward mode uses the normal 1F1B train schedule but drops only the final
+    reduce/optimizer instructions. Forward-only mode is used by routing-freeze
+    capture so the same gate decisions are replayed for +eps and -eps.
+    """
+
+    from deepspeed.runtime.pipe import schedule as _ds_schedule
+
+    class _TrainNoStepSchedule(_ds_schedule.TrainSchedule):
+        def steps(self):  # type: ignore[override]
+            skip = (
+                _ds_schedule.ReduceTiedGrads,
+                _ds_schedule.ReduceGrads,
+                _ds_schedule.OptimizerStep,
+            )
+            for cmds in super().steps():
+                kept = [cmd for cmd in cmds if not isinstance(cmd, skip)]
+                yield kept
+
+    sched_cls = _TrainNoStepSchedule if backward else _ds_schedule.InferenceSchedule
+    sched = sched_cls(
+        micro_batches=int(getattr(engine, "micro_batches", 1)),
+        stages=int(getattr(engine, "num_stages", 1)),
+        stage_id=int(getattr(engine, "stage_id", 0)),
+    )
+    old_iter = getattr(engine, "data_iterator", None)
+    old_total_loss = getattr(engine, "total_loss", None)
+    old_total_additional = getattr(engine, "total_additional_losses", None)
+    old_compute_loss = getattr(engine, "_compute_loss", True)
+    old_outputs = getattr(engine, "fwd_outputs", None)
+    try:
+        engine.set_dataiterator(_pipeline_replay_iterator(cached_microbatches))
+        engine.module.train()
+        engine.total_loss = None
+        engine.total_additional_losses = None
+        engine._compute_loss = True
+        engine._exec_schedule(sched)
+    finally:
+        engine.set_dataiterator(old_iter)
+        engine.total_loss = old_total_loss
+        engine.total_additional_losses = old_total_additional
+        engine._compute_loss = old_compute_loss
+        if old_outputs is not None:
+            engine.fwd_outputs = old_outputs
+
+
 if _HAS_TRITON_HESSIAN:
     @triton.jit
     def _scale_grad_inplace_with_pcg_z_kernel(
@@ -872,6 +959,8 @@ def _compute_fd_fast_flat(
     grad_offsets: List[int],
     restore_src_list: List[torch.Tensor],
     grad_accum_views: List[torch.Tensor],
+    pipeline_engine: Optional[Any] = None,
+    pipeline_microbatches: Optional[List[Any]] = None,
 ) -> Optional[List[torch.Tensor]]:
     """Fast FD with batched grad-flat stream + per-tensor hash-based perturb.
 
@@ -907,12 +996,39 @@ def _compute_fd_fast_flat(
     ctx_mgr = (RoutingFreezeContext(gates_for_freeze)
                if gates_for_freeze else None)
 
+    def _restore_theta0() -> None:
+        with torch.no_grad():
+            for _p, _snap in zip(expert_ps, restore_src_list):
+                _p.data.copy_(_snap, non_blocking=True)
+
+    def _clear_pipeline_grads() -> None:
+        if pipeline_engine is None:
+            return
+        try:
+            for _p in pipeline_engine.module.parameters():
+                _p.grad = None
+        except Exception:
+            for _p in expert_ps:
+                _p.grad = None
+
     _tsum = {"perturb": 0.0, "hook": 0.0, "bwd": 0.0}
     try:
         with (ctx_mgr if ctx_mgr is not None else nullcontext()):
             if ctx_mgr is not None:
                 try:
-                    ctx_mgr.capture(forward_loss_fn)
+                    if pipeline_engine is not None:
+                        if pipeline_microbatches is None:
+                            raise RuntimeError("pipeline FD missing cached microbatches")
+                        _restore_theta0()
+                        ctx_mgr.capture(
+                            lambda: _pipeline_exec_batch(
+                                pipeline_engine,
+                                pipeline_microbatches,
+                                backward=False,
+                            )
+                        )
+                    else:
+                        ctx_mgr.capture(forward_loss_fn)
                 except Exception as exc:
                     print(f"[proposal] finite_diff: routing-freeze capture failed: {exc}",
                           flush=True)
@@ -966,10 +1082,23 @@ def _compute_fd_fast_flat(
                         handles.append(hook_param.register_hook(_scale_hook))
                     _sync(); _t_hook = _time.perf_counter()
                     try:
-                        if not _backward_inplace(forward_loss_fn, expert_ps,
-                                                  model_for_full_zero,
-                                                  preserve_expert_grad_storage=preserve_param_grad_storage):
-                            return None
+                        if pipeline_engine is not None:
+                            if pipeline_microbatches is None:
+                                raise RuntimeError("pipeline FD missing cached microbatches")
+                            _pipeline_exec_batch(
+                                pipeline_engine,
+                                pipeline_microbatches,
+                                backward=True,
+                            )
+                            _clear_pipeline_grads()
+                        else:
+                            if not _backward_inplace(
+                                forward_loss_fn,
+                                expert_ps,
+                                model_for_full_zero,
+                                preserve_expert_grad_storage=preserve_param_grad_storage,
+                            ):
+                                return None
                     finally:
                         for handle in handles:
                             handle.remove()
@@ -1018,6 +1147,8 @@ def compute_hessian_finite_diff_core(
     grad_flat: Optional[torch.Tensor] = None,
     grad_offsets: Optional[List[int]] = None,
     grad_accum_views: Optional[List[torch.Tensor]] = None,
+    pipeline_engine: Optional[Any] = None,
+    pipeline_microbatches: Optional[List[Any]] = None,
 ) -> Optional[List[torch.Tensor]]:
     """Accumulate one finite-difference batch into caller-owned ``grad_flat``.
 
@@ -1049,6 +1180,8 @@ def compute_hessian_finite_diff_core(
             grad_offsets=grad_offsets,
             restore_src_list=theta_snap_ref,
             grad_accum_views=grad_accum_views,
+            pipeline_engine=pipeline_engine,
+            pipeline_microbatches=pipeline_microbatches,
         )
 
     raise RuntimeError(
@@ -1084,54 +1217,81 @@ def compute_hessian_finite_diff(
     if not expert_ps:
         return None
 
-    # ---- Load batch ONCE (Common Random Numbers). ----
-    # Capture (tokens, labels, mask, attn, pos) once via get_batch then
-    # run a custom forward that bypasses forward_step_func's iterator
-    # advance. Caller may also pre-capture and inject via batch_override.
-    if batch_override is not None:
-        batch = batch_override
+    pipeline_engine = m0 if _is_pipeline_engine(m0) else None
+    pipeline_microbatches = None
+    if pipeline_engine is not None:
+        try:
+            pipeline_microbatches = _pipeline_cached_microbatches(pipeline_engine, di)
+        except Exception as exc:
+            print(f"[proposal] finite_diff: pipeline batch cache failed: {exc}", flush=True)
+            return None
+        batch = None
     else:
-        try:
-            from pretrain_gpt import get_batch as _get_batch_gpt
-        except Exception as exc:
-            print(f"[proposal] finite_diff: cannot import get_batch: {exc}", flush=True)
-            return None
-        try:
-            batch = _get_batch_gpt(di)
-        except Exception as exc:
-            print(f"[proposal] finite_diff: get_batch failed: {exc}", flush=True)
-            return None
-    tokens, labels, loss_mask, attention_mask, position_ids = batch[:5]
-
-    # Build a closure that re-runs the model forward + LM loss on the
-    # cached batch. Mirrors Megatron's training forward.
-    import torch.nn.functional as F
-
-    def _forward_loss() -> Tuple[torch.Tensor, Dict[str, Any]]:
-        out = m0(tokens, position_ids, attention_mask)
-        logits = out[0] if isinstance(out, tuple) else out
-        if logits is None or not torch.is_tensor(logits):
-            raise RuntimeError("finite_diff: model returned non-tensor")
-        if logits.dim() >= 2:
-            V = logits.size(-1)
-            flat_logits = logits.reshape(-1, V)
+        # ---- Load batch ONCE (Common Random Numbers). ----
+        # Capture (tokens, labels, mask, attn, pos) once via get_batch then
+        # run a custom forward that bypasses forward_step_func's iterator
+        # advance. Caller may also pre-capture and inject via batch_override.
+        if batch_override is not None:
+            batch = batch_override
         else:
-            flat_logits = logits
-        flat_labels = labels.reshape(-1) if labels is not None else None
-        if flat_labels is None:
-            raise RuntimeError("finite_diff: labels missing")
-        if loss_mask is not None and loss_mask.numel() == flat_logits.size(0):
-            per_tok = F.cross_entropy(flat_logits.float(), flat_labels, reduction="none")
-            denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
-            loss = (per_tok * loss_mask.view(-1).float()).sum() / denom
-        else:
-            loss = F.cross_entropy(flat_logits.float(), flat_labels, reduction="mean")
-        return loss, {}
+            try:
+                from pretrain_gpt import get_batch as _get_batch_gpt
+            except Exception as exc:
+                print(f"[proposal] finite_diff: cannot import get_batch: {exc}", flush=True)
+                return None
+            try:
+                batch = _get_batch_gpt(di)
+            except Exception as exc:
+                print(f"[proposal] finite_diff: get_batch failed: {exc}", flush=True)
+                return None
+
+    if pipeline_engine is None:
+        tokens, labels, loss_mask, attention_mask, position_ids = batch[:5]
+
+        # Build a closure that re-runs the model forward + LM loss on the
+        # cached batch. Mirrors Megatron's training forward.
+        import torch.nn.functional as F
+
+        def _forward_loss() -> Tuple[torch.Tensor, Dict[str, Any]]:
+            out = m0(tokens, position_ids, attention_mask)
+            logits = out[0] if isinstance(out, tuple) else out
+            if logits is None or not torch.is_tensor(logits):
+                raise RuntimeError("finite_diff: model returned non-tensor")
+            if logits.dim() >= 2:
+                V = logits.size(-1)
+                flat_logits = logits.reshape(-1, V)
+            else:
+                flat_logits = logits
+            flat_labels = labels.reshape(-1) if labels is not None else None
+            if flat_labels is None:
+                raise RuntimeError("finite_diff: labels missing")
+            if loss_mask is not None and loss_mask.numel() == flat_logits.size(0):
+                per_tok = F.cross_entropy(
+                    flat_logits.float(),
+                    flat_labels,
+                    reduction="none",
+                )
+                denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
+                loss = (per_tok * loss_mask.view(-1).float()).sum() / denom
+            else:
+                loss = F.cross_entropy(flat_logits.float(), flat_labels, reduction="mean")
+            return loss, {}
+    else:
+        def _forward_loss() -> Tuple[torch.Tensor, Dict[str, Any]]:
+            raise RuntimeError("pipeline FD uses PipelineEngine schedules")
 
     # ---- Routing freeze setup ----
     from .routing_freeze import identify_gate_modules_safe
     gates_for_freeze: Optional[List[Tuple[str, torch.nn.Module]]] = None
-    if use_routing_freeze:
+    if use_routing_freeze and pipeline_engine is not None:
+        if _should_write():
+            print(
+                "[proposal] finite_diff: DeepSpeed PipelineEngine schedule "
+                "anchor disables routing-freeze replay; cached +/- "
+                "microbatches are still shared.",
+                flush=True,
+            )
+    elif use_routing_freeze:
         gates, _rules = identify_gate_modules_safe(model)
         if not gates:
             print("[proposal] finite_diff: WARN no gates identified; running "
@@ -1168,4 +1328,6 @@ def compute_hessian_finite_diff(
         grad_flat=grad_flat,
         grad_offsets=grad_offsets,
         grad_accum_views=grad_accum_views,
+        pipeline_engine=pipeline_engine,
+        pipeline_microbatches=pipeline_microbatches,
     )

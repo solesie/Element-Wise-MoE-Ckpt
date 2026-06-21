@@ -173,9 +173,6 @@ class AosEmitter:
         self._segment_d2h: Optional[object] = None  # SegmentD2H
         self._direct_plan: Optional[_DirectAosPlan] = None
         self._direct_plan_capacity_signature: Optional[Tuple[int, ...]] = None
-        self._direct_segment_plan_layout_key: Optional[
-            Tuple[int, ...]
-        ] = None
 
     def _ensure_segment_d2h(self, device: torch.device) -> None:
         if self._segment_d2h is not None:
@@ -315,7 +312,6 @@ class AosEmitter:
         compute_event,
         gpu_refs,
         lossy_state: Optional[LossyRecordWriteInputs] = None,
-        d2h_start_event: Optional[Any] = None,
         pinned_aos: Optional[torch.Tensor] = None,
         layout_mirror: Optional[PinnedAosLayoutMirror] = None,
         copy_to_host: bool = True,
@@ -330,7 +326,6 @@ class AosEmitter:
         tables, and cursor-cap tensors. Selection and emit happen inside
         direct emission.
         """
-        import os
         import time
 
         profile = os.environ.get("PROPOSAL_AOS_PROFILE", "") in (
@@ -400,18 +395,41 @@ class AosEmitter:
                 f"the prepared expert count ({cursor.numel()}, {overflow.numel()} "
                 f"< {len(expert_specs)})"
             )
+        enable_sample_feedback = bool(
+            getattr(lossy_state, "enable_direct_probe_sample_feedback", True)
+        )
         direct_plan.layout_state.launch_update(
             cursor=cursor,
             stream=self._segment_d2h._compute_stream,
-            sample_blocks_current=getattr(lossy_state, "sample_blocks_current", None),
-            probe_count_mismatch_streak=getattr(
-                lossy_state, "probe_count_mismatch_streak", None,
+            sample_blocks_current=(
+                getattr(lossy_state, "sample_blocks_current", None)
+                if enable_sample_feedback
+                else None
             ),
-            sample_grow_hold=getattr(lossy_state, "sample_grow_hold", None),
-            ci_shortfall_streak=getattr(lossy_state, "ci_shortfall_streak", None),
-            probe_diagnostics=getattr(lossy_state, "probe_diagnostics", None),
-            probe_expected_selected_count=getattr(
-                lossy_state, "probe_expected_selected_count", None,
+            probe_count_mismatch_streak=(
+                getattr(lossy_state, "probe_count_mismatch_streak", None)
+                if enable_sample_feedback
+                else None
+            ),
+            sample_grow_hold=(
+                getattr(lossy_state, "sample_grow_hold", None)
+                if enable_sample_feedback
+                else None
+            ),
+            ci_shortfall_streak=(
+                getattr(lossy_state, "ci_shortfall_streak", None)
+                if enable_sample_feedback
+                else None
+            ),
+            probe_diagnostics=(
+                getattr(lossy_state, "probe_diagnostics", None)
+                if enable_sample_feedback
+                else None
+            ),
+            probe_expected_selected_count=(
+                getattr(lossy_state, "probe_expected_selected_count", None)
+                if enable_sample_feedback
+                else None
             ),
             capacity_demand_hint=getattr(lossy_state, "capacity_demand_hint", None),
             total_elems_global=int(getattr(lossy_state, "total_elems_global", 0)),
@@ -455,7 +473,6 @@ class AosEmitter:
             segments,
             target_pinned_aos,
             copy_to_host=bool(copy_to_host),
-            d2h_start_event=d2h_start_event,
         )
         t_after_run = time.perf_counter() if profile_this else 0.0
         t_after_final_sync = time.perf_counter() if profile_this else 0.0
@@ -476,50 +493,6 @@ class AosEmitter:
                 flush=True,
             )
         return expert_specs, total_aos, d2h_done_event
-
-
-def cut_into_blob_aligned_segments(
-    expert_specs: Sequence["ExpertSpec"],
-    max_segment_bytes: int,
-) -> List[Tuple[int, int]]:
-    """Partition the global AOS layout into segments of at most
-    ``max_segment_bytes``, with every cut on an expert blob boundary.
-
-    Guarantees: each segment is non-empty, and every expert's blob
-    lies entirely within ONE segment — so records never straddle
-    segment boundaries. Required because records are 16 B and
-    segment_d2h's fixed-size cuts would otherwise
-    misalign with record boundaries.
-
-    Returns a list of ``(byte_offset, byte_length)`` tuples.
-    Raises ``ValueError`` if a single expert blob exceeds
-    ``max_segment_bytes`` (the segment size must accommodate the
-    largest single blob).
-    """
-    if max_segment_bytes <= 0:
-        raise ValueError(
-            f"max_segment_bytes must be positive: {max_segment_bytes}"
-        )
-    segments: List[Tuple[int, int]] = []
-    if not expert_specs:
-        return segments
-    seg_lo = expert_specs[0].aos_byte_off
-    seg_hi = seg_lo
-    for spec in expert_specs:
-        blob_end = spec.aos_byte_off + spec.blob_padded_bytes
-        if blob_end - seg_lo > max_segment_bytes:
-            # Cut before this expert (its inclusion would overflow).
-            if seg_hi == seg_lo:
-                raise ValueError(
-                    f"expert blob {spec.blob_padded_bytes} bytes "
-                    f"> max_segment_bytes {max_segment_bytes}"
-                )
-            segments.append((seg_lo, seg_hi - seg_lo))
-            seg_lo = spec.aos_byte_off
-        seg_hi = blob_end
-    if seg_hi > seg_lo:
-        segments.append((seg_lo, seg_hi - seg_lo))
-    return segments
 
 
 def _fixed_segments_for_bytes(

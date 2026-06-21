@@ -237,8 +237,11 @@ if _HAS_TRITON:
             hint = tl.full((), 0, tl.int64)
             if USE_CAPACITY_HINT:
                 hint_f = tl.maximum(tl.load(capacity_demand_hint_ptr + i), 0.0)
-                hint = hint_f.to(tl.int64)
-            previous_demand = tl.maximum(tl.load(cursor_ptr + i), 0)
+                hint = tl.minimum(hint_f.to(tl.int64), max_i)
+            # The direct-emission cursor is the raw selected count.  Overflow is
+            # tracked separately for diagnostics and written count, so adding it
+            # here would double-count capped records.
+            previous_demand = tl.minimum(tl.maximum(tl.load(cursor_ptr + i), 0), max_i)
             demand = tl.maximum(hint, previous_demand)
             demand_sum += tl.minimum(demand, max_i)
         use_demand = USE_CAPACITY_HINT & (demand_sum > 0)

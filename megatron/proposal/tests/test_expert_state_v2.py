@@ -197,6 +197,56 @@ def test_lfcl_batch_uses_one_pinned_slab_and_releases_once(tmp_path: Path):
     assert e1["e1.w:param"].reshape(-1).tolist() == pytest.approx([20.0, 21.0, 22.0])
 
 
+def test_lfsy_recovery_keeps_latest_record_when_indices_repeat(tmp_path: Path):
+    state = ExpertState(
+        {(0, 0): [("e.w", torch.Size([4]), 4)]},
+        output_dir=tmp_path,
+        fresh=True,
+    )
+    try:
+        state.append_lossy_records_for_test(
+            (0, 0), step=1,
+            tensor_updates=[
+                ("e.w", torch.tensor([1, 2], dtype=torch.int32),
+                 torch.tensor([11.0, 12.0]),
+                 torch.tensor([1.1, 1.2]),
+                 torch.tensor([0.11, 0.12])),
+            ],
+        )
+        state.append_lossy_records_for_test(
+            (0, 0), step=2,
+            tensor_updates=[
+                ("e.w", torch.tensor([1, 3], dtype=torch.int32),
+                 torch.tensor([21.0, 23.0]),
+                 torch.tensor([2.1, 2.3]),
+                 torch.tensor([0.21, 0.23])),
+            ],
+        )
+        state.append_lossy_records_for_test(
+            (0, 0), step=3,
+            tensor_updates=[
+                ("e.w", torch.tensor([2], dtype=torch.int32),
+                 torch.tensor([32.0]),
+                 torch.tensor([3.2]),
+                 torch.tensor([0.32])),
+            ],
+        )
+    finally:
+        state.shutdown()
+
+    payload = read_expert_state(tmp_path, layer=0, expert=0)
+    assert payload["_rolling_step"] == 3
+    assert payload["e.w:param"].reshape(-1).tolist() == pytest.approx(
+        [0.0, 21.0, 32.0, 23.0],
+    )
+    assert payload["e.w:exp_avg"].reshape(-1).tolist() == pytest.approx(
+        [0.0, 2.1, 3.2, 2.3],
+    )
+    assert payload["e.w:exp_avg_sq"].reshape(-1).tolist() == pytest.approx(
+        [0.0, 0.21, 0.32, 0.23],
+    )
+
+
 def test_pinned_aos_capacity_uses_local_worst_case(tmp_path: Path):
     expert_map = {
         (0, 0): [("expert0.w", torch.Size([1000]), 1000)],

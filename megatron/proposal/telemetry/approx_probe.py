@@ -39,6 +39,9 @@ class ApproxProbeTelemetry:
         self._probe_done_events = []
         self._decision_done_events = []
         self._pending: Dict[int, Dict[str, Any]] = {}
+        self._detail_enabled = os.environ.get(
+            "PROPOSAL_APPROX_PROBE_TELEMETRY_DETAIL", ""
+        ) in ("1", "true", "TRUE")
         if self.enabled:
             assert self._path is not None
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,7 +49,16 @@ class ApproxProbeTelemetry:
 
     @classmethod
     def from_env(cls) -> "ApproxProbeTelemetry":
-        return cls(os.environ.get("PROPOSAL_APPROX_PROBE_TELEMETRY_LOG", ""))
+        path = os.environ.get("PROPOSAL_APPROX_PROBE_TELEMETRY_LOG", "")
+        if path and os.environ.get("PROPOSAL_APPROX_PROBE_TELEMETRY_ALL_RANKS", "") not in (
+            "1", "true", "TRUE",
+        ):
+            try:
+                if int(os.environ.get("RANK", "0") or "0") != 0:
+                    path = ""
+            except ValueError:
+                path = ""
+        return cls(path)
 
     def ensure_buffers(self) -> None:
         if not self.enabled or self._diag_host is not None:
@@ -131,7 +143,12 @@ class ApproxProbeTelemetry:
         self._diag_host[slot].copy_(diagnostics.reshape(-1)[:8], non_blocking=True)
         self._code_host[slot].copy_(decision_code.reshape(()), non_blocking=True)
         self._probe_reject_host[slot].copy_(probe_reject.reshape(()), non_blocking=True)
-        if sum_q is not None and sum_q2 is not None and n_blocks is not None:
+        if (
+            self._detail_enabled
+            and sum_q is not None
+            and sum_q2 is not None
+            and n_blocks is not None
+        ):
             self._ensure_sample_buffers(
                 n_strata=int(n_strata),
                 n_candidates=int(n_candidates),
@@ -226,16 +243,17 @@ class ApproxProbeTelemetry:
                 self._probe_done_events[slot], self._decision_done_events[slot],
             ),
         }
-        if self._sum_q_host is not None:
+        if self._detail_enabled and self._sum_q_host is not None:
             record["candidate_sample"] = self._candidate_sample_record(
                 slot=slot,
                 pending=pending,
                 target=target,
                 total=total,
             )
-        expert_summary = self._expert_overflow_summary(direct_feedback)
-        if expert_summary:
-            record["expert_overflow_summary"] = expert_summary
+        if self._detail_enabled:
+            expert_summary = self._expert_overflow_summary(direct_feedback)
+            if expert_summary:
+                record["expert_overflow_summary"] = expert_summary
         self._handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _expert_overflow_summary(
@@ -313,8 +331,14 @@ class ApproxProbeTelemetry:
         assert self._sum_q_host is not None
         assert self._sum_q2_host is not None
         assert self._n_blocks_host is not None
-        n_candidates = int(pending["n_candidates"])
-        n_strata = int(pending["n_strata"])
+        n_candidates = min(
+            int(pending["n_candidates"]),
+            int(self._n_blocks_host.shape[2]),
+        )
+        n_strata = min(
+            int(pending["n_strata"]),
+            int(self._n_blocks_host.shape[1]),
+        )
         stratum_total = [float(x) for x in pending.get("stratum_total_elems", [])]
         if len(stratum_total) < n_strata:
             stratum_total = stratum_total + [0.0] * (n_strata - len(stratum_total))

@@ -11,9 +11,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import numpy as np
 import torch
 
 import math
@@ -22,13 +21,6 @@ from ..runtime import CheckpointWorkerPool, WriteRecord, get_d2h_stream
 from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
 from ..refresh.fp32_state import get_mapper
 from .expert_writer import ExpertState, HEADER_BLOCK_BYTES
-
-
-def _fp32_param(p: torch.nn.Parameter) -> torch.Tensor:
-    m = get_mapper()
-    if m is not None:
-        return m.get_param(p)
-    return p.data.to(torch.float32)
 
 
 def _fp32_param_live_view(p: torch.nn.Parameter) -> torch.Tensor:
@@ -57,14 +49,18 @@ def _fp32_param_live_view(p: torch.nn.Parameter) -> torch.Tensor:
     )
 
 
-def _fp32_opt_state(
+def _fp32_opt_state_live_view(
     optimizer: torch.optim.Optimizer,
     p: torch.nn.Parameter,
     key: str,
 ) -> Optional[torch.Tensor]:
+    """Return an existing local FP32 Adam-state view; never materialize full state."""
+
     m = get_mapper()
     if m is not None:
-        return m.get_state(p, key)
+        local = m.get_local_state_view(p, key)
+        if local is not None:
+            return local
     return optimizer.state.get(p, {}).get(key)
 
 
@@ -73,15 +69,6 @@ DS_EXPERT_IDX_RE = re.compile(r"deepspeed_experts\.(\d+)\.")
 
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
-
-
-def _d2h_copy_chunk_bytes() -> int:
-    """Return the largest contiguous D2H copy launch for FC payloads."""
-
-    return max(
-        1 * 1024 * 1024,
-        int(getattr(binary_io, "PIN_CHUNK_BYTES", 64 * 1024 * 1024)),
-    )
 
 
 def _alloc_sector_aligned_pinned_fp32(numel: int) -> torch.Tensor:
@@ -94,24 +81,17 @@ def _round_up_bytes(value: int, align: int) -> int:
     return ((int(value) + align - 1) // align) * align
 
 
-def _launch_chunked_d2h_copies(
+def _launch_d2h_copies(
     dsts: List[torch.Tensor],
     srcs: List[torch.Tensor],
 ) -> None:
-    """Launch GPU→pinned copies in bounded chunks.
-
-    Non-expert FC can exceed 1 GiB. A single foreach copy burst competes
-    with the next iteration's forward/backward for memory and PCIe/NVLink
-    bandwidth. This helper preserves the same D2H semantics and breaks
-    large runs into fixed-size views without CPU-side sleep/pacing.
-    """
+    """Launch one GPU→pinned copy per contiguous FC tensor slice."""
 
     if not dsts:
         return
     if len(dsts) != len(srcs):
         raise ValueError("D2H copy source/destination list length mismatch")
 
-    chunk_elems = max(1, _d2h_copy_chunk_bytes() // 4)
     for dst, src in zip(dsts, srcs):
         n = int(src.numel())
         if n != int(dst.numel()):
@@ -120,26 +100,11 @@ def _launch_chunked_d2h_copies(
             )
 
     for dst, src in zip(dsts, srcs):
-        n = int(src.numel())
-        off = 0
-        while off < n:
-            take = min(chunk_elems, n - off)
-            dst.narrow(0, off, take).copy_(
-                src.narrow(0, off, take),
-                non_blocking=True,
-            )
-            off += take
+        dst.copy_(src, non_blocking=True)
 
 
-def _count_chunked_d2h_copies(srcs: List[torch.Tensor]) -> int:
-    if not srcs:
-        return 0
-    chunk_elems = max(1, _d2h_copy_chunk_bytes() // 4)
-    total = 0
-    for src in srcs:
-        n = int(src.numel())
-        total += (n + chunk_elems - 1) // chunk_elems
-    return int(total)
+def _count_d2h_copies(srcs: List[torch.Tensor]) -> int:
+    return int(len(srcs))
 
 
 def _detect_expert_layout(named_params, num_experts: int) -> str:
@@ -204,6 +169,8 @@ class FCManager:
         commit_nonexpert_fc: bool = True,
         test_skip_expert_d2h: bool = False,
         test_skip_nonexpert_d2h: bool = False,
+        nonexpert_shard_rank: int = 0,
+        nonexpert_shard_count: int = 1,
     ) -> None:
         if nonexpert_fc_W < 1:
             raise ValueError(f"nonexpert_fc_W must be ≥1, got {nonexpert_fc_W}")
@@ -226,6 +193,15 @@ class FCManager:
         self._expert_tensors_by_layer: Dict[int, List[str]] = {}
         self._non_expert_names: List[str] = []
         self._enumerate_params()
+        self._nonexpert_shard_rank = max(0, int(nonexpert_shard_rank))
+        self._nonexpert_shard_count = max(1, int(nonexpert_shard_count))
+        if self._nonexpert_shard_rank >= self._nonexpert_shard_count:
+            raise ValueError(
+                "nonexpert_shard_rank must be < nonexpert_shard_count, "
+                f"got {self._nonexpert_shard_rank} / {self._nonexpert_shard_count}"
+            )
+        if self._nonexpert_shard_count > 1:
+            self._apply_nonexpert_name_shard()
         self._sorted_layers: List[int] = sorted(self._expert_tensors_by_layer.keys())
         self._num_layers = len(self._sorted_layers)
 
@@ -266,9 +242,9 @@ class FCManager:
         else:
             self._experts_per_lfcl_event = 0
 
-        # Legacy "round_robin" (MoC sequential): LAYER-wise round robin.
-        # Preserved for MoC
-        # baseline compatibility; driven by _layer_rr_tick.
+        # MoC sequential baseline: layer-wise round robin, driven by
+        # _layer_rr_tick.  This is an explicit ablation mode, not the proposal
+        # LFCL default above.
         self._layer_rr_tick = 0
 
         self._expert_fc_files: Dict[ExpertId, List[Tuple[Path, Optional[WriteRecord]]]] = {}
@@ -286,12 +262,7 @@ class FCManager:
         # one per-iteration contiguous slab and one writer lease, matching
         # the AOS ownership model.
         self._collect_pinned_cpu: Optional[torch.Tensor] = None
-        try:
-            _ne_ring_slots = max(
-                1, int(os.environ.get("PROPOSAL_NONEXPERT_PINNED_RING", "4")),
-            )
-        except ValueError:
-            _ne_ring_slots = 4
+        _ne_ring_slots = 4
         self._collect_nonexpert_pinned_ring: List[Optional[torch.Tensor]] = [
             None for _ in range(_ne_ring_slots)
         ]
@@ -300,6 +271,7 @@ class FCManager:
         ]
         for _ev in self._collect_nonexpert_pinned_ready:
             _ev.set()
+        self._collect_nonexpert_d2h_events: List[Optional["torch.cuda.Event"]] = []
         self._collect_nonexpert_pinned_cursor: int = 0
         self._lfcl_batch_pinned: Optional[torch.Tensor] = None
         self._lfcl_batch_ready = threading.Event()
@@ -318,11 +290,17 @@ class FCManager:
         if torch.cuda.is_available():
             self._collect_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._collect_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
+            self._collect_nonexpert_d2h_events = [
+                torch.cuda.Event() for _ in self._collect_nonexpert_pinned_ring
+            ]
             self._lfcl_batch_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._lfcl_batch_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
         else:
             self._collect_main_event = None
             self._collect_d2h_event = None
+            self._collect_nonexpert_d2h_events = [
+                None for _ in self._collect_nonexpert_pinned_ring
+            ]
             self._lfcl_batch_main_event = None
             self._lfcl_batch_d2h_event = None
 
@@ -381,6 +359,8 @@ class FCManager:
                         math.ceil(local_expert_numel * ratio * (1.0 + tolerance)),
                     ),
                 )
+            else:
+                pinned_aos_record_capacity = None
             self._expert_state = ExpertState(
                 expert_tensor_map, output_dir=self.expert_output_dir,
                 fresh=fresh_expert_state,
@@ -390,6 +370,7 @@ class FCManager:
                 commit_lossy_records=commit_expert_lossy_records,
                 test_skip_d2h=bool(test_skip_expert_d2h),
             )
+        self._init_nonexpert_pinned_buffers()
 
     # ------------------------------------------------------------------
     def _enumerate_params(self) -> None:
@@ -422,6 +403,74 @@ class FCManager:
                 continue
             self._non_expert_names.append(name)
 
+    def _apply_nonexpert_name_shard(self) -> None:
+        """Keep only this EP replica's size-balanced non-expert tensor shard."""
+        if not self._non_expert_names:
+            return
+        named_params = dict(self.model.named_parameters())
+        shard_names: List[List[str]] = [
+            [] for _ in range(self._nonexpert_shard_count)
+        ]
+        shard_loads = [0 for _ in range(self._nonexpert_shard_count)]
+        weighted: List[Tuple[int, str]] = []
+        for name in self._non_expert_names:
+            p = named_params[name]
+            weighted.append((int(p.numel()), name))
+        if not weighted:
+            self._non_expert_names = []
+            return
+        for numel, name in sorted(weighted, reverse=True):
+            shard = min(
+                range(self._nonexpert_shard_count),
+                key=lambda idx: (shard_loads[idx], idx),
+            )
+            shard_names[shard].append(name)
+            shard_loads[shard] += int(numel)
+        selected = set(shard_names[self._nonexpert_shard_rank])
+        self._non_expert_names = [
+            name for name in self._non_expert_names if name in selected
+        ]
+
+    def _init_nonexpert_pinned_buffers(self) -> None:
+        """Allocate non-expert FC pinned destination buffers before training.
+
+        The hot path must only enqueue D2H copies into already-owned pinned
+        memory.  Lazy cudaHostAlloc in the first few iterations shows up as a
+        multi-second proposal stall and violates the allocation contract.
+        """
+
+        if self.test_skip_nonexpert_d2h or not self._non_expert_names:
+            return
+        named_params = self._named_params_cache
+        if named_params is None:
+            named_params = dict(self.model.named_parameters())
+            self._named_params_cache = named_params
+        total_numel = 0
+        for name in self._non_expert_names:
+            p = named_params[name]
+            total_numel += int(p.numel()) * 3
+        header_bytes = int(binary_io.HEADER_BLOCK_BYTES)
+        padded_bytes = _round_up_bytes(
+            header_bytes + int(total_numel) * 4,
+            int(binary_io.PIN_CHUNK_BYTES),
+        )
+        pinned_numel = padded_bytes // 4
+        if (
+            self.cp_target == "disk"
+            and self._checkpoint_workers is not None
+            and len(self._collect_nonexpert_pinned_ring) > 1
+        ):
+            for i in range(len(self._collect_nonexpert_pinned_ring)):
+                if self._collect_nonexpert_pinned_ring[i] is None:
+                    self._collect_nonexpert_pinned_ring[i] = (
+                        _alloc_sector_aligned_pinned_fp32(pinned_numel)
+                    )
+            return
+        if self._collect_pinned_cpu is None:
+            self._collect_pinned_cpu = _alloc_sector_aligned_pinned_fp32(
+                pinned_numel,
+            )
+
     # ------------------------------------------------------------------
     @property
     def num_layers(self) -> int:
@@ -434,6 +483,13 @@ class FCManager:
     @property
     def expert_state(self) -> Optional[ExpertState]:
         return self._expert_state
+
+    @property
+    def expert_aos_total_bytes(self) -> int:
+        state = self._expert_state
+        if state is None:
+            return 0
+        return int(state.pinned_aos_total_bytes)
 
     def _init_lfcl_batch_pinned(
         self,
@@ -496,7 +552,7 @@ class FCManager:
         src = field.get(key)
         if src is not None:
             return src
-        v = _fp32_opt_state(self.optimizer, field["param"], key)
+        v = _fp32_opt_state_live_view(self.optimizer, field["param"], key)
         if v is None:
             return None
         src = v.detach()
@@ -668,7 +724,7 @@ class FCManager:
 
             xfer_t0 = time.perf_counter()
             cuda_event: Optional["torch.cuda.Event"] = None
-            d2h_copy_cmds = _count_chunked_d2h_copies(srcs)
+            d2h_copy_cmds = _count_d2h_copies(srcs)
             if torch.cuda.is_available():
                 d2h_stream = get_d2h_stream()
                 d2h_event = self._lfcl_batch_d2h_event
@@ -682,7 +738,7 @@ class FCManager:
                         d2h_stream.wait_event(ready_event)
                     else:
                         d2h_stream.wait_event(main_event)
-                    _launch_chunked_d2h_copies(dsts, srcs)
+                    _launch_d2h_copies(dsts, srcs)
                     d2h_event.record(d2h_stream)
                 cuda_event = d2h_event
             else:
@@ -718,7 +774,6 @@ class FCManager:
         step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[List[ExpertId], bool]:
         """Fire non-expert FC at iteration ``step`` (1-indexed) if due
         (step == 1 or step % W == 0).
@@ -747,7 +802,6 @@ class FCManager:
                 step,
                 ready_event=ready_event,
                 d2h_event_callback=d2h_event_callback,
-                d2h_start_event=d2h_start_event,
             )
             sub["nonexpert_fc_ms"] = (time.perf_counter() - _t_ne0) * 1000.0
             nonexpert_fired = True
@@ -764,7 +818,6 @@ class FCManager:
         named_params: Optional[Dict[str, torch.nn.Parameter]] = None,
         *,
         ready_event: Optional["torch.cuda.Event"] = None,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
         header_block_bytes: int = 0,
         chunk_pad_bytes: int = 0,
         preserve_order: bool = False,
@@ -773,9 +826,9 @@ class FCManager:
 
         Per-source path: launches one non_blocking D2H per source straight
         into a pinned host buffer, returns payload-dict views into that
-        buffer. ``cuda_event`` is recorded on d2h_stream and stashed on
-        ``self._last_collect_cuda_event`` so the caller can forward it to
-        the writer (which must wait on it before reading the host data).
+        buffer. ``cuda_event`` is recorded on d2h_stream and stashed in
+        thread-local metadata so the caller can forward it to the writer
+        (which must wait on it before reading the host data).
         If ``ready_event`` is provided, the producer/D2H stream waits on it
         device-side. The worker thread must not host-sync on the event.
 
@@ -848,10 +901,10 @@ class FCManager:
             entries: List[Tuple[str, Optional[torch.Tensor], torch.Size, int]] = []
             for name in names:
                 p = named_params[name]
-                src = _fp32_param(p).detach()
+                src = _fp32_param_live_view(p).detach()
                 entries.append((f"{name}:param", src, src.shape, int(src.numel())))
                 for key in ("exp_avg", "exp_avg_sq"):
-                    v = _fp32_opt_state(self.optimizer, p, key)
+                    v = _fp32_opt_state_live_view(self.optimizer, p, key)
                     if v is None:
                         if preserve_order:
                             # LFCL path: reserve a zero slot in the pinned
@@ -963,12 +1016,15 @@ class FCManager:
         )
         producer_ready_event = ready_event
         ready_event_for_writer: Optional[threading.Event] = None
+        ring_d2h_event: Optional["torch.cuda.Event"] = None
         if use_nonexpert_ring:
             ring = self._collect_nonexpert_pinned_ring
             slot = int(self._collect_nonexpert_pinned_cursor) % len(ring)
             ready_event_for_writer = self._collect_nonexpert_pinned_ready[slot]
             ready_event_for_writer.wait()
             ready_event_for_writer.clear()
+            if slot < len(self._collect_nonexpert_d2h_events):
+                ring_d2h_event = self._collect_nonexpert_d2h_events[slot]
             pinned = ring[slot]
             if pinned is None:
                 init_numel = int(max(pinned_numel, pinned_numel * 1.5))
@@ -1120,10 +1176,10 @@ class FCManager:
 
         cuda_event: Optional["torch.cuda.Event"] = None
         read_event: Optional["torch.cuda.Event"] = None
-        d2h_copy_cmds = _count_chunked_d2h_copies(merged_srcs)
+        d2h_copy_cmds = _count_d2h_copies(merged_srcs)
         if torch.cuda.is_available():
             d2h_stream = get_d2h_stream()
-            d2h_event = self._collect_d2h_event
+            d2h_event = ring_d2h_event if ring_d2h_event is not None else self._collect_d2h_event
             if d2h_event is None:
                 raise RuntimeError("FCManager collect events were not initialized")
             main_event = self._collect_main_event
@@ -1136,9 +1192,7 @@ class FCManager:
                     d2h_stream.wait_event(producer_ready_event)
                 else:
                     d2h_stream.wait_event(main_event)
-                if d2h_start_event is not None:
-                    d2h_stream.wait_event(d2h_start_event)
-                _launch_chunked_d2h_copies(merged_dsts, merged_srcs)
+                _launch_d2h_copies(merged_dsts, merged_srcs)
                 cuda_event = d2h_event
                 cuda_event.record(d2h_stream)
             read_event = cuda_event
@@ -1154,8 +1208,6 @@ class FCManager:
             "nentries": len(entries),
             "d2h_copy_cmds": int(d2h_copy_cmds),
         }
-        # Stash the event + pinned info for the immediate caller's
-        # submit(). Stashed in a thread-local because the non-expert
         # Keep thread-local metadata for the non-expert worker.
         if not hasattr(self, "_collect_tls"):
             self._collect_tls = threading.local()
@@ -1171,11 +1223,6 @@ class FCManager:
         }
         if ready_event_for_writer is not None:
             self._collect_tls.pinned_info["ready_event"] = ready_event_for_writer
-        # Back-compat alias for callers that still read the single-slot
-        # ``self._last_collect_cuda_event``. Safe under sequential
-        # access from a SINGLE worker thread; concurrent calls from
-        # both workers should read the thread-local instead.
-        self._last_collect_cuda_event = cuda_event
         return payload, total_bytes
 
 
@@ -1183,7 +1230,6 @@ class FCManager:
         self,
         *,
         ready_event: Optional["torch.cuda.Event"] = None,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         # named_params=None: the callee will lazily build it ONLY if the
         # enum cache misses. Steady-state (cache hit) skips the
@@ -1191,7 +1237,6 @@ class FCManager:
         return self._collect_param_payload(
             self._non_expert_names, None,
             ready_event=ready_event,
-            d2h_start_event=d2h_start_event,
             header_block_bytes=binary_io.HEADER_BLOCK_BYTES,
             chunk_pad_bytes=binary_io.PIN_CHUNK_BYTES,
         )
@@ -1207,14 +1252,11 @@ class FCManager:
             return None
         return getattr(tls, "pinned_info", None)
 
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     def _fire_nonexpert_fc(
         self,
         step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> None:
         if self.test_skip_nonexpert_d2h:
             self._last_nonexpert_collect_ms = 0.0
@@ -1231,7 +1273,6 @@ class FCManager:
         _t_col0 = time.perf_counter()
         payload, payload_bytes = self._collect_nonexpert_payload(
             ready_event=ready_event,
-            d2h_start_event=d2h_start_event,
         )
         self._last_nonexpert_collect_ms = (time.perf_counter() - _t_col0) * 1000.0
         self._last_nonexpert_collect_sub_ms = dict(getattr(self, "_last_collect_sub_ms", {}))
@@ -1257,8 +1298,16 @@ class FCManager:
                     f"copy_cmds={int(sub.get('d2h_copy_cmds', 0))}",
                     flush=True,
                 )
-        # Raw-binary format (PRPTENS magic).
-        path = self.output_dir / f"fc_nonexpert_iter{step:08d}.bin"
+        # Raw-binary format (PRPTENS magic).  Single-rank keeps the historical
+        # filename.  Multi-EP disk mode writes one disjoint tensor-name shard per
+        # EP replica into the same PP-local non_expert directory.
+        if self._nonexpert_shard_count > 1:
+            path = self.output_dir / (
+                f"fc_nonexpert_ep{self._nonexpert_shard_rank:02d}"
+                f"of{self._nonexpert_shard_count:02d}_iter{step:08d}.bin"
+            )
+        else:
+            path = self.output_dir / f"fc_nonexpert_iter{step:08d}.bin"
 
         to_unlink: List[Path] = []
         self._nonexpert_fc_files.append((path, None))
@@ -1280,9 +1329,8 @@ class FCManager:
             async_mode=self._checkpoint_workers is not None,
         )
 
-        cuda_event = getattr(self, "_last_collect_cuda_event", None)
         tls = getattr(self, "_collect_tls", None)
-        read_event = getattr(tls, "read_event", cuda_event) if tls is not None else cuda_event
+        read_event = getattr(tls, "read_event", None) if tls is not None else None
         if d2h_event_callback is not None:
             d2h_event_callback(read_event)
         pinned_info = self._last_collect_pinned_info()
@@ -1294,46 +1342,27 @@ class FCManager:
         rec = WriteRecord(tag="fc", path=path, submit_time=time.perf_counter())
         if not self.commit_nonexpert_fc:
             _ready_event = pinned_info.get("ready_event")
-
-            def _release_after_d2h(
-                _cuda_event=cuda_event,
-                _ready_event=_ready_event,
-                _rec=rec,
-                _stats=stats,
-            ) -> None:
-                t0 = time.perf_counter()
-                _rec.queue_delay_ms = (t0 - _rec.submit_time) * 1000.0
-                if not self.test_skip_nonexpert_d2h:
-                    try:
-                        if _cuda_event is not None:
-                            _cuda_event.synchronize()
-                    except Exception as exc:
-                        _rec.error = f"{type(exc).__name__}: {exc}"
-                _rec.write_time_ms = (time.perf_counter() - t0) * 1000.0
-                _rec.file_bytes = 0
-                _rec.done = True
-                _stats.write_time_ms = _rec.write_time_ms
-                _stats.file_bytes = 0
-                _stats.queue_delay_ms = _rec.queue_delay_ms
-                if _ready_event is not None:
-                    try:
-                        _ready_event.set()
-                    except Exception:
-                        pass
-
-            if self._checkpoint_workers is not None:
-                self._checkpoint_workers.submit_non_expert_commit(
-                    _release_after_d2h,
-                )
-            else:
-                _release_after_d2h()
+            # write-off+D2H-on still exposes the D2H event to the optimizer
+            # fence through ``d2h_event_callback`` above.  That fence completes
+            # before the next proposal dispatch can reuse this FC slot, so a
+            # second host-side cuda_event.synchronize() in the commit worker is
+            # pure overhead and can delay the next ring lease in PP runs.
+            if _ready_event is not None:
+                _ready_event.set()
+            rec.queue_delay_ms = 0.0
+            rec.write_time_ms = 0.0
+            rec.file_bytes = 0
+            rec.done = True
+            stats.write_time_ms = 0.0
+            stats.file_bytes = 0
+            stats.queue_delay_ms = 0.0
             self._nonexpert_fc_files[-1] = (path, rec)
             self.write_log.append(stats)
             self._write_records.append(rec)
             return
         # Pre-build the header bytes on the training/owner thread — small
         # CPU work (~tens of µs). The writer thread does the stamp +
-        # single os.write after syncing on cuda_event.
+        # single os.write after syncing on the D2H read event.
         header_bytes = binary_io.build_prptens_header_block(
             pinned_info["plan"],
             scalars={"step": int(step)},
@@ -1341,7 +1370,7 @@ class FCManager:
 
         def _do_save(
             _path=path, _pinned_info=pinned_info, _header=header_bytes,
-            _cuda_event=cuda_event, _on_complete=_unlink, _rec=rec,
+            _cuda_event=read_event, _on_complete=_unlink, _rec=rec,
             _stats=stats, _step=int(step), _payload=payload,
         ) -> None:
             t0 = time.perf_counter()

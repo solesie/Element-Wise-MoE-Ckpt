@@ -210,8 +210,6 @@ def prepare_segment_entry_tables(
     segment_bytes: int,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    import os
-
     _validate_direct_lossy_state(lossy_state)
     active_groups = [
         group_plan
@@ -301,7 +299,6 @@ def emit_segment_direct_from_plan(
 ) -> None:
     """Fill one AOS segment with score-based direct emission and cursor caps."""
 
-    import os
     import time
 
     profile = os.environ.get("PROPOSAL_DIRECT_EMIT_PROFILE", "") in (
@@ -387,7 +384,7 @@ def emit_segment_direct_from_plan(
             continue
         raise RuntimeError(
             "direct emission requires GPU segment-entry tables; "
-            "legacy entry-block fallback is not part of the final path"
+            "entry-block fallback is not part of the final path"
         )
     t_after_emit = time.perf_counter() if profile else 0.0
 

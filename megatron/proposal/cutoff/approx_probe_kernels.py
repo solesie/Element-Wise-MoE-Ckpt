@@ -29,22 +29,22 @@ if _HAS_TRITON:
         v12, v13, v14, v15,
     ):
         tl.store(total_th_ptr, tl.maximum(tau_center, 1.0e-12))
-        tl.store(candidate_tau_ptr + 0, v0, mask=n_candidates > 0)
-        tl.store(candidate_tau_ptr + 1, v1, mask=n_candidates > 1)
-        tl.store(candidate_tau_ptr + 2, v2, mask=n_candidates > 2)
-        tl.store(candidate_tau_ptr + 3, v3, mask=n_candidates > 3)
-        tl.store(candidate_tau_ptr + 4, v4, mask=n_candidates > 4)
-        tl.store(candidate_tau_ptr + 5, v5, mask=n_candidates > 5)
-        tl.store(candidate_tau_ptr + 6, v6, mask=n_candidates > 6)
-        tl.store(candidate_tau_ptr + 7, v7, mask=n_candidates > 7)
-        tl.store(candidate_tau_ptr + 8, v8, mask=n_candidates > 8)
-        tl.store(candidate_tau_ptr + 9, v9, mask=n_candidates > 9)
-        tl.store(candidate_tau_ptr + 10, v10, mask=n_candidates > 10)
-        tl.store(candidate_tau_ptr + 11, v11, mask=n_candidates > 11)
-        tl.store(candidate_tau_ptr + 12, v12, mask=n_candidates > 12)
-        tl.store(candidate_tau_ptr + 13, v13, mask=n_candidates > 13)
-        tl.store(candidate_tau_ptr + 14, v14, mask=n_candidates > 14)
-        tl.store(candidate_tau_ptr + 15, v15, mask=n_candidates > 15)
+        tl.store(candidate_tau_ptr + 0, tl.where(n_candidates > 0, v0, 0.0))
+        tl.store(candidate_tau_ptr + 1, tl.where(n_candidates > 1, v1, 0.0))
+        tl.store(candidate_tau_ptr + 2, tl.where(n_candidates > 2, v2, 0.0))
+        tl.store(candidate_tau_ptr + 3, tl.where(n_candidates > 3, v3, 0.0))
+        tl.store(candidate_tau_ptr + 4, tl.where(n_candidates > 4, v4, 0.0))
+        tl.store(candidate_tau_ptr + 5, tl.where(n_candidates > 5, v5, 0.0))
+        tl.store(candidate_tau_ptr + 6, tl.where(n_candidates > 6, v6, 0.0))
+        tl.store(candidate_tau_ptr + 7, tl.where(n_candidates > 7, v7, 0.0))
+        tl.store(candidate_tau_ptr + 8, tl.where(n_candidates > 8, v8, 0.0))
+        tl.store(candidate_tau_ptr + 9, tl.where(n_candidates > 9, v9, 0.0))
+        tl.store(candidate_tau_ptr + 10, tl.where(n_candidates > 10, v10, 0.0))
+        tl.store(candidate_tau_ptr + 11, tl.where(n_candidates > 11, v11, 0.0))
+        tl.store(candidate_tau_ptr + 12, tl.where(n_candidates > 12, v12, 0.0))
+        tl.store(candidate_tau_ptr + 13, tl.where(n_candidates > 13, v13, 0.0))
+        tl.store(candidate_tau_ptr + 14, tl.where(n_candidates > 14, v14, 0.0))
+        tl.store(candidate_tau_ptr + 15, tl.where(n_candidates > 15, v15, 0.0))
 
     @triton.jit
     def _age2_load_code(age_words_ptr, global_elem_idx):
@@ -237,7 +237,12 @@ if _HAS_TRITON:
         best_ratio = tl.load(diagnostics_ptr + 0)
         best_tau = tl.load(diagnostics_ptr + 3)
         target = tl.maximum(target_ratio, 1.0e-12)
-        valid = (best_tau > 0.0) & (best_tau == best_tau) & (best_ratio > 0.0) & (best_ratio == best_ratio)
+        valid = (
+            (best_tau > 0.0)
+            & (best_tau == best_tau)
+            & (best_ratio > 0.0)
+            & (best_ratio == best_ratio)
+        )
         if not valid:
             tl.store(decision_code_ptr, 0)
             return
@@ -272,7 +277,7 @@ if _HAS_TRITON:
             tau_directed = best_tau * tl.exp(direction * mul * step)
             tau_centered = best_tau * tl.exp(offset * step)
             tau = tl.where(centered, tau_centered, tau_directed)
-            tl.store(candidate_tau_ptr + cand_i, tau, mask=enabled)
+            tl.store(candidate_tau_ptr + cand_i, tl.where(enabled, tau, 0.0))
 
     @triton.jit
     def _probe_decision_kernel(
@@ -328,6 +333,7 @@ if _HAS_TRITON:
         best_bound = float("inf")
         best_valid = False
         best_mean = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
+        best_hint = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
         sampled_blocks = 0.0
 
         bracket_tau = 0.0
@@ -336,6 +342,7 @@ if _HAS_TRITON:
         bracket_se = float("inf")
         bracket_width = float("inf")
         bracket_mean = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
+        bracket_hint = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
 
         for cand_i in tl.static_range(0, MAX_CANDIDATES):
             enabled_i = cand_i < N_CANDIDATES
@@ -360,6 +367,11 @@ if _HAS_TRITON:
             mean_i = tl.where(n_i > 0.0, sum_i / n_i, 0.0)
             numer_i = tl.maximum(sum2_i - (sum_i * sum_i) / tl.maximum(n_i, 1.0), 0.0)
             s2_i = tl.where(n_i > 1.0, numer_i / tl.maximum(n_i - 1.0, 1.0), 0.25)
+            se_blocks_i = tl.sqrt(s2_i / tl.maximum(n_i, 1.0))
+            hint_i = tl.minimum(
+                mean_i + 1.96 * se_blocks_i,
+                1.0,
+            )
             ratio_i = tl.sum(tl.where(active, weights * mean_i, 0.0), axis=0)
             var_i = tl.sum(
                 tl.where(active, weights * weights * s2_i / tl.maximum(n_i, 1.0), 0.0),
@@ -384,6 +396,7 @@ if _HAS_TRITON:
             best_se = tl.where(take_i, se_i, best_se)
             best_bound = tl.where(take_i, bound_i, best_bound)
             best_mean = tl.where(take_i, mean_i, best_mean)
+            best_hint = tl.where(take_i, hint_i, best_hint)
             best_valid = best_valid | valid_i
 
             for cand_j in tl.static_range(0, MAX_CANDIDATES):
@@ -407,6 +420,11 @@ if _HAS_TRITON:
                 mean_j = tl.where(n_j > 0.0, sum_j / n_j, 0.0)
                 numer_j = tl.maximum(sum2_j - (sum_j * sum_j) / tl.maximum(n_j, 1.0), 0.0)
                 s2_j = tl.where(n_j > 1.0, numer_j / tl.maximum(n_j - 1.0, 1.0), 0.25)
+                se_blocks_j = tl.sqrt(s2_j / tl.maximum(n_j, 1.0))
+                hint_j = tl.minimum(
+                    mean_j + 1.96 * se_blocks_j,
+                    1.0,
+                )
                 ratio_j = tl.sum(tl.where(active, weights * mean_j, 0.0), axis=0)
                 var_j = tl.sum(
                     tl.where(active, weights * weights * s2_j / tl.maximum(n_j, 1.0), 0.0),
@@ -453,11 +471,13 @@ if _HAS_TRITON:
                     mean_i,
                     mean_j,
                 )
+                endpoint_hint = tl.maximum(hint_i, hint_j)
                 bracket_tau = tl.where(take_pair, tl.exp(pred_x), bracket_tau)
                 bracket_score = tl.where(take_pair, pair_score, bracket_score)
                 bracket_se = tl.where(take_pair, pair_se, bracket_se)
                 bracket_width = tl.where(take_pair, x_hi - x_lo, bracket_width)
                 bracket_mean = tl.where(take_pair, endpoint_mean, bracket_mean)
+                bracket_hint = tl.where(take_pair, endpoint_hint, bracket_hint)
                 bracket_found = bracket_found | take_pair
 
         best_accept = best_valid & (best_bound <= allowed)
@@ -471,6 +491,7 @@ if _HAS_TRITON:
         chosen_ratio = tl.where(use_bracket_tau, target, best_ratio)
         chosen_se = tl.where(use_bracket_tau, bracket_se, best_se)
         chosen_mean = tl.where(use_bracket_tau, bracket_mean, best_mean)
+        chosen_hint = tl.where(use_bracket_tau, bracket_hint, best_hint)
         decision = tl.where(
             best_accept,
             2,
@@ -528,7 +549,7 @@ if _HAS_TRITON:
             tl.where(use_bracket_for_reprobe, bracket_width, 0.0),
         )
         if STORE_CAPACITY_HINT:
-            hint = tl.maximum(chosen_mean, 0.0) * total_elems
+            hint = tl.maximum(chosen_hint, 0.0) * total_elems
             expert_idx = tl.load(stratum_expert_idx_ptr + offs, mask=active, other=-1)
             expert_idx_safe = tl.maximum(expert_idx, 0)
             tl.atomic_add(
@@ -537,6 +558,197 @@ if _HAS_TRITON:
                 mask=active & (expert_idx >= 0),
                 sem="relaxed",
             )
+
+    @triton.jit
+    def _reduce_probe_candidate_stats_kernel(
+        sum_q_ptr,
+        sum_q2_ptr,
+        n_blocks_ptr,
+        stratum_total_elem_ptr,
+        stats_ptr,
+        population_elements,
+        STRATUM_STRIDE: tl.constexpr,
+        N_STRATA: tl.constexpr,
+        N_CANDIDATES: tl.constexpr,
+        BLOCK_STRATA: tl.constexpr,
+        MAX_CANDIDATES: tl.constexpr,
+    ):
+        offs = tl.arange(0, BLOCK_STRATA)
+        mask = offs < N_STRATA
+        total_elems = tl.load(
+            stratum_total_elem_ptr + offs,
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+        pop = tl.maximum(population_elements, 1.0)
+        weights = total_elems / pop
+        active = mask & (total_elems > 0.0)
+
+        for cand_i in tl.static_range(0, MAX_CANDIDATES):
+            enabled_i = cand_i < N_CANDIDATES
+            n_i = tl.load(
+                n_blocks_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled_i,
+                other=0,
+            ).to(tl.float32)
+            sum_i = tl.load(
+                sum_q_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled_i,
+                other=0.0,
+            )
+            sum2_i = tl.load(
+                sum_q2_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled_i,
+                other=0.0,
+            )
+            mean_i = tl.where(n_i > 0.0, sum_i / n_i, 0.0)
+            numer_i = tl.maximum(
+                sum2_i - (sum_i * sum_i) / tl.maximum(n_i, 1.0),
+                0.0,
+            )
+            s2_i = tl.where(n_i > 1.0, numer_i / tl.maximum(n_i - 1.0, 1.0), 0.25)
+            ratio_i = tl.sum(tl.where(active, weights * mean_i, 0.0), axis=0)
+            var_i = tl.sum(
+                tl.where(
+                    active,
+                    weights * weights * s2_i / tl.maximum(n_i, 1.0),
+                    0.0,
+                ),
+                axis=0,
+            )
+            missing_i = tl.sum(
+                tl.where(active & (n_i <= 0.0), weights, 0.0),
+                axis=0,
+            )
+            sampled_i = tl.sum(tl.where(active, n_i, 0.0), axis=0)
+            tl.store(stats_ptr + 0 * MAX_CANDIDATES + cand_i, ratio_i, mask=enabled_i)
+            tl.store(stats_ptr + 1 * MAX_CANDIDATES + cand_i, var_i, mask=enabled_i)
+            tl.store(stats_ptr + 2 * MAX_CANDIDATES + cand_i, missing_i, mask=enabled_i)
+            tl.store(stats_ptr + 3 * MAX_CANDIDATES + cand_i, sampled_i, mask=enabled_i)
+
+    @triton.jit
+    def _store_global_probe_decision_kernel(
+        total_th_ptr,
+        probe_reject_ptr,
+        decision_code_ptr,
+        sample_blocks_current_ptr,
+        ci_shortfall_streak_ptr,
+        sample_grow_hold_ptr,
+        diagnostics_ptr,
+        chosen_tau,
+        chosen_ratio,
+        chosen_se,
+        best_bound,
+        next_sample,
+        strict_accept,
+        sampled_blocks,
+        accept,
+        bracket_width,
+        decision,
+        stored_streak,
+        grow_hold_value,
+    ):
+        ok = accept != 0
+        tl.store(total_th_ptr, chosen_tau, mask=ok)
+        tl.store(probe_reject_ptr, tl.where(ok, 0, 1))
+        tl.store(decision_code_ptr, decision)
+        tl.store(sample_blocks_current_ptr, next_sample)
+        tl.store(ci_shortfall_streak_ptr, stored_streak)
+        tl.store(sample_grow_hold_ptr, grow_hold_value)
+        tl.store(diagnostics_ptr + 0, chosen_ratio)
+        tl.store(diagnostics_ptr + 1, chosen_se)
+        tl.store(diagnostics_ptr + 2, best_bound)
+        tl.store(diagnostics_ptr + 3, chosen_tau)
+        tl.store(diagnostics_ptr + 4, next_sample.to(tl.float32))
+        tl.store(diagnostics_ptr + 5, tl.where(strict_accept != 0, 1.0, 0.0))
+        tl.store(diagnostics_ptr + 6, sampled_blocks)
+        tl.store(diagnostics_ptr + 7, tl.where(ok, 1.0, 0.0))
+        tl.store(diagnostics_ptr + 8, bracket_width)
+
+    @triton.jit
+    def _capacity_hint_from_probe_kernel(
+        candidate_tau_ptr,
+        sum_q_ptr,
+        sum_q2_ptr,
+        n_blocks_ptr,
+        stratum_total_elem_ptr,
+        stratum_expert_idx_ptr,
+        total_th_ptr,
+        capacity_demand_hint_ptr,
+        STRATUM_STRIDE: tl.constexpr,
+        N_STRATA: tl.constexpr,
+        N_CANDIDATES: tl.constexpr,
+        BLOCK_STRATA: tl.constexpr,
+        MAX_CANDIDATES: tl.constexpr,
+    ):
+        offs = tl.arange(0, BLOCK_STRATA)
+        mask = offs < N_STRATA
+        total_elems = tl.load(
+            stratum_total_elem_ptr + offs,
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+        active = mask & (total_elems > 0.0)
+        chosen_tau = tl.maximum(tl.load(total_th_ptr), 1.0e-30)
+        log_chosen = tl.log(chosen_tau)
+
+        best_tau_below = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
+        best_hint_below = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
+        best_log_below = tl.full((BLOCK_STRATA,), -float("inf"), tl.float32)
+        fallback_hint = tl.full((BLOCK_STRATA,), 0.0, tl.float32)
+        fallback_dist = tl.full((BLOCK_STRATA,), float("inf"), tl.float32)
+        valid_any = tl.full((BLOCK_STRATA,), False, tl.int1)
+
+        for cand_i in tl.static_range(0, MAX_CANDIDATES):
+            enabled = cand_i < N_CANDIDATES
+            tau_i = tl.load(candidate_tau_ptr + cand_i, mask=enabled, other=0.0)
+            n_i = tl.load(
+                n_blocks_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled,
+                other=0,
+            ).to(tl.float32)
+            sum_i = tl.load(
+                sum_q_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled,
+                other=0.0,
+            )
+            sum2_i = tl.load(
+                sum_q2_ptr + offs * STRATUM_STRIDE + cand_i,
+                mask=mask & enabled,
+                other=0.0,
+            )
+            valid_i = enabled & active & (tau_i > 0.0) & (tau_i == tau_i) & (n_i > 0.0)
+            mean_i = tl.where(n_i > 0.0, sum_i / tl.maximum(n_i, 1.0), 0.0)
+            numer = tl.maximum(sum2_i - (sum_i * sum_i) / tl.maximum(n_i, 1.0), 0.0)
+            sample_var = tl.where(n_i > 1.0, numer / tl.maximum(n_i - 1.0, 1.0), 0.25)
+            se_i = tl.sqrt(sample_var / tl.maximum(n_i, 1.0))
+            cap_hint_i = tl.minimum(
+                mean_i + 1.96 * se_i,
+                1.0,
+            )
+            log_tau = tl.log(tau_i)
+            below = valid_i & (tau_i <= chosen_tau) & (log_tau > best_log_below)
+            best_tau_below = tl.where(below, tau_i, best_tau_below)
+            best_log_below = tl.where(below, log_tau, best_log_below)
+            best_hint_below = tl.where(below, cap_hint_i, best_hint_below)
+
+            dist = tl.abs(log_tau - log_chosen)
+            take_fallback = valid_i & (dist < fallback_dist)
+            fallback_dist = tl.where(take_fallback, dist, fallback_dist)
+            fallback_hint = tl.where(take_fallback, cap_hint_i, fallback_hint)
+            valid_any = valid_any | valid_i
+
+        use_below = best_tau_below > 0.0
+        cap_hint = tl.where(use_below, best_hint_below, fallback_hint)
+        hint = tl.maximum(cap_hint, 0.0) * total_elems
+        expert_idx = tl.load(stratum_expert_idx_ptr + offs, mask=active, other=-1)
+        expert_idx_safe = tl.maximum(expert_idx, 0)
+        tl.atomic_add(
+            capacity_demand_hint_ptr + expert_idx_safe,
+            hint,
+            mask=active & valid_any & (expert_idx >= 0),
+            sem="relaxed",
+        )
 
 def _groups_per_program(group_size: int, target_block: Optional[int] = None) -> int:
     if target_block is None:
@@ -597,20 +809,20 @@ def launch_generated_block_probe_for_group(
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
-        entry_elem_start: torch.Tensor,
-        entry_group_start: torch.Tensor,
-        entry_group_count: torch.Tensor,
-        entry_stratum_idx: torch.Tensor,
-        entry_block_entry_idx: torch.Tensor,
-        entry_block_local_group_start: torch.Tensor,
-        candidate_taus: torch.Tensor,
+    entry_elem_start: torch.Tensor,
+    entry_group_start: torch.Tensor,
+    entry_group_count: torch.Tensor,
+    entry_stratum_idx: torch.Tensor,
+    entry_block_entry_idx: torch.Tensor,
+    entry_block_local_group_start: torch.Tensor,
+    candidate_taus: torch.Tensor,
     sum_q: torch.Tensor,
     sum_q2: torch.Tensor,
     n_blocks: torch.Tensor,
-        sample_blocks_current: torch.Tensor,
-        n_candidates: int,
-        total_entry_blocks: int,
-        max_samples_per_group: int,
+    sample_blocks_current: torch.Tensor,
+    n_candidates: int,
+    total_entry_blocks: int,
+    max_samples_per_group: int,
     master_off_elem: int,
     group_size: int,
     lr_over_bc1: float,
@@ -802,16 +1014,146 @@ def launch_probe_decision(
         USE_SAMPLE_GROW_HOLD=bool(use_sample_grow_hold),
         STRATUM_STRIDE=int(sum_q.shape[1]),
         N_STRATA=int(n_strata),
-        N_CANDIDATES=int(n_cand),
+        N_CANDIDATES=int(candidate_capacity),
         BLOCK_STRATA=int(block_strata),
         MAX_CANDIDATES=int(candidate_capacity),
         STORE_CAPACITY_HINT=bool(store_capacity_hint),
     )
 
 
+def launch_reduce_probe_candidate_stats(
+    *,
+    sum_q: torch.Tensor,
+    sum_q2: torch.Tensor,
+    n_blocks: torch.Tensor,
+    stratum_total_elems: torch.Tensor,
+    candidate_stats: torch.Tensor,
+    n_candidates: int,
+    total_elems_global: int,
+) -> None:
+    if not _HAS_TRITON:
+        return
+    n_cand = min(
+        max(0, int(n_candidates)),
+        int(sum_q.shape[1]),
+        int(candidate_stats.shape[1]),
+    )
+    n_strata = min(int(sum_q.shape[0]), int(stratum_total_elems.numel()))
+    if n_cand <= 0 or n_strata <= 0:
+        return
+    block_strata = 1
+    while block_strata < n_strata:
+        block_strata <<= 1
+    _reduce_probe_candidate_stats_kernel[(1,)](
+        sum_q,
+        sum_q2,
+        n_blocks,
+        stratum_total_elems,
+        candidate_stats,
+        float(max(1, int(total_elems_global))),
+        STRATUM_STRIDE=int(sum_q.shape[1]),
+        N_STRATA=int(n_strata),
+        N_CANDIDATES=int(candidate_stats.shape[1]),
+        BLOCK_STRATA=int(block_strata),
+        MAX_CANDIDATES=int(candidate_stats.shape[1]),
+    )
+
+
+def launch_store_global_probe_decision(
+    *,
+    total_th: torch.Tensor,
+    probe_reject: torch.Tensor,
+    decision_code: torch.Tensor,
+    sample_blocks_current: torch.Tensor,
+    ci_shortfall_streak: torch.Tensor,
+    sample_grow_hold: torch.Tensor,
+    diagnostics: torch.Tensor,
+    chosen_tau: float,
+    chosen_ratio: float,
+    chosen_se: float,
+    best_bound: float,
+    next_sample: int,
+    strict_accept: bool,
+    sampled_blocks: float,
+    accept: bool,
+    bracket_width: float,
+    decision: int,
+    stored_streak: int,
+    grow_hold_value: int,
+) -> None:
+    if not _HAS_TRITON:
+        return
+    _store_global_probe_decision_kernel[(1,)](
+        total_th,
+        probe_reject,
+        decision_code,
+        sample_blocks_current,
+        ci_shortfall_streak,
+        sample_grow_hold,
+        diagnostics,
+        float(chosen_tau),
+        float(chosen_ratio),
+        float(chosen_se),
+        float(best_bound),
+        int(next_sample),
+        int(1 if strict_accept else 0),
+        float(sampled_blocks),
+        int(1 if accept else 0),
+        float(bracket_width),
+        int(decision),
+        int(stored_streak),
+        int(grow_hold_value),
+    )
+
+
+def launch_capacity_hint_from_probe(
+    *,
+    candidate_taus: torch.Tensor,
+    sum_q: torch.Tensor,
+    sum_q2: torch.Tensor,
+    n_blocks: torch.Tensor,
+    stratum_total_elems: torch.Tensor,
+    stratum_expert_idx: torch.Tensor,
+    total_th: torch.Tensor,
+    capacity_demand_hint: torch.Tensor,
+    n_candidates: int,
+) -> None:
+    if not _HAS_TRITON:
+        return
+    n_cand = min(max(0, int(n_candidates)), int(candidate_taus.numel()), int(sum_q.shape[1]))
+    n_strata = min(
+        int(sum_q.shape[0]),
+        int(stratum_total_elems.numel()),
+        int(stratum_expert_idx.numel()),
+    )
+    if n_cand <= 0 or n_strata <= 0 or int(capacity_demand_hint.numel()) <= 0:
+        return
+    block_strata = 1
+    while block_strata < n_strata:
+        block_strata <<= 1
+    _capacity_hint_from_probe_kernel[(1,)](
+        candidate_taus,
+        sum_q,
+        sum_q2,
+        n_blocks,
+        stratum_total_elems,
+        stratum_expert_idx,
+        total_th,
+        capacity_demand_hint,
+        STRATUM_STRIDE=int(sum_q.shape[1]),
+        N_STRATA=int(n_strata),
+        N_CANDIDATES=int(sum_q.shape[1]),
+        BLOCK_STRATA=int(block_strata),
+        MAX_CANDIDATES=int(sum_q.shape[1]),
+    )
+
+
 __all__ = [
     "launch_generated_block_probe_for_group",
+    "launch_capacity_hint_from_probe",
     "launch_probe_decision",
+    "launch_reduce_probe_candidate_stats",
+    "launch_store_global_probe_decision",
     "launch_retry_candidates_if_code",
     "launch_stage_candidate_taus",
     "launch_zero_probe_accumulators_if_code",

@@ -34,5 +34,12 @@
     }
   },
 
+  "timers": {
+    "throughput": {
+      "enabled": true,
+      "synchronized": false
+    }
+  },
+
   "wall_clock_breakdown" : false
 }

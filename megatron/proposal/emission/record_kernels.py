@@ -40,7 +40,8 @@ RECORD_WORDS: int = RECORD.record_words
 PREFIX_BYTES: int = RECORD.prefix_bytes
 SECTOR_BYTES: int = RECORD.sector_bytes
 GROUP_SCAN_TARGET_ELEMENTS: int = 256
-DIRECT_EMIT_WORKERS_PER_SM: int = 32
+# Keep direct-emission scan occupancy low enough to fit under PP/EP training slack.
+DIRECT_EMIT_WORKERS_PER_SM: int = 2
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ class LossyRecordWriteInputs:
     sample_blocks_min: int = 1
     sample_blocks_cap: int = 1
     probe_count_mismatch_grow_after: int = 3
+    enable_direct_probe_sample_feedback: bool = True
     aos_layout_offsets: Optional[torch.Tensor] = None
     aos_layout_capacities: Optional[torch.Tensor] = None
     aos_layout_header_device: Optional[torch.Tensor] = None

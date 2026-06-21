@@ -23,6 +23,10 @@ HIDDEN_SIZE=${HIDDEN_SIZE:-768}
 NUM_ATTN_HEADS=${NUM_ATTN_HEADS:-12}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-24}
 BATCH_SIZE=${BATCH_SIZE:-8}
+NUM_GPUS=${NUM_GPUS:-1}
+TP_SIZE=${TP_SIZE:-1}
+PP_SIZE=${PP_SIZE:-1}
+EP_PARALLEL_SIZE=${EP_PARALLEL_SIZE:-1}
 # Reduced expert count for better per-expert token saturation:
 # Original "16 16 32 32 48 48" with cap=1.0 gave ~0.43× tokens/expert.
 # New "4 4 8 8 8 8" (40 total) + topk=2 + cap=1.25 restores healthy token flow.
@@ -54,7 +58,9 @@ if [ -d "${CP_DIR}" ]; then
 else
     mkdir -p "${CP_DIR}"
 fi
-mkdir -p "${CP_DIR}/non_expert" "${CP_DIR}/expert"
+if [ "${NUM_GPUS}" = "1" ] && [ "${PP_SIZE}" = "1" ] && [ "${EP_PARALLEL_SIZE}" = "1" ]; then
+    mkdir -p "${CP_DIR}/non_expert" "${CP_DIR}/expert"
+fi
 rm -f "${FAULT_LOG}"
 
 PROPOSAL_FLAGS=""
@@ -307,7 +313,7 @@ data_options=" \
 megatron_options=" \
     --override-opt_param-scheduler \
     --adam-beta1 0.9 --adam-beta2 0.95 \
-    --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 \
+    --tensor-model-parallel-size ${TP_SIZE} --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
     --num-experts ${PRMOE_SPEC} \
     --moe-loss-coeff ${MLC} \
     --moe-train-capacity-factor ${MOE_TRAIN_CAP:-1.25} --moe-eval-capacity-factor ${MOE_EVAL_CAP:-1.25} --moe-min-capacity 4 \
@@ -343,9 +349,14 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
     | sed "s/CONFIG_CL_DURATION/0/" > ${config_json}
 
+PIPELINE_FLAG=""
+if [ "${PP_SIZE}" -eq 1 ]; then
+    PIPELINE_FLAG="--no-pipeline-parallel"
+fi
+
 deepspeed_options=" \
     --deepspeed --deepspeed_config ${config_json} \
-    --pipeline-model-parallel-size 1 --no-pipeline-parallel \
+    --pipeline-model-parallel-size ${PP_SIZE} ${PIPELINE_FLAG} \
     --create-moe-param-group"
 
 if [ -n "${NSYS_PROFILE:-}" ]; then
@@ -354,6 +365,6 @@ if [ -n "${NSYS_PROFILE:-}" ]; then
 else
     NSYS_PREFIX=""
 fi
-run_cmd="${NSYS_PREFIX} deepspeed --num_gpus 1 --master_port ${MASTER_PORT:-29500} ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
-echo "[etc] TAG=${TAG} NUM_SLOTS=${NUM_SLOTS} LOG=${LOG_FILE}"
+run_cmd="${NSYS_PREFIX} deepspeed --num_gpus ${NUM_GPUS} --master_port ${MASTER_PORT:-29500} ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options}"
+echo "[etc] TAG=${TAG} NUM_SLOTS=${NUM_SLOTS} GPUS=${NUM_GPUS} EP=${EP_PARALLEL_SIZE} PP=${PP_SIZE} LOG=${LOG_FILE}"
 eval ${run_cmd} 2>&1 | tee "${LOG_FILE}"

@@ -11,8 +11,13 @@ import torch
 
 from ..checkpoint.static_descriptors import device_tensor_from_pinned_host
 from ..checkpoint.step_context import global_selection_element_count
-from .adaptive_controller import CutoffDecision
-
+from .global_cpu_decision import (
+    choose_global_probe_decision_cpu,
+    reduce_direct_feedback_cpu,
+    retry_candidate_ladder_cpu,
+    sync_candidate_ladder_cpu,
+    valid_positive_threshold,
+)
 try:
     import triton
     _HAS_TRITON = True
@@ -25,7 +30,12 @@ _APPROX_PROBE_COUNT_MISMATCH_GROW_AFTER = 3
 
 class CutoffOrchestrationMixin:
     def _valid_positive_threshold(self, tau: float) -> bool:
-        return bool(math.isfinite(float(tau)) and float(tau) > 0.0)
+        return valid_positive_threshold(float(tau))
+
+    def _selection_src_rank(self) -> int:
+        topology = getattr(self, "_topology", None)
+        ranks = getattr(topology, "selection_ranks", [0])
+        return int(ranks[0])
 
     def _stage_candidate_taus(
         self,
@@ -39,10 +49,24 @@ class CutoffOrchestrationMixin:
             return 0
         from ..cutoff.approx_probe_kernels import launch_stage_candidate_taus
 
+        cap = min(int(taus_dev.numel()), 16)
+        if cap <= 0:
+            return 0
+        valid_values = [
+            float(v) for v in values[:cap]
+            if self._valid_positive_threshold(float(v))
+        ]
+        if not valid_values:
+            valid_values = [float(max(tau_center, 1.0e-12))]
+        fill = float(valid_values[-1])
+        padded_values = valid_values[:cap]
+        if len(padded_values) < cap:
+            padded_values.extend([fill] * (cap - len(padded_values)))
+        self._selection_candidate_taus_host = tuple(padded_values)
         return launch_stage_candidate_taus(
             candidate_taus=taus_dev,
             total_th=total_th,
-            values=tuple(float(v) for v in values),
+            values=tuple(padded_values),
             tau_center=float(max(tau_center, 1.0e-12)),
         )
 
@@ -124,7 +148,7 @@ class CutoffOrchestrationMixin:
         hparams: Any,
         total_elems_global: int,
         group_size: int,
-        process_group: Any,
+        cpu_process_group: Any,
         world_size: int,
         random_mode: bool,
         random_salt: int,
@@ -180,14 +204,31 @@ class CutoffOrchestrationMixin:
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
-        if (
-            int(world_size) > 1
-            and process_group is not None
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
-            torch.distributed.all_reduce(smin, op=torch.distributed.ReduceOp.MIN, group=process_group)
-            torch.distributed.all_reduce(smax, op=torch.distributed.ReduceOp.MAX, group=process_group)
+        minmax_pinned = getattr(self, "_cold_start_minmax_pinned", None)
+        if minmax_pinned is None or minmax_pinned.numel() != 2:
+            raise RuntimeError("cold-start min/max pinned scratch was not initialized")
+        minmax_pinned[0:1].copy_(smin.reshape(1), non_blocking=True)
+        minmax_pinned[1:2].copy_(smax.reshape(1), non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        if int(world_size) > 1:
+            if (
+                cpu_process_group is None
+                or not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                raise RuntimeError("multi-rank cold-start cutoff requires CPU/Gloo group")
+            torch.distributed.all_reduce(
+                minmax_pinned[0:1],
+                op=torch.distributed.ReduceOp.MIN,
+                group=cpu_process_group,
+            )
+            torch.distributed.all_reduce(
+                minmax_pinned[1:2],
+                op=torch.distributed.ReduceOp.MAX,
+                group=cpu_process_group,
+            )
+            smin.reshape(1).copy_(minmax_pinned[0:1], non_blocking=True)
+            smax.reshape(1).copy_(minmax_pinned[1:2], non_blocking=True)
         hist.zero_()
         for grp in self._groups:
             launch_build_score_log_hist_for_group(
@@ -215,24 +256,21 @@ class CutoffOrchestrationMixin:
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
-        if (
-            int(world_size) > 1
-            and process_group is not None
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
-            torch.distributed.all_reduce(hist, op=torch.distributed.ReduceOp.SUM, group=process_group)
         pinned = getattr(self, "_cold_start_hist_pinned", None)
         if pinned is None or pinned.numel() != hist.numel():
-            pinned = torch.empty(hist.numel(), dtype=torch.int64, pin_memory=True)
-            self._cold_start_hist_pinned = pinned
+            raise RuntimeError("cold-start histogram pinned scratch was not initialized")
         pinned.copy_(hist, non_blocking=True)
-        stream = torch.cuda.current_stream()
-        stream.synchronize()
+        torch.cuda.current_stream().synchronize()
+        if int(world_size) > 1:
+            torch.distributed.all_reduce(
+                pinned,
+                op=torch.distributed.ReduceOp.SUM,
+                group=cpu_process_group,
+            )
         return self._choose_tau_from_cold_start_hist(
             hist=pinned,
-            smin=float(smin.item()),
-            smax=float(smax.item()),
+            smin=float(minmax_pinned[0].item()),
+            smax=float(minmax_pinned[1].item()),
             total_elems_global=int(total_elems_global),
         )
 
@@ -246,36 +284,34 @@ class CutoffOrchestrationMixin:
         cached = getattr(self, "_global_selection_element_count_host", None)
         if cached is not None and int(cached) > 0:
             return int(cached)
+        scratch = self._selection_global_n_elements
+        if int(world_size) > 1:
+            scratch_cpu = getattr(self, "_selection_global_n_elements_cpu", None)
+            if scratch_cpu is None:
+                scratch_cpu = torch.empty(1, dtype=torch.int64)
+                self._selection_global_n_elements_cpu = scratch_cpu
+            scratch = scratch_cpu
         count = global_selection_element_count(
             int(local_n_elements),
-            self._selection_global_n_elements,
+            scratch,
             process_group=process_group,
             world_size=int(world_size),
         )
         self._global_selection_element_count_host = int(count)
         return int(count)
 
-    def _consume_direct_emission_feedback(
+    def _apply_direct_emission_feedback(
         self,
         *,
+        feedback: Dict[str, Any],
         total_elems_global: int,
     ) -> None:
-        warning = getattr(self, "_approx_probe_reject_warning", None)
-        if warning is not None:
-            warning.emit_ready()
         n_global = max(1, int(total_elems_global))
-        expert_state = getattr(self, "_expert_state", None)
-        if expert_state is None:
-            return
-        consume = getattr(expert_state, "consume_direct_emission_feedback", None)
-        if consume is None:
-            return
-        feedback = consume()
         if not feedback:
             return
-        tau = float(feedback.get("tau", 0.0))
         written = int(feedback.get("written", 0))
         selected = int(feedback.get("selected", written))
+        tau = float(feedback.get("tau", 0.0))
         ratio = float(selected) / float(n_global)
         telemetry = getattr(self, "_approx_probe_telemetry", None)
         if telemetry is not None and getattr(telemetry, "enabled", False):
@@ -304,6 +340,62 @@ class CutoffOrchestrationMixin:
             total_elems_global=int(n_global),
             cutoff_tolerance=float(self.cutoff_K_tolerance),
         )
+
+    def _consume_direct_emission_feedback(
+        self,
+        *,
+        total_elems_global: int,
+        world_size: int = 1,
+        process_group: Any = None,
+    ) -> None:
+        warning = getattr(self, "_approx_probe_reject_warning", None)
+        if warning is not None:
+            warning.emit_ready()
+        expert_state = getattr(self, "_expert_state", None)
+        consume = (
+            getattr(expert_state, "consume_direct_emission_feedback", None)
+            if expert_state is not None
+            else None
+        )
+        if int(world_size) > 1:
+            if (
+                process_group is None
+                or not torch.distributed.is_available()
+                or not torch.distributed.is_initialized()
+            ):
+                return
+            feedback = getattr(self, "_pending_direct_emission_feedback", None)
+            if feedback is None:
+                feedback = consume() if consume is not None else None
+            counts = getattr(self, "_direct_feedback_counts_cpu", None)
+            if counts is None or int(counts.numel()) != 6:
+                counts = torch.empty(6, dtype=torch.int64)
+                self._direct_feedback_counts_cpu = counts
+            if feedback:
+                self._pending_direct_emission_feedback = feedback
+            global_feedback = reduce_direct_feedback_cpu(
+                feedback=feedback,
+                counts=counts,
+                world_size=int(world_size),
+                process_group=process_group,
+            )
+            if global_feedback is None:
+                return
+            self._pending_direct_emission_feedback = None
+            self._apply_direct_emission_feedback(
+                feedback=global_feedback,
+                total_elems_global=int(total_elems_global),
+            )
+            return
+        feedback = getattr(self, "_pending_direct_emission_feedback", None)
+        if feedback is None:
+            feedback = consume() if consume is not None else None
+        if feedback:
+            self._pending_direct_emission_feedback = None
+            self._apply_direct_emission_feedback(
+                feedback=feedback,
+                total_elems_global=int(total_elems_global),
+            )
 
     def _emit_lfcl_overlap_telemetry(
         self,
@@ -363,15 +455,18 @@ class CutoffOrchestrationMixin:
         n_candidates: int,
         total_elems_global: int,
         group_size: int,
-        process_group: Any,
         world_size: int,
+        cpu_process_group: Any,
         random_mode: bool,
         random_salt: int,
     ) -> str:
         from ..cutoff.approx_probe_kernels import (
+            launch_capacity_hint_from_probe,
             launch_generated_block_probe_for_group,
             launch_probe_decision,
+            launch_reduce_probe_candidate_stats,
             launch_retry_candidates_if_code,
+            launch_store_global_probe_decision,
             launch_zero_probe_accumulators_if_code,
         )
         from ..score_policy import launch_update_ehat_geom_lut
@@ -471,119 +566,266 @@ class CutoffOrchestrationMixin:
                     stream=telemetry_stream,
                 )
 
-        launch_probe_decision(
-            candidate_taus=self._selection_candidate_taus,
+        use_cpu_global_probe = (
+            int(world_size) > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and cpu_process_group is not None
+        )
+
+        def _stage_global_candidate_stats(
+            n_current_candidates: int,
+        ) -> int:
+            n_current = min(
+                int(n_current_candidates),
+                int(self._approx_probe_candidate_stats.shape[1]),
+            )
+            if n_current <= 0:
+                return 0
+            launch_reduce_probe_candidate_stats(
                 sum_q=self._approx_probe_sum_q,
                 sum_q2=self._approx_probe_sum_q2,
                 n_blocks=self._approx_probe_n_blocks,
                 stratum_total_elems=self._approx_probe_stratum_total_elems_device,
-                stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
-                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
-                total_th=runtime_state.scratch.total_th,
-            probe_reject=self._approx_probe_reject,
-            decision_code=self._approx_probe_decision_code,
-            sample_blocks_current=self._approx_probe_sample_blocks_current,
-            ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
-            diagnostics=self._approx_probe_diagnostics,
-            sample_grow_hold=self._approx_probe_sample_grow_hold,
-            total_elems_global=int(total_elems_global),
-            target_ratio=float(self.topk_ratio),
-            cutoff_tolerance=float(self.cutoff_K_tolerance),
-            sample_blocks_min=int(self._approx_probe_sample_blocks_min),
-            sample_blocks_cap=int(self._approx_probe_sample_blocks_cap),
-            ci_shortfall_grow_after=int(_APPROX_PROBE_CI_SHORTFALL_GROW_AFTER),
-            n_candidates=int(n_cand),
-        )
-        t_after_decision1 = time.perf_counter() if profile else 0.0
+                candidate_stats=self._approx_probe_candidate_stats,
+                n_candidates=int(n_current),
+                total_elems_global=int(total_elems_global),
+            )
+            return int(n_current)
 
-        retry_n_cand = int(self._selection_candidate_taus.numel())
-        launch_retry_candidates_if_code(
-            candidate_taus=self._selection_candidate_taus,
-            diagnostics=self._approx_probe_diagnostics,
-            decision_code=self._approx_probe_decision_code,
-            n_candidates=int(retry_n_cand),
-            source_n_candidates=int(n_cand),
-            target_ratio=float(self.topk_ratio),
-            run_if_decision_code=3,
-        )
-        t_after_retry_candidates = time.perf_counter() if profile else 0.0
-        launch_zero_probe_accumulators_if_code(
-            sum_q=self._approx_probe_sum_q,
-            sum_q2=self._approx_probe_sum_q2,
-            n_blocks=self._approx_probe_n_blocks,
-            decision_code=self._approx_probe_decision_code,
-            run_if_decision_code=3,
-        )
-        t_after_guarded_zero = time.perf_counter() if profile else 0.0
-        for grp in self._groups:
-            group_blocks = int(grp.get("approx_entry_block_count", 0))
-            if group_blocks <= 0:
-                continue
-            max_samples_for_group = int(math.ceil(
-                float(self._approx_probe_sample_blocks_cap)
-                * float(group_blocks)
-                / float(max(1, int(self._approx_probe_total_entry_blocks)))
-            ))
-            max_samples_for_group = max(1, min(max_samples_for_group, group_blocks))
-            launch_generated_block_probe_for_group(
-                m_flat=grp["m_flat"],
-                v_flat=grp["v_flat"],
-                age2bit_words=age2bit_state.age_words,
-                ehat_geom_lut=age2bit_state.ehat_geom_lut,
-                h_lut_values=runtime_state.quantiles.h_lut.values,
-                h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
-                h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
-                entry_elem_start=grp["entry_elem_start"],
-                entry_group_start=grp["entry_group_start"],
-                entry_group_count=grp["entry_group_count"],
-                entry_stratum_idx=grp["entry_stratum_idx"],
-                entry_block_entry_idx=grp["entry_block_entry_idx"],
-                entry_block_local_group_start=grp["entry_block_local_group_start"],
+        def _reduce_global_candidate_stats(
+            n_current_candidates: int,
+        ) -> Optional[torch.Tensor]:
+            if not use_cpu_global_probe:
+                return None
+            n_current = _stage_global_candidate_stats(int(n_current_candidates))
+            if n_current <= 0:
+                return None
+            if cpu_process_group is None:
+                raise RuntimeError("multi-rank cutoff probe requires CPU/Gloo group")
+            pinned_stats = getattr(
+                self,
+                "_approx_probe_candidate_stats_pinned",
+                None,
+            )
+            if pinned_stats is None:
+                raise RuntimeError("global probe CPU reduction requires pinned stats buffer")
+            # Copy the whole tiny 4 x candidate-capacity matrix.  Slicing the
+            # column prefix makes a non-contiguous 2-D view for n<capacity and
+            # can turn the async D2H enqueue into the place where CUDA waits.
+            stats_view = self._approx_probe_candidate_stats
+            pinned_view = pinned_stats
+            pinned_view.copy_(stats_view, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.all_reduce(
+                pinned_view,
+                op=torch.distributed.ReduceOp.SUM,
+                group=cpu_process_group,
+            )
+            return pinned_view[:, :n_current]
+
+        def _launch_decision_for_current_stats(
+            *,
+            n_current_candidates: int,
+            run_if_decision_code: int = -1,
+        ) -> Optional[Dict[str, Any]]:
+            n_current = int(n_current_candidates)
+            if n_current <= 0:
+                return None
+            if use_cpu_global_probe:
+                global_stats = _reduce_global_candidate_stats(n_current)
+                if global_stats is None:
+                    return None
+                decision = choose_global_probe_decision_cpu(
+                    stats=global_stats,
+                    n_candidates=int(n_current),
+                    candidates=list(getattr(self, "_selection_candidate_taus_host", ())),
+                    target_ratio=float(self.topk_ratio),
+                    cutoff_tolerance=float(self.cutoff_K_tolerance),
+                    sample_blocks_min=int(self._approx_probe_sample_blocks_min),
+                    sample_blocks_current=int(self._approx_probe_sample_blocks_current.item()),
+                    sample_blocks_cap=int(self._approx_probe_sample_blocks_cap),
+                    ci_shortfall_streak=int(self._approx_probe_ci_shortfall_streak.item()),
+                    sample_grow_hold=int(self._approx_probe_sample_grow_hold.item()),
+                    ci_shortfall_grow_after=int(_APPROX_PROBE_CI_SHORTFALL_GROW_AFTER),
+                    run_if_decision_code=int(run_if_decision_code),
+                )
+                store_decision = {
+                    key: decision[key]
+                    for key in (
+                        "chosen_tau",
+                        "chosen_ratio",
+                        "chosen_se",
+                        "best_bound",
+                        "next_sample",
+                        "strict_accept",
+                        "sampled_blocks",
+                        "accept",
+                        "bracket_width",
+                        "decision",
+                        "stored_streak",
+                        "grow_hold_value",
+                    )
+                }
+                launch_store_global_probe_decision(
+                    total_th=runtime_state.scratch.total_th,
+                    probe_reject=self._approx_probe_reject,
+                    decision_code=self._approx_probe_decision_code,
+                    sample_blocks_current=self._approx_probe_sample_blocks_current,
+                    ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
+                    sample_grow_hold=self._approx_probe_sample_grow_hold,
+                    diagnostics=self._approx_probe_diagnostics,
+                    **store_decision,
+                )
+                return decision
+            launch_probe_decision(
                 candidate_taus=self._selection_candidate_taus,
                 sum_q=self._approx_probe_sum_q,
                 sum_q2=self._approx_probe_sum_q2,
                 n_blocks=self._approx_probe_n_blocks,
+                stratum_total_elems=self._approx_probe_stratum_total_elems_device,
+                stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
+                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
+                total_th=runtime_state.scratch.total_th,
+                probe_reject=self._approx_probe_reject,
+                decision_code=self._approx_probe_decision_code,
                 sample_blocks_current=self._approx_probe_sample_blocks_current,
-                total_entry_blocks=int(self._approx_probe_total_entry_blocks),
-                master_off_elem=int(grp["master_off"]) * int(group_size),
-                group_size=int(group_size),
-                lr_over_bc1=float(hparams.lr_over_bc1),
-                sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
-                eps=float(hparams.eps),
-                step=int(global_step),
-                score_policy_id=int(getattr(self, "score_policy_id", 0)),
-                random_mode=bool(random_mode),
-                random_salt=int(random_salt),
+                ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
+                diagnostics=self._approx_probe_diagnostics,
+                sample_grow_hold=self._approx_probe_sample_grow_hold,
+                total_elems_global=int(total_elems_global),
+                target_ratio=float(self.topk_ratio),
+                cutoff_tolerance=float(self.cutoff_K_tolerance),
+                sample_blocks_min=int(self._approx_probe_sample_blocks_min),
+                sample_blocks_cap=int(self._approx_probe_sample_blocks_cap),
+                ci_shortfall_grow_after=int(_APPROX_PROBE_CI_SHORTFALL_GROW_AFTER),
+                n_candidates=int(n_current),
+                run_if_decision_code=int(run_if_decision_code),
+            )
+            return None
+
+        global_decision = _launch_decision_for_current_stats(n_current_candidates=int(n_cand))
+        t_after_decision1 = time.perf_counter() if profile else 0.0
+
+        retry_n_cand = int(self._selection_candidate_taus.numel())
+        local_retry_probe = not use_cpu_global_probe
+        global_retry_probe = bool(
+            use_cpu_global_probe
+            and global_decision is not None
+            and bool(global_decision.get("needs_retry", False))
+        )
+        final_n_cand = int(
+            retry_n_cand if (local_retry_probe or global_retry_probe) else n_cand
+        )
+        if local_retry_probe:
+            launch_retry_candidates_if_code(
+                candidate_taus=self._selection_candidate_taus,
+                diagnostics=self._approx_probe_diagnostics,
+                decision_code=self._approx_probe_decision_code,
                 n_candidates=int(retry_n_cand),
-                max_samples_per_group=int(max_samples_for_group),
-                decision_code_guard=self._approx_probe_decision_code,
+                source_n_candidates=int(n_cand),
+                target_ratio=float(self.topk_ratio),
                 run_if_decision_code=3,
             )
+        elif global_retry_probe and global_decision is not None:
+            retry_candidates = retry_candidate_ladder_cpu(
+                global_decision,
+                source_candidates=list(getattr(
+                    self,
+                    "_selection_candidate_taus_host",
+                    (),
+                )),
+                capacity=int(retry_n_cand),
+                target_ratio=float(self.topk_ratio),
+            )
+            retry_candidates, self._candidate_ladder_sync_cpu = sync_candidate_ladder_cpu(
+                retry_candidates,
+                tau_center=float(global_decision.get("chosen_tau", 1.0)),
+                scratch=getattr(self, "_candidate_ladder_sync_cpu", None),
+                capacity=int(getattr(self, "_selection_candidate_capacity", 16)),
+                cpu_process_group=cpu_process_group,
+                world_size=int(world_size),
+                src_rank=self._selection_src_rank(),
+            )
+            retry_n_cand = self._stage_candidate_taus(
+                retry_candidates,
+                tau_center=float(global_decision.get("chosen_tau", 1.0)),
+            )
+            final_n_cand = int(retry_n_cand)
+        t_after_retry_candidates = time.perf_counter() if profile else 0.0
+        run_retry_probe = bool(local_retry_probe or global_retry_probe)
+        if run_retry_probe:
+            launch_zero_probe_accumulators_if_code(
+                sum_q=self._approx_probe_sum_q,
+                sum_q2=self._approx_probe_sum_q2,
+                n_blocks=self._approx_probe_n_blocks,
+                decision_code=self._approx_probe_decision_code,
+                run_if_decision_code=3,
+            )
+        t_after_guarded_zero = time.perf_counter() if profile else 0.0
+        if run_retry_probe:
+            for grp in self._groups:
+                group_blocks = int(grp.get("approx_entry_block_count", 0))
+                if group_blocks <= 0:
+                    continue
+                max_samples_for_group = int(math.ceil(
+                    float(self._approx_probe_sample_blocks_cap)
+                    * float(group_blocks)
+                    / float(max(1, int(self._approx_probe_total_entry_blocks)))
+                ))
+                max_samples_for_group = max(1, min(max_samples_for_group, group_blocks))
+                launch_generated_block_probe_for_group(
+                    m_flat=grp["m_flat"],
+                    v_flat=grp["v_flat"],
+                    age2bit_words=age2bit_state.age_words,
+                    ehat_geom_lut=age2bit_state.ehat_geom_lut,
+                    h_lut_values=runtime_state.quantiles.h_lut.values,
+                    h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+                    h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+                    entry_elem_start=grp["entry_elem_start"],
+                    entry_group_start=grp["entry_group_start"],
+                    entry_group_count=grp["entry_group_count"],
+                    entry_stratum_idx=grp["entry_stratum_idx"],
+                    entry_block_entry_idx=grp["entry_block_entry_idx"],
+                    entry_block_local_group_start=grp["entry_block_local_group_start"],
+                    candidate_taus=self._selection_candidate_taus,
+                    sum_q=self._approx_probe_sum_q,
+                    sum_q2=self._approx_probe_sum_q2,
+                    n_blocks=self._approx_probe_n_blocks,
+                    sample_blocks_current=self._approx_probe_sample_blocks_current,
+                    total_entry_blocks=int(self._approx_probe_total_entry_blocks),
+                    master_off_elem=int(grp["master_off"]) * int(group_size),
+                    group_size=int(group_size),
+                    lr_over_bc1=float(hparams.lr_over_bc1),
+                    sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+                    eps=float(hparams.eps),
+                    step=int(global_step),
+                    score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                    random_mode=bool(random_mode),
+                    random_salt=int(random_salt),
+                    n_candidates=int(retry_n_cand),
+                    max_samples_per_group=int(max_samples_for_group),
+                    decision_code_guard=self._approx_probe_decision_code,
+                    run_if_decision_code=3,
+                )
         t_after_second_probe = time.perf_counter() if profile else 0.0
-        launch_probe_decision(
-            candidate_taus=self._selection_candidate_taus,
+        if run_retry_probe:
+            _launch_decision_for_current_stats(
+                n_current_candidates=int(retry_n_cand),
+                run_if_decision_code=3,
+            )
+        if use_cpu_global_probe:
+            launch_capacity_hint_from_probe(
+                candidate_taus=self._selection_candidate_taus,
                 sum_q=self._approx_probe_sum_q,
                 sum_q2=self._approx_probe_sum_q2,
                 n_blocks=self._approx_probe_n_blocks,
                 stratum_total_elems=self._approx_probe_stratum_total_elems_device,
                 stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
-                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
                 total_th=runtime_state.scratch.total_th,
-            probe_reject=self._approx_probe_reject,
-            decision_code=self._approx_probe_decision_code,
-            sample_blocks_current=self._approx_probe_sample_blocks_current,
-            ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
-            diagnostics=self._approx_probe_diagnostics,
-            sample_grow_hold=self._approx_probe_sample_grow_hold,
-            total_elems_global=int(total_elems_global),
-            target_ratio=float(self.topk_ratio),
-            cutoff_tolerance=float(self.cutoff_K_tolerance),
-            sample_blocks_min=int(self._approx_probe_sample_blocks_min),
-            sample_blocks_cap=int(self._approx_probe_sample_blocks_cap),
-            ci_shortfall_grow_after=int(_APPROX_PROBE_CI_SHORTFALL_GROW_AFTER),
-            n_candidates=int(retry_n_cand),
-            run_if_decision_code=3,
-        )
+                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
+                n_candidates=int(final_n_cand),
+            )
         t_after_decision2 = time.perf_counter() if profile else 0.0
         if telemetry_enabled:
             for telemetry in telemetry_sinks:
@@ -610,7 +852,7 @@ class CutoffOrchestrationMixin:
                     diagnostics=self._approx_probe_diagnostics,
                     decision_code=self._approx_probe_decision_code,
                     probe_reject=self._approx_probe_reject,
-                    n_candidates=int(n_cand),
+                    n_candidates=int(final_n_cand),
                     n_strata=int(getattr(self, "_approx_probe_n_strata", 0)),
                     total_entry_blocks=int(
                         getattr(self, "_approx_probe_total_entry_blocks", 0)
@@ -733,15 +975,17 @@ class CutoffOrchestrationMixin:
             return None
 
         world = int(getattr(self, "_proposal_world_size", 1))
-        pg = getattr(self, "_proposal_pg", None)
+        cpu_pg = getattr(self, "_proposal_cpu_pg", None)
         total_elems_global = self._global_selection_element_count_cached(
             int(runtime_state.index.n_total_elements),
-            process_group=pg,
+            process_group=cpu_pg,
             world_size=world,
         )
         t_after_global = time.perf_counter() if profile else 0.0
         self._consume_direct_emission_feedback(
             total_elems_global=int(total_elems_global),
+            world_size=int(world),
+            process_group=cpu_pg,
         )
         t_after_feedback = time.perf_counter() if profile else 0.0
         hparams = AdamHParams(
@@ -777,7 +1021,7 @@ class CutoffOrchestrationMixin:
                 hparams=hparams,
                 total_elems_global=int(total_elems_global),
                 group_size=int(group_size),
-                process_group=pg,
+                cpu_process_group=getattr(self, "_proposal_cpu_pg", None),
                 world_size=int(world),
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
@@ -809,6 +1053,15 @@ class CutoffOrchestrationMixin:
             t_after_decide = time.perf_counter() if profile else 0.0
         if not candidates:
             candidates = [float(max(tau_center, 1.0e-12))]
+        candidates, self._candidate_ladder_sync_cpu = sync_candidate_ladder_cpu(
+            candidates,
+            tau_center=float(tau_center),
+            scratch=getattr(self, "_candidate_ladder_sync_cpu", None),
+            capacity=int(getattr(self, "_selection_candidate_capacity", 16)),
+            cpu_process_group=cpu_pg,
+            world_size=int(world),
+            src_rank=self._selection_src_rank(),
+        )
         n_candidates = self._stage_candidate_taus(
             candidates,
             tau_center=float(tau_center),
@@ -821,7 +1074,7 @@ class CutoffOrchestrationMixin:
             n_candidates=int(n_candidates),
             total_elems_global=int(total_elems_global),
             group_size=int(group_size),
-            process_group=pg,
+            cpu_process_group=cpu_pg,
             world_size=int(world),
             random_mode=bool(random_mode),
             random_salt=int(random_salt),

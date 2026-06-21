@@ -23,19 +23,16 @@ Layout:
 
 The pinned-buffer contract (base + length both 4 KiB-aligned) is
 enforced inside the C++ binary_io layer; alloc_pinned_uint8_sector_aligned
-guarantees the base alignment, and the write wrappers below round the
+guarantees the base alignment, and the read/write wrappers below round the
 length up to SECTOR_BYTES before passing to C++.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import struct
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
 import torch
 from torch.utils.cpp_extension import load
 
@@ -61,16 +58,9 @@ _cext = load(
 HEADER_BLOCK_BYTES: int = int(_cext.HEADER_BLOCK_BYTES)
 SECTOR_BYTES: int = int(_cext.SECTOR_BYTES)
 
-# Pin-buffer chunk granularity (used by callers that want to round up
-# the per-file pinned allocation to a larger chunk so the C++ writer's
-# LBA bookkeeping stays uniform). Override via PROPOSAL_PIN_CHUNK_MB.
-_DEFAULT_PIN_CHUNK_MB = 64
-try:
-    PIN_CHUNK_BYTES: int = max(
-        1, int(os.environ.get("PROPOSAL_PIN_CHUNK_MB", _DEFAULT_PIN_CHUNK_MB))
-    ) * 1024 * 1024
-except ValueError:
-    PIN_CHUNK_BYTES = _DEFAULT_PIN_CHUNK_MB * 1024 * 1024
+# Pin-buffer chunk granularity.  Keep fixed so checkpoint sizing is
+# reproducible across runs.
+PIN_CHUNK_BYTES: int = 64 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +158,6 @@ _TORCH_DTYPE_STR = {
     torch.int64: "int64", torch.uint8: "uint8", torch.int8: "int8",
 }
 _STR_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_DTYPE_STR.items()}
-_STR_TO_NUMPY_DTYPE = {
-    "float32": np.float32, "float16": np.float16, "int32": np.int32,
-    "int64": np.int64, "uint8": np.uint8, "int8": np.int8,
-}
 
 
 def build_prptens_header_block(
@@ -205,22 +191,37 @@ def build_prptens_header_block(
 
 
 def is_binary_format(path: Path) -> bool:
-    """Magic-byte probe; safe on missing/truncated files."""
-    if _cext.file_size(str(path)) < len(MAGIC):
+    """Magic-byte probe through the same aligned read path as recovery."""
+    nbytes = int(_cext.file_size(str(path)))
+    if nbytes < len(MAGIC):
         return False
-    return _cext.read_file_range(str(path), 0, len(MAGIC)) == MAGIC
+    blob = read_file_aligned(path, min(nbytes, HEADER_BLOCK_BYTES))
+    return bytes(blob.narrow(0, 0, len(MAGIC)).numpy().tobytes()) == MAGIC
 
 
 def load_binary(
     path: Path, device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-    """Read a PRPTENS file. Returns (tensor_dict, scalars). All file IO
-    goes through the C++ binary_io::read_file_range; this function is
-    pure header parse + tensor reconstruction."""
+    """Read a PRPTENS file. Returns (tensor_dict, scalars).
+
+    Recovery reads the whole file once, then reconstructs tensors from byte
+    views. This avoids one pread/open round-trip per tensor entry.
+    """
     path_s = str(Path(path))
-    header_block = _cext.read_file_range(path_s, 0, HEADER_BLOCK_BYTES)
-    if len(header_block) < 16:
+    nbytes_total = int(_cext.file_size(path_s))
+    if nbytes_total < 16:
         raise ValueError(f"load_binary: header too short in {path}")
+    blob = read_file_aligned(path_s, nbytes_total)
+    got = int(blob.numel())
+    if got < HEADER_BLOCK_BYTES:
+        raise ValueError(f"load_binary: header too short in {path}")
+    if got < nbytes_total:
+        blob = blob.narrow(0, 0, got)
+    header_block = bytes(
+        blob.narrow(0, 0, min(int(blob.numel()), HEADER_BLOCK_BYTES))
+        .numpy()
+        .tobytes()
+    )
     if header_block[:len(MAGIC)] != MAGIC:
         raise ValueError(
             f"load_binary: bad magic in {path}; expected {MAGIC!r}")
@@ -237,17 +238,14 @@ def load_binary(
         shape = tuple(int(x) for x in e["shape"])
         dtype_str = e["dtype"]
         nbytes = int(e["nbytes"])
-        raw = _cext.read_file_range(path_s, HEADER_BLOCK_BYTES + off, nbytes)
-        if dtype_str == "bfloat16":
-            arr = np.frombuffer(raw, dtype=np.uint16).reshape(shape).copy()
-            t = torch.from_numpy(arr).view(torch.bfloat16)
-        else:
-            np_dtype = _STR_TO_NUMPY_DTYPE.get(dtype_str)
-            if np_dtype is None:
-                raise ValueError(
-                    f"load_binary: no numpy dtype mapping for {dtype_str!r}")
-            arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape).copy()
-            t = torch.from_numpy(arr)
+        data_off = HEADER_BLOCK_BYTES + off
+        if data_off < 0 or data_off + nbytes > int(blob.numel()):
+            raise ValueError(f"load_binary: truncated entry {e['name']!r} in {path}")
+        dtype = _STR_TO_TORCH_DTYPE.get(dtype_str)
+        if dtype is None:
+            raise ValueError(f"load_binary: no torch dtype mapping for {dtype_str!r}")
+        raw_u8 = blob.narrow(0, data_off, nbytes)
+        t = raw_u8.view(dtype).clone().view(shape)
         if device is not None:
             t = t.to(device)
         out[e["name"]] = t
@@ -410,11 +408,90 @@ def unlink_path(path) -> None:
     _cext.unlink_path(str(path))
 
 
-def read_file_range(path, offset: int, nbytes: int) -> bytes:
-    """``::pread(path, offset, nbytes)``; returns bytes (≤ nbytes if EOF)."""
-    return _cext.read_file_range(str(path), int(offset), int(nbytes))
+def read_file_into_tensor(path, dst_u8: torch.Tensor, offset: int, nbytes: int) -> int:
+    """Read bytes directly into a CPU uint8 tensor via one C++ entry point."""
+    if dst_u8.device.type != "cpu" or dst_u8.dtype != torch.uint8:
+        raise ValueError("read_file_into_tensor: dst_u8 must be a CPU uint8 tensor")
+    if not dst_u8.is_contiguous():
+        raise ValueError("read_file_into_tensor: dst_u8 must be contiguous")
+    if int(offset) & (SECTOR_BYTES - 1):
+        raise ValueError("read_file_into_tensor: offset must be 4 KiB aligned")
+    _require_pinned_aligned_buffer(
+        dst_u8,
+        where="read_file_into_tensor",
+        total_padded=int(nbytes),
+    )
+    return int(_cext.read_file_into_tensor(
+        str(path), dst_u8, int(offset), int(nbytes),
+    ))
+
+
+def read_file_aligned(path, nbytes: int) -> torch.Tensor:
+    """Read one CP object through the aligned C++ read path.
+
+    The pread request length is rounded to 4 KiB. The returned tensor is
+    narrowed to the actual bytes read, so old truncated files still report
+    their real length after satisfying the read alignment contract.
+    """
+
+    logical = int(nbytes)
+    if logical < 0:
+        raise ValueError("read_file_aligned: negative nbytes")
+    padded = _round_up_sector(logical)
+    buf = alloc_pinned_uint8_sector_aligned(padded)
+    got = read_file_into_tensor(path, buf, 0, padded)
+    return buf.narrow(0, 0, int(got))
 
 
 def file_size(path) -> int:
     """``::stat(path).st_size`` or -1 if the file is missing."""
     return int(_cext.file_size(str(path)))
+
+
+def load_lfcl_payload_interleaved(
+    lfcl_u8: torch.Tensor,
+    *,
+    payload_offset_bytes: int,
+    numels_i64: torch.Tensor,
+    p_flat: torch.Tensor,
+    m_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> None:
+    _cext.load_lfcl_payload_interleaved(
+        lfcl_u8,
+        int(payload_offset_bytes),
+        numels_i64,
+        p_flat,
+        m_flat,
+        v_flat,
+    )
+
+
+def replay_lfsy_log_into_dense(
+    lfsy_u8: torch.Tensor,
+    *,
+    total_numel: int,
+    p_flat: torch.Tensor,
+    m_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> Dict[str, int]:
+    result = _cext.replay_lfsy_log_into_dense(
+        lfsy_u8,
+        int(total_numel),
+        p_flat,
+        m_flat,
+        v_flat,
+        int(HEADER_BLOCK_BYTES),
+        int(SECTOR_BYTES),
+        8,
+        16,
+    )
+    keys = (
+        "max_step",
+        "n_blocks",
+        "blocks_replayed",
+        "records_seen",
+        "records_applied",
+        "remaining",
+    )
+    return {k: int(v) for k, v in zip(keys, result)}

@@ -16,6 +16,17 @@ except Exception:
 
 
 class RefreshOrchestrationMixin:
+    def _device_all_reduce_if_needed(self, tensor: torch.Tensor, op) -> None:
+        pg = getattr(self, "_proposal_pg", None)
+        world = int(getattr(self, "_proposal_world_size", 1))
+        if (
+            world > 1
+            and pg is not None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.all_reduce(tensor, op=op, group=pg)
+
     def _quantile_operating_band_slice(self, n: int) -> slice:
         width = max(1, int(math.ceil(float(n) * float(self.topk_ratio))))
         start = max(0, int(n) - int(width))
@@ -140,17 +151,20 @@ class RefreshOrchestrationMixin:
             return
         runtime_state = self.lossy_cp_state
         if runtime_state is not None:
+            cpu_pg = getattr(self, "_proposal_cpu_pg", None)
             total_elems_global = self._global_selection_element_count_cached(
                 int(runtime_state.index.n_total_elements),
-                process_group=getattr(self, "_proposal_pg", None),
+                process_group=cpu_pg,
                 world_size=int(getattr(self, "_proposal_world_size", 1)),
             )
             self._consume_direct_emission_feedback(
                 total_elems_global=int(total_elems_global),
+                world_size=int(getattr(self, "_proposal_world_size", 1)),
+                process_group=cpu_pg,
             )
         old_h_q = (
             self._h_quantile_values.detach().clone()
-            if self._h_anchor_initialised else None
+            if getattr(self, "_h_anchor_initialised", False) else None
         )
         srcs = h_flat if isinstance(h_flat, (list, tuple)) else [h_flat]
         flats = [s.detach().reshape(-1) for s in srcs
@@ -173,11 +187,14 @@ class RefreshOrchestrationMixin:
         h_hi_t.zero_()
         for flat in flats:
             launch_reduce_positive_minmax(flat, h_lo_t, h_hi_t)
+        self._device_all_reduce_if_needed(h_lo_t, torch.distributed.ReduceOp.MIN)
+        self._device_all_reduce_if_needed(h_hi_t, torch.distributed.ReduceOp.MAX)
         hist.zero_()
         for flat in flats:
             launch_build_log_hist_from_bounds(
                 flat, hist, min_bound=h_lo_t, max_bound=h_hi_t,
             )
+        self._device_all_reduce_if_needed(hist, torch.distributed.ReduceOp.SUM)
         launch_fill_quantiles_from_log_hist(
             hist, self._h_quantile_values, min_bound=h_lo_t, max_bound=h_hi_t,
         )
@@ -212,7 +229,7 @@ class RefreshOrchestrationMixin:
         """
         if not _HAS_TRITON_REFRESH:
             return
-        if self.selection_mode != "v_hat" and not self._h_anchor_initialised:
+        if self.selection_mode != "v_hat" and not getattr(self, "_h_anchor_initialised", False):
             return
         if not getattr(self, "_flat_layout_done", False):
             return
@@ -287,6 +304,8 @@ class RefreshOrchestrationMixin:
         )
         for v in v_flats:
             launch_reduce_positive_minmax(v.detach().reshape(-1), v_lo_t, v_hi_t)
+        self._device_all_reduce_if_needed(v_lo_t, torch.distributed.ReduceOp.MIN)
+        self._device_all_reduce_if_needed(v_hi_t, torch.distributed.ReduceOp.MAX)
         hist.zero_()
         for v in v_flats:
             launch_build_log_hist_from_bounds(
@@ -295,6 +314,7 @@ class RefreshOrchestrationMixin:
                 min_bound=v_lo_t,
                 max_bound=v_hi_t,
             )
+        self._device_all_reduce_if_needed(hist, torch.distributed.ReduceOp.SUM)
         launch_fill_quantiles_from_log_hist(
             hist,
             self._v_quantile_values,

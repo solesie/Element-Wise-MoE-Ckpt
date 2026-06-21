@@ -783,12 +783,6 @@ def train_step(forward_step_func, data_iterator,
     # as belt-and-suspenders guard against worker pickup / PCIe stalls.
     if _has_nvtx_t and _rng_iter is not None:
         _nvtx_t.end_range(_rng_iter)
-    if (
-        getattr(args, 'proposal_enable', False)
-        and os.environ.get("PROPOSAL_DISPATCH_AT_OPT_FENCE", "") in ("1", "true", "True")
-        and getattr(args, "iteration", 0) > 0
-    ):
-        proposal_dispatch_post_iter(model, iter_T=args.iteration)
     if getattr(args, 'proposal_enable', False):
         proposal_wait_d2h_before_optimizer()
     _rng_opt = _nvtx_t.start_range(f"iter{args.iteration+1}_optimizer") if _has_nvtx_t else None
@@ -1323,11 +1317,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        if (
-            getattr(args, 'proposal_enable', False)
-            and iteration > 0
-            and os.environ.get("PROPOSAL_DISPATCH_AT_OPT_FENCE", "") not in ("1", "true", "True")
-        ):
+        if getattr(args, 'proposal_enable', False) and iteration > 0:
             proposal_dispatch_post_iter(model, iter_T=iteration)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,

@@ -7,8 +7,6 @@ workers, and returns. Worker threads own all proposal GPU/D2H/file work.
 """
 from __future__ import annotations
 
-import os
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,7 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .runtime import CheckpointWorkerPool, get_d2h_stream
+from .runtime import CheckpointWorkerPool
+from .distributed import ProposalTopology, topology_from_args
 from .refresh.fp32_state import (
     Fp32StateMapper,
     get_engine_optimizer,
@@ -41,8 +40,6 @@ class PostStepCheckpointTask:
     expert_read_ready: threading.Event = field(default_factory=threading.Event)
     non_expert_d2h_event: Optional["torch.cuda.Event"] = None
     expert_d2h_event: Optional["torch.cuda.Event"] = None
-    non_expert_d2h_start_event: Optional["torch.cuda.Event"] = None
-    expert_d2h_start_event: Optional["torch.cuda.Event"] = None
     non_expert_error: Optional[BaseException] = None
     expert_error: Optional[BaseException] = None
     non_expert_started_at: float = 0.0
@@ -62,6 +59,7 @@ class ProposalController:
         self._enabled = False
         self._cp_dir = None
         self._proposal_config = None                  # ProposalConfig
+        self._topology: Optional[ProposalTopology] = None
         self._h_anchor = None                         # HQuantileAnchor
         self._latest_post_step_checkpoint_task = None
         self._last_dispatched_iter_T = -1
@@ -81,7 +79,6 @@ class ProposalController:
         global_step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
-        expert_d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> Any:
         if self._lossy_cp is None:
             return None
@@ -90,7 +87,6 @@ class ProposalController:
             global_step=global_step,
             ready_event=ready_event,
             d2h_event_callback=d2h_event_callback,
-            expert_d2h_start_event=expert_d2h_start_event,
         )
 
     def wait_d2h_before_optimizer(self) -> None:
@@ -155,6 +151,7 @@ _CONTROLLER = ProposalController()
 def get_controller() -> ProposalController:
     return _CONTROLLER
 
+
 def _unwrap_ds_engine(model):
     m = model[0] if isinstance(model, (list, tuple)) else model
     while hasattr(m, "module") and not hasattr(m, "named_parameters"):
@@ -176,10 +173,51 @@ def _get_ds_optimizer(model):
 
 
 def _should_write() -> bool:
-    """File writes are gated to DP rank 0. Tracker compute runs on all ranks."""
+    """Rank-0 console/log side effects only. Data ownership uses topology."""
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
     return torch.distributed.get_rank() == 0
+
+
+def _install_pipeline_optimizer_fence(model: Any) -> None:
+    """Wire the proposal fence into DeepSpeed PipelineEngine's optimizer step.
+
+    PipelineEngine executes forward/backward and optimizer.step inside
+    ``train_batch()``, so the normal Megatron optimizer-fence call site is not
+    reached.  Install an instance-local schedule hook that preserves the
+    single-GPU contract: proposal D2H/read work for the previous step must be
+    complete before the next optimizer mutation of p/m/v.
+    """
+    engine = model[0] if isinstance(model, (list, tuple)) else model
+    if getattr(engine, "_proposal_pipeline_fence_installed", False):
+        return
+    instr_map = getattr(engine, "_INSTRUCTION_MAP", None)
+    if not isinstance(instr_map, dict) or not hasattr(engine, "train_batch"):
+        return
+
+    opt_key = None
+    original = None
+    for key, fn in instr_map.items():
+        if getattr(key, "__name__", "") == "OptimizerStep":
+            opt_key = key
+            original = fn
+            break
+    if opt_key is None or original is None:
+        return
+
+    def _proposal_optimizer_step(self, *args: Any, **kwargs: Any) -> Any:
+        proposal_wait_d2h_before_optimizer()
+        return original(self, *args, **kwargs)
+
+    local_map = dict(instr_map)
+    local_map[opt_key] = _proposal_optimizer_step
+    engine._INSTRUCTION_MAP = local_map
+    engine._proposal_pipeline_fence_installed = True
+    if _should_write():
+        print(
+            "[proposal] PipelineEngine optimizer fence installed",
+            flush=True,
+        )
 
 
 def init_proposal(
@@ -227,24 +265,21 @@ def init_proposal(
         num_experts_spec = int(ne_arg)
         num_experts_scalar = int(ne_arg)
 
+    topology = topology_from_args(args)
+    get_controller()._topology = topology
+
     # B3: guard unsupported configs.
     zero_stage = int(getattr(args, "zero_stage", 0) or 0)
-    ep_size = int(getattr(args, "moe_expert_parallel_size", getattr(args, "ep_size", 1)) or 1)
-    tp_size = int(getattr(args, "tensor_model_parallel_size", 1) or 1)
-    pp_size = int(getattr(args, "pipeline_model_parallel_size", 1) or 1)
+    ep_size = int(topology.ep_size)
+    tp_size = int(topology.tp_size)
+    pp_size = int(topology.pp_size)
     if zero_stage >= 3:
         raise NotImplementedError(
             f"proposal: ZeRO-3 partitions params; not supported (zero_stage={zero_stage})."
         )
-    if ep_size > 1:
+    if tp_size > 1:
         raise NotImplementedError(
-            f"proposal: expert-parallel size > 1 requires cross-EP all-gather of importance "
-            f"scores (out of scope); got ep_size={ep_size}."
-        )
-    if tp_size > 1 or pp_size > 1:
-        raise NotImplementedError(
-            f"proposal: tensor/pipeline parallel > 1 unsupported "
-            f"(tp={tp_size}, pp={pp_size})."
+            f"proposal: tensor parallel > 1 unsupported (tp={tp_size})."
         )
 
     inner_model = _unwrap_ds_engine(model)
@@ -255,10 +290,10 @@ def init_proposal(
         torch.cuda.synchronize()
         _baseline_alloc = torch.cuda.memory_allocated()
         _baseline_reserved = torch.cuda.memory_reserved()
-        print(f"[proposal] BASELINE VRAM (before proposal init): "
-              f"alloc={_baseline_alloc/1e6:.1f} MB, "
-              f"reserved={_baseline_reserved/1e6:.1f} MB", flush=True)
-        get_controller()._config.setdefault("_baseline_alloc", _baseline_alloc) if False else None
+        if _should_write():
+            print(f"[proposal] BASELINE VRAM (before proposal init): "
+                  f"alloc={_baseline_alloc/1e6:.1f} MB, "
+                  f"reserved={_baseline_reserved/1e6:.1f} MB", flush=True)
         # Stash on module so we can compare after init.
         globals()["_baseline_alloc_mb"] = _baseline_alloc / 1e6
         # Audit: capture baseline + install alloc trace patches (env-gated).
@@ -285,14 +320,6 @@ def init_proposal(
                     f"but its name does not match the expected "
                     f"'deepspeed_experts.<idx>.' pattern; model layout unexpected."
                 )
-            # B3 (runtime): cross-check param.group_name implied EP size.
-            gname = getattr(p, "group_name", "")
-            m = re.fullmatch(r"ep_size_(\d+)", gname) if gname else None
-            if m is not None and int(m.group(1)) > 1:
-                raise NotImplementedError(
-                    f"proposal: detected expert param {name!r} with group_name={gname!r} "
-                    f"implying EP>1; unsupported."
-                )
             expert_param_names.append(name)
 
     if not expert_param_names:
@@ -301,7 +328,7 @@ def init_proposal(
             "Is this an MoE model?"
         )
 
-    if torch.distributed.get_rank() == 0:
+    if topology.is_global_rank0:
         print(
             f"[proposal] Fp32StateMapper mode={mapper.mode}  "
             f"masters={len(getattr(mapper, '_direct_master', {}))} "
@@ -323,8 +350,7 @@ def init_proposal(
         )
 
     get_controller()._cp_dir = Path(cp_root)
-    if _should_write():
-        get_controller()._cp_dir.mkdir(parents=True, exist_ok=True)
+    get_controller()._cp_dir.mkdir(parents=True, exist_ok=True)
 
     get_controller()._config = {
         "selection_mode": get_controller()._proposal_config.selection_mode,
@@ -337,6 +363,10 @@ def init_proposal(
         "num_experts": num_experts_scalar,
         "num_experts_spec": num_experts_spec,
         "proposal_config": get_controller()._proposal_config,
+        "topology": topology,
+        "rank_namespace": topology.namespace,
+        "writes_expert": topology.writes_expert,
+        "writes_nonexpert": topology.writes_nonexpert,
     }
     _test_skip_expert_commit = bool(
         getattr(args, "proposal_test_skip_expert_commit", False)
@@ -371,20 +401,20 @@ def init_proposal(
     get_controller()._config["expert_lossy_enabled"] = (
         get_controller()._config["cp_mode"] != "sequential"
     )
+    cp_target = str(get_controller()._proposal_config.cp_target)
     get_controller()._config["expert_lossy_commit_enabled"] = (
-        not _test_skip_expert_commit
+        (not _test_skip_expert_commit) and topology.writes_expert
     )
     get_controller()._config["nonexpert_commit_enabled"] = (
-        not _test_skip_nonexpert_commit
+        (not _test_skip_nonexpert_commit)
+        and (topology.writes_nonexpert or cp_target == "test_dram")
     )
 
-    get_controller()._checkpoint_workers = (
-        CheckpointWorkerPool(
-            non_expert_queue_size=get_controller()._config["async_queue"],
-            expert_queue_size=max(get_controller()._config["async_queue"] * 4, 16),
-        )
-        if _should_write() else None
+    get_controller()._checkpoint_workers = CheckpointWorkerPool(
+        non_expert_queue_size=get_controller()._config["async_queue"],
+        expert_queue_size=max(get_controller()._config["async_queue"] * 4, 16),
     )
+    _install_pipeline_optimizer_fence(model)
 
     if get_controller()._config["expert_lossy_enabled"]:
         get_controller()._lossy_cp = LossyCheckpointPipeline(
@@ -408,32 +438,102 @@ def init_proposal(
     else:
         get_controller()._lossy_cp = None
 
-    # ---- NCCL process group for proposal histogram all-reduce ----
-    # Per-rank score histograms are reduced so all ranks derive the same
-    # global cutoff. Single-GPU runs leave `_proposal_pg = None`.
+    # ---- Process groups for proposal reductions ----
+    # Per-iteration cutoff/feedback aggregates are tiny. Keep them on a CPU
+    # group for every multi-GPU topology so EP, PP, and EP+PP share one
+    # ordering contract and proposal workers never inject independent NCCL
+    # collectives into the training pipeline.
     _proposal_pg = None
+    _proposal_cpu_pg = None
     _proposal_world_size = 1
     try:
         if (torch.distributed.is_available()
                 and torch.distributed.is_initialized()):
-            _proposal_world_size = int(torch.distributed.get_world_size())
+            _proposal_world_size = int(len(topology.selection_ranks))
+            _proposal_ranks = list(topology.selection_ranks)
             if _proposal_world_size > 1:
                 _proposal_pg = torch.distributed.new_group(
-                    ranks=list(range(_proposal_world_size)),
+                    ranks=_proposal_ranks,
+                )
+                _proposal_cpu_pg = torch.distributed.new_group(
+                    ranks=_proposal_ranks,
+                    backend="gloo",
                 )
                 if _should_write():
-                    print(f"[proposal] NCCL proposal_pg created "
-                          f"(world_size={_proposal_world_size})",
-                          flush=True)
+                    print(
+                        f"[proposal] proposal process groups created "
+                        f"(world_size={_proposal_world_size})",
+                        flush=True,
+                    )
     except Exception as _exc:
         _proposal_pg = None
+        _proposal_cpu_pg = None
         _proposal_world_size = 1
         if _should_write():
-            print(f"[proposal] proposal_pg init failed (single-GPU path): "
-                  f"{_exc}", flush=True)
+            print(
+                f"[proposal] proposal process-group init failed; "
+                f"falling back to local cutoff: {_exc}",
+                flush=True,
+            )
     if get_controller()._lossy_cp is not None:
         get_controller()._lossy_cp._proposal_pg = _proposal_pg
+        get_controller()._lossy_cp._proposal_cpu_pg = _proposal_cpu_pg
         get_controller()._lossy_cp._proposal_world_size = _proposal_world_size
+        get_controller()._lossy_cp._topology = topology
+
+    topk_ratio = float(
+        get_controller()._proposal_config.topk_ratio,
+    )
+    pinned_aos_capacity_ratio = float(topk_ratio)
+    pinned_aos_capacity_tolerance = float(
+        get_controller()._proposal_config.pinned_aos_capacity_tolerance,
+    )
+    if get_controller()._lossy_cp is not None:
+        local_selection_elems = max(
+            0,
+            int(getattr(get_controller()._lossy_cp, "total_tracked", 0)),
+        )
+        global_selection_elems = int(local_selection_elems)
+        if _proposal_world_size > 1 and local_selection_elems > 0:
+            try:
+                count_t = torch.tensor(
+                    [local_selection_elems],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                torch.distributed.all_reduce(
+                    count_t,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=_proposal_cpu_pg,
+                )
+                global_selection_elems = int(count_t.item())
+            except Exception as _cap_exc:
+                global_selection_elems = int(local_selection_elems)
+                if _should_write():
+                    print(
+                        "[proposal] global AOS capacity sizing failed; "
+                        f"using local K capacity: {_cap_exc}",
+                        flush=True,
+                    )
+        setattr(
+            get_controller()._lossy_cp,
+            "_local_selection_element_count_host",
+            int(local_selection_elems),
+        )
+        setattr(
+            get_controller()._lossy_cp,
+            "_global_selection_element_count_host",
+            int(global_selection_elems),
+        )
+        if _proposal_world_size > 1 and local_selection_elems > 0:
+            if _should_write():
+                print(
+                    "[proposal] multi-rank selection domain "
+                    f"local={local_selection_elems} global={global_selection_elems} "
+                    f"aos_capacity_ratio={pinned_aos_capacity_ratio:.6f} "
+                    f"tolerance={pinned_aos_capacity_tolerance:.6f}",
+                    flush=True,
+                )
 
     # CP layout: split non-expert + expert into separate subdirectories
     # so they can be mounted on different devices.
@@ -441,117 +541,117 @@ def init_proposal(
     #   <cp>/expert/      — expert rolling LFSY + LFCL compaction
     # H_g is GPU-only (BF16 in ``_h_quantile_values``). Recovery
     # rebuilds it on the next FD refresh; no disk persist path.
-    _nonexpert_cp_dir = get_controller()._cp_dir / "non_expert"
-    _expert_cp_dir = get_controller()._cp_dir / "expert"
+    _nonexpert_cp_dir = topology.nonexpert_dir(get_controller()._cp_dir)
+    _expert_cp_dir = topology.expert_dir(get_controller()._cp_dir)
+    get_controller()._config["nonexpert_cp_dir"] = _nonexpert_cp_dir
+    get_controller()._config["expert_cp_dir"] = _expert_cp_dir
 
     # MoC-System baseline uses round_robin single-expert sequential FC.
     fc_schedule = (
         "sequential" if get_controller()._config["cp_mode"] == "sequential" else "proposal"
     )
-    if _should_write():
-        get_controller()._fc = FCManager(
-            model=inner_model,
-            optimizer=inner_opt,
-            output_dir=_nonexpert_cp_dir,
-            expert_output_dir=_expert_cp_dir,
-            num_experts=num_experts_spec,
-            nonexpert_fc_W=get_controller()._config["nonexpert_fc_W"],
-            checkpoint_workers=get_controller()._checkpoint_workers,
+    get_controller()._fc = FCManager(
+        model=inner_model,
+        optimizer=inner_opt,
+        output_dir=_nonexpert_cp_dir,
+        expert_output_dir=_expert_cp_dir,
+        num_experts=num_experts_spec,
+        nonexpert_fc_W=get_controller()._config["nonexpert_fc_W"],
+        checkpoint_workers=get_controller()._checkpoint_workers,
+        schedule=fc_schedule,
+        lfcl_fraction_pct=get_controller()._config["lfcl_fraction_pct"],
+        fresh_expert_state=True,
+        # cp_target: 'disk' (default) or 'test_dram'. Both targets use
+        # the same proposal GPU path; test_dram is an in-memory
+        # correctness/recovery diagnostic target.
+        cp_target=cp_target,
+        pinned_aos_capacity_ratio=float(pinned_aos_capacity_ratio),
+        pinned_aos_capacity_tolerance=float(pinned_aos_capacity_tolerance),
+        enable_expert_state=True,
+        commit_expert_lossy_records=(
+            get_controller()._config["expert_lossy_commit_enabled"]
+        ),
+        commit_nonexpert_fc=(
+            get_controller()._config["nonexpert_commit_enabled"]
+        ),
+        test_skip_expert_d2h=bool(_test_skip_expert_d2h),
+        test_skip_nonexpert_d2h=bool(
+            _test_skip_nonexpert_d2h
+            or (not topology.writes_nonexpert and cp_target != "test_dram")
+        ),
+        nonexpert_shard_rank=(
+            int(topology.ep_rank) if cp_target != "test_dram" else 0
+        ),
+        nonexpert_shard_count=(
+            int(topology.ep_size) if cp_target != "test_dram" else 1
+        ),
+    )
+    # Wire the ExpertState sink into the lossy checkpoint path. Each proposal
+    # step then routes selected expert records into ExpertState.write_for_iter.
+    # Sequential mode never calls the lossy path, so it skips this wiring.
+    if get_controller()._config["cp_mode"] != "sequential":
+        get_controller().attach_expert_state(get_controller()._fc.expert_state)
+        if torch.cuda.is_available():
+            get_controller()._fc.expert_state.warmup_record_pipeline(
+                next(inner_model.parameters()).device,
+            )
+    if _test_skip_expert_commit:
+        if _test_expert_selection_only:
+            print("[proposal] TEST MODE proposal-test-expert-selection-only: "
+                  "expert selection/cutoff and host layout run; GPU "
+                  "record emission, D2H, CPU scatter, LFSY writes, and "
+                  "LFCL commit are skipped.",
+                  flush=True)
+        elif _test_skip_expert_d2h:
+            print("[proposal] TEST MODE proposal-test-skip-expert-d2h: "
+                  "expert selection/AOS materialization run; AOS D2H, "
+                  "CPU scatter, LFSY writes, and LFCL commit are skipped.",
+                  flush=True)
+        else:
+            print("[proposal] TEST MODE proposal-test-skip-expert-commit: "
+                  "expert selection/AOS/D2H and LFCL payload D2H still "
+                  "run; CPU scatter, LFSY writes, and LFCL commit are "
+                  "skipped.",
+                  flush=True)
+    if _test_skip_nonexpert_commit:
+        if _test_skip_nonexpert_d2h:
+            print("[proposal] TEST MODE proposal-test-skip-nonexpert-d2h: "
+                  "non-expert FC D2H and PRPTENS file write/fsync are "
+                  "skipped.",
+                  flush=True)
+        else:
+            print("[proposal] TEST MODE proposal-test-skip-nonexpert-commit: "
+                  "non-expert FC D2H still runs; PRPTENS file write/fsync "
+                  "is skipped.",
+                  flush=True)
+
+    # Expert LFCL compaction materializes plan-target live GPU p/m/v into a
+    # pinned LFCL payload; ExpertState owns durable file commit.
+    # ``fc_manager.fire_nonexpert_fc_if_due()`` only handles non-expert FC.
+    if _test_skip_expert_d2h:
+        get_controller()._expert_lossless_fc = None
+    else:
+        from .storage.lossless_compaction import ExpertLosslessFC
+        from .storage.lfcl_plan import LossyLogSizeBasedPlan, RoundRobinPlan
+        lfcl_policy = get_controller()._proposal_config.lfcl_plan_policy
+        if lfcl_policy == "round_robin":
+            lfcl_planner = RoundRobinPlan()
+        elif lfcl_policy == "lossy_log_size":
+            lfcl_planner = LossyLogSizeBasedPlan()
+        else:
+            raise ValueError(f"unknown LFCL plan policy: {lfcl_policy!r}")
+        get_controller()._expert_lossless_fc = ExpertLosslessFC(
+            all_expert_ids=get_controller()._fc._all_expert_ids,
+            separated_tensors_by_slot=get_controller()._fc._separated_tensors_by_slot,
+            sorted_layers=get_controller()._fc._sorted_layers,
+            expert_state=get_controller()._fc.expert_state,
+            fc_manager=get_controller()._fc,
+            interval_iters=get_controller()._proposal_config.lfcl_interval_iters,
             schedule=fc_schedule,
             lfcl_fraction_pct=get_controller()._config["lfcl_fraction_pct"],
-            fresh_expert_state=True,
-            # cp_target: 'disk' (default) or 'test_dram'. Both targets use
-            # the same proposal GPU path; test_dram is an in-memory
-            # correctness/recovery diagnostic target.
-            cp_target=get_controller()._proposal_config.cp_target,
-            pinned_aos_capacity_ratio=float(
-                get_controller()._proposal_config.topk_ratio,
-            ),
-            pinned_aos_capacity_tolerance=float(
-                get_controller()._proposal_config.pinned_aos_capacity_tolerance,
-            ),
-            enable_expert_state=True,
-            commit_expert_lossy_records=(
-                get_controller()._config["expert_lossy_commit_enabled"]
-            ),
-            commit_nonexpert_fc=(
-                get_controller()._config["nonexpert_commit_enabled"]
-            ),
-            test_skip_expert_d2h=bool(_test_skip_expert_d2h),
-            test_skip_nonexpert_d2h=bool(_test_skip_nonexpert_d2h),
+            planner=lfcl_planner,
+            commit_payload=get_controller()._config["expert_lossy_commit_enabled"],
         )
-        # Wire the ExpertState sink into the lossy checkpoint path. Each
-        # proposal step then routes selected expert records into
-        # ExpertState.write_for_iter. Sequential mode never calls the lossy
-        # path, so it skips this wiring.
-        if get_controller()._config["cp_mode"] != "sequential":
-            get_controller().attach_expert_state(get_controller()._fc.expert_state)
-            if torch.cuda.is_available():
-                get_controller()._fc.expert_state.warmup_record_pipeline(
-                    next(inner_model.parameters()).device,
-        )
-        if _test_skip_expert_commit:
-            if _test_expert_selection_only:
-                print("[proposal] TEST MODE proposal-test-expert-selection-only: "
-                      "expert selection/cutoff and host layout run; GPU "
-                      "record emission, D2H, CPU scatter, LFSY writes, and "
-                      "LFCL commit are skipped.",
-                      flush=True)
-            elif _test_skip_expert_d2h:
-                print("[proposal] TEST MODE proposal-test-skip-expert-d2h: "
-                      "expert selection/AOS materialization run; AOS D2H, "
-                      "CPU scatter, LFSY writes, and LFCL commit are skipped.",
-                      flush=True)
-            else:
-                print("[proposal] TEST MODE proposal-test-skip-expert-commit: "
-                      "expert selection/AOS/D2H and LFCL payload D2H still "
-                      "run; CPU scatter, LFSY writes, and LFCL commit are "
-                      "skipped.",
-                      flush=True)
-        if _test_skip_nonexpert_commit:
-            if _test_skip_nonexpert_d2h:
-                print("[proposal] TEST MODE proposal-test-skip-nonexpert-d2h: "
-                      "non-expert FC D2H and PRPTENS file write/fsync are "
-                      "skipped.",
-                      flush=True)
-            else:
-                print("[proposal] TEST MODE proposal-test-skip-nonexpert-commit: "
-                      "non-expert FC D2H still runs; PRPTENS file write/fsync "
-                      "is skipped.",
-                      flush=True)
-
-        # Expert LFCL compaction materializes plan-target live GPU p/m/v
-        # into a pinned LFCL payload; ExpertState owns durable file commit.
-        # ``fc_manager.fire_nonexpert_fc_if_due()`` only handles non-expert
-        # FC after this split.
-        if _test_skip_expert_d2h:
-            get_controller()._expert_lossless_fc = None
-        else:
-            from .storage.lossless_compaction import ExpertLosslessFC
-            from .storage.lfcl_plan import LossyLogSizeBasedPlan, RoundRobinPlan
-            lfcl_policy = get_controller()._proposal_config.lfcl_plan_policy
-            if lfcl_policy == "round_robin":
-                lfcl_planner = RoundRobinPlan()
-            elif lfcl_policy == "lossy_log_size":
-                lfcl_planner = LossyLogSizeBasedPlan()
-            else:
-                raise ValueError(f"unknown LFCL plan policy: {lfcl_policy!r}")
-            get_controller()._expert_lossless_fc = ExpertLosslessFC(
-                all_expert_ids=get_controller()._fc._all_expert_ids,
-                separated_tensors_by_slot=get_controller()._fc._separated_tensors_by_slot,
-                sorted_layers=get_controller()._fc._sorted_layers,
-                expert_state=get_controller()._fc.expert_state,
-                fc_manager=get_controller()._fc,
-                interval_iters=get_controller()._proposal_config.lfcl_interval_iters,
-                schedule=fc_schedule,
-                lfcl_fraction_pct=get_controller()._config["lfcl_fraction_pct"],
-                planner=lfcl_planner,
-                commit_payload=not _test_skip_expert_commit,
-            )
-    else:
-        get_controller()._fc = None
-        get_controller()._expert_lossless_fc = None
-
     get_controller()._config["_inner_model"] = inner_model
     get_controller()._config["_inner_opt"] = inner_opt
     # Persist fault log path early so proposal_shutdown dumps land next to it
@@ -574,8 +674,6 @@ def init_proposal(
             pass
     # Diagnostic: per-refresh expert coverage / skipped tensor ratio / eps.
     get_controller()._config["_h_diag_records"] = []
-    # ANALYSIS: non-expert |H| probe — comparison of expert vs non-expert |H|
-    # distribution at score_diag_iters; retained for measurement purposes.
 
     # POST-INIT VRAM diff vs baseline. Large selection buffers have already
     # been initialized, so this captures the steady V2 allocation footprint.
@@ -584,9 +682,12 @@ def init_proposal(
         _post_init_alloc = torch.cuda.memory_allocated()
         _baseline = globals().get("_baseline_alloc_mb", 0.0) * 1e6
         delta = (_post_init_alloc - _baseline) / 1e6
-        print(f"[proposal] POST-INIT VRAM: alloc={_post_init_alloc/1e6:.1f} MB "
-              f"(Δ from baseline = {delta:+.1f} MB; lazy buffers add at iter 1)",
-              flush=True)
+        if _should_write():
+            print(
+                f"[proposal] POST-INIT VRAM: alloc={_post_init_alloc/1e6:.1f} MB "
+                f"(Δ from baseline = {delta:+.1f} MB; lazy buffers add at iter 1)",
+                flush=True,
+            )
     # Audit: post_init record (R1 baseline). dump_breakdown captures
     # lossy checkpoint GPU buffers if initialized.
     from .telemetry import diagnostics as _proposal_diagnostics
@@ -733,7 +834,6 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
                 step=task.iter_T,
                 ready_event=task.cuda_event,
                 d2h_event_callback=_mark_non_expert_read_ready,
-                d2h_start_event=task.non_expert_d2h_start_event,
             )
     except BaseException as exc:
         task.non_expert_error = exc
@@ -774,7 +874,6 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
                     global_step=task.iter_T,
                     ready_event=task.cuda_event,
                     d2h_event_callback=_mark_expert_d2h_event,
-                    expert_d2h_start_event=task.expert_d2h_start_event,
                 )
         fired_experts: List[Tuple[int, int]] = []
         if get_controller()._expert_lossless_fc is not None:
@@ -826,22 +925,11 @@ def proposal_wait_d2h_before_optimizer() -> None:
     """
     if not get_controller()._enabled or not torch.cuda.is_available():
         return
-    import os as _os_probe_fence
-    _probe = _os_probe_fence.environ.get("PROPOSAL_MAIN_PROBE", "") in ("1", "true", "True")
-    import time as _time_probe
-    _t0 = _time_probe.perf_counter() if _probe else 0
     task = get_controller()._latest_post_step_checkpoint_task
     if task is not None:
         current = torch.cuda.current_stream()
-        if task.non_expert_d2h_start_event is not None:
-            task.non_expert_d2h_start_event.record(current)
-        if task.expert_d2h_start_event is not None:
-            task.expert_d2h_start_event.record(current)
-        _t_before_non_expert = _time_probe.perf_counter() if _probe else 0
         task.non_expert_read_ready.wait()
-        _t_after_non_expert = _time_probe.perf_counter() if _probe else 0
         task.expert_read_ready.wait()
-        _t_after_expert = _time_probe.perf_counter() if _probe else 0
         if task.non_expert_error is not None:
             raise RuntimeError(
                 f"proposal non-expert checkpoint task failed at "
@@ -851,82 +939,12 @@ def proposal_wait_d2h_before_optimizer() -> None:
             raise RuntimeError(
                 f"proposal expert checkpoint task failed at iter {task.iter_T}"
             ) from task.expert_error
-        _non_event_ready = None
-        _expert_event_ready = None
-        if _probe:
-            try:
-                _non_event_ready = (
-                    True if task.non_expert_d2h_event is None
-                    else bool(task.non_expert_d2h_event.query())
-                )
-            except Exception:
-                _non_event_ready = False
-            try:
-                _expert_event_ready = (
-                    True if task.expert_d2h_event is None
-                    else bool(task.expert_d2h_event.query())
-                )
-            except Exception:
-                _expert_event_ready = False
         if task.non_expert_d2h_event is not None:
             current.wait_event(task.non_expert_d2h_event)
         if task.expert_d2h_event is not None:
             current.wait_event(task.expert_d2h_event)
-        _t_after_event_waits = _time_probe.perf_counter() if _probe else 0
         if task is get_controller()._latest_post_step_checkpoint_task:
             get_controller()._latest_post_step_checkpoint_task = None
-        if _probe:
-            _non_wait_ms = (_t_after_non_expert - _t_before_non_expert) * 1000.0
-            _expert_wait_ms = (_t_after_expert - _t_after_non_expert) * 1000.0
-            _event_wait_ms = (_t_after_event_waits - _t_after_expert) * 1000.0
-            try:
-                _probe_every = max(
-                    1,
-                    int(_os_probe_fence.environ.get("PROPOSAL_MAIN_PROBE_EVERY", "10") or "10"),
-                )
-            except ValueError:
-                _probe_every = 10
-            _force_probe_row = int(task.iter_T) % _probe_every == 0
-            if _force_probe_row or max(_non_wait_ms, _expert_wait_ms, _event_wait_ms) > 0.5:
-                _queue_ne_ms = (
-                    (task.non_expert_started_at - task.submitted_at) * 1000.0
-                    if task.non_expert_started_at else -1.0
-                )
-                _queue_ex_ms = (
-                    (task.expert_started_at - task.submitted_at) * 1000.0
-                    if task.expert_started_at else -1.0
-                )
-                _run_ne_ms = (
-                    (task.non_expert_ready_at - task.non_expert_started_at) * 1000.0
-                    if task.non_expert_started_at and task.non_expert_ready_at else -1.0
-                )
-                _run_ex_ms = (
-                    (task.expert_ready_at - task.expert_started_at) * 1000.0
-                    if task.expert_started_at and task.expert_ready_at else -1.0
-                )
-                print(
-                    f"[probe] fence_detail@iter{task.iter_T}: "
-                    f"wait_non_expert={_non_wait_ms:.2f}ms "
-                    f"wait_expert={_expert_wait_ms:.2f}ms "
-                    f"event_wait={_event_wait_ms:.2f}ms "
-                    f"non_event_ready={int(bool(_non_event_ready))} "
-                    f"expert_event_ready={int(bool(_expert_event_ready))} "
-                    f"queue_ne={_queue_ne_ms:.2f}ms "
-                    f"queue_ex={_queue_ex_ms:.2f}ms "
-                    f"run_ne={_run_ne_ms:.2f}ms "
-                    f"run_ex={_run_ex_ms:.2f}ms",
-                    flush=True,
-                )
-    _t_before_wait_stream = _t_after_wait_stream = 0
-    if _probe:
-        _t1 = _time_probe.perf_counter()
-        if (_t1 - _t0) * 1000 > 0.5:
-            _wait_stream_ms = 0.0
-            print(
-                f"[probe] fence: {(_t1-_t0)*1000:.2f}ms "
-                f"wait_stream={_wait_stream_ms:.2f}ms",
-                flush=True,
-            )
 
 
 def _submit_post_step_checkpoint_task(task: PostStepCheckpointTask) -> None:
@@ -964,50 +982,16 @@ def proposal_dispatch_post_iter(model, iter_T: int) -> None:
     iter_T = int(iter_T)
     if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
         return
-    import os as _os_probe_dispatch
-    _probe = _os_probe_dispatch.environ.get(
-        "PROPOSAL_MAIN_PROBE", "") in ("1", "true", "True")
-    import time as _time_probe
-    _t0 = _time_probe.perf_counter() if _probe else 0.0
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
         event.record()
     task = PostStepCheckpointTask(
         cuda_event=event,
         iter_T=iter_T,
-        non_expert_d2h_start_event=(
-            torch.cuda.Event()
-            if torch.cuda.is_available()
-            and (
-                os.environ.get("PROPOSAL_DEFER_NONEXPERT_D2H_TO_FENCE", "")
-                in ("1", "true", "TRUE")
-                or os.environ.get("PROPOSAL_DEFER_ALL_D2H_TO_FENCE", "")
-                in ("1", "true", "TRUE")
-            )
-            else None
-        ),
-        expert_d2h_start_event=(
-            torch.cuda.Event()
-            if torch.cuda.is_available()
-            and (
-                os.environ.get("PROPOSAL_DEFER_AOS_D2H_TO_FENCE", "")
-                in ("1", "true", "TRUE")
-                or os.environ.get("PROPOSAL_DEFER_ALL_D2H_TO_FENCE", "")
-                in ("1", "true", "TRUE")
-            )
-            else None
-        ),
     )
     get_controller()._latest_post_step_checkpoint_task = task
     _submit_post_step_checkpoint_task(task)
     get_controller()._last_dispatched_iter_T = iter_T
-    if _probe:
-        _t1 = _time_probe.perf_counter()
-        if (_t1 - _t0) * 1000 > 0.5:
-            print(
-                f"[probe] dispatch@iter{iter_T}: {(_t1-_t0)*1000:.2f}ms",
-                flush=True,
-            )
     from .telemetry import diagnostics as _d
     _d._proposal_post_iter_diagnostics(model, int(iter_T))
 
@@ -1051,6 +1035,8 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         num_experts=num_experts,
         expert_state_image=_expert_state_image,
         nonexpert_state_image=_nonexpert_state_image,
+        nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
+        expert_dir=get_controller()._config.get("expert_cp_dir"),
     )
     _t_rec1 = _time.perf_counter()
     # H_g is GPU-only; the next FD refresh will repopulate it. No disk
@@ -1155,6 +1141,8 @@ def _simulate_fault_impl(
         num_experts=num_experts,
         expert_state_image=_expert_state_image,
         nonexpert_state_image=_nonexpert_state_image,
+        nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
+        expert_dir=get_controller()._config.get("expert_cp_dir"),
     )
     # H_g is GPU-only; next FD refresh repopulates it.
     recover_s = time.perf_counter() - t0

@@ -161,6 +161,7 @@ class LossyCheckpointPipeline(
         )
         self._direct_write_total_th_ring_device: Optional[torch.Tensor] = None
         self._global_selection_element_count_host: Optional[int] = None
+        self._local_selection_element_count_host: Optional[int] = None
         self._selection_candidate_capacity = 16
         self._cold_start_cutoff_ready = False
         self.test_expert_selection_only = bool(
@@ -390,6 +391,12 @@ class LossyCheckpointPipeline(
         self._approx_probe_n_blocks = torch.zeros(
             (n_strata, cand_cap), dtype=torch.int32, device=device,
         )
+        self._approx_probe_candidate_stats = torch.zeros(
+            (4, cand_cap), dtype=torch.float32, device=device,
+        )
+        self._approx_probe_candidate_stats_pinned = torch.empty(
+            (4, cand_cap), dtype=torch.float32, pin_memory=True,
+        )
         self._approx_probe_reject = torch.ones(
             (), dtype=torch.int32, device=device,
         )
@@ -402,19 +409,8 @@ class LossyCheckpointPipeline(
         self._approx_probe_capacity_demand_hint = torch.zeros(
             max(1, len(eid_to_expert_idx)), dtype=torch.float32, device=device,
         )
-        import os as _os_probe_sample
-        default_sample_fraction = float(
-            _os_probe_sample.environ.get(
-                "PROPOSAL_APPROX_PROBE_DEFAULT_SAMPLE_FRACTION",
-                str(_APPROX_PROBE_DEFAULT_SAMPLE_FRACTION),
-            )
-        )
-        max_sample_fraction = float(
-            _os_probe_sample.environ.get(
-                "PROPOSAL_APPROX_PROBE_MAX_SAMPLE_FRACTION",
-                str(_APPROX_PROBE_MAX_SAMPLE_FRACTION),
-            )
-        )
+        default_sample_fraction = float(_APPROX_PROBE_DEFAULT_SAMPLE_FRACTION)
+        max_sample_fraction = float(_APPROX_PROBE_MAX_SAMPLE_FRACTION)
         default_sample_fraction = max(0.0, min(1.0, default_sample_fraction))
         max_sample_fraction = max(default_sample_fraction, min(1.0, max_sample_fraction))
         total_blocks = max(1, int(self._approx_probe_total_entry_blocks))
@@ -542,11 +538,27 @@ class LossyCheckpointPipeline(
             p = self._name_to_param.get(n)
             if p is None:
                 continue
-            m = (mapper.get_state(p, "exp_avg")
-                 if mapper is not None
-                 else optimizer.state.get(p, {}).get("exp_avg"))
-            v = fp32_v_t(optimizer, p)
+            m = (
+                mapper.get_local_state_view(p, "exp_avg")
+                if mapper is not None
+                else optimizer.state.get(p, {}).get("exp_avg")
+            )
+            v = (
+                mapper.get_local_state_view(p, "exp_avg_sq")
+                if mapper is not None
+                else optimizer.state.get(p, {}).get("exp_avg_sq")
+            )
             if m is None or v is None:
+                continue
+            # Expert hot path needs rank-local zero-copy views. Public mapper
+            # getters may intentionally return full-state safe API tensors for
+            # non-expert FC/recovery, so use local views here.
+            p_local = (
+                mapper.get_local_param_view(p)
+                if mapper is not None
+                else fp32_param(p)
+            )
+            if p_local is None:
                 continue
             # Resolve which BF16-Opt group this tensor lives in. Use the
             # mapper's coord table when available; otherwise fall back to a
@@ -564,11 +576,7 @@ class LossyCheckpointPipeline(
             b["sizes"].append(int(p.numel()))
             b["m_refs"].append(m.detach().reshape(-1))
             b["v_refs"].append(v.detach().reshape(-1))
-            # FP32 master view for batched p index_select. Same FP32
-            # master buffer as ``master_flat = mapper._fp32_flat[g_idx]``,
-            # so all p_refs in this bucket share storage and form a
-            # zero-copy flat view over the BF16-Opt group's params.
-            b["p_refs"].append(fp32_param(p).detach().reshape(-1))
+            b["p_refs"].append(p_local.detach().reshape(-1))
 
         if not buckets:
             return
@@ -647,6 +655,9 @@ class LossyCheckpointPipeline(
         self._cold_start_hist_pinned = torch.empty(
             self._n_bins_cutoff, dtype=torch.int64, pin_memory=True,
         )
+        self._cold_start_minmax_pinned = torch.empty(
+            2, dtype=torch.float32, pin_memory=True,
+        )
         self._selection_smin = torch.full(
             (), float("inf"), dtype=torch.float32, device=device,
         )
@@ -656,7 +667,16 @@ class LossyCheckpointPipeline(
         self._selection_global_n_elements = torch.zeros(
             (), dtype=torch.int64, device=device,
         )
-        cand_cap = int(getattr(self, "_selection_candidate_capacity", 4))
+        cand_cap = int(getattr(self, "_selection_candidate_capacity", 16))
+        self._candidate_ladder_sync_cpu = torch.empty(
+            cand_cap + 1, dtype=torch.float64,
+        )
+        self._selection_global_n_elements_cpu = torch.empty(
+            1, dtype=torch.int64,
+        )
+        self._direct_feedback_counts_cpu = torch.empty(
+            6, dtype=torch.int64,
+        )
         self._selection_candidate_taus = torch.empty(
             cand_cap, dtype=torch.float32, device=device,
         )
@@ -1015,7 +1035,6 @@ class LossyCheckpointPipeline(
         global_step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
-        expert_d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[
         LossyStepStats,
         Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -1154,9 +1173,7 @@ class LossyCheckpointPipeline(
             lossy_write_inputs=lossy_write_inputs,
             selection_event=selection_event,
             d2h_event_callback=d2h_event_callback,
-            expert_d2h_start_event=expert_d2h_start_event,
         )
-
         _t0_end = _time.perf_counter()
         phase_launch_ms = (_t0_end - _t0_dispatch_end) * 1000.0
         phase_setup_ms = (_t0_p1 - _t0_dispatch_end) * 1000.0

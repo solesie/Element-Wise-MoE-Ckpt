@@ -265,27 +265,34 @@ void unlink_path(const std::string& path) {
     (void)syscall_unlink_allow_enoent(path, "unlink_path");
 }
 
-std::string read_file_range(const std::string& path,
-                            int64_t offset,
-                            int64_t nbytes) {
+size_t read_file_into_buffer(const std::string& path,
+                             int64_t dst_addr,
+                             int64_t offset,
+                             int64_t nbytes) {
+    if (dst_addr == 0)
+        throw std::invalid_argument("read_file_into_buffer: null dst ptr");
+    if (offset < 0)
+        throw std::invalid_argument("read_file_into_buffer: negative offset");
     if (nbytes < 0)
-        throw std::invalid_argument("read_file_range: negative nbytes");
-    if (nbytes == 0) return std::string();
-    int fd = syscall_open_rdonly(path, "read_file_range");
-    std::string out(static_cast<size_t>(nbytes), '\0');
+        throw std::invalid_argument("read_file_into_buffer: negative nbytes");
+    check_aligned(dst_addr, nbytes, "read_file_into_buffer");
+    if ((offset & (SECTOR_BYTES - 1)) != 0)
+        throw std::invalid_argument(
+            "read_file_into_buffer: offset not 4 KiB-aligned");
+    if (nbytes == 0) return 0;
+    int fd = syscall_open_rdonly(path, "read_file_into_buffer");
     size_t read_total = 0;
     try {
         read_total = syscall_pread_loop(
-            fd, &out[0], static_cast<size_t>(nbytes), offset,
-            "read_file_range");
+            fd, reinterpret_cast<void*>(dst_addr),
+            static_cast<size_t>(nbytes), offset,
+            "read_file_into_buffer");
     } catch (...) {
         syscall_close_noexcept(fd);
         throw;
     }
     syscall_close_noexcept(fd);
-    if (read_total < static_cast<size_t>(nbytes))
-        out.resize(read_total);
-    return out;
+    return read_total;
 }
 
 int64_t file_size(const std::string& path) {

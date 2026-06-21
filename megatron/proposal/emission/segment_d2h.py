@@ -17,9 +17,7 @@ GPU→pinned D2H flows through this primitive.
     optimizer-fence event: the next iter cannot reuse the slab before the
     copy is complete.
 
-Segments are caller-supplied — the AOS layout is partitioned at
-expert-blob boundaries by ``aos_emitter.cut_into_blob_aligned_segments``
-so records never straddle. Each segment has its own
+Segments are caller-supplied by the AOS layout. Each segment has its own
 ``(byte_offset, byte_length)`` tuple; the pipeline does not assume a
 fixed segment size and only requires that every segment fit within
 ``segment_bytes`` (the size of the GPU staging buffers allocated at
@@ -94,8 +92,7 @@ class SegmentD2H:
         dst: torch.Tensor,
         *,
         copy_to_host: bool = True,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
-    ) -> Optional["torch.cuda.Event"]:
+    ) -> Tuple[Optional["torch.cuda.Event"], Optional["torch.cuda.Event"]]:
         segment_list = [(int(o), int(n)) for o, n in segments if int(n) > 0]
         if not segment_list:
             return None, None
@@ -104,7 +101,6 @@ class SegmentD2H:
             segment_list,
             dst,
             copy_to_host=bool(copy_to_host),
-            d2h_start_event=d2h_start_event,
         )
 
     def _validate_run_inputs(
@@ -151,7 +147,6 @@ class SegmentD2H:
         dst: torch.Tensor,
         *,
         copy_to_host: bool,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
     ):
         segment_list = self._validate_run_inputs(
             segments, dst, copy_to_host=bool(copy_to_host),
@@ -176,7 +171,6 @@ class SegmentD2H:
                 segment_list,
                 dst,
                 copy_to_host=bool(copy_to_host),
-                d2h_start_event=d2h_start_event,
             )
 
         self._prod_done = [None] * len(self._gpu_bufs)
@@ -195,7 +189,6 @@ class SegmentD2H:
                 dst,
                 copy_to_host=bool(copy_to_host),
                 join_d2h_on_compute=True,
-                d2h_start_event=d2h_start_event,
                 external_done_events=(
                     self._graph_external_d2h_done,
                     self._graph_external_producer_done,
@@ -217,7 +210,6 @@ class SegmentD2H:
         *,
         copy_to_host: bool = True,
         join_d2h_on_compute: bool = False,
-        d2h_start_event: Optional["torch.cuda.Event"] = None,
         external_done_events: Optional[Tuple["torch.cuda.Event", "torch.cuda.Event"]] = None,
     ) -> Optional["torch.cuda.Event"]:
         """Stream caller-supplied segments from GPU through ``producer``
@@ -226,9 +218,7 @@ class SegmentD2H:
         ``segments`` is an iterable of ``(byte_offset, byte_length)``
         tuples; each entry's ``byte_length`` must satisfy
         ``0 < byte_length <= segment_bytes`` (the construction-time
-        staging buffer size). Segments may have variable size — the
-        expert lossy path partitions at expert-blob boundaries via
-        ``aos_emitter.cut_into_blob_aligned_segments``.
+        staging buffer size). Segments may have variable size.
 
         ``producer(seg_view, byte_off, n)`` is invoked on
         ``compute_stream``. ``seg_view`` is a contiguous uint8 GPU slice
@@ -277,7 +267,6 @@ class SegmentD2H:
         last_index = len(segment_list) - 1
         external_d2h_done = external_done_events[0] if external_done_events else None
         external_producer_done = external_done_events[1] if external_done_events else None
-        d2h_start_waited = False
         for seg_index, (byte_off, n) in enumerate(segment_list):
             # Back-pressure: producer must not overwrite a staging buffer
             # whose previous d2h is still in flight.
@@ -308,9 +297,6 @@ class SegmentD2H:
                     last_event = external_d2h_done
                 buf = (buf + 1) % nb
                 continue
-            if d2h_start_event is not None and not d2h_start_waited:
-                self._d2h_stream.wait_event(d2h_start_event)
-                d2h_start_waited = True
             self._d2h_stream.wait_event(producer_event_for_wait)
             with torch.cuda.stream(self._d2h_stream):
                 t0 = time.perf_counter() if profile and time is not None else 0.0

@@ -159,7 +159,6 @@ class EmissionOrchestrationMixin:
         lossy_write_inputs: Dict[str, Any],
         selection_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
-        expert_d2h_start_event: Optional["torch.cuda.Event"] = None,
     ) -> None:
         """Submit one direct-emission lossy-record iteration.
 
@@ -224,7 +223,7 @@ class EmissionOrchestrationMixin:
             if runtime_state is not None:
                 total_elems_for_actual_k = self._global_selection_element_count_cached(
                     int(runtime_state.index.n_total_elements),
-                    process_group=getattr(self, "_proposal_pg", None),
+                    process_group=getattr(self, "_proposal_cpu_pg", None),
                     world_size=int(getattr(self, "_proposal_world_size", 1)),
                 )
             target_selected_count = int(round(
@@ -267,6 +266,7 @@ class EmissionOrchestrationMixin:
                 probe_count_mismatch_grow_after=int(
                     _APPROX_PROBE_COUNT_MISMATCH_GROW_AFTER
                 ),
+                enable_direct_probe_sample_feedback=True,
                 age2bit_words=(
                     age2bit_state.age_words if age2bit_state is not None else None
                 ),
@@ -292,5 +292,4 @@ class EmissionOrchestrationMixin:
                 gpu_refs=gpu_refs_for_writer,
                 lossy_state=_lossy_state,
                 d2h_event_callback=d2h_event_callback,
-                d2h_start_event=expert_d2h_start_event,
             )

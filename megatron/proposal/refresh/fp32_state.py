@@ -282,6 +282,35 @@ class Fp32StateMapper:
             return None
         return state_value.narrow(0, offset, numel).view(param.shape)
 
+    def get_local_param_view(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        coord = self._coords.get(id(param))
+        if coord is None or self._fp32_flat is None:
+            return None
+        group_idx, offset, numel = coord
+        if group_idx >= len(self._fp32_flat):
+            return None
+        flat = self._fp32_flat[group_idx]
+        if offset < 0 or offset + numel > int(flat.numel()):
+            return None
+        return flat.narrow(0, offset, numel).view(param.shape)
+
+    def get_local_state_view(
+        self, param: torch.nn.Parameter, key: str
+    ) -> Optional[torch.Tensor]:
+        coord = self._coords.get(id(param))
+        if coord is None or self._fp32_flat is None:
+            return None
+        group_idx, offset, numel = coord
+        if group_idx >= len(self._fp32_flat):
+            return None
+        master_flat = self._fp32_flat[group_idx]
+        state_value = self._inner_opt.state.get(master_flat, {}).get(key)
+        if state_value is None:
+            return None
+        if offset < 0 or offset + numel > int(state_value.numel()):
+            return None
+        return state_value.narrow(0, offset, numel).view(param.shape)
+
     def get_grad_accum_view(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Return the FP32 storage where training normally accumulates grad."""
 
@@ -358,7 +387,9 @@ class Fp32StateMapper:
             flat_slice.copy_(
                 value.flatten().to(device=flat_slice.device, dtype=flat_slice.dtype)
             )
-        param.data.copy_(value.view(param.shape).to(device=param.device, dtype=param.dtype))
+        param.data.copy_(
+            value.view(param.shape).to(device=param.device, dtype=param.dtype)
+        )
 
     @torch.no_grad()
     def set_state(

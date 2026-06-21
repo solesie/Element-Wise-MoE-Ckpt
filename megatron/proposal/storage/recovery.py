@@ -29,6 +29,9 @@ _EXPERT_LOSSLESS_RE = re.compile(r"^fc_expert_L(\d+)_E(\d+)\.bin$")
 # expert_state.read_expert_state which locates it by convention).
 _EXPERT_LOSSY_RE = re.compile(r"^lossy_expert_L(\d+)_E(\d+)\.bin$")
 _NONEXPERT_FC_RE = re.compile(r"^fc_nonexpert_iter(\d+)\.bin$")
+_NONEXPERT_FC_SHARD_RE = re.compile(
+    r"^fc_nonexpert_ep(\d+)of(\d+)_iter(\d+)\.bin$"
+)
 _LAYER_IN_NAME = re.compile(r"\.layers\.(\d+)\.")
 _DS_EXPERT_IDX_RE = re.compile(r"deepspeed_experts\.(\d+)\.")
 
@@ -59,6 +62,9 @@ class RecoveryDiagnostics:
 
 def _scan_cp_dir(
     cp_dir: Path,
+    *,
+    nonexpert_dir: Optional[Path] = None,
+    expert_dir: Optional[Path] = None,
 ) -> Tuple[
     List[Tuple[int, Path]],
     Dict[ExpertId, Tuple[Path, Path]],
@@ -66,12 +72,16 @@ def _scan_cp_dir(
     """Discover all CP artifacts in ``cp_dir``.
 
     Returns a 3-tuple:
-      - ``nonexpert_fcs``: non-expert full FC files (``fc_nonexpert_iter{T}.bin``).
+      - ``nonexpert_fcs``: non-expert full/shard FC files.  Sharded
+        multi-EP files share the same iter and are all applied at recovery.
       - ``expert_pairs``: per-expert ``(lossless_path, lossy_path)`` pair.
         Either path may point at a non-existent file if that half hasn't
         been written yet — ``read_expert_state`` tolerates missing files.
     """
-    scan_dirs = [cp_dir / "non_expert", cp_dir / "expert"]
+    scan_dirs = [
+        Path(nonexpert_dir) if nonexpert_dir is not None else cp_dir / "non_expert",
+    ]
+    scan_dirs.append(Path(expert_dir) if expert_dir is not None else cp_dir / "expert")
     expert_new: Dict[ExpertId, Dict[str, Path]] = {}
     nonexpert_fcs: List[Tuple[int, Path]] = []
 
@@ -94,6 +104,10 @@ def _scan_cp_dir(
             m = _NONEXPERT_FC_RE.match(f.name)
             if m is not None:
                 nonexpert_fcs.append((int(m.group(1)), f))
+                continue
+            m = _NONEXPERT_FC_SHARD_RE.match(f.name)
+            if m is not None:
+                nonexpert_fcs.append((int(m.group(3)), f))
 
     expert_pairs: Dict[ExpertId, Tuple[Path, Path]] = {}
     for eid, parts in expert_new.items():
@@ -159,46 +173,33 @@ def _apply_payload_dict_to_model(
     data: Dict[str, Any],
     target_params: Dict[str, torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
-    stream: Optional["torch.cuda.Stream"] = None,
 ) -> int:
-    """Scatter a pre-read CPU payload dict into model + optimizer state.
-    Serial GPU-side application; split out from ``_load_fc_payload_into``
-    so Phase A (binary read on CPU) can run in parallel across experts.
-    """
+    """Scatter a pre-read CPU payload dict into model + optimizer state."""
     mapper = get_mapper()
     rolling_step = int(data.get("_rolling_step", 0)) if isinstance(data, dict) else 0
-    ctx = (
-        torch.cuda.stream(stream)
-        if stream is not None and torch.cuda.is_available()
-        else None
-    )
-    if ctx is None:
-        from contextlib import nullcontext
-        ctx = nullcontext()
-    with ctx:
-        for key, tensor in data.items():
-            if not isinstance(key, str) or ":" not in key:
-                continue
-            name, field_name = key.rsplit(":", 1)
-            p = target_params.get(name)
-            if p is None:
-                continue
-            value = tensor.to(device=p.device, dtype=torch.float32, non_blocking=True)
-            if field_name == "param":
-                if mapper is not None:
-                    mapper.set_param(p, value)
-                else:
-                    p.data.copy_(value.to(dtype=p.dtype), non_blocking=True)
-            elif field_name in ("exp_avg", "exp_avg_sq"):
-                if mapper is not None:
-                    mapper.set_state(p, value, field_name)
-                else:
-                    state = optimizer.state.setdefault(p, {})
-                    slot = state.get(field_name)
-                    if slot is None:
-                        slot = torch.zeros_like(p, dtype=torch.float32)
-                        state[field_name] = slot
-                    slot.copy_(value.to(dtype=slot.dtype), non_blocking=True)
+    for key, tensor in data.items():
+        if not isinstance(key, str) or ":" not in key:
+            continue
+        name, field_name = key.rsplit(":", 1)
+        p = target_params.get(name)
+        if p is None:
+            continue
+        value = tensor.to(device=p.device, dtype=torch.float32, non_blocking=True)
+        if field_name == "param":
+            if mapper is not None:
+                mapper.set_param(p, value)
+            else:
+                p.data.copy_(value.to(dtype=p.dtype), non_blocking=True)
+        elif field_name in ("exp_avg", "exp_avg_sq"):
+            if mapper is not None:
+                mapper.set_state(p, value, field_name)
+            else:
+                state = optimizer.state.setdefault(p, {})
+                slot = state.get(field_name)
+                if slot is None:
+                    slot = torch.zeros_like(p, dtype=torch.float32)
+                    state[field_name] = slot
+                slot.copy_(value.to(dtype=slot.dtype), non_blocking=True)
     return rolling_step
 
 
@@ -239,6 +240,8 @@ def recover(
     load_expert_fcs: bool = True,
     expert_state_image: Optional[Any] = None,
     nonexpert_state_image: Optional[Any] = None,
+    nonexpert_dir: Optional[Path] = None,
+    expert_dir: Optional[Path] = None,
 ) -> RecoveryDiagnostics:
     """Rebuild state from CP files at ``t_fault``.
 
@@ -260,7 +263,11 @@ def recover(
 
     cp_dir = Path(cp_dir)
     _t0 = _time.perf_counter()
-    nonexpert_fcs, expert_pairs = _scan_cp_dir(cp_dir)
+    nonexpert_fcs, expert_pairs = _scan_cp_dir(
+        cp_dir,
+        nonexpert_dir=nonexpert_dir,
+        expert_dir=expert_dir,
+    )
     non_expert_params, by_expert_params = _classify_params(model)
     _phase["scan_classify_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
@@ -284,19 +291,47 @@ def recover(
         diag.nonexpert_fc_iter = int(ne_step)
         diag.nonexpert_fc_path = "test_dram"
     else:
-        best_ne: Optional[Tuple[int, Path]] = None
+        best_ne_iter: Optional[int] = None
         for it, path in nonexpert_fcs:
             if it > t_fault:
                 continue
-            if best_ne is None or it > best_ne[0]:
-                best_ne = (it, path)
-        if best_ne is None:
+            if best_ne_iter is None or it > best_ne_iter:
+                best_ne_iter = int(it)
+        if best_ne_iter is None:
             raise RuntimeError(
                 f"No non-expert FC found with iter ≤ {t_fault} in {cp_dir}"
             )
-        _load_fc_payload_into(best_ne[1], non_expert_params, optimizer)
-        diag.nonexpert_fc_iter = best_ne[0]
-        diag.nonexpert_fc_path = str(best_ne[1])
+        best_ne_paths = [
+            path for it, path in nonexpert_fcs if int(it) == int(best_ne_iter)
+        ]
+        shard_seen: Dict[int, int] = {}
+        shard_count: Optional[int] = None
+        for path in best_ne_paths:
+            m = _NONEXPERT_FC_SHARD_RE.match(path.name)
+            if m is None:
+                continue
+            shard = int(m.group(1))
+            count = int(m.group(2))
+            if shard_count is None:
+                shard_count = count
+            elif shard_count != count:
+                raise RuntimeError(
+                    f"Mixed non-expert shard counts at iter {best_ne_iter}: "
+                    f"{shard_count} and {count}"
+                )
+            shard_seen[shard] = count
+        if shard_count is not None and len(shard_seen) != int(shard_count):
+            missing = [
+                i for i in range(int(shard_count)) if i not in shard_seen
+            ]
+            raise RuntimeError(
+                f"Missing non-expert FC shard(s) at iter {best_ne_iter}: "
+                f"{missing}"
+            )
+        for path in sorted(best_ne_paths):
+            _load_fc_payload_into(path, non_expert_params, optimizer)
+        diag.nonexpert_fc_iter = int(best_ne_iter)
+        diag.nonexpert_fc_path = ",".join(str(p) for p in sorted(best_ne_paths))
     _phase["nonexpert_fc_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     # 2. Per-expert state. Disk mode loads the V2 ``(LFCL, LFSY)`` pair and
@@ -333,10 +368,10 @@ def recover(
             )
     elif load_expert_fcs:
         # Phase A (parallel, CPU-bound): read each expert's (LFCL, LFSY)
-        # pair from disk via read_expert_state: pure numpy scatter, GIL-free
-        # during I/O + numpy kernels. Phase B (serial, GPU) applies the
-        # resulting CPU dicts to model/optimizer so we don't race on the
-        # default CUDA stream or on mapper state.
+        # pair via read_expert_state, which uses one aligned read per object
+        # and C++ reverse replay. Phase B (serial, GPU) applies the resulting
+        # CPU dicts to model/optimizer so we don't race on CUDA stream or
+        # mapper state.
         from concurrent.futures import ThreadPoolExecutor
         from .expert_writer import read_expert_state
 
@@ -349,10 +384,12 @@ def recover(
         _t_read0 = _time.perf_counter()
         new_pair_data: Dict[ExpertId, Dict[str, Any]] = {}
         if eids_with_new_pair:
-            # Thread pool width: min(32, n_experts). Diminishing returns past
-            # ~8 due to GIL on dict mutation + file descriptor contention,
-            # but headroom helps when experts vary in lossy-log size.
-            n_workers = min(32, max(1, len(eids_with_new_pair)))
+            # Recovery reads whole LFCL/LFSY objects into aligned pinned buffers.
+            # Keep concurrency bounded so large logs do not pin many GB at once.
+            n_workers = min(
+                2,
+                max(1, len(eids_with_new_pair)),
+            )
 
             def _read_one(eid: ExpertId) -> Tuple[ExpertId, Dict[str, Any]]:
                 L, E = eid
@@ -365,29 +402,16 @@ def recover(
                     new_pair_data[eid] = data
         _phase["expert_read_ms"] = (_time.perf_counter() - _t_read0) * 1000.0
 
-        # Phase B: apply the CPU payloads serially on the default CUDA stream.
+        # Phase B: apply CPU payloads serially.  This keeps recovery's GPU
+        # transient lifetime predictable after the one-read CPU replay.
         _t_apply0 = _time.perf_counter()
-        stream_pool: List["torch.cuda.Stream"] = []
-        if torch.cuda.is_available() and eids_with_new_pair:
-            stream_pool = [
-                torch.cuda.Stream()
-                for _ in range(min(8, len(eids_with_new_pair)))
-            ]
-        for apply_i, eid in enumerate(eids_with_new_pair):
+        for eid in eids_with_new_pair:
             data = new_pair_data[eid]
             target = by_expert_params[eid]
-            stream = (
-                stream_pool[apply_i % len(stream_pool)]
-                if stream_pool else None
-            )
-            log_step = _apply_payload_dict_to_model(
-                data, target, optimizer, stream=stream,
-            )
+            log_step = _apply_payload_dict_to_model(data, target, optimizer)
             if log_step <= t_fault:
                 log_loaded[eid] = log_step
                 diag.expert_fc_iters[eid] = log_step
-        for stream in stream_pool:
-            stream.synchronize()
         _phase["expert_apply_ms"] = (_time.perf_counter() - _t_apply0) * 1000.0
 
         diag.rolling_experts_loaded = len(log_loaded)
@@ -395,7 +419,7 @@ def recover(
         if diag.expert_fc_count == 0:
             raise RuntimeError(
                 f"No expert LFCL/LFSY state found with "
-                f"iter ≤ {t_fault} in {cp_dir}"
+                f"iter ≤ {t_fault} in {expert_dir or cp_dir}"
             )
     _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
 

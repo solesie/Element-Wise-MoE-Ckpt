@@ -90,13 +90,13 @@ void close_fd(int fd);
 // File deletion. Swallows ENOENT for idempotent caller paths.
 void unlink_path(const std::string& path);
 
-// Read helpers. All recovery-side reads (rare events) go through
-// these so file-IO syscalls live in one place. ``read_file_range``
-// returns ``nbytes`` bytes starting at ``offset`` (uses ::pread so
-// no fd-position state is touched).
-std::string read_file_range(const std::string& path,
-                            int64_t offset,
-                            int64_t nbytes);
+// Read helpers. All recovery-side reads go through this caller-owned CPU
+// memory path to avoid thousands of small Python<->C++ pread calls.
+// Returns bytes actually read.
+size_t read_file_into_buffer(const std::string& path,
+                             int64_t dst_addr,
+                             int64_t offset,
+                             int64_t nbytes);
 
 // ``::stat()``-based file size in bytes, or -1 if the file is missing.
 int64_t file_size(const std::string& path);

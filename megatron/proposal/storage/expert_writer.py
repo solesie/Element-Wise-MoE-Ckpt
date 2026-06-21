@@ -245,8 +245,9 @@ class ExpertState:
         self._direct_feedback_consumed_step: int = -1
         self._direct_feedback_expert_ids: List[ExpertId] = []
         self._latest_direct_feedback: Optional[Dict[str, Any]] = None
-        self._direct_layout_feedback_enabled = bool(
-            os.environ.get("PROPOSAL_APPROX_PROBE_TELEMETRY_LOG", "")
+        self._direct_layout_feedback_enabled = (
+            os.environ.get("PROPOSAL_APPROX_PROBE_TELEMETRY_DETAIL", "")
+            in ("1", "true", "TRUE")
         )
         self._prepared_direct_updates_key: Optional[int] = None
         self._prepared_direct_updates: Optional[
@@ -276,9 +277,7 @@ class ExpertState:
                     int(pinned_aos_record_capacity),
                 ),
             )
-            _capacity_desc = (
-                f"configured capacity ({_record_capacity} records)"
-            )
+            _capacity_desc = f"configured capacity ({_record_capacity} records)"
         self._pinned_aos_record_capacity = int(_record_capacity)
         _sect = int(_BIN_SECTOR_BYTES)
         _n_local_experts = len(expert_tensor_map)
@@ -316,26 +315,8 @@ class ExpertState:
                 // _BIN_SECTOR_BYTES
             ) * _BIN_SECTOR_BYTES
             _max_expert_blob_bytes = max(_max_expert_blob_bytes, _blob_bytes)
-        _segment_mb_env = os.environ.get("PROPOSAL_AOS_SEGMENT_MB", "")
-        if _segment_mb_env:
-            try:
-                _segment_bytes = max(1, int(_segment_mb_env)) * 1024 * 1024
-            except ValueError as exc:
-                raise ValueError(
-                    "PROPOSAL_AOS_SEGMENT_MB must be an integer MiB value"
-                ) from exc
-        else:
-            _segment_bytes = DEFAULT_SEGMENT_BYTES
-        _segment_buffers_env = os.environ.get("PROPOSAL_AOS_SEGMENT_BUFFERS", "")
-        if _segment_buffers_env:
-            try:
-                _num_segment_buffers = max(1, int(_segment_buffers_env))
-            except ValueError as exc:
-                raise ValueError(
-                    "PROPOSAL_AOS_SEGMENT_BUFFERS must be an integer value"
-                ) from exc
-        else:
-            _num_segment_buffers = 2
+        _segment_bytes = DEFAULT_SEGMENT_BYTES
+        _num_segment_buffers = 2
 
         # Lossy record pipeline shares ``self._pinned_aos`` — no internal
         # growth. GPU staging/descriptor pools are warmed by init_proposal
@@ -396,8 +377,10 @@ class ExpertState:
 
     def aos_cuda_graph_ready(self) -> bool:
         return bool(getattr(self._record_pipeline, "cuda_graph_ready", False))
-        self._ensure_lossy_log_byte_device_counter(device)
-        self._ensure_direct_emission_counters(device)
+
+    @property
+    def pinned_aos_total_bytes(self) -> int:
+        return int(self._pinned_aos_total_bytes)
 
     def _ensure_direct_emission_counters(self, device: torch.device) -> None:
         if not isinstance(device, torch.device):
@@ -627,25 +610,8 @@ class ExpertState:
             fn(*args)
 
     def _acquire_pinned_aos(self) -> Tuple[torch.Tensor, threading.Event]:
-        import os as _os_acquire_profile
-        _profile = _os_acquire_profile.environ.get(
-            "PROPOSAL_AOS_ACQUIRE_PROFILE", ""
-        ) in ("1", "true", "TRUE")
-        if _profile:
-            import time as _time_acquire_profile
-            _t0 = _time_acquire_profile.perf_counter()
-        else:
-            _time_acquire_profile = None
-            _t0 = 0.0
         ready = self._pinned_aos_ready
         ready.wait()
-        if _profile and _time_acquire_profile is not None:
-            _dt = (_time_acquire_profile.perf_counter() - _t0) * 1000.0
-            if _dt > 0.5:
-                print(
-                    f"[proposal] aos_acquire_wait={_dt:.1f}ms",
-                    flush=True,
-                )
         ready.clear()
         return self._pinned_aos, ready
 
@@ -876,10 +842,10 @@ class ExpertState:
     ) -> None:
         ready_event = batch_info.get("ready_event")
         try:
-            if cuda_event is not None:
-                cuda_event.synchronize()
             if not commit_payload:
                 return
+            if cuda_event is not None:
+                cuda_event.synchronize()
             for item in list(batch_info.get("entries", [])):
                 expert_id = tuple(item.get("expert_id"))  # type: ignore[arg-type]
                 ent = self._entries.get(expert_id)
@@ -1106,7 +1072,6 @@ class ExpertState:
         gpu_refs: Optional[List[torch.Tensor]] = None,
         lossy_state: Optional[Any] = None,
         d2h_event_callback: Optional[Any] = None,
-        d2h_start_event: Optional[Any] = None,
     ) -> int:
         """GPU AOS batch submit (Phase 3). See ``AosEmitter``.
 
@@ -1155,7 +1120,7 @@ class ExpertState:
             return 0
         self._do_lossy_fc_aos_emit(
             int(step), prepared, compute_event, gpu_refs,
-            lossy_state, d2h_event_callback, d2h_start_event,
+            lossy_state, d2h_event_callback,
         )
         return grand_total
 
@@ -1167,7 +1132,6 @@ class ExpertState:
         gpu_refs,
         lossy_state: Optional[Any] = None,
         d2h_event_callback: Optional[Any] = None,
-        d2h_start_event: Optional[Any] = None,
     ) -> None:
         """Run GPU AOS emission + D2H on the expert_launcher thread.
 
@@ -1194,17 +1158,12 @@ class ExpertState:
             self._direct_feedback_expert_ids = [
                 ent.expert_id for ent, _total_n, _filtered in prepared
             ]
-            (
-                expert_specs,
-                total_aos,
-                d2h_done_event,
-            ) = self._record_pipeline.run(
+            expert_specs, total_aos, d2h_done_event = self._record_pipeline.run(
                 step=int(step),
                 prepared=prepared,
                 compute_event=compute_event,
                 gpu_refs=gpu_refs,
                 lossy_state=lossy_state,
-                d2h_start_event=d2h_start_event,
                 pinned_aos=pinned_aos,
                 layout_mirror=self._pinned_aos_layout_mirror,
                 copy_to_host=not self.test_skip_d2h,
@@ -1225,6 +1184,14 @@ class ExpertState:
             pinned_aos_ready.set()
             raise
         if total_aos == 0:
+            pinned_aos_ready.set()
+            return
+        if not self.commit_lossy_records:
+            # write-off+D2H-on exposes the final D2H/feedback event to the
+            # optimizer fence above.  The next proposal dispatch happens only
+            # after that fence and optimizer step, so a no-commit expert_writer
+            # task that only synchronizes the same event before releasing the
+            # reusable slab is redundant and can delay PP runs.
             pinned_aos_ready.set()
             return
         self._dispatch(
@@ -1305,16 +1272,6 @@ class ExpertState:
         return self._direct_feedback_event
 
     def consume_direct_emission_feedback(self) -> Optional[Dict[str, Any]]:
-        import os as _os_feedback_profile
-        _profile = _os_feedback_profile.environ.get(
-            "PROPOSAL_DIRECT_FEEDBACK_PROFILE", ""
-        ) in ("1", "true", "TRUE")
-        if _profile:
-            import time as _time_feedback_profile
-            _t0 = _time_feedback_profile.perf_counter()
-        else:
-            _time_feedback_profile = None
-            _t0 = 0.0
         event = self._direct_feedback_event
         step = int(getattr(self, "_direct_feedback_step", -1))
         if (
@@ -1324,18 +1281,7 @@ class ExpertState:
         ):
             return None
         try:
-            ready = event.query()
-            _t_after_query = (
-                _time_feedback_profile.perf_counter()
-                if _profile and _time_feedback_profile is not None else 0.0
-            )
-            if not ready:
-                if _profile and _time_feedback_profile is not None:
-                    print(
-                        f"[proposal] direct_feedback_profile @iter{int(step)}: "
-                        f"not_ready query={(_t_after_query - _t0) * 1000.0:.1f}ms",
-                        flush=True,
-                    )
+            if not event.query():
                 return None
         except Exception:
             return None
@@ -1349,29 +1295,13 @@ class ExpertState:
             return None
         cursor = self._direct_record_cursor_pinned.narrow(0, 0, n)
         overflow = self._direct_overflow_count_pinned.narrow(0, 0, n)
-        _t_before_lists = (
-            _time_feedback_profile.perf_counter()
-            if _profile and _time_feedback_profile is not None else 0.0
-        )
         cursor_list = [int(x) for x in cursor.tolist()]
         overflow_list = [int(x) for x in overflow.tolist()]
-        selected = int(cursor.sum().item())
-        dropped = int(overflow.sum().item())
+        selected = int(sum(cursor_list))
+        dropped = int(sum(overflow_list))
         written = max(0, selected - dropped)
         tau = float(self._direct_total_th_pinned[0].item())
-        _t_after_lists = (
-            _time_feedback_profile.perf_counter()
-            if _profile and _time_feedback_profile is not None else 0.0
-        )
         self._direct_feedback_consumed_step = int(step)
-        if _profile and _time_feedback_profile is not None:
-            print(
-                f"[proposal] direct_feedback_profile @iter{int(step)}: "
-                f"query={(_t_after_query - _t0) * 1000.0:.1f}ms "
-                f"lists={(_t_after_lists - _t_before_lists) * 1000.0:.1f}ms "
-                f"n={int(n)} selected={int(selected)} overflow={int(dropped)}",
-                flush=True,
-            )
         feedback = {
             "step": int(step),
             "selected": int(selected),
@@ -1440,13 +1370,11 @@ class ExpertState:
                         flush=True,
                     )
                 return
-            if d2h_done_event is not None:
-                d2h_done_event.synchronize()
-            _t_ready = (
-                _time_profile.perf_counter()
-                if _profile and _time_profile is not None else 0.0
-            )
             if not self.commit_lossy_records:
+                # write-off+D2H-on still fences the optimizer on d2h_done_event
+                # before p/m/v can be mutated again. Since no CPU consumer reads
+                # this slab in write-off mode, do not make the writer thread
+                # block on the D2H event just to release the next lease.
                 if _profile and _time_profile is not None:
                     _t_done = _time_profile.perf_counter()
                     print(
@@ -1456,6 +1384,12 @@ class ExpertState:
                         flush=True,
                     )
                 return
+            if d2h_done_event is not None:
+                d2h_done_event.synchronize()
+            _t_ready = (
+                _time_profile.perf_counter()
+                if _profile and _time_profile is not None else 0.0
+            )
             layout_mirror.update_from_header(
                 pinned_aos=pinned_aos,
                 prepared=prepared,
@@ -1785,128 +1719,99 @@ def read_expert_state(
          "{tname}:exp_avg_sq": ...}
 
     Algorithm:
-      1. If ``fc_expert_L{L:02d}_E{E:02d}.bin`` exists, load it fully →
-         dense payload baseline.
-      2. If ``lossy_expert_L{L:02d}_E{E:02d}.bin`` exists, replay every
-         block in its appended order, scattering each record into the
-         dense flat arrays (later-step writes overwrite earlier).
-      3. Slice the concatenated buffers back into per-tensor shapes.
+      1. Read LFCL and LFSY at most once each through the C++ read helper.
+      2. Load LFCL into dense flat CPU tensors through a C++ memcpy helper.
+      3. Replay LFSY newest-to-oldest in C++ using a seen bitset, so each
+         element keeps only its latest record.
+      4. Slice the concatenated buffers back into per-tensor views.
     """
     expert_dir = Path(expert_dir)
     lossless_path = expert_dir / _lossless_name(layer, expert)
     lossy_path = expert_dir / _lossy_name(layer, expert)
 
+    def _read_full_file(path: Path, nbytes: int) -> torch.Tensor:
+        from .proposal_io import read_file_aligned
+
+        return read_file_aligned(path, int(nbytes))
+
+    def _header_bytes(blob: torch.Tensor) -> bytes:
+        n = min(int(blob.numel()), int(HEADER_BLOCK_BYTES))
+        return bytes(blob.narrow(0, 0, n).numpy().tobytes())
+
     # ------------------------------------------------------------------
     # 1) LFCL compaction baseline → dense (param, m, v) flat buffers.
-    # All file IO goes through proposal_io.read_file_range (binary_io.cpp).
+    # All file IO goes through proposal_io's C++ read helpers.
     # ------------------------------------------------------------------
-    from .proposal_io import read_file_range as _pread, file_size as _fsize
+    from .proposal_io import (
+        file_size as _fsize,
+        load_lfcl_payload_interleaved,
+        replay_lfsy_log_into_dense,
+    )
+
+    lfsy_blob: Optional[torch.Tensor] = None
     lossless_size = _fsize(lossless_path)
     if lossless_size >= 0:
-        header_block = _pread(lossless_path, 0, HEADER_BLOCK_BYTES)
+        lfcl_blob = _read_full_file(lossless_path, int(lossless_size))
+        header_block = _header_bytes(lfcl_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFCL:
             raise ValueError(f"expected LFCL in {lossless_path}, got {magic!r}")
         tensors_meta = meta["tensors"]
         total_numel = int(meta["total_numel"])
-        p_flat = np.zeros(total_numel, dtype=np.float32)
-        m_flat = np.zeros(total_numel, dtype=np.float32)
-        v_flat = np.zeros(total_numel, dtype=np.float32)
-        cursor = 0
-        file_off = HEADER_BLOCK_BYTES
-        for entry in tensors_meta:
-            numel = int(entry["numel"])
-            for buf in (p_flat, m_flat, v_flat):
-                raw = _pread(lossless_path, file_off, numel * 4)
-                buf[cursor:cursor + numel] = np.frombuffer(raw, dtype=np.float32)
-                file_off += numel * 4
-            cursor += numel
+        p_flat = torch.empty(total_numel, dtype=torch.float32)
+        m_flat = torch.empty(total_numel, dtype=torch.float32)
+        v_flat = torch.empty(total_numel, dtype=torch.float32)
+        numels = torch.tensor(
+            [int(entry["numel"]) for entry in tensors_meta],
+            dtype=torch.int64,
+        )
+        load_lfcl_payload_interleaved(
+            lfcl_blob,
+            payload_offset_bytes=HEADER_BLOCK_BYTES,
+            numels_i64=numels,
+            p_flat=p_flat,
+            m_flat=m_flat,
+            v_flat=v_flat,
+        )
         base_step = int(meta.get("step", 0))
     else:
         # No LFCL compaction baseline yet — read schema from LFSY header only.
         lossy_size_probe = _fsize(lossy_path)
         if lossy_size_probe < 0:
             return {"_rolling_step": 0}
-        header_block = _pread(lossy_path, 0, HEADER_BLOCK_BYTES)
+        lfsy_blob = _read_full_file(lossy_path, int(lossy_size_probe))
+        header_block = _header_bytes(lfsy_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
             return {"_rolling_step": 0}
         tensors_meta = meta["tensors"]
         total_numel = int(meta["total_numel"])
-        p_flat = np.zeros(total_numel, dtype=np.float32)
-        m_flat = np.zeros(total_numel, dtype=np.float32)
-        v_flat = np.zeros(total_numel, dtype=np.float32)
+        p_flat = torch.zeros(total_numel, dtype=torch.float32)
+        m_flat = torch.zeros(total_numel, dtype=torch.float32)
+        v_flat = torch.zeros(total_numel, dtype=torch.float32)
         base_step = 0
 
     # ------------------------------------------------------------------
     # 2) Replay lossy FC append log (if present).
-    #
-    # Deduplicate by idx keeping the LAST occurrence, then one scatter per
-    # field.
     # ------------------------------------------------------------------
     max_step = base_step
     lossy_size = _fsize(lossy_path)
     if lossy_size >= 0:
-        block_desc: List[Tuple[int, int, int]] = []
-        header_block = _pread(lossy_path, 0, HEADER_BLOCK_BYTES)
+        if lfsy_blob is None:
+            lfsy_blob = _read_full_file(lossy_path, int(lossy_size))
+        header_block = _header_bytes(lfsy_blob)
         magic, _ver, _meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
             return {"_rolling_step": int(max_step)}
-        # write path (append_lossy_log_from_pinned) pads every block to
-        # SECTOR_BYTES (4 KiB) for O_DIRECT/io_uring-compatible writes,
-        # so each block starts on a sector boundary. Walk by sector.
-        from .proposal_io import SECTOR_BYTES, _round_up_sector
-        offset = HEADER_BLOCK_BYTES
-        while offset + BLOCK_PREFIX_BYTES <= lossy_size:
-            prefix_bytes = _pread(lossy_path, offset, BLOCK_PREFIX_BYTES)
-            if len(prefix_bytes) < BLOCK_PREFIX_BYTES:
-                break
-            count, step = struct.unpack("<II", prefix_bytes)
-            if count == 0:
-                # empty / padding block — advance to next sector
-                offset += SECTOR_BYTES
-                continue
-            payload_bytes = count * RECORD_BYTES
-            data_off = offset + BLOCK_PREFIX_BYTES
-            if data_off + payload_bytes > lossy_size:
-                break  # truncated / corrupt tail
-            if step > max_step:
-                max_step = int(step)
-            block_desc.append((int(data_off), int(count), int(step)))
-            # Advance to next sector boundary — block is padded to
-            # SECTOR_BYTES by the writer.
-            offset = _round_up_sector(data_off + payload_bytes)
-
-        if block_desc:
-            seen = np.zeros(int(total_numel), dtype=np.bool_)
-            remaining = int(total_numel)
-            for data_off, count, _step in reversed(block_desc):
-                raw = _pread(lossy_path, data_off, int(count) * RECORD_BYTES)
-                recs = np.frombuffer(raw, dtype=_RECORD_DTYPE)
-                if int(recs.shape[0]) == 0:
-                    continue
-                rev = recs[::-1]
-                _, first_in_rev = np.unique(rev["idx"], return_index=True)
-                last_in_block = rev[first_in_rev]
-                idx64 = last_in_block["idx"].astype(np.int64)
-                valid = (idx64 >= 0) & (idx64 < int(total_numel))
-                if not bool(valid.all()):
-                    idx64 = idx64[valid]
-                    last_in_block = last_in_block[valid]
-                if idx64.size == 0:
-                    continue
-                unseen = ~seen[idx64]
-                if not bool(unseen.any()):
-                    continue
-                apply_idx = idx64[unseen]
-                apply_recs = last_in_block[unseen]
-                p_flat[apply_idx] = apply_recs["p"]
-                m_flat[apply_idx] = apply_recs["m"]
-                v_flat[apply_idx] = apply_recs["v"]
-                seen[apply_idx] = True
-                remaining -= int(apply_idx.size)
-                if remaining <= 0:
-                    break
+        replay = replay_lfsy_log_into_dense(
+            lfsy_blob,
+            total_numel=int(total_numel),
+            p_flat=p_flat,
+            m_flat=m_flat,
+            v_flat=v_flat,
+        )
+        if int(replay.get("max_step", 0)) > max_step:
+            max_step = int(replay["max_step"])
 
     # ------------------------------------------------------------------
     # 3) Slice flat buffers back into per-tensor views.
@@ -1917,14 +1822,8 @@ def read_expert_state(
         tname = entry["name"]
         numel = int(entry["numel"])
         shape = torch.Size(entry["shape"])
-        payload[f"{tname}:param"] = torch.from_numpy(
-            p_flat[cursor:cursor + numel].copy()
-        ).view(shape)
-        payload[f"{tname}:exp_avg"] = torch.from_numpy(
-            m_flat[cursor:cursor + numel].copy()
-        ).view(shape)
-        payload[f"{tname}:exp_avg_sq"] = torch.from_numpy(
-            v_flat[cursor:cursor + numel].copy()
-        ).view(shape)
+        payload[f"{tname}:param"] = p_flat.narrow(0, cursor, numel).view(shape)
+        payload[f"{tname}:exp_avg"] = m_flat.narrow(0, cursor, numel).view(shape)
+        payload[f"{tname}:exp_avg_sq"] = v_flat.narrow(0, cursor, numel).view(shape)
         cursor += numel
     return payload
