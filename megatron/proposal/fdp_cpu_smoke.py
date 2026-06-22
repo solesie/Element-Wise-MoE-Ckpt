@@ -19,6 +19,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 import pickle
 import re
@@ -521,9 +522,24 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
             lfsy_expected[eid] = bytes(header)
         expected_cmds["expert"] += data_write_cmds(len(header))
 
+    lfcs_slots_per_iter = 1
+    if args.round_robin_scope == "slot":
+        explicit_slots = int(args.train_like_lfcs_slots_per_iter)
+        if explicit_slots > 0:
+            lfcs_slots_per_iter = explicit_slots
+        elif float(args.train_like_lfcs_fraction_pct) > 0.0:
+            lfcs_slots_per_iter = int(math.ceil(
+                len(slots) * float(args.train_like_lfcs_fraction_pct) / 100.0
+            ))
+        lfcs_slots_per_iter = max(1, min(lfcs_slots_per_iter, len(slots)))
+
     def lossless_eids_for_step(step: int):
         if args.round_robin_scope == "slot":
-            return [slots[(int(step) - 1) % len(slots)]]
+            start = ((int(step) - 1) * int(lfcs_slots_per_iter)) % len(slots)
+            return [
+                slots[(start + i) % len(slots)]
+                for i in range(int(lfcs_slots_per_iter))
+            ]
         expert = (int(step) - 1) % experts_per_layer
         return [(layer, expert) for layer in range(layers)]
 
@@ -551,6 +567,7 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
         "[fdp-smoke] train-like mode: "
         f"iters={args.train_like_iters} slots={len(slots)} "
         f"scope={rr_desc} "
+        f"lfcs_slots_per_iter={len(lossless_eids_for_step(1))} "
         f"writers={'two-thread' if args.two_writer_threads else 'single-thread'} "
         "payload_mode=prebuilt-per-iter "
         f"nefc_payload={nefc_desc} "
@@ -1483,10 +1500,23 @@ def parse_args() -> argparse.Namespace:
                    default="expert",
                    help=("LFCS selection for train-like mode: expert selects "
                          "the same expert index across all layers; slot "
-                         "selects one flattened layer/expert slot"))
+                         "selects flattened layer/expert slots"))
+    p.add_argument("--train-like-lfcs-slots-per-iter", type=int, default=0,
+                   help=("when --round-robin-scope=slot, select this many "
+                         "flattened layer/expert slots for LFCS per iter; "
+                         "0 falls back to --train-like-lfcs-fraction-pct or 1"))
+    p.add_argument("--train-like-lfcs-fraction-pct", type=float, default=0.0,
+                   help=("when --round-robin-scope=slot and explicit slot "
+                         "count is 0, select ceil(total_slots * pct / 100) "
+                         "LFCS slots per iter"))
     p.add_argument("--preset-2g-iter", action="store_true",
                    help=("set train-like payload sizes to roughly 2GiB of "
                          "data-region writes per iteration"))
+    p.add_argument("--preset-768-slot-1pct", action="store_true",
+                   help=("set train-like shape to 12 layers * 64 experts, "
+                         "slot round-robin 1%% LFCS = 8 slots/iter, "
+                         "NEFC=2048MiB, LFCS=70MiB/file, "
+                         "LFSY=1.84MiB/file"))
     p.add_argument("--train-like-lossy-records", type=int, default=5,
                    help="base LFSY record count per lossy expert append")
     p.add_argument("--train-like-nefc-mib", type=float, default=0.0,
@@ -1545,6 +1575,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yes", action="store_true",
                    help="required with --run")
     args = p.parse_args()
+    if args.preset_768_slot_1pct and args.preset_2g_iter:
+        raise SystemExit(
+            "--preset-768-slot-1pct and --preset-2g-iter cannot be used together"
+        )
+    if args.preset_768_slot_1pct:
+        args.layers = 12
+        args.experts_per_layer = 64
+        args.round_robin_scope = "slot"
+        args.train_like_lfcs_slots_per_iter = 8
+        args.train_like_lfcs_fraction_pct = 1.0
+        args.train_like_nefc_mib = 2048.0
+        args.train_like_lfcs_mib = 70.0
+        args.train_like_lossy_mib = 1.84
     if args.preset_2g_iter:
         args.train_like_nefc_mib = 256.0
         args.train_like_lfcs_mib = 256.0
