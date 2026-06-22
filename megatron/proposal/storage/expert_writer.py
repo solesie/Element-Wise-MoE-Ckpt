@@ -60,11 +60,13 @@ from .proposal_io import (
     SECTOR_BYTES as _BIN_SECTOR_BYTES,
     alloc_pinned_uint8_sector_aligned,
     append_lossy_log_from_pinned,
+    backend_kind,
     close_fd,
     fsync_fd,
     open_lossy_log_for_append,
     scatter_lossy_records_to_dense_by_intervals,
     write_header_payload_from_pinned_keep_open,
+    write_lfcs_from_pinned,
 )
 from ..emission.segment_d2h import DEFAULT_SEGMENT_BYTES
 from ..emission.aos_emitter import AosEmitter
@@ -802,6 +804,7 @@ class ExpertState:
             pinned,
             payload_offset_bytes,
             payload_bytes,
+            step=int(step),
         )
         ent.lossless_step = int(step)
         ent.step = int(step)
@@ -926,6 +929,7 @@ class ExpertState:
         pinned: torch.Tensor,
         payload_offset_bytes: int,
         payload_bytes: int,
+        step: int,
     ) -> None:
         import os as _os
 
@@ -945,6 +949,19 @@ class ExpertState:
             raise RuntimeError(
                 "LFCL writer expects payload immediately after the header block"
             )
+        if backend_kind() == "fdp":
+            L, E = ent.expert_id
+            write_lfcs_from_pinned(
+                ent.lossless_path,
+                pinned,
+                header,
+                int(payload_bytes),
+                layer=int(L),
+                expert=int(E),
+                step=int(step),
+                generation=int(step),
+            )
+            return
         tmp_path = Path(str(ent.lossless_path) + ".tmp")
         fd, _padded = write_header_payload_from_pinned_keep_open(
             tmp_path,
@@ -1057,6 +1074,7 @@ class ExpertState:
         append_lossy_log_from_pinned(
             int(ent.lossy_fd), blob, int(blob_nbytes),
             layer=int(L), expert=int(E), step=int(step),
+            generation=max(0, int(ent.lossless_step)),
         )
         fsync_fd(int(ent.lossy_fd))
         self._add_lossy_log_bytes(ent.expert_id, int(padded_nbytes))
@@ -1442,6 +1460,7 @@ class ExpertState:
                 append_lossy_log_from_pinned(
                     int(ent.lossy_fd), blob, int(append_nbytes),
                     layer=int(L), expert=int(E), step=int(step),
+                    generation=max(0, int(ent.lossless_step)),
                 )
                 fsync_fd(int(ent.lossy_fd))
                 self._add_lossy_log_bytes_from_writer(
@@ -1689,7 +1708,15 @@ class ExpertState:
             "record_bytes": RECORD_BYTES,
         }
         header = _pack_header(MAGIC_LFSY, header_meta)
-        ent.lossy_fd = open_lossy_log_for_append(ent.lossy_path, header)
+        L, E = ent.expert_id
+        ent.lossy_fd = open_lossy_log_for_append(
+            ent.lossy_path,
+            header,
+            layer=int(L),
+            expert=int(E),
+            step=int(step),
+            generation=max(0, int(ent.lossless_step)),
+        )
         fsync_fd(int(ent.lossy_fd))
         self._fsync_parent_dir(ent.lossy_path)
         ent.lossy_start_step = int(step)
