@@ -30,6 +30,7 @@ length up to SECTOR_BYTES before passing to C++.
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -52,6 +53,39 @@ _cext = load(
     extra_include_paths=[str(_src_dir)],
     verbose=False,
 )
+_fdp_cext = None
+_FDP_COMPLETED_FD = -(1 << 30)
+
+
+def backend_kind() -> str:
+    """Return the active proposal I/O backend name."""
+    kind = os.environ.get("PROPOSAL_IO_BACKEND", "file").strip().lower()
+    if kind not in ("file", "fdp"):
+        raise ValueError(
+            "PROPOSAL_IO_BACKEND must be 'file' or 'fdp', "
+            f"got {kind!r}"
+        )
+    return kind
+
+
+def _get_fdp():
+    """Lazy-load and open the raw NVMe FDP backend session."""
+    global _fdp_cext
+    if _fdp_cext is None:
+        _fdp_cext = load(
+            name="proposal_fdp_cext",
+            sources=[
+                str(_src_dir / "fdp_store.cpp"),
+                str(_src_dir / "fdp_passthru.cpp"),
+                str(_src_dir / "proposal_fdp_io.cpp"),
+            ],
+            extra_cflags=["-O3", "-std=c++17", "-fopenmp"],
+            extra_ldflags=["-lgomp", "-luring"],
+            extra_include_paths=[str(_src_dir)],
+            verbose=False,
+        )
+        _fdp_cext.open_session_from_env()
+    return _fdp_cext
 
 
 # Re-export constants from C++ side.
@@ -96,6 +130,24 @@ def _require_pinned_aligned_buffer(
         raise ValueError(f"{where}: length is not 4 KiB aligned")
     if int(total_padded) > int(tensor.numel() * tensor.element_size()):
         raise ValueError(f"{where}: requested write exceeds pinned tensor")
+
+
+def _require_cpu_aligned_buffer(
+    tensor: torch.Tensor,
+    *,
+    where: str,
+    total_padded: int,
+) -> None:
+    if tensor.device.type != "cpu":
+        raise ValueError(f"{where}: tensor must be on CPU")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{where}: tensor must be contiguous")
+    if (int(tensor.data_ptr()) & (SECTOR_BYTES - 1)) != 0:
+        raise ValueError(f"{where}: base pointer is not 4 KiB aligned")
+    if (int(total_padded) & (SECTOR_BYTES - 1)) != 0:
+        raise ValueError(f"{where}: length is not 4 KiB aligned")
+    if int(total_padded) > int(tensor.numel() * tensor.element_size()):
+        raise ValueError(f"{where}: requested write exceeds tensor")
 
 
 def alloc_pinned_uint8_sector_aligned(nbytes: int) -> torch.Tensor:
@@ -275,13 +327,32 @@ def write_prptens_from_pinned(
     to the next SECTOR_BYTES multiple. Pad bytes between data end and
     sector boundary are already zero-filled by the allocator.
     """
-    del step  # routing metadata only — consumed by io_uring path
     total_padded = _round_up_sector(HEADER_BLOCK_BYTES + int(payload_bytes))
+    if backend_kind() == "fdp":
+        _require_cpu_aligned_buffer(
+            pinned_tensor,
+            where="write_prptens_from_pinned",
+            total_padded=int(total_padded),
+        )
+        del mode
+        fdp = _get_fdp()
+        written = int(fdp.write_nefc(
+            str(Path(final_path).name),
+            int(pinned_tensor.data_ptr()),
+            header_bytes,
+            int(payload_bytes),
+            int(total_padded),
+            int(step),
+        ))
+        if bool(fsync):
+            fdp.flush_metadata(int(step))
+        return written
     _require_pinned_aligned_buffer(
         pinned_tensor,
         where="write_prptens_from_pinned",
         total_padded=int(total_padded),
     )
+    del step  # routing metadata only — consumed by file path
     return int(_cext.write_prptens(
         str(Path(final_path)), int(pinned_tensor.data_ptr()),
         header_bytes, int(total_padded), int(mode), bool(fsync),
@@ -304,18 +375,111 @@ def write_prptens_from_pinned_keep_open(
     worker.
     """
 
-    del step
     total_padded = _round_up_sector(HEADER_BLOCK_BYTES + int(payload_bytes))
+    if backend_kind() == "fdp":
+        _require_cpu_aligned_buffer(
+            pinned_tensor,
+            where="write_prptens_from_pinned_keep_open",
+            total_padded=int(total_padded),
+        )
+        written = write_prptens_from_pinned(
+            final_path,
+            pinned_tensor,
+            header_bytes,
+            int(payload_bytes),
+            step=int(step),
+            mode=int(mode),
+            fsync=True,
+        )
+        return _FDP_COMPLETED_FD, int(written)
     _require_pinned_aligned_buffer(
         pinned_tensor,
         where="write_prptens_from_pinned_keep_open",
         total_padded=int(total_padded),
     )
+    del step
     fd = int(_cext.write_prptens_keep_open(
         str(Path(final_path)), int(pinned_tensor.data_ptr()),
         header_bytes, int(total_padded), int(mode),
     ))
     return fd, int(total_padded)
+
+
+def write_lfcs_from_pinned(
+    final_path: Path,
+    pinned_tensor: torch.Tensor,
+    header_bytes: bytes,
+    payload_bytes: int,
+    *,
+    layer: int,
+    expert: int,
+    step: int,
+    generation: int = 0,
+    mode: int = 0o644,
+) -> int:
+    """Write an LFCL/LFCS object through the active backend."""
+    total_padded = _round_up_sector(HEADER_BLOCK_BYTES + int(payload_bytes))
+    if backend_kind() == "fdp":
+        _require_cpu_aligned_buffer(
+            pinned_tensor,
+            where="write_lfcs_from_pinned",
+            total_padded=int(total_padded),
+        )
+        del mode
+        return int(_get_fdp().write_lfcs(
+            str(Path(final_path).name),
+            int(pinned_tensor.data_ptr()),
+            header_bytes,
+            int(payload_bytes),
+            int(total_padded),
+            int(layer),
+            int(expert),
+            int(step),
+            int(generation),
+        ))
+    _require_pinned_aligned_buffer(
+        pinned_tensor,
+        where="write_lfcs_from_pinned",
+        total_padded=int(total_padded),
+    )
+    fd, padded = write_header_payload_from_pinned_keep_open(
+        final_path,
+        pinned_tensor,
+        header_bytes,
+        int(payload_bytes),
+        mode=int(mode),
+    )
+    try:
+        fsync_fd(fd)
+    finally:
+        close_fd(fd)
+    return int(padded)
+
+
+def write_lossless_from_pinned(
+    final_path: Path,
+    pinned_tensor: torch.Tensor,
+    header_bytes: bytes,
+    payload_bytes: int,
+    *,
+    layer: int,
+    expert: int,
+    step: int,
+    generation: int = 0,
+    mode: int = 0o644,
+) -> int:
+    """Backward-compatible name for LFCL/LFCS writes."""
+    return write_lfcs_from_pinned(
+        final_path,
+        pinned_tensor,
+        header_bytes,
+        int(payload_bytes),
+        layer=int(layer),
+        expert=int(expert),
+        step=int(step),
+        generation=int(generation),
+        mode=int(mode),
+    )
 
 
 def write_header_payload_from_pinned_keep_open(
@@ -353,7 +517,14 @@ def write_header_payload_from_pinned_keep_open(
 
 
 def open_lossy_log_for_append(
-    path: Path, header_bytes: bytes, *, mode: int = 0o644,
+    path: Path,
+    header_bytes: bytes,
+    *,
+    layer: Optional[int] = None,
+    expert: Optional[int] = None,
+    step: Optional[int] = None,
+    generation: Optional[int] = None,
+    mode: int = 0o644,
 ) -> int:
     """Create+truncate the lossy file, write a HEADER_BLOCK_BYTES header
     region (chunk-aligned), return the open fd. Reader treats the first
@@ -362,6 +533,18 @@ def open_lossy_log_for_append(
     # Allocate a single-shot 4 KiB-aligned pinned buffer for the header,
     # let C++ stamp it + write it, then drop the ref. Steady-state lossy
     # writes use append_lossy_log_from_pinned with already-padded blobs.
+    if backend_kind() == "fdp":
+        del mode
+        if layer is None or expert is None or generation is None:
+            raise RuntimeError("FDP LFSY open requires layer/expert/generation")
+        return int(_get_fdp().open_lfsy(
+            str(Path(path).name),
+            header_bytes,
+            int(layer),
+            int(expert),
+            int(step if step is not None else -1),
+            int(generation),
+        ))
     hdr_pin = alloc_pinned_uint8_sector_aligned(HEADER_BLOCK_BYTES)
     return int(_cext.open_lossy_log_for_append(
         str(Path(path)), int(hdr_pin.data_ptr()),
@@ -375,36 +558,67 @@ def append_lossy_log_from_pinned(
     layer: int,
     expert: int,
     step: int,
+    generation: Optional[int] = None,
 ) -> int:
     """Append a (count u32, step u32, records...) blob to ``fd`` via
     the C++ LFSY append helper. ``pinned_tensor`` must be 4 KiB-aligned
     (base + length); ``total_bytes`` is rounded up to the next
     SECTOR_BYTES multiple — the pad tail in pinned_tensor is already
     zero-filled."""
-    del layer, expert, step
     if pinned_tensor.dtype != torch.uint8 or not pinned_tensor.is_contiguous():
         raise ValueError("append_lossy_log_from_pinned: tensor must be contiguous uint8")
     total_padded = _round_up_sector(total_bytes)
+    if backend_kind() == "fdp":
+        _require_cpu_aligned_buffer(
+            pinned_tensor,
+            where="append_lossy_log_from_pinned",
+            total_padded=int(total_padded),
+        )
+        if generation is None:
+            raise RuntimeError("FDP LFSY append requires generation")
+        return int(_get_fdp().append_lfsy(
+            int(fd),
+            int(pinned_tensor.data_ptr()),
+            int(total_bytes),
+            int(total_padded),
+            int(layer),
+            int(expert),
+            int(step),
+            int(generation),
+        ))
     _require_pinned_aligned_buffer(
         pinned_tensor,
         where="append_lossy_log_from_pinned",
         total_padded=int(total_padded),
     )
+    del layer, expert, step, generation
     return int(_cext.append_lossy_log(
         int(fd), int(pinned_tensor.data_ptr()), int(total_padded),
     ))
 
 
 def fsync_fd(fd: int) -> None:
+    if backend_kind() == "fdp":
+        if int(fd) == _FDP_COMPLETED_FD:
+            return
+        _get_fdp().fsync_handle(int(fd))
+        return
     _cext.fsync_fd(int(fd))
 
 
 def close_fd(fd: int) -> None:
+    if backend_kind() == "fdp":
+        if int(fd) == _FDP_COMPLETED_FD:
+            return
+        _get_fdp().close_lfsy(int(fd))
+        return
     _cext.close_fd(int(fd))
 
 
 def unlink_path(path) -> None:
     """``::unlink(path)``; swallows ENOENT for idempotent callers."""
+    if backend_kind() == "fdp":
+        return
     _cext.unlink_path(str(path))
 
 
@@ -495,3 +709,150 @@ def replay_lfsy_log_into_dense(
         "remaining",
     )
     return {k: int(v) for k, v in zip(keys, result)}
+
+
+def flush_metadata(iter: int = 0) -> None:
+    """Flush the FDP metadata image when the FDP backend is active."""
+    if backend_kind() == "fdp":
+        _get_fdp().flush_metadata(int(iter))
+
+
+def fdp_begin_data_batch() -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_begin_data_batch requires PROPOSAL_IO_BACKEND=fdp")
+    _get_fdp().begin_data_batch()
+
+
+def fdp_end_data_batch() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_end_data_batch requires PROPOSAL_IO_BACKEND=fdp")
+    return dict(_get_fdp().end_data_batch())
+
+
+def fdp_end_data_batch_stats() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_end_data_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    return dict(_get_fdp().end_data_batch_stats())
+
+
+def fdp_begin_nefc_batch() -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_begin_nefc_batch requires PROPOSAL_IO_BACKEND=fdp")
+    _get_fdp().begin_nefc_batch()
+
+
+def fdp_end_nefc_batch() -> int:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_end_nefc_batch requires PROPOSAL_IO_BACKEND=fdp")
+    return int(_get_fdp().end_nefc_batch())
+
+
+def fdp_end_nefc_batch_stats() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_end_nefc_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    return dict(_get_fdp().end_nefc_batch_stats())
+
+
+def fdp_begin_expert_batch() -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_begin_expert_batch requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    _get_fdp().begin_expert_batch()
+
+
+def fdp_end_expert_batch() -> int:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_end_expert_batch requires PROPOSAL_IO_BACKEND=fdp")
+    return int(_get_fdp().end_expert_batch())
+
+
+def fdp_end_expert_batch_stats() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_end_expert_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    return dict(_get_fdp().end_expert_batch_stats())
+
+
+def fdp_stats() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        return {"backend": "file"}
+    return dict(_get_fdp().stats())
+
+
+def open_fdp_session() -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError("open_fdp_session requires PROPOSAL_IO_BACKEND=fdp")
+    _get_fdp()
+
+
+def fdp_format_or_load() -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_format_or_load requires PROPOSAL_IO_BACKEND=fdp")
+    _get_fdp().format_or_load()
+
+
+def fdp_debug_read_metadata_summary() -> Dict[str, Any]:
+    if backend_kind() != "fdp":
+        return {"backend": "file"}
+    return dict(_get_fdp().debug_read_metadata_summary())
+
+
+def fdp_debug_read_lfsy_entries() -> List[Dict[str, Any]]:
+    if backend_kind() != "fdp":
+        return []
+    return [dict(entry) for entry in _get_fdp().debug_read_lfsy_entries()]
+
+
+def fdp_debug_raw_write_read_smoke() -> bool:
+    if backend_kind() != "fdp":
+        return False
+    return bool(_get_fdp().debug_raw_write_read_smoke())
+
+
+def fdp_debug_read_nefc(offset: int, nbytes: int) -> bytes:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_debug_read_nefc requires PROPOSAL_IO_BACKEND=fdp")
+    return bytes(_get_fdp().debug_read_nefc(int(offset), int(nbytes)))
+
+
+def fdp_debug_read_lfcs(layer: int, expert: int,
+                        offset: int, nbytes: int) -> bytes:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_debug_read_lfcs requires PROPOSAL_IO_BACKEND=fdp")
+    return bytes(_get_fdp().debug_read_lfcs(
+        int(layer), int(expert), int(offset), int(nbytes)
+    ))
+
+
+def fdp_debug_read_lfsy(layer: int, expert: int,
+                        offset: int, nbytes: int) -> bytes:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_debug_read_lfsy requires PROPOSAL_IO_BACKEND=fdp")
+    return bytes(_get_fdp().debug_read_lfsy(
+        int(layer), int(expert), int(offset), int(nbytes)
+    ))
+
+
+def fdp_debug_alloc_chunk() -> int:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_debug_alloc_chunk requires PROPOSAL_IO_BACKEND=fdp")
+    return int(_get_fdp().debug_alloc_chunk())
+
+
+def fdp_debug_free_chunk(chunk_id: int) -> None:
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_debug_free_chunk requires PROPOSAL_IO_BACKEND=fdp")
+    _get_fdp().debug_free_chunk(int(chunk_id))
+
+
+def close_fdp_session() -> None:
+    global _fdp_cext
+    if _fdp_cext is not None:
+        _fdp_cext.close_session()
+        _fdp_cext = None
