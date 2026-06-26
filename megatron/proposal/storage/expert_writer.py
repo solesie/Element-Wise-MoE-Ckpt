@@ -245,6 +245,12 @@ class ExpertState:
         self._direct_feedback_step: int = -1
         self._direct_feedback_n_experts: int = 0
         self._direct_feedback_consumed_step: int = -1
+        self._direct_feedback_tau_version: int = -1
+        self._direct_feedback_tau_h_epoch: int = -1
+        self._direct_feedback_tau_source_step: int = -1
+        self._direct_feedback_tau_apply_from_step: int = -1
+        self._direct_feedback_tau_lagged: bool = False
+        self._direct_feedback_tau_lr_over_bc1: float = 0.0
         self._direct_feedback_expert_ids: List[ExpertId] = []
         self._latest_direct_feedback: Optional[Dict[str, Any]] = None
         self._direct_layout_feedback_enabled = (
@@ -1287,6 +1293,20 @@ class ExpertState:
             self._direct_feedback_event.record(d2h_stream)
         self._direct_feedback_step = int(step)
         self._direct_feedback_n_experts = int(n)
+        self._direct_feedback_tau_version = int(getattr(lossy_state, "tau_version", -1))
+        self._direct_feedback_tau_h_epoch = int(getattr(lossy_state, "tau_h_epoch", -1))
+        self._direct_feedback_tau_source_step = int(
+            getattr(lossy_state, "tau_source_step", -1)
+        )
+        self._direct_feedback_tau_apply_from_step = int(
+            getattr(lossy_state, "tau_apply_from_step", -1)
+        )
+        self._direct_feedback_tau_lagged = bool(
+            getattr(lossy_state, "tau_lagged", False)
+        )
+        self._direct_feedback_tau_lr_over_bc1 = float(
+            getattr(lossy_state, "tau_lr_over_bc1", 0.0)
+        )
         return self._direct_feedback_event
 
     def consume_direct_emission_feedback(self) -> Optional[Dict[str, Any]]:
@@ -1326,6 +1346,18 @@ class ExpertState:
             "written": int(written),
             "overflow": int(dropped),
             "tau": float(tau),
+            "tau_version": int(getattr(self, "_direct_feedback_tau_version", -1)),
+            "tau_h_epoch": int(getattr(self, "_direct_feedback_tau_h_epoch", -1)),
+            "tau_source_step": int(
+                getattr(self, "_direct_feedback_tau_source_step", -1)
+            ),
+            "tau_apply_from_step": int(
+                getattr(self, "_direct_feedback_tau_apply_from_step", -1)
+            ),
+            "tau_lagged": bool(getattr(self, "_direct_feedback_tau_lagged", False)),
+            "tau_lr_over_bc1": float(
+                getattr(self, "_direct_feedback_tau_lr_over_bc1", 0.0)
+            ),
             "n_experts": int(n),
             "selected_by_expert": cursor_list,
             "overflow_by_expert": overflow_list,

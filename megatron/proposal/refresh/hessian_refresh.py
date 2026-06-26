@@ -38,6 +38,44 @@ def _should_write() -> bool:
     return torch.distributed.get_rank() == 0
 
 
+def _reset_zero_anchor_backward_state(ds_opt: Any) -> None:
+    """Drop ZeRO backward book-keeping produced by anchor-only backward passes."""
+
+    if ds_opt is None or not hasattr(ds_opt, "ipg_buckets"):
+        return
+    try:
+        for bucket in getattr(ds_opt, "ipg_buckets", {}).values():
+            try:
+                bucket.clear()
+            except Exception:
+                pass
+            try:
+                bucket.index = 0
+            except Exception:
+                pass
+        setattr(ds_opt, "ready_for_gradients", False)
+        setattr(ds_opt, "_epilogue_ran_this_backward", False)
+        for i in range(len(getattr(ds_opt, "params_already_reduced", ()))):
+            ds_opt.params_already_reduced[i] = False
+        prev = getattr(ds_opt, "previous_reduced_grads", None)
+        if prev is not None:
+            for grads in prev.values():
+                grads.clear()
+        for name in ("all_grad_tensors", "averaged_gradients"):
+            table = getattr(ds_opt, name, None)
+            if isinstance(table, dict):
+                for key in list(table.keys()):
+                    table[key] = None
+            elif isinstance(table, list):
+                for idx in range(len(table)):
+                    table[idx] = None
+        reset = getattr(ds_opt, "reset_partition_gradient_structures", None)
+        if callable(reset):
+            reset()
+    except Exception as exc:
+        print(f"[proposal] anchor ZeRO state reset warning: {exc}", flush=True)
+
+
 def proposal_set_anchor_data_iter(it: Any) -> None:
     """Install a dedicated validation data iterator used ONLY by
     proposal_refresh_h_quantile. Keeps the shared valid_data_iterator
@@ -456,7 +494,15 @@ def _refresh_h_quantile_from_finite_diff(
             and _restore_grad_acc_hooks
         ):
             try:
-                _ds_engine_opt.create_grad_acc_hooks()
+                recreate = getattr(_ds_engine_opt, "create_grad_acc_hooks", None)
+                if not callable(recreate):
+                    recreate = getattr(
+                        _ds_engine_opt,
+                        "create_gradient_handling_hooks",
+                        None,
+                    )
+                if callable(recreate):
+                    recreate()
             except Exception:
                 pass
         if _ds_engine_opt is not None:
@@ -466,6 +512,7 @@ def _refresh_h_quantile_from_finite_diff(
                 except Exception:
                     pass
         restore_training_state(_config.get("_inner_opt"), _train_state_snap)
+        _reset_zero_anchor_backward_state(_ds_engine_opt)
         # Final belt-and-suspenders: force-clear any residual lp.grad.
         # model may be a list/tuple (Megatron DDP wrapper) — unwrap first.
         _m_clear = model[0] if isinstance(model, (list, tuple)) else model

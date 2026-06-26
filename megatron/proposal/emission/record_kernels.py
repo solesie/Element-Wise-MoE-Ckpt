@@ -61,6 +61,8 @@ class LossyRecordWriteInputs:
     bf16_groups_mvph: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
     name_list: List[str]
     group_size: int
+    score_linear_groups: Optional[List[Optional[torch.Tensor]]] = None
+    score_linear_release: Optional[Callable[[Optional["torch.cuda.Event"]], None]] = None
     within_off_per_name: List[int] = field(default_factory=list)
     group_count_per_name: List[int] = field(default_factory=list)
     h_lut_values: Optional[torch.Tensor] = None
@@ -72,6 +74,12 @@ class LossyRecordWriteInputs:
     step_device: Optional[torch.Tensor] = None
     random_mode: bool = False
     random_salt: int = 0
+    tau_version: int = -1
+    tau_h_epoch: int = -1
+    tau_source_step: int = -1
+    tau_apply_from_step: int = -1
+    tau_lagged: bool = False
+    tau_lr_over_bc1: float = 0.0
     direct_emission_enabled: bool = False
     direct_record_cursor: Optional[torch.Tensor] = None
     direct_overflow_count: Optional[torch.Tensor] = None
@@ -220,7 +228,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _write_direct_records_segment_workqueue_kernel(
-        m_ptr, v_ptr, p_ptr,
+        m_ptr, linear_ptr, v_ptr, p_ptr,
         age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
@@ -308,6 +316,7 @@ if _HAS_TRITON:
             )
 
             m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
+            linear = tl.load(linear_ptr + elem_off, mask=elem_mask, other=0.0)
             v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
             v_fp32 = v.to(tl.float32)
             lr_scalar = lr_over_bc1
@@ -323,6 +332,7 @@ if _HAS_TRITON:
             age_code = _age2_load_code(age_words_ptr, global_elem_idx_for_score)
             elem_score = _proposal_element_score_from_lut(
                 m,
+                linear,
                 v_fp32,
                 age_code,
                 h_lut_ptr,
@@ -502,6 +512,7 @@ def launch_direct_records_for_segment_entry_workqueue(
     m_view: torch.Tensor,
     v_view: torch.Tensor,
     p_view: torch.Tensor,
+    score_linear_view: Optional[torch.Tensor] = None,
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
@@ -567,6 +578,7 @@ def launch_direct_records_for_segment_entry_workqueue(
     workers = min(max_tasks, _direct_emit_worker_count(record_out_i32))
     _write_direct_records_segment_workqueue_kernel[(workers,)](
         m_view,
+        score_linear_view if score_linear_view is not None else m_view,
         v_view,
         p_view,
         age2bit_words,

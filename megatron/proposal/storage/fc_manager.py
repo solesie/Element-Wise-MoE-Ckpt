@@ -163,7 +163,7 @@ class FCManager:
         fresh_expert_state: bool = True,
         cp_target: str = "disk",
         pinned_aos_capacity_ratio: Optional[float] = None,
-        pinned_aos_capacity_tolerance: float = 0.25,
+        pinned_aos_capacity_tolerance: float = 0.75,
         enable_expert_state: bool = True,
         commit_expert_lossy_records: bool = True,
         commit_nonexpert_fc: bool = True,

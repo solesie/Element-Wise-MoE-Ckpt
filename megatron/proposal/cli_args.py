@@ -38,20 +38,29 @@ def add_proposal_args(parser):
                            "abs_h_taylor_first_and_second_order",
                            "abs_h_taylor_only_second_order",
                        ],
-                       help="Production hessian score policy. Default uses "
-                            "max(0, -m*e_hat + 0.5*|H|*e_hat^2); the "
-                            "second-order ablation uses |H|*e_hat^2.")
+                       help="Production hessian score policy. The default "
+                            "uses the configured first-order source plus "
+                            "0.5*|H|*e_hat^2; the second-order ablation uses "
+                            "|H|*e_hat^2.")
+    group.add_argument("--proposal-score-linear-source", type=str,
+                       default="grad",
+                       choices=["grad", "momentum"],
+                       help="First-order Taylor source for hessian scoring. "
+                            "'grad' leases DeepSpeed ZeRO-1/2 optimizer "
+                            "gradients when available and falls back to "
+                            "momentum otherwise. 'momentum' preserves the "
+                            "legacy -m*e_hat term.")
     group.add_argument("--proposal-n-bins-cutoff", type=int, default=4096,
                        help="Selection cutoff-search histogram bins. Default 4096.")
     group.add_argument("--proposal-cutoff-k-tolerance", type=float, default=0.04,
                        help="Allowed relative K-budget tolerance for cutoff "
                             "search. Default 0.04.")
     group.add_argument("--proposal-pinned-aos-capacity-tolerance", type=float,
-                       default=0.25,
+                       default=0.75,
                        help="Host pinned AOS slab capacity margin over "
                             "--proposal-topk-ratio. This is a buffer-capacity "
                             "contract, not a cutoff accuracy tolerance. "
-                            "Default 0.25.")
+                            "Default 0.75.")
     group.add_argument("--proposal-adaptive-cutoff-window", type=int, default=16,
                        help="Sliding-window length for adaptive cutoff selected-ratio "
                             "control. Default 16.")
@@ -66,6 +75,23 @@ def add_proposal_args(parser):
     group.add_argument("--proposal-adaptive-cutoff-retry-tolerance", type=float, default=0.04,
                        help="Relative selected-ratio slack used by adaptive cutoff "
                             "certification and guards. Default 0.04.")
+    group.add_argument("--proposal-pp-lagged-cutoff", action="store_true",
+                       help="PP test/production option: reuse a versioned adaptive "
+                            "tau snapshot for selection and skip same-iteration "
+                            "global probe/retry rendezvous. Strict cutoff remains "
+                            "the bootstrap and fallback path.")
+    group.add_argument("--proposal-pp-lagged-band-fraction", type=float, default=0.25,
+                       help="Allowed lagged selected-ratio band as a fraction of K. "
+                            "Default 0.25, so K=4%% accepts 3%%..5%%.")
+    group.add_argument("--proposal-pp-lagged-safety-lag", type=int, default=1,
+                       help="Minimum steps before a newly learned PP lagged tau "
+                            "snapshot becomes selectable. Default 1.")
+    group.add_argument("--proposal-pp-lagged-max-staleness", type=int, default=8,
+                       help="Maximum age in steps for a PP lagged tau snapshot "
+                            "before strict cutoff re-anchors. Default 8.")
+    group.add_argument("--proposal-pp-lagged-strict-after-bad", type=int, default=1,
+                       help="Consecutive out-of-band lagged feedbacks before "
+                            "strict cutoff fallback. Default 1.")
     group.add_argument("--proposal-n-q", type=int, default=4096,
                        help="Number of v/h quantile points. Default 4096.")
     group.add_argument("--proposal-h-lookup-lut-bins", type=int, default=8192,

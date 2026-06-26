@@ -24,6 +24,7 @@ from .refresh.fp32_state import (
 )
 from .refresh.hessian_refresh import HQuantileAnchor
 from .config import ProposalConfig
+from .grad_lease import GradScoreLease
 from .storage.fc_manager import FCManager, _detect_expert_layout, DS_EXPERT_IDX_RE
 from .checkpoint.lossy_checkpoint_engine import LossyCheckpointPipeline
 from .storage.recovery import recover
@@ -59,6 +60,7 @@ class ProposalController:
         self._enabled = False
         self._cp_dir = None
         self._proposal_config = None                  # ProposalConfig
+        self._grad_score_lease = None                 # GradScoreLease
         self._topology: Optional[ProposalTopology] = None
         self._h_anchor = None                         # HQuantileAnchor
         self._latest_post_step_checkpoint_task = None
@@ -177,6 +179,51 @@ def _should_write() -> bool:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
     return torch.distributed.get_rank() == 0
+
+
+def _install_grad_score_lease(
+    engine_opt: Any,
+    inner_opt: Any,
+) -> Optional[GradScoreLease]:
+    """Install a lease on the first optimizer object exposing grad flats."""
+
+    candidates: List[Any] = []
+    seen: set[int] = set()
+
+    def add_chain(root: Any) -> None:
+        cur = root
+        for _ in range(8):
+            if cur is None:
+                return
+            cur_id = id(cur)
+            if cur_id in seen:
+                return
+            seen.add(cur_id)
+            candidates.append(cur)
+            nxt = getattr(cur, "optimizer", None)
+            if nxt is None or nxt is cur:
+                return
+            cur = nxt
+
+    add_chain(engine_opt)
+    add_chain(inner_opt)
+    for candidate in candidates:
+        lease = GradScoreLease(candidate)
+        if lease.install():
+            if _should_write():
+                print(
+                    "[proposal] score first-order source: grad "
+                    f"(lease installed on {candidate.__class__.__name__})",
+                    flush=True,
+                )
+            return lease
+    if _should_write():
+        print(
+            "[proposal] score first-order source: grad requested, "
+            "but no DeepSpeed grad lease point was found; falling back to momentum",
+            flush=True,
+        )
+    return None
 
 
 def _install_pipeline_optimizer_fence(model: Any) -> None:
@@ -307,6 +354,11 @@ def init_proposal(
     # of the pipeline never touches DeepSpeed internals directly.
     mapper = Fp32StateMapper(engine_opt, inner_opt, inner_model)
     set_mapper(mapper)
+    get_controller()._grad_score_lease = (
+        _install_grad_score_lease(engine_opt, inner_opt)
+        if get_controller()._proposal_config.score_linear_source == "grad"
+        else None
+    )
 
     # B1: detect expert params by DeepSpeed's param.allreduce=False tag.
     expert_param_names: List[str] = []
@@ -435,6 +487,9 @@ def init_proposal(
         # Required so iter-1 H refresh has valid metadata before the first
         # lossy checkpoint step runs on expert_launcher.
         get_controller()._lossy_cp._init_lossy_flat_layout(inner_opt)
+        get_controller()._lossy_cp.set_grad_score_lease(
+            get_controller()._grad_score_lease,
+        )
     else:
         get_controller()._lossy_cp = None
 
@@ -1244,6 +1299,13 @@ def proposal_shutdown() -> Dict[str, Any]:
         ws = get_controller()._checkpoint_workers.summary()
         summary["async_total_write_ms"] = ws.get("total_write_ms", 0.0)
         get_controller()._checkpoint_workers.shutdown()
+    lease = getattr(get_controller(), "_grad_score_lease", None)
+    if lease is not None:
+        try:
+            lease.uninstall()
+        except Exception:
+            pass
+        get_controller()._grad_score_lease = None
     # Audit: dump per-iter alloc trace summary to audit log (R2 evidence).
     try:
         from .telemetry import diagnostics as _proposal_diagnostics

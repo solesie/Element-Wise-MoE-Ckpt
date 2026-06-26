@@ -76,7 +76,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _generated_probe_entries_kernel(
-        m_ptr, v_ptr,
+        m_ptr, linear_ptr, v_ptr,
         age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
@@ -167,12 +167,14 @@ if _HAS_TRITON:
         block_elem_count = tl.sum(elem_mask.to(tl.float32), axis=0)
 
         m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
+        linear = tl.load(linear_ptr + elem_off, mask=elem_mask, other=0.0)
         v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
         v_fp32 = v.to(tl.float32)
         global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
         age_code = _age2_load_code(age_words_ptr, global_elem_idx)
         elem_score = _proposal_element_score_from_lut(
             m,
+            linear,
             v_fp32,
             age_code,
             h_lut_ptr,
@@ -803,6 +805,7 @@ def launch_stage_candidate_taus(
 def launch_generated_block_probe_for_group(
     *,
     m_flat: torch.Tensor,
+    score_linear_flat: Optional[torch.Tensor] = None,
     v_flat: torch.Tensor,
     age2bit_words: torch.Tensor,
     ehat_geom_lut: torch.Tensor,
@@ -847,6 +850,7 @@ def launch_generated_block_probe_for_group(
     guard = decision_code_guard if decision_code_guard is not None else sample_blocks_current
     _generated_probe_entries_kernel[(max_samples,)](
         m_flat,
+        score_linear_flat if score_linear_flat is not None else m_flat,
         v_flat,
         age2bit_words,
         ehat_geom_lut,

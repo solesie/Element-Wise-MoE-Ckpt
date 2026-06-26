@@ -20,6 +20,7 @@ class ProposalConfig:
     group_size: int
     selection_mode: str
     score_policy: str
+    score_linear_source: str
 
     # Selection cutoff search.
     n_bins_cutoff: int = 4096
@@ -29,7 +30,11 @@ class ProposalConfig:
     adaptive_cutoff_warmup_iters: int = 0
     adaptive_cutoff_skip_warmup_iters: int = 0
     adaptive_cutoff_retry_tolerance: float = 0.04
-
+    pp_lagged_cutoff: bool = False
+    pp_lagged_band_fraction: float = 0.25
+    pp_lagged_safety_lag: int = 1
+    pp_lagged_max_staleness: int = 8
+    pp_lagged_strict_after_bad: int = 1
     # Quantile tables.
     n_q: int = 4096
     n_bins_quantile_log: int = 1024
@@ -50,7 +55,7 @@ class ProposalConfig:
     cp_mode: str = "proposal"
     cp_target: str = "disk"
     cp_dir: Path = Path("./cp")
-    pinned_aos_capacity_tolerance: float = 0.25
+    pinned_aos_capacity_tolerance: float = 0.75
 
     # Worker pool.
     async_queue: int = 5
@@ -84,6 +89,12 @@ class ProposalConfig:
             raise ValueError(
                 "proposal_score_policy must be one of "
                 f"{valid_score_policies}; got {score_policy!r}"
+            )
+        score_linear_source = getattr(args, "proposal_score_linear_source", "grad")
+        if score_linear_source not in ("grad", "momentum"):
+            raise ValueError(
+                "proposal_score_linear_source must be 'grad' or 'momentum'; "
+                f"got {score_linear_source!r}"
             )
         cp_mode = getattr(args, "proposal_cp_mode", "proposal")
         if cp_mode not in ("proposal", "sequential"):
@@ -138,6 +149,7 @@ class ProposalConfig:
             group_size=max(1, int(getattr(args, "proposal_block_quant_g", 8))),
             selection_mode=str(selection_mode),
             score_policy=str(score_policy),
+            score_linear_source=str(score_linear_source),
             n_bins_cutoff=int(getattr(args, "proposal_n_bins_cutoff", 4096)),
             cutoff_K_tolerance=float(
                 getattr(args, "proposal_cutoff_k_tolerance", 0.04)
@@ -173,6 +185,28 @@ class ProposalConfig:
                     ) or 0.04
                 ),
             ),
+            pp_lagged_cutoff=bool(
+                getattr(args, "proposal_pp_lagged_cutoff", False)
+            ),
+            pp_lagged_band_fraction=max(
+                0.0,
+                float(
+                    getattr(args, "proposal_pp_lagged_band_fraction", 0.25)
+                    or 0.25
+                ),
+            ),
+            pp_lagged_safety_lag=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_safety_lag", 1) or 1),
+            ),
+            pp_lagged_max_staleness=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_max_staleness", 8) or 8),
+            ),
+            pp_lagged_strict_after_bad=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_strict_after_bad", 1) or 1),
+            ),
             n_q=int(getattr(args, "proposal_n_q", 4096)),
             h_lookup_lut_bins=int(
                 getattr(args, "proposal_h_lookup_lut_bins", 8192)
@@ -193,8 +227,8 @@ class ProposalConfig:
                     getattr(
                         args,
                         "proposal_pinned_aos_capacity_tolerance",
-                        0.25,
-                    ) or 0.25
+                        0.75,
+                    ) or 0.75
                 ),
             ),
             async_queue=int(getattr(args, "proposal_async_queue", 5)),

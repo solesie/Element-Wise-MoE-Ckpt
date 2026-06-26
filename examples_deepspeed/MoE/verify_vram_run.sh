@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run verification: VRAM audit + R1-R4 PASS/FAIL evaluation.
-# - exp_etc (medium, 226M MoE48), refresh_every=20 (5+ anchors in 130 iter)
+# Run proposal test verification: VRAM audit + R1-R4 PASS/FAIL evaluation.
+# - test model: 125M MoE-48E, refresh_every=5
 # - PROPOSAL_VRAM_AUDIT=1 captures per-phase memory snapshots
 # - PROPOSAL_PER_ITER_ALLOC_TRACE=1 traces tensor allocs in proposal hot path
 set -e
@@ -15,7 +15,7 @@ AUDIT_LOG="$OUT/vram_audit.jsonl"
 echo "============== run with VRAM audit =============="
 env NUM_LAYERS=12 HIDDEN_SIZE=768 NUM_ATTN_HEADS=12 \
     GLOBAL_BATCH_SIZE=8 BATCH_SIZE=2 SEQ_LEN=2048 \
-    MOE_TOPK=1 PRMOE_SPEC=48 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25 \
+    MOE_TOPK=1 NUM_EXPERTS=48 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25 \
     LR_WARMUP_ITERS=50 TRAIN_ITERS=2000 \
     FAULT_INTERVAL=0 \
     HESSIAN_REFRESH_EVERY=5 \
@@ -26,7 +26,7 @@ env NUM_LAYERS=12 HIDDEN_SIZE=768 NUM_ATTN_HEADS=12 \
     EXTRA_MEGATRON_FLAGS="--exit-interval 20 --eval-interval 999999 --eval-iters 0 --log-interval 5 --proposal-test-skip-expert-commit --proposal-test-skip-nonexpert-commit" \
     OUTPUT_BASEPATH=$OUT SEED=2024 \
     VARIANT=verify_vram \
-    bash "$DIR/proposal_etc_template.sh" > "$OUT/run.log" 2>&1 || true
+    bash "$DIR/proposal_test_template.sh" > "$OUT/run.log" 2>&1 || true
 
 echo "--- run errors (filtered) ---"
 grep -E "Error|Traceback|FAIL" "$OUT/run.log" | \

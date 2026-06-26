@@ -337,6 +337,13 @@ def emit_segment_direct_from_plan(
         m_flat, v_flat, p_flat, master_off_elem = (
             lossy_state.bf16_groups_mvph[group_plan.bf16_group_idx]
         )
+        score_linear_view = None
+        score_linear_groups = getattr(lossy_state, "score_linear_groups", None)
+        if (
+            score_linear_groups is not None
+            and 0 <= int(group_plan.bf16_group_idx) < len(score_linear_groups)
+        ):
+            score_linear_view = score_linear_groups[group_plan.bf16_group_idx]
         if (
             group_plan.segment_entry_indices is not None
             and group_plan.segment_entry_counts is not None
@@ -347,6 +354,7 @@ def emit_segment_direct_from_plan(
                 m_view=m_flat,
                 v_view=v_flat,
                 p_view=p_flat,
+                score_linear_view=score_linear_view,
                 h_lut_values=lossy_state.h_lut_values,
                 h_lut_log_v_min=lossy_state.h_lut_log_v_min,
                 h_lut_inv_log_v_width=lossy_state.h_lut_inv_log_v_width,
