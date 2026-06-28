@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 DEFAULT_LFCL_INTERVAL_ITERS = 1
@@ -20,6 +20,7 @@ class ProposalConfig:
     group_size: int
     selection_mode: str
     score_policy: str
+    score_linear_source: str
 
     # Selection cutoff search.
     n_bins_cutoff: int = 4096
@@ -29,7 +30,11 @@ class ProposalConfig:
     adaptive_cutoff_warmup_iters: int = 0
     adaptive_cutoff_skip_warmup_iters: int = 0
     adaptive_cutoff_retry_tolerance: float = 0.04
-
+    pp_lagged_cutoff: bool = False
+    pp_lagged_band_fraction: float = 0.25
+    pp_lagged_safety_lag: int = 1
+    pp_lagged_max_staleness: int = 8
+    pp_lagged_strict_after_bad: int = 1
     # Quantile tables.
     n_q: int = 4096
     n_bins_quantile_log: int = 1024
@@ -50,7 +55,7 @@ class ProposalConfig:
     cp_mode: str = "proposal"
     cp_target: str = "disk"
     cp_dir: Path = Path("./cp")
-    pinned_aos_capacity_tolerance: float = 0.25
+    pinned_aos_capacity_tolerance: float = 0.75
 
     # Worker pool.
     async_queue: int = 5
@@ -60,6 +65,17 @@ class ProposalConfig:
     fault_warmup: int = 0
     fault_log: Optional[Path] = None
     test_expert_selection_only: bool = False
+
+    # Telemetry-only independent oracle. This is intentionally outside the
+    # production selection/write path.
+    independent_oracle_enable: bool = False
+    independent_oracle_iters: Tuple[int, ...] = ()
+    independent_oracle_log_dir: Optional[Path] = None
+    independent_oracle_rank_sample: int = 1048576
+    independent_oracle_rank_sample_seed: int = 20240625
+    independent_oracle_actual_batches: int = 4
+    independent_oracle_hvp_batches: int = 4
+    independent_oracle_batch_seed: int = 20240625
 
     @classmethod
     def from_args(cls, args, cp_root: str) -> "ProposalConfig":
@@ -84,6 +100,12 @@ class ProposalConfig:
             raise ValueError(
                 "proposal_score_policy must be one of "
                 f"{valid_score_policies}; got {score_policy!r}"
+            )
+        score_linear_source = getattr(args, "proposal_score_linear_source", "grad")
+        if score_linear_source not in ("grad", "momentum"):
+            raise ValueError(
+                "proposal_score_linear_source must be 'grad' or 'momentum'; "
+                f"got {score_linear_source!r}"
             )
         cp_mode = getattr(args, "proposal_cp_mode", "proposal")
         if cp_mode not in ("proposal", "sequential"):
@@ -133,11 +155,32 @@ class ProposalConfig:
         )
         n_anchor_batches = max(1, _mb_per_iter // 2)
 
+        def _parse_int_tuple(raw) -> Tuple[int, ...]:
+            if raw is None:
+                return ()
+            if isinstance(raw, (list, tuple)):
+                vals = raw
+            else:
+                vals = str(raw).replace(";", ",").split(",")
+            out = []
+            for item in vals:
+                text = str(item).strip()
+                if text:
+                    out.append(int(text))
+            return tuple(out)
+
+        independent_oracle_log_dir_raw = getattr(
+            args,
+            "proposal_independent_oracle_log_dir",
+            None,
+        )
+
         return cls(
             topk_ratio=topk_ratio,
             group_size=max(1, int(getattr(args, "proposal_block_quant_g", 8))),
             selection_mode=str(selection_mode),
             score_policy=str(score_policy),
+            score_linear_source=str(score_linear_source),
             n_bins_cutoff=int(getattr(args, "proposal_n_bins_cutoff", 4096)),
             cutoff_K_tolerance=float(
                 getattr(args, "proposal_cutoff_k_tolerance", 0.04)
@@ -173,6 +216,28 @@ class ProposalConfig:
                     ) or 0.04
                 ),
             ),
+            pp_lagged_cutoff=bool(
+                getattr(args, "proposal_pp_lagged_cutoff", False)
+            ),
+            pp_lagged_band_fraction=max(
+                0.0,
+                float(
+                    getattr(args, "proposal_pp_lagged_band_fraction", 0.25)
+                    or 0.25
+                ),
+            ),
+            pp_lagged_safety_lag=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_safety_lag", 1) or 1),
+            ),
+            pp_lagged_max_staleness=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_max_staleness", 8) or 8),
+            ),
+            pp_lagged_strict_after_bad=max(
+                1,
+                int(getattr(args, "proposal_pp_lagged_strict_after_bad", 1) or 1),
+            ),
             n_q=int(getattr(args, "proposal_n_q", 4096)),
             h_lookup_lut_bins=int(
                 getattr(args, "proposal_h_lookup_lut_bins", 8192)
@@ -193,8 +258,8 @@ class ProposalConfig:
                     getattr(
                         args,
                         "proposal_pinned_aos_capacity_tolerance",
-                        0.25,
-                    ) or 0.25
+                        0.75,
+                    ) or 0.75
                 ),
             ),
             async_queue=int(getattr(args, "proposal_async_queue", 5)),
@@ -203,5 +268,59 @@ class ProposalConfig:
             fault_log=Path(fault_log_raw) if fault_log_raw else None,
             test_expert_selection_only=bool(
                 getattr(args, "proposal_test_expert_selection_only", False)
+            ),
+            independent_oracle_enable=bool(
+                getattr(args, "proposal_independent_oracle_enable", False)
+            ),
+            independent_oracle_iters=_parse_int_tuple(
+                getattr(args, "proposal_independent_oracle_iters", "")
+            ),
+            independent_oracle_log_dir=(
+                Path(independent_oracle_log_dir_raw)
+                if independent_oracle_log_dir_raw else None
+            ),
+            independent_oracle_rank_sample=max(
+                0,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_rank_sample",
+                        1048576,
+                    ) or 0
+                ),
+            ),
+            independent_oracle_rank_sample_seed=int(
+                getattr(
+                    args,
+                    "proposal_independent_oracle_rank_sample_seed",
+                    20240625,
+                ) or 20240625
+            ),
+            independent_oracle_actual_batches=max(
+                1,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_actual_batches",
+                        4,
+                    ) or 4
+                ),
+            ),
+            independent_oracle_hvp_batches=max(
+                0,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_hvp_batches",
+                        4,
+                    ) or 0
+                ),
+            ),
+            independent_oracle_batch_seed=int(
+                getattr(
+                    args,
+                    "proposal_independent_oracle_batch_seed",
+                    20240625,
+                ) or 20240625
             ),
         )

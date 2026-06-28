@@ -15,16 +15,15 @@ rm -rf "$OUT"; mkdir -p "$OUT"/log "$OUT"/cp
 
 env NUM_LAYERS=2 HIDDEN_SIZE=256 NUM_ATTN_HEADS=4 \
     GLOBAL_BATCH_SIZE=4 BATCH_SIZE=2 SEQ_LEN=512 \
-    MOE_TOPK=1 PRMOE_SPEC=8 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25 \
+    MOE_TOPK=1 NUM_EXPERTS=8 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25 \
     LR_WARMUP_ITERS=2 TRAIN_ITERS=2000 \
     FAULT_INTERVAL=0 \
     HESSIAN_REFRESH_EVERY=2 \
     BLOCK_QUANT_G=8 NONEXPERT_FC_W=1 CP_TARGET=test_dram \
-    PROPOSAL_ROUTING_FREEZE_ENABLE=1 \
     EXTRA_MEGATRON_FLAGS="--exit-interval 5 --eval-interval 999999 --eval-iters 0 --log-interval 1" \
     OUTPUT_BASEPATH=$OUT SEED=2024 \
-    VARIANT=proposal_fd_kpct \
-    bash "$DIR/proposal_etc_template.sh" > "$OUT/run.log" 2>&1 || true
+    VARIANT=verify_vram \
+    bash "$DIR/proposal_test_template.sh" > "$OUT/run.log" 2>&1 || true
 
 echo "=== anchor fire / crash signal ==="
 grep -aE "HRefresh|h_q|anchor|Fp32StateMapper mode|RuntimeError|Traceback|Error" "$OUT/run.log" \

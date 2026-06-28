@@ -6,7 +6,7 @@ depend on that mapping, but neither owns DeepSpeed optimizer internals.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -44,6 +44,8 @@ except ImportError:
 
 
 ParamCoord = Tuple[int, int, int]  # (group_idx, offset, numel)
+LocalPartitionFragment = Tuple[str, torch.nn.Parameter, int, int, int, int]
+# (name, param, group_idx, local_offset, param_offset, numel)
 TrainingStateSnapshot = Dict[str, Any]
 
 
@@ -64,6 +66,9 @@ class Fp32StateMapper:
         self._fp32_flat: Optional[List[torch.Tensor]] = None
         self._fp32_grad_flat: Optional[List[torch.Tensor]] = None
         self._direct_master: Dict[int, torch.Tensor] = {}
+        self._zero_params_in_partition: List[List[torch.nn.Parameter]] = []
+        self._zero_first_offset: List[int] = []
+        self._zero_partition_size: List[int] = []
         self._mode = "unknown"
         self._candidate_summaries: List[str] = []
         self._build()
@@ -180,6 +185,15 @@ class Fp32StateMapper:
         self._fp32_grad_flat = getattr(candidate, "fp32_groups_gradients_flat", None)
         self._mode = "zero12"
         self._coords = self._index_groups(candidate, "bit16_groups")
+        self._zero_params_in_partition = [
+            list(group) for group in getattr(candidate, "params_in_partition", [])
+        ]
+        self._zero_first_offset = [
+            int(v) for v in getattr(candidate, "first_offset", [])
+        ]
+        self._zero_partition_size = [
+            int(v) for v in getattr(candidate, "partition_size", [])
+        ]
         return True
 
     def _try_fp16_zero0(self, candidate: object) -> bool:
@@ -257,7 +271,13 @@ class Fp32StateMapper:
         if coord is None or self._fp32_flat is None:
             return param.data.to(torch.float32)
         group_idx, offset, numel = coord
-        return self._fp32_flat[group_idx].narrow(0, offset, numel).view(param.shape)
+        flat = self._fp32_flat[group_idx]
+        if offset < 0 or offset + numel > int(flat.numel()):
+            raise RuntimeError(
+                "FP32 full-param view is not local to this ZeRO partition; "
+                "use a ZeRO partition-aware path or DeepSpeed safe full API."
+            )
+        return flat.narrow(0, offset, numel).view(param.shape)
 
     def get_state(self, param: torch.nn.Parameter, key: str) -> Optional[torch.Tensor]:
         if self._mode in ("megatron_float16", "unfused_fp16"):
@@ -280,9 +300,19 @@ class Fp32StateMapper:
         state_value = self._inner_opt.state.get(master_flat, {}).get(key)
         if state_value is None:
             return None
+        if offset < 0 or offset + numel > int(state_value.numel()):
+            raise RuntimeError(
+                "FP32 optimizer-state full-param view is not local to this "
+                "ZeRO partition; use a ZeRO partition-aware path or "
+                "DeepSpeed safe full API."
+            )
         return state_value.narrow(0, offset, numel).view(param.shape)
 
     def get_local_param_view(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        if self._mode in ("megatron_float16", "unfused_fp16"):
+            master = self._direct_master.get(id(param))
+            if master is not None:
+                return master
         coord = self._coords.get(id(param))
         if coord is None or self._fp32_flat is None:
             return None
@@ -297,6 +327,11 @@ class Fp32StateMapper:
     def get_local_state_view(
         self, param: torch.nn.Parameter, key: str
     ) -> Optional[torch.Tensor]:
+        if self._mode in ("megatron_float16", "unfused_fp16"):
+            master = self._direct_master.get(id(param))
+            if master is None:
+                return None
+            return self._inner_opt.state.get(master, {}).get(key)
         coord = self._coords.get(id(param))
         if coord is None or self._fp32_flat is None:
             return None
@@ -310,6 +345,125 @@ class Fp32StateMapper:
         if offset < 0 or offset + numel > int(state_value.numel()):
             return None
         return state_value.narrow(0, offset, numel).view(param.shape)
+
+    def zero12_local_fragments(
+        self,
+        named_params: Iterable[Tuple[str, torch.nn.Parameter]],
+    ) -> List[LocalPartitionFragment]:
+        """Return ZeRO-1/2 local partition fragments for the requested params.
+
+        DeepSpeed's ZeRO-1/2 fp32 master is partitioned by flat element range,
+        not by tensor object.  A non-expert tensor can straddle a partition
+        boundary, so checkpoint code must use these local fragments instead of
+        treating ``single_partition_of_fp32_groups`` as a full-param flat.
+        """
+
+        if self._mode != "zero12" or self._fp32_flat is None:
+            return []
+        wanted: Dict[int, Tuple[str, torch.nn.Parameter]] = {
+            id(p): (name, p) for name, p in named_params
+        }
+        if not wanted:
+            return []
+
+        fragments: List[LocalPartitionFragment] = []
+        n_groups = min(len(self._zero_params_in_partition), len(self._fp32_flat))
+        for group_idx in range(n_groups):
+            part_size = (
+                self._zero_partition_size[group_idx]
+                if group_idx < len(self._zero_partition_size)
+                else int(self._fp32_flat[group_idx].numel())
+            )
+            part_size = min(int(part_size), int(self._fp32_flat[group_idx].numel()))
+            first_offset = (
+                self._zero_first_offset[group_idx]
+                if group_idx < len(self._zero_first_offset)
+                else 0
+            )
+            local_offset = 0
+            for idx, param in enumerate(self._zero_params_in_partition[group_idx]):
+                param_offset = int(first_offset) if idx == 0 else 0
+                available = int(param.numel()) - int(param_offset)
+                if available <= 0:
+                    continue
+                n = min(int(available), int(part_size) - int(local_offset))
+                if n <= 0:
+                    break
+                hit = wanted.get(id(param))
+                if hit is not None:
+                    name, p = hit
+                    fragments.append((
+                        str(name),
+                        p,
+                        int(group_idx),
+                        int(local_offset),
+                        int(param_offset),
+                        int(n),
+                    ))
+                local_offset += int(n)
+                if local_offset >= part_size:
+                    break
+        return fragments
+
+    def zero12_partition_view(
+        self,
+        group_idx: int,
+        local_offset: int,
+        numel: int,
+        *,
+        state_key: Optional[str] = None,
+    ) -> Optional[torch.Tensor]:
+        if self._mode != "zero12" or self._fp32_flat is None:
+            return None
+        group_idx = int(group_idx)
+        local_offset = int(local_offset)
+        numel = int(numel)
+        if group_idx < 0 or group_idx >= len(self._fp32_flat):
+            return None
+        flat = self._fp32_flat[group_idx]
+        if local_offset < 0 or local_offset + numel > int(flat.numel()):
+            return None
+        if state_key is None:
+            return flat.narrow(0, local_offset, numel)
+        state = self._inner_opt.state.setdefault(flat, {})
+        slot = state.get(state_key)
+        if slot is None:
+            slot = torch.zeros_like(flat)
+            state[state_key] = slot
+        if local_offset + numel > int(slot.numel()):
+            return None
+        return slot.narrow(0, local_offset, numel)
+
+    @torch.no_grad()
+    def copy_zero12_partition_fragment(
+        self,
+        *,
+        group_idx: int,
+        local_offset: int,
+        value: torch.Tensor,
+        state_key: Optional[str] = None,
+    ) -> None:
+        dst = self.zero12_partition_view(
+            int(group_idx),
+            int(local_offset),
+            int(value.numel()),
+            state_key=state_key,
+        )
+        if dst is None:
+            raise RuntimeError(
+                "ZeRO partition payload does not match local optimizer layout: "
+                f"group={group_idx} offset={local_offset} n={value.numel()}"
+            )
+        dst.copy_(value.reshape(-1).to(device=dst.device, dtype=dst.dtype))
+
+    def sync_zero12_fp32_to_lp(self) -> None:
+        """Refresh ZeRO low-precision model weights from local fp32 partitions."""
+
+        if self._mode != "zero12":
+            return
+        update_lp = getattr(self._engine_opt, "update_lp_params", None)
+        if callable(update_lp):
+            update_lp()
 
     def get_grad_accum_view(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Return the FP32 storage where training normally accumulates grad."""
@@ -345,17 +499,6 @@ class Fp32StateMapper:
                     f"anchor requires FP32 grad accumulation storage, got {main_grad.dtype}"
                 )
             return main_grad.view(-1)
-
-        if self._mode in ("megatron_float16", "unfused_fp16"):
-            master = self._direct_master.get(id(param))
-            if master is not None:
-                if master.grad is None:
-                    master.grad = torch.zeros_like(master, dtype=torch.float32)
-                if master.grad.dtype != torch.float32:
-                    raise RuntimeError(
-                        f"anchor requires FP32 master.grad, got {master.grad.dtype}"
-                    )
-                return master.grad.view(-1)
 
         if param.grad is None:
             if param.dtype not in (torch.float32, torch.float16, torch.bfloat16):

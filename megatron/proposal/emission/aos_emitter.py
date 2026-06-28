@@ -368,8 +368,11 @@ class AosEmitter:
         for spec in expert_specs:
             spec.step = int(step)
         total_aos = int(direct_plan.total_aos)
+        release_score_linear = getattr(lossy_state, "score_linear_release", None)
         t_after_layout = time.perf_counter() if profile_this else 0.0
         if total_aos == 0:
+            if callable(release_score_linear):
+                release_score_linear(compute_event)
             if gpu_refs is not None:
                 gpu_refs.clear()
             return expert_specs, 0, None
@@ -468,12 +471,19 @@ class AosEmitter:
                 step=int(step),
             )
 
-        d2h_done_event, _producer_done_event = self._segment_d2h.run(
-            _producer,
-            segments,
-            target_pinned_aos,
-            copy_to_host=bool(copy_to_host),
-        )
+        try:
+            d2h_done_event, _producer_done_event = self._segment_d2h.run(
+                _producer,
+                segments,
+                target_pinned_aos,
+                copy_to_host=bool(copy_to_host),
+            )
+        except BaseException:
+            if callable(release_score_linear):
+                release_score_linear(None)
+            raise
+        if callable(release_score_linear):
+            release_score_linear(_producer_done_event)
         t_after_run = time.perf_counter() if profile_this else 0.0
         t_after_final_sync = time.perf_counter() if profile_this else 0.0
         if gpu_refs is not None:

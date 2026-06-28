@@ -30,6 +30,9 @@ _EXPERT_LOSSLESS_RE = re.compile(r"^fc_expert_L(\d+)_E(\d+)\.bin$")
 _EXPERT_LOSSY_RE = re.compile(r"^lossy_expert_L(\d+)_E(\d+)\.bin$")
 _NONEXPERT_FC_RE = re.compile(r"^fc_nonexpert_iter(\d+)\.bin$")
 _NONEXPERT_FC_SHARD_RE = re.compile(
+    r"^fc_nonexpert_shard(\d+)of(\d+)_iter(\d+)\.bin$"
+)
+_NONEXPERT_FC_LEGACY_EP_SHARD_RE = re.compile(
     r"^fc_nonexpert_ep(\d+)of(\d+)_iter(\d+)\.bin$"
 )
 _LAYER_IN_NAME = re.compile(r"\.layers\.(\d+)\.")
@@ -106,6 +109,10 @@ def _scan_cp_dir(
                 nonexpert_fcs.append((int(m.group(1)), f))
                 continue
             m = _NONEXPERT_FC_SHARD_RE.match(f.name)
+            if m is not None:
+                nonexpert_fcs.append((int(m.group(3)), f))
+                continue
+            m = _NONEXPERT_FC_LEGACY_EP_SHARD_RE.match(f.name)
             if m is not None:
                 nonexpert_fcs.append((int(m.group(3)), f))
 
@@ -203,6 +210,57 @@ def _apply_payload_dict_to_model(
     return rolling_step
 
 
+def _apply_zero12_partition_payload(
+    data: Dict[str, Any],
+    scalars: Dict[str, Any],
+) -> int:
+    owner = scalars.get("owner_global_rank", None)
+    if owner is not None:
+        cur_rank = (
+            int(torch.distributed.get_rank())
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        if int(owner) != int(cur_rank):
+            return int(scalars.get("step", 0) or 0)
+    mapper = get_mapper()
+    if mapper is None or getattr(mapper, "mode", "") != "zero12":
+        raise RuntimeError("ZeRO partition PRPTENS payload requires zero12 mapper")
+    fragments = list(scalars.get("fragments", []) or [])
+    for frag in fragments:
+        frag_idx = int(frag["index"])
+        group_idx = int(frag["group_idx"])
+        local_offset = int(frag["local_offset"])
+        for field_name, state_key in (
+            ("param", None),
+            ("exp_avg", "exp_avg"),
+            ("exp_avg_sq", "exp_avg_sq"),
+        ):
+            tensor = data.get(f"frag{frag_idx}:{field_name}")
+            if tensor is None:
+                continue
+            mapper.copy_zero12_partition_fragment(
+                group_idx=group_idx,
+                local_offset=local_offset,
+                value=tensor.to(dtype=torch.float32),
+                state_key=state_key,
+            )
+    mapper.sync_zero12_fp32_to_lp()
+    return int(scalars.get("step", 0) or 0)
+
+
+def _apply_fc_payload_to_model(
+    data: Dict[str, Any],
+    scalars: Dict[str, Any],
+    target_params: Dict[str, torch.nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    if str(scalars.get("payload_kind", "")) == "zero12_nonexpert_partition":
+        return _apply_zero12_partition_payload(data, scalars)
+    rolling_step = _apply_payload_dict_to_model(data, target_params, optimizer)
+    return int(scalars.get("step", rolling_step) or rolling_step)
+
+
 def _load_fc_payload_into(
     payload_path: Path,
     target_params: Dict[str, torch.nn.Parameter],
@@ -226,8 +284,9 @@ def _load_fc_payload_into(
                                   expert=expert_id[1])
     else:
         from .proposal_io import load_binary
-        tensor_dict, _scalars = load_binary(payload_path)
+        tensor_dict, scalars = load_binary(payload_path)
         data = tensor_dict
+        return _apply_fc_payload_to_model(data, scalars, target_params, optimizer)
     return _apply_payload_dict_to_model(data, target_params, optimizer)
 
 
@@ -430,6 +489,7 @@ def recover(
             ne_payload = nonexpert_state_image
         if ne_payload is None:
             raise RuntimeError("test_dram non-expert state is empty")
+        ne_scalars = dict(ne_payload.get("_prptens_scalars", {}))
         ne_step_raw = ne_payload.get("_rolling_step", -1)
         ne_step = int(ne_step_raw.item()) if torch.is_tensor(ne_step_raw) else int(ne_step_raw)
         if ne_step > int(t_fault):
@@ -437,7 +497,7 @@ def recover(
                 f"test_dram non-expert state step {ne_step} is newer "
                 f"than requested fault step {int(t_fault)}"
             )
-        _apply_payload_dict_to_model(ne_payload, non_expert_params, optimizer)
+        _apply_fc_payload_to_model(ne_payload, ne_scalars, non_expert_params, optimizer)
         diag.nonexpert_fc_iter = int(ne_step)
         diag.nonexpert_fc_path = "test_dram"
     else:
@@ -458,6 +518,8 @@ def recover(
         shard_count: Optional[int] = None
         for path in best_ne_paths:
             m = _NONEXPERT_FC_SHARD_RE.match(path.name)
+            if m is None:
+                m = _NONEXPERT_FC_LEGACY_EP_SHARD_RE.match(path.name)
             if m is None:
                 continue
             shard = int(m.group(1))

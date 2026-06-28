@@ -1,6 +1,6 @@
 # Element-Wise MoE Checkpoint Redesign
 
-본 문서는 proposal checkpoint Redesign 의 활성 아키텍처 및 구현 계약이다. 알고리즘 본질 — **element-wise importance**, **age2bit/vbin floor 기반 단일 K-budget
+본 문서는 proposal checkpoint Redesign 의 활성 아키텍처 및 구현 계약이다. 알고리즘 본질 — **element-wise importance**, **rho/e_hat 기반 abs-H Taylor 단일 K-budget
 경쟁**, **v_t→H quantile matching**, **non-expert lossless + expert lossy + round-robin LFCL(default)** —
 은 그대로 유지하고, **구현 우회 장치** (sample-sort, multi-pool 별도 walk, 1-iter lag,
 snapshot, anchor h_ratio rescale, 4-stream, 2525-라인 cp_hooks) 만 정리한다.
@@ -14,7 +14,7 @@ cost 를 줄인다. resident host dense recovery image 를 매 iter CPU scatter 
 non-expert FC 만 exact lossless 로 유지된다.
 
 V2 의 4 가지 핵심 변경:
-- **element-wise 단일컷**: `score_i = H_i * age2bit_i^2 * delta_eff_i^2` 로 `K% ±1~2%` 범위에서 enforce
+- **element-wise 단일컷**: 기본 `score_i = max(0, -m_i*e_hat_i + 0.5*|H_i|*e_hat_i^2)` 로 `K% ±1~2%` 범위에서 enforce
 - **재귀 linear-bin search**: sort 폐기, magic 상수 0
 - **단일 proposal compute stream + 1 d2h**: V1 compute split 병합 (host-sync 이미 직렬화)
 - **cp_hooks 삭제 완료**: hooks / pipeline / h_refresh / diagnostics 4 모듈로 분할
@@ -65,7 +65,7 @@ hessian을 제외하곤 단순 손실률 비교 측정용이므로 성능에 주
 
 Pinned AOS slab 용량은 cutoff 정확도 tolerance 와 별개의 host-buffer 계약이다.
 production 은 `topk_ratio × (1 + pinned_aos_capacity_tolerance)` records 를 기준으로
-single pinned slab 를 init 단계에서 한 번만 잡으며, 기본 `pinned_aos_capacity_tolerance=0.25`
+single pinned slab 를 init 단계에서 한 번만 잡으며, 기본 `pinned_aos_capacity_tolerance=0.75`
 는 K-budget 주변의 local burst, per-expert prefix, 4 KiB alignment padding 을 흡수하기 위한
 용량 여유다. cutoff controller 는 여전히 strict K-band(`cutoff_K_tolerance`,
 기본 0.04) 를 정확도 기준으로 사용한다. host slab 여유를 cutoff feedback band 로
@@ -159,9 +159,13 @@ iter 0 (특수 케이스):
   `(lr/bc1 · m / (√v · √(1/bc2) + eps))²` 로 inline 계산한 현재 update 제곱.
 - **`age2bit_i`** — actual written 기준으로 reset되는 2-bit age representative
   (`1, 4, 16, 64`).
-- **`delta_eff_i²`** — young code 에서는 `delta_i²`, old code 에서는
-  `max(delta_i², floor_mid/old[vbin_i])`.
-- **`score_i = H_i × age2bit_i² × delta_eff_i²`** — production selection score.
+- **`geom_lut`** — 매 iteration 작은 GPU LUT 로 갱신되는 Adam 감쇠 기반 누적계수.
+  rho 는 LUT 갱신 kernel 안에서만 계산되고, per-element score kernel 은 rho 를 직접 계산하지 않는다.
+- **`e_hat_i`** — 현재 Adam update 방향과 `geom_lut[age_code_i, H_lut_idx_i]` 로 만든
+  마지막 write 이후 residual proxy.
+- **production score policy** — default
+  `max(0, -m_i*e_hat_i + 0.5*|H_i|*e_hat_i^2)`, ablation
+  `|H_i|*e_hat_i^2`.
 - **`τ = total_th`** — `|{i : score_i ≥ τ 또는 force_i}|` 가 `K_total` 의 허용 오차 안에 드는
   단일 임계값. `K_total = topk_ratio × N_total_elements_global`, 목표 오차는
   `±1~2%` (`ProposalConfig.cutoff_K_tolerance`).
@@ -183,7 +187,7 @@ training halt
   -> drain proposal workers
   -> H refresh / h_q 갱신 완료
   -> v_q refresh 완료
-  -> h_lookup_lut rebuild + refresh-boundary cutoff 보정 완료
+  -> h_lookup_lut rebuild + refresh-boundary cutoff bridge 적용 완료
 training resume
 ```
 
@@ -275,8 +279,9 @@ Probe, guarded exact fallback, direct emission, controller feedback 은 모두 �
 
 ```
 age2bit_i   = {1, 4, 16, 64}[age_code_i]
-delta_eff_i = max(delta_i^2, floor_for(age_code_i, vbin_i))
-score_i     = H(v_i) * age2bit_i^2 * delta_eff_i
+geom_i      = geom_lut[age_code_i, H_lut_idx(v_i)]
+e_hat_i     = -delta_update_i * geom_i
+score_i     = score_policy(m_i, |H(v_i)|, e_hat_i)
 selected_i  = (score_i >= τ) or force_i
 ```
 
@@ -296,7 +301,7 @@ Direct emission is the only production materialization path. Writer input is ful
 tname-span descriptors plus GPU-owned per-expert layout state; no per-name selected-count
 layout is built.
 
-- GPU kernel computes the same element-wise age2bit/vbin score predicate inline.
+- GPU kernel computes the same element-wise rho/e_hat Taylor score predicate inline.
 - Each selected element reserves one cursor slot.
 - `slot < capacity` records are written. Overflowing records are skipped and counted.
 - Age reset is based on actual write outcome: written element resets to age code `00`;
@@ -875,12 +880,12 @@ fallback 은 NaN / no positive survival / no valid τ 같은 clueless 상태에�
 
 ### 20.2 Adaptive cutoff 개선 방향
 
-exact cutoff 는 `score_i = H_i * age2bit_i^2 * delta_eff_i^2` 의 global τ 를 min/max + log/refine
+exact cutoff 는 active production score 의 global τ 를 min/max + log/refine
 histogram 으로 구한다. 이전 full-scan exact cutoff 는
 매 iter 사용하기에는 비싸다. 하지만 현재 adaptive controller 의 regression / `τ *= R/ρ`
 계열 보정은 `R(τ)=P(score≥τ or force)` 의 log-log tail slope 를 α=1 로 가정하므로, 실제 α가 크거나
 drift 가 있는 warmup/refresh 직후에 ratio 가 크게 흔들린다.
-ADAPTIVE_CUTOFF_STABILITY.md 항상 참조.
+아래 계약이 adaptive cutoff 의 현재 단일 문서 기준이다.
 
 현재 adaptive cutoff 계약:
 - AdaptiveCutoffController 는 τ ladder 중심값만 제공한다.
@@ -890,13 +895,13 @@ ADAPTIVE_CUTOFF_STABILITY.md 항상 참조.
 - Sample size 증가는 CI shortfall 이 아니라 direct-emission actual cursor count 와 probe expected count 의 반복 mismatch 로 결정한다.
 - direct emission cursor cap 이 hard guarantee 이고, realized cursor count / overflow feedback 이 다음 iter τ 를 교정한다.
 - device-guarded exact fallback 은 no finite τ / no positive survival / NaN 같은 clueless 상태에서만 active 된다.
-- H refresh 는 score remap 이 scalar 라고 가정하지 않는다. refresh 직전 direct cursor feedback 을
-  먼저 consume 한 뒤, 기존 τ model rows 를 drop 하고, refresh 후 첫 normal cutoff step 이
-  cold-start cutoff bootstrap 으로 새 τ scale 을 잡는다. H refresh body 자체는 approx probe,
-  direct-emission layout, AOS materialization 을 수행하지 않는다. `κ_h` bridge estimate 는
-  telemetry / 향후 predictor 분석용으로만 기록하며,
-  현재 production 에서는 τ row 에 직접 곱하지 않는다. 실험상 scalar bridge 를 적용하면 refresh step 에
-  severe over-select 가 발생할 수 있다.
+- H refresh 는 score remap 이 완전한 scalar 라고 가정하지 않는다. 현재 구현은 refresh 직전
+  direct cursor feedback 을 먼저 consume 하고, H/v quantile 과 `h_lookup_lut` 를 갱신한 뒤
+  median log-ratio 기반 bridge scale 을 AdaptiveCutoffController 에 적용한다. cold-start
+  histogram bootstrap 은 initial step 에만 사용하며, refresh 후마다 강제하지 않는다.
+  H refresh body 자체는 approx probe, direct-emission layout, AOS materialization 을 수행하지
+  않는다. 따라서 refresh 직후 1~2 iter 의 τ/layout transient 는 가능한 품질 현상으로 보되,
+  hard correctness 는 direct emission cursor/capacity guard 가 맡는다.
 
 ### 20.3 v_q 재사용
 
@@ -963,7 +968,7 @@ adaptive per-expert cap 재배분 검증:
 
 selection quality 결론:
 - 기존 group-dg score / group-forced emission / global element priority 는 production hot path 에서 폐기됐다.
-- 현재 production score 는 age2bit/vbin floor element-wise 단일 score 이며, force 는 τ count 에 포함되고 capacity cap 을 우회하지 않는다.
+- 현재 production score 는 rho/e_hat 기반 abs-H Taylor element-wise 단일 score 이며, force 는 τ count 에 포함되고 capacity cap 을 우회하지 않는다.
 - steady telemetry 에서 sample fraction 은 1%로 유지됐고, probe/direct score identity 와 K-band 가 확인됐다.
 
 H refresh boundary 검증:

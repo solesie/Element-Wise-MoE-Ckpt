@@ -270,15 +270,11 @@ def retry_candidate_ladder_cpu(
     return out or [float(max(best_tau, 1.0e-12))]
 
 
-def reduce_direct_feedback_cpu(
-    *,
+def pack_direct_feedback_counts(
     feedback: Optional[Dict[str, Any]],
     counts: torch.Tensor,
-    process_group: Any,
-    world_size: int,
-) -> Optional[Dict[str, Any]]:
-    """All-reduce tiny direct-emission feedback and return a global record."""
-
+) -> None:
+    """Pack one rank's direct-emission feedback into a tiny CPU tensor."""
     local_written = int(feedback.get("written", 0)) if feedback else 0
     local_selected = (
         int(feedback.get("selected", local_written)) if feedback else 0
@@ -289,6 +285,8 @@ def reduce_direct_feedback_cpu(
         else 0
     )
     local_step = int(feedback.get("step", 0)) if feedback else 0
+    local_tau_version = int(feedback.get("tau_version", -1)) if feedback else -1
+    local_h_epoch = int(feedback.get("tau_h_epoch", -1)) if feedback else -1
 
     counts[0] = 1 if feedback else 0
     counts[1] = local_selected
@@ -296,11 +294,29 @@ def reduce_direct_feedback_cpu(
     counts[3] = local_overflow
     counts[4] = local_step
     counts[5] = local_step * local_step
-    torch.distributed.all_reduce(
-        counts,
-        op=torch.distributed.ReduceOp.SUM,
-        group=process_group,
-    )
+    if int(counts.numel()) >= 10:
+        counts[6] = local_tau_version
+        counts[7] = local_tau_version * local_tau_version
+        counts[8] = local_h_epoch
+        counts[9] = local_h_epoch * local_h_epoch
+    if int(counts.numel()) >= 14:
+        counts[10] = (
+            1 if (feedback is not None and bool(feedback.get("tau_lagged", False)))
+            else 0
+        )
+        counts[11] = int(feedback.get("tau_source_step", -1)) if feedback else -1
+        counts[12] = int(feedback.get("tau_apply_from_step", -1)) if feedback else -1
+        counts[13] = 0
+
+
+def finish_direct_feedback_reduce_cpu(
+    *,
+    feedback: Optional[Dict[str, Any]],
+    counts: torch.Tensor,
+    world_size: int,
+) -> Optional[Dict[str, Any]]:
+    """Parse reduced direct-emission feedback if every rank reported same key."""
+
     ready_ranks = int(counts[0].item())
     if feedback is None or ready_ranks != int(world_size):
         return None
@@ -308,6 +324,15 @@ def reduce_direct_feedback_cpu(
     step_sq_sum = int(counts[5].item())
     if step_sum * step_sum != ready_ranks * step_sq_sum:
         return None
+    if int(counts.numel()) >= 10:
+        version_sum = int(counts[6].item())
+        version_sq_sum = int(counts[7].item())
+        if version_sum * version_sum != ready_ranks * version_sq_sum:
+            return None
+        epoch_sum = int(counts[8].item())
+        epoch_sq_sum = int(counts[9].item())
+        if epoch_sum * epoch_sum != ready_ranks * epoch_sq_sum:
+            return None
 
     out = dict(feedback)
     out.update({
@@ -316,4 +341,31 @@ def reduce_direct_feedback_cpu(
         "overflow": int(counts[3].item()),
         "step": int(step_sum // max(1, ready_ranks)),
     })
+    if int(counts.numel()) >= 10:
+        out.update({
+            "tau_version": int(int(counts[6].item()) // max(1, ready_ranks)),
+            "tau_h_epoch": int(int(counts[8].item()) // max(1, ready_ranks)),
+        })
     return out
+
+
+def reduce_direct_feedback_cpu(
+    *,
+    feedback: Optional[Dict[str, Any]],
+    counts: torch.Tensor,
+    process_group: Any,
+    world_size: int,
+) -> Optional[Dict[str, Any]]:
+    """All-reduce tiny direct-emission feedback and return a global record."""
+
+    pack_direct_feedback_counts(feedback, counts)
+    torch.distributed.all_reduce(
+        counts,
+        op=torch.distributed.ReduceOp.SUM,
+        group=process_group,
+    )
+    return finish_direct_feedback_reduce_cpu(
+        feedback=feedback,
+        counts=counts,
+        world_size=int(world_size),
+    )

@@ -2,7 +2,11 @@
 
 The active path ranks elements with one score:
 
-    default score(i) = max(0, -m_i * e_hat_i + 0.5 * |H_i| * e_hat_i^2)
+    default score(i) = max(0, -linear_i * e_hat_i + 0.5 * |H_i| * e_hat_i^2)
+
+where ``linear_i`` is selected by ``proposal_score_linear_source``.  The
+default source is the leased optimizer gradient, with momentum as an explicit
+fallback/legacy mode.
 
 ``LossyCpState`` holds the runtime views used by cutoff search and record
 write. ``LossyCheckpointPipeline`` owns one lossy checkpoint iteration.
@@ -124,6 +128,24 @@ class LossyCheckpointPipeline(
                 ),
             )
         )
+        self._pp_lagged_tau = None
+        if bool(getattr(proposal_config, "pp_lagged_cutoff", False)):
+            from ..cutoff.pp_lagged_tau import PPLaggedTauState
+            self._pp_lagged_tau = PPLaggedTauState(
+                target_ratio=float(topk_ratio),
+                band_fraction=float(
+                    getattr(proposal_config, "pp_lagged_band_fraction", 0.25)
+                ),
+                safety_lag=int(
+                    getattr(proposal_config, "pp_lagged_safety_lag", 1)
+                ),
+                max_staleness=int(
+                    getattr(proposal_config, "pp_lagged_max_staleness", 8)
+                ),
+                strict_after_bad=int(
+                    getattr(proposal_config, "pp_lagged_strict_after_bad", 2)
+                ),
+            )
         from ..telemetry.approx_probe import ApproxProbeTelemetry
         self._approx_probe_telemetry = ApproxProbeTelemetry.from_env()
         from ..telemetry.sparse_cache_shadow import SparseCacheShadowTelemetry
@@ -148,6 +170,13 @@ class LossyCheckpointPipeline(
             if proposal_config is not None else DEFAULT_SCORE_POLICY
         )
         self.score_policy_id = int(score_policy_id(self.score_policy))
+        self.score_linear_source = str(
+            getattr(proposal_config, "score_linear_source", "grad")
+            if proposal_config is not None else "grad"
+        )
+        self._grad_score_lease = None
+        self._score_linear_release_pending = False
+        self._current_global_step_for_selection = -1
         # Production reads H through the quantile table. In hessian mode the
         # single hot-path score is the configured abs-H Taylor policy.  Probe
         # and direct emission must use the same helper/LUT snapshot; group-dg,
@@ -155,6 +184,7 @@ class LossyCheckpointPipeline(
 
         self._selection_total_th: Optional[torch.Tensor] = None    # () fp32
         self._selection_total_th_host: float = 1.0
+        self._selection_tau_meta: Dict[str, Any] = {}
         async_queue = int(
             getattr(proposal_config, "async_queue", 5)
             if proposal_config is not None else 5
@@ -163,6 +193,7 @@ class LossyCheckpointPipeline(
         self._global_selection_element_count_host: Optional[int] = None
         self._local_selection_element_count_host: Optional[int] = None
         self._selection_candidate_capacity = 16
+        self._cold_start_hist_iters = 4
         self._cold_start_cutoff_ready = False
         self.test_expert_selection_only = bool(
             getattr(proposal_config, "test_expert_selection_only", False)
@@ -449,6 +480,9 @@ class LossyCheckpointPipeline(
     def tracked_names(self) -> List[str]:
         return list(self._tracked_names)
 
+    def set_grad_score_lease(self, lease: object) -> None:
+        self._grad_score_lease = lease
+
     def full_save_names(self) -> List[str]:
         return list(self._full_save_names)
 
@@ -564,19 +598,32 @@ class LossyCheckpointPipeline(
             # mapper's coord table when available; otherwise fall back to a
             # synthetic single-bucket index 0 (best-effort for non-DS modes).
             g_idx = 0
+            opt_elem_offset = 0
             if mapper is not None and hasattr(mapper, "_coords"):
                 coord = mapper._coords.get(id(p))
                 if coord is not None:
                     g_idx = coord[0]
+                    opt_elem_offset = int(coord[1])
+                elif getattr(mapper, "mode", "") in (
+                    "megatron_float16",
+                    "unfused_fp16",
+                ):
+                    # These optimizers keep one FP32 master tensor plus Adam
+                    # state per low-precision parameter, not a shared flat
+                    # group. Treat each tracked tensor as its own local group
+                    # so the hot path still gets zero-copy p/m/v views.
+                    g_idx = len(buckets)
+                    opt_elem_offset = 0
             b = buckets.setdefault(g_idx, {
                 "names": [], "sizes": [], "m_refs": [], "v_refs": [],
-                "p_refs": [],
+                "p_refs": [], "opt_offsets": [],
             })
             b["names"].append(n)
             b["sizes"].append(int(p.numel()))
             b["m_refs"].append(m.detach().reshape(-1))
             b["v_refs"].append(v.detach().reshape(-1))
             b["p_refs"].append(p_local.detach().reshape(-1))
+            b["opt_offsets"].append(int(opt_elem_offset))
 
         if not buckets:
             return
@@ -675,7 +722,7 @@ class LossyCheckpointPipeline(
             1, dtype=torch.int64,
         )
         self._direct_feedback_counts_cpu = torch.empty(
-            6, dtype=torch.int64,
+            14, dtype=torch.int64,
         )
         self._selection_candidate_taus = torch.empty(
             cand_cap, dtype=torch.float32, device=device,
@@ -718,6 +765,7 @@ class LossyCheckpointPipeline(
             m_refs = b["m_refs"]
             v_refs = b["v_refs"]
             p_refs = b["p_refs"]
+            opt_offsets = b.get("opt_offsets", [])
             group_total = sum(sizes)
             group_groups = group_total // g
             master_off = cur_off  # start of this group's region in flat
@@ -809,6 +857,9 @@ class LossyCheckpointPipeline(
                 "m_flat": m_flat,
                 "v_flat": v_flat,
                 "p_flat": p_flat,
+                "optimizer_elem_offset": (
+                    int(opt_offsets[0]) if opt_offsets else 0
+                ),
                 "master_off": master_off,  # global flat element offset
                 "start_name_in_grp": start_name_in_grp,
                 "end_name_in_grp": end_name_in_grp,
@@ -915,7 +966,17 @@ class LossyCheckpointPipeline(
                   f"hist_i64={mem_hist:.3f}MB -> "
                   f"total={mem_total:.1f}MB",
                   flush=True)
-            for grp in self._groups:
+            preview_groups = list(self._groups)
+            if len(preview_groups) > 16:
+                hidden = len(preview_groups) - 12
+                preview_groups = preview_groups[:8] + preview_groups[-4:]
+                print(
+                    f"[proposal] bf16_group detail truncated: "
+                    f"showing 12/{len(self._groups)} groups "
+                    f"({hidden} omitted)",
+                    flush=True,
+                )
+            for grp in preview_groups:
                 print(f"[proposal] bf16_group g_idx={grp['g_idx']}: "
                       f"n_tensors={len(grp['names'])}, "
                       f"total={grp['total']}, "
@@ -928,6 +989,63 @@ class LossyCheckpointPipeline(
             pass
 
         self._flat_layout_done = True
+
+    @torch.no_grad()
+    def _refresh_score_linear_views(self) -> None:
+        use_grad = str(getattr(self, "score_linear_source", "grad")) == "grad"
+        lease = getattr(self, "_grad_score_lease", None) if use_grad else None
+        self._score_linear_release_pending = bool(
+            lease is not None and getattr(lease, "has_leases", False)
+        )
+        cache_grad_for_oracle = bool(use_grad and self._independent_oracle_wants_grad_cache())
+        for grp in getattr(self, "_groups", ()) or ():
+            grp["score_linear_flat"] = None
+            if lease is None:
+                continue
+            m_flat = grp.get("m_flat")
+            if not isinstance(m_flat, torch.Tensor):
+                continue
+            view_for_group = getattr(lease, "view_for_group", None)
+            if view_for_group is None:
+                continue
+            view = view_for_group(
+                int(grp.get("g_idx", -1)),
+                int(grp.get("optimizer_elem_offset", 0)),
+                int(m_flat.numel()),
+            )
+            if isinstance(view, torch.Tensor):
+                grp["score_linear_flat"] = view
+                if cache_grad_for_oracle:
+                    grp["g_score_flat"] = view.detach().clone()
+
+    def _independent_oracle_wants_grad_cache(self) -> bool:
+        cfg = getattr(self, "proposal_config", None)
+        if cfg is None or not bool(getattr(cfg, "independent_oracle_enable", False)):
+            return False
+        step = int(getattr(self, "_current_global_step_for_selection", -1))
+        if step < 0:
+            return False
+        iters = tuple(int(x) for x in getattr(cfg, "independent_oracle_iters", ()) or ())
+        return not iters or step in iters
+
+    def clear_independent_oracle_grad_cache(self) -> None:
+        for grp in getattr(self, "_groups", ()) or ():
+            grp.pop("g_score_flat", None)
+
+    def _release_score_linear_after_event(
+        self,
+        event: Optional["torch.cuda.Event"],
+    ) -> None:
+        lease = getattr(self, "_grad_score_lease", None)
+        if lease is None:
+            self._score_linear_release_pending = False
+            return
+        try:
+            lease.release_after(event)
+        finally:
+            self._score_linear_release_pending = False
+            for grp in getattr(self, "_groups", ()) or ():
+                grp["score_linear_flat"] = None
 
     @torch.no_grad()
     def _refresh_lossy_cp_state_refs(self) -> None:
@@ -958,6 +1076,7 @@ class LossyCheckpointPipeline(
 
         device = self._selection_hist.device
         h_lut = self._ensure_h_lookup_lut(device=device)
+        self._refresh_score_linear_views()
 
         bf16_opt_groups: List[BF16OptGroupView] = []
         for grp in self._groups:
@@ -968,6 +1087,7 @@ class LossyCheckpointPipeline(
             m_flat = grp.get("m_flat")
             v_flat = grp.get("v_flat")
             p_flat = grp.get("p_flat")
+            score_linear_flat = grp.get("score_linear_flat")
             if m_flat is None or v_flat is None or p_flat is None:
                 raise RuntimeError(
                     "LossyCpState requires m/v/p flat views for every group."
@@ -977,6 +1097,7 @@ class LossyCheckpointPipeline(
                 v_flat=v_flat,
                 p_flat=p_flat,
                 master_off_elem=int(grp["master_off"]) * int(self.group_size),
+                score_linear_flat=score_linear_flat,
                 name_start=int(grp["start_name_in_grp"]),
                 name_end=int(grp["end_name_in_grp"]),
                 entry_elem_start=grp.get("entry_elem_start"),
@@ -1053,6 +1174,7 @@ class LossyCheckpointPipeline(
         """
         import time as _time
         _t0_entry = _time.perf_counter()
+        self._current_global_step_for_selection = int(global_step)
         device = next(self.model.parameters()).device
         group_size = max(1, int(self.group_size))
         _t0_dispatch_start = _time.perf_counter()
@@ -1167,6 +1289,7 @@ class LossyCheckpointPipeline(
             "random_mode": bool(getattr(self, "_selection_random_mode", False)),
             "random_salt": int(getattr(self, "_selection_random_salt", 0)),
         }
+        lossy_write_inputs.update(dict(getattr(self, "_selection_tau_meta", {}) or {}))
 
         self._lossy_record_writer.write_for_iter(
             optimizer,
@@ -1174,6 +1297,8 @@ class LossyCheckpointPipeline(
             selection_event=selection_event,
             d2h_event_callback=d2h_event_callback,
         )
+        if bool(getattr(self, "_score_linear_release_pending", False)):
+            self._release_score_linear_after_event(None)
         _t0_end = _time.perf_counter()
         phase_launch_ms = (_t0_end - _t0_dispatch_end) * 1000.0
         phase_setup_ms = (_t0_p1 - _t0_dispatch_end) * 1000.0

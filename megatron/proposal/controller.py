@@ -7,6 +7,7 @@ workers, and returns. Worker threads own all proposal GPU/D2H/file work.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from .refresh.fp32_state import (
 )
 from .refresh.hessian_refresh import HQuantileAnchor
 from .config import ProposalConfig
+from .grad_lease import GradScoreLease
 from .storage.fc_manager import FCManager, _detect_expert_layout, DS_EXPERT_IDX_RE
 from .checkpoint.lossy_checkpoint_engine import LossyCheckpointPipeline
 from .storage.recovery import recover
@@ -59,6 +61,7 @@ class ProposalController:
         self._enabled = False
         self._cp_dir = None
         self._proposal_config = None                  # ProposalConfig
+        self._grad_score_lease = None                 # GradScoreLease
         self._topology: Optional[ProposalTopology] = None
         self._h_anchor = None                         # HQuantileAnchor
         self._latest_post_step_checkpoint_task = None
@@ -94,6 +97,14 @@ class ProposalController:
 
     def record_loss(self, step: int, loss: Optional[float]) -> None:
         proposal_record_loss(step, loss)
+
+    def run_independent_oracle(
+        self,
+        model: Any,
+        data_iterator: Any,
+        iteration: int,
+    ) -> None:
+        proposal_run_independent_oracle(model, data_iterator, iteration)
 
     def vram_audit_iter_begin(self, step: int) -> None:
         proposal_vram_audit_iter_begin(step)
@@ -179,6 +190,51 @@ def _should_write() -> bool:
     return torch.distributed.get_rank() == 0
 
 
+def _install_grad_score_lease(
+    engine_opt: Any,
+    inner_opt: Any,
+) -> Optional[GradScoreLease]:
+    """Install a lease on the first optimizer object exposing grad flats."""
+
+    candidates: List[Any] = []
+    seen: set[int] = set()
+
+    def add_chain(root: Any) -> None:
+        cur = root
+        for _ in range(8):
+            if cur is None:
+                return
+            cur_id = id(cur)
+            if cur_id in seen:
+                return
+            seen.add(cur_id)
+            candidates.append(cur)
+            nxt = getattr(cur, "optimizer", None)
+            if nxt is None or nxt is cur:
+                return
+            cur = nxt
+
+    add_chain(engine_opt)
+    add_chain(inner_opt)
+    for candidate in candidates:
+        lease = GradScoreLease(candidate)
+        if lease.install():
+            if _should_write():
+                print(
+                    "[proposal] score first-order source: grad "
+                    f"(lease installed on {candidate.__class__.__name__})",
+                    flush=True,
+                )
+            return lease
+    if _should_write():
+        print(
+            "[proposal] score first-order source: grad requested, "
+            "but no DeepSpeed grad lease point was found; falling back to momentum",
+            flush=True,
+        )
+    return None
+
+
 def _install_pipeline_optimizer_fence(model: Any) -> None:
     """Wire the proposal fence into DeepSpeed PipelineEngine's optimizer step.
 
@@ -251,7 +307,7 @@ def init_proposal(
     if torch.cuda.is_available() and get_controller()._dispatch_ready_event is None:
         get_controller()._dispatch_ready_event = torch.cuda.Event()
 
-    # PR-MoE support: args.num_experts may be a list of per-layer counts.
+    # args.num_experts may be a list of per-layer expert counts.
     # FCManager re-derives per-layer counts from observed expert tensors;
     # we pass the raw spec through and use max() as the scalar metadata for
     # checkpoint managers, which only use it for sizing/logging.
@@ -307,6 +363,11 @@ def init_proposal(
     # of the pipeline never touches DeepSpeed internals directly.
     mapper = Fp32StateMapper(engine_opt, inner_opt, inner_model)
     set_mapper(mapper)
+    get_controller()._grad_score_lease = (
+        _install_grad_score_lease(engine_opt, inner_opt)
+        if get_controller()._proposal_config.score_linear_source == "grad"
+        else None
+    )
 
     # B1: detect expert params by DeepSpeed's param.allreduce=False tag.
     expert_param_names: List[str] = []
@@ -435,6 +496,9 @@ def init_proposal(
         # Required so iter-1 H refresh has valid metadata before the first
         # lossy checkpoint step runs on expert_launcher.
         get_controller()._lossy_cp._init_lossy_flat_layout(inner_opt)
+        get_controller()._lossy_cp.set_grad_score_lease(
+            get_controller()._grad_score_lease,
+        )
     else:
         get_controller()._lossy_cp = None
 
@@ -705,6 +769,62 @@ def proposal_record_loss(step: int, loss: Optional[float]) -> None:
         get_controller()._pending_fault_record["post_fault_loss"] = float(loss)
         _flush_fault_record(get_controller()._pending_fault_record)
         get_controller()._pending_fault_record = None
+
+
+def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> None:
+    """Run telemetry-only rollback oracle for the current checkpoint image."""
+
+    ctrl = get_controller()
+    if not ctrl._enabled or ctrl._lossy_cp is None or ctrl._proposal_config is None:
+        if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+            print(
+                "[proposal] independent_oracle skip: "
+                f"enabled={bool(ctrl._enabled)} "
+                f"lossy_cp={ctrl._lossy_cp is not None} "
+                f"config={ctrl._proposal_config is not None} "
+                f"iter={int(iteration)}",
+                flush=True,
+            )
+        return
+    try:
+        from .telemetry.independent_oracle import independent_oracle_enabled
+        if not independent_oracle_enabled(ctrl._proposal_config, int(iteration)):
+            if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+                iters = tuple(int(x) for x in getattr(ctrl._proposal_config, "independent_oracle_iters", ()) or ())
+                print(
+                    "[proposal] independent_oracle skip: "
+                    f"disabled_for_iter iter={int(iteration)} iters={iters}",
+                    flush=True,
+                )
+            return
+    except Exception as exc:
+        if _should_write():
+            print(f"[proposal] independent_oracle: enable check failed: {exc}", flush=True)
+        return
+    if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+        print(f"[proposal] independent_oracle run: iter={int(iteration)}", flush=True)
+
+    # Normal V2 dispatches iter T at the beginning of iter T+1.  The oracle
+    # measures a fault at iter T, so make the current post-step image visible
+    # before evaluating rollback loss.
+    if int(iteration) > int(getattr(ctrl, "_last_dispatched_iter_T", -1)):
+        proposal_dispatch_post_iter(model, iter_T=int(iteration))
+    if ctrl._checkpoint_workers is not None:
+        ctrl._checkpoint_workers.drain()
+
+    try:
+        from .telemetry.independent_oracle import run_independent_oracle
+        run_independent_oracle(
+            model=model,
+            data_iterator=data_iterator,
+            iteration=int(iteration),
+            lossy_cp=ctrl._lossy_cp,
+            proposal_config=ctrl._proposal_config,
+        )
+    finally:
+        clear = getattr(ctrl._lossy_cp, "clear_independent_oracle_grad_cache", None)
+        if callable(clear):
+            clear()
 
 
 def _proposal_tracked_gpu_memory_breakdown() -> Tuple[float, List[Tuple[str, float]]]:
@@ -1244,6 +1364,13 @@ def proposal_shutdown() -> Dict[str, Any]:
         ws = get_controller()._checkpoint_workers.summary()
         summary["async_total_write_ms"] = ws.get("total_write_ms", 0.0)
         get_controller()._checkpoint_workers.shutdown()
+    lease = getattr(get_controller(), "_grad_score_lease", None)
+    if lease is not None:
+        try:
+            lease.uninstall()
+        except Exception:
+            pass
+        get_controller()._grad_score_lease = None
     # Audit: dump per-iter alloc trace summary to audit log (R2 evidence).
     try:
         from .telemetry import diagnostics as _proposal_diagnostics

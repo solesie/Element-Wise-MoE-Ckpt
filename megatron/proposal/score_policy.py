@@ -76,6 +76,7 @@ if _HAS_TRITON:
     @triton.jit
     def _proposal_element_score_from_lut(
         m,
+        linear,
         v,
         age_code,
         h_lut_ptr,
@@ -104,7 +105,7 @@ if _HAS_TRITON:
         second_order = h_abs * e_hat * e_hat
         if SCORE_POLICY == 1:
             return second_order
-        first_order = -m * e_hat
+        first_order = -linear * e_hat
         return tl.maximum(first_order + 0.5 * second_order, 0.0)
 
     @triton.jit

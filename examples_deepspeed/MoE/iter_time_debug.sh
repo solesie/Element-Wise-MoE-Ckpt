@@ -9,7 +9,7 @@
 #   세 도구로 동시 추적. ARCHITECTURE_V2.md §0.4 검증 게이트 (iter time gap ≤ 10 ms)
 #   를 직접 측정.
 #
-# 기준: verify_vram_run.sh (125M-48E, TRAIN_ITERS=2000, --exit-interval 20).
+# 기준: verify_vram_run.sh (125M MoE-48E test, TRAIN_ITERS=2000, --exit-interval 20).
 #   모델 / 학습 설정 그대로 inheriting, iter time 측정 목적의 차이만 반영.
 #
 # verify_vram_run.sh 대비 변경점:
@@ -70,7 +70,7 @@ fi
 COMMON=(
     NUM_LAYERS=12 HIDDEN_SIZE=768 NUM_ATTN_HEADS=12
     GLOBAL_BATCH_SIZE=8 BATCH_SIZE=2 SEQ_LEN=2048
-    MOE_TOPK=1 PRMOE_SPEC=48 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25
+    MOE_TOPK=1 NUM_EXPERTS=48 MOE_TRAIN_CAP=1.25 MOE_EVAL_CAP=1.25
     LR_WARMUP_ITERS=50 TRAIN_ITERS=2000
     FAULT_INTERVAL=0
     BLOCK_QUANT_G=8 NONEXPERT_FC_W=1 CP_TARGET=${CP_TARGET:-disk}
@@ -98,7 +98,7 @@ env "${COMMON[@]}" \
     NSYS_OUT="$OUT/baseline/nsys" \
     OUTPUT_BASEPATH="$OUT/baseline" \
     VARIANT=baseline \
-    bash "$DIR/proposal_etc_template.sh" > "$OUT/baseline/run.log" 2>&1 || true
+    bash "$DIR/proposal_test_template.sh" > "$OUT/baseline/run.log" 2>&1 || true
 
 grep "elapsed time per iteration" "$OUT/baseline/run.log" \
     | sed -E 's/.*elapsed time per iteration \(ms\): ([0-9.]+).*/\1/' \
@@ -114,7 +114,7 @@ env "${COMMON[@]}" \
     NSYS_OUT="$OUT/proposal/nsys" \
     OUTPUT_BASEPATH="$OUT/proposal" \
     VARIANT=iter_time_debug \
-    bash "$DIR/proposal_etc_template.sh" > "$OUT/proposal/run.log" 2>&1 &
+    bash "$DIR/proposal_test_template.sh" > "$OUT/proposal/run.log" 2>&1 &
 PROPOSAL_PID=$!
 
 # py-spy 1 회 best-effort. 20 iter × ~200ms ≈ 4 s 총 길이 라 sleep 1 s 만.

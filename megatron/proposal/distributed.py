@@ -58,8 +58,8 @@ class ProposalTopology:
         return f"dp{self.dp_rank}/pp{self.pp_rank}/ep{self.ep_rank}"
 
     @property
-    def canonical_nonexpert_namespace(self) -> str:
-        return f"dp{self.dp_rank}/pp{self.pp_rank}/ep0"
+    def nonexpert_namespace(self) -> str:
+        return f"dp{self.dp_rank}/pp{self.pp_rank}"
 
     @property
     def selection_ranks(self) -> List[int]:
@@ -80,7 +80,7 @@ class ProposalTopology:
         root = Path(cp_root)
         if self.world_size <= 1:
             return root / "non_expert"
-        return root / self.canonical_nonexpert_namespace / "non_expert"
+        return root / self.nonexpert_namespace / "non_expert"
 
 
 def topology_from_args(args: Any) -> ProposalTopology:

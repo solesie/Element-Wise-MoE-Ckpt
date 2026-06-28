@@ -190,6 +190,11 @@ class EmissionOrchestrationMixin:
             ))
 
         if bool(getattr(self, "test_expert_selection_only", False)):
+            release_score_linear = getattr(
+                self, "_release_score_linear_after_event", None,
+            )
+            if callable(release_score_linear):
+                release_score_linear(selection_event)
             if d2h_event_callback is not None:
                 if torch.cuda.is_available():
                     event_no_aos = self._acquire_ring_event("compute")
@@ -236,6 +241,14 @@ class EmissionOrchestrationMixin:
                 bf16_groups_mvph=static_inputs["mvph"],
                 name_list=static_inputs["name_list"],
                 group_size=int(group_size),
+                score_linear_groups=tuple(
+                    grp.get("score_linear_flat") for grp in self._groups
+                ),
+                score_linear_release=getattr(
+                    self,
+                    "_release_score_linear_after_event",
+                    None,
+                ),
                 within_off_per_name=static_inputs["within_off_per_name"],
                 group_count_per_name=static_inputs["group_count_per_name"],
                 h_lut_values=pending.get("h_lut_values"),
@@ -247,6 +260,12 @@ class EmissionOrchestrationMixin:
                 step_device=step_dev,
                 random_mode=bool(pending.get("random_mode", False)),
                 random_salt=int(pending.get("random_salt", 0)),
+                tau_version=int(pending.get("tau_version", -1)),
+                tau_h_epoch=int(pending.get("tau_h_epoch", -1)),
+                tau_source_step=int(pending.get("tau_source_step", -1)),
+                tau_apply_from_step=int(pending.get("tau_apply_from_step", -1)),
+                tau_lagged=bool(pending.get("tau_lagged", False)),
+                tau_lr_over_bc1=float(pending.get("tau_lr_over_bc1", 0.0)),
                 direct_emission_enabled=bool(
                     pending.get("direct_emission_enabled", False)
                 ),
@@ -293,3 +312,9 @@ class EmissionOrchestrationMixin:
                 lossy_state=_lossy_state,
                 d2h_event_callback=d2h_event_callback,
             )
+        else:
+            release_score_linear = getattr(
+                self, "_release_score_linear_after_event", None,
+            )
+            if callable(release_score_linear):
+                release_score_linear(selection_event)

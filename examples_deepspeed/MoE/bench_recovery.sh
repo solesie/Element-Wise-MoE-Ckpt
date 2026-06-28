@@ -22,7 +22,7 @@ NUM_ATTN_HEADS=12
 GLOBAL_BATCH_SIZE=24
 BATCH_SIZE=8
 EXPERT_INTERVAL=2
-PRMOE_SPEC="4 4 8 8 8 8"
+NUM_EXPERTS_SPEC="4 4 8 8 8 8"
 
 CP_DIR=${CP_DIR:-${PWD}/results/exp_etc_new/cp/proposal_ema_hutch_seed2024}
 T_FAULT=${T_FAULT:-834}
@@ -54,7 +54,7 @@ VALID_DATA_PATH=${VALID_DATA_PATH:-/home/asdf1234/data/slimpajama_6b/slimpajama_
 
 MEGATRON_OPTS="--override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95 \
     --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 \
-    --num-experts ${PRMOE_SPEC} --expert-interval ${EXPERT_INTERVAL} \
+    --num-experts ${NUM_EXPERTS_SPEC} --expert-interval ${EXPERT_INTERVAL} \
     --moe-loss-coeff 0.01 \
     --moe-train-capacity-factor 1.25 --moe-eval-capacity-factor 1.25 --moe-min-capacity 4 \
     --topk 2 --init-method-std 0.014 \

@@ -1,9 +1,9 @@
 #!/bin/bash
-DIR=`pwd`
+DIR=$(cd "$(dirname "$0")" && pwd)
 ###############################################################################
 ### Main configs
 ## GPT-3 models use 2K sequence length/context window
-SEQ_LEN=2048
+SEQ_LEN=${SEQ_LEN:-2048}
 
 ### The "GPT-3 XXX" below are configs from GPT-3 paper
 ### https://arxiv.org/abs/2005.14165, choose based on
@@ -14,7 +14,7 @@ MODEL_SIZE=0.125
 NUM_LAYERS=12
 HIDDEN_SIZE=768
 NUM_ATTN_HEADS=12
-GLOBAL_BATCH_SIZE=256
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
 # LR=6.0e-4
 # MIN_LR=6.0e-5
 
@@ -84,7 +84,7 @@ GLOBAL_BATCH_SIZE=256
 ### Training duration configs
 ## The main termination condition, original GPT-3 paper trains for 300B tokens
 ## For MoE model, we found sometimes training a bit more to 330B tokens helps
-TRAIN_TOKENS=300000000000
+TRAIN_TOKENS=${TRAIN_TOKENS:-300000000000}
 # TRAIN_TOKENS=330000000000
 
 ## TRAIN_ITERS is another termination condition and also affect the number of 
@@ -92,41 +92,43 @@ TRAIN_TOKENS=300000000000
 ## above, and techniques like curriculum learning has less token in some steps,
 ## so we just set this config large enough to make sure we have enough
 ## processed data and don't terminate by TRAIN_ITERS.
-TRAIN_ITERS=$(( ${TRAIN_TOKENS} * 3 / ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))
+TRAIN_ITERS=${TRAIN_ITERS:-$(( ${TRAIN_TOKENS} * 3 / ${GLOBAL_BATCH_SIZE} / ${SEQ_LEN} ))}
 
 ## Another termination condition in minutes. Set it large enough to avoid
 ## undesired early termination.
-EXIT_DURATION=30000000
+EXIT_DURATION=${EXIT_DURATION:-30000000}
 ###############################################################################
 ### LR configs
 ## LR warmup and decay duration, this token-based config is preferable since
 ## no need to readjust when the batch size/seqlen is changed.
 ## Original GPT-3 paper uses 375M warmup tokens and 260B decay tokens.
 ## For MoE model, we found that setting the decay token to 300B helps.
-WARMUP_TOKENS=375000000
+WARMUP_TOKENS=${WARMUP_TOKENS:-375000000}
 # LR_DECAY_TOKENS=260000000000
-LR_DECAY_TOKENS=300000000000
+LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-300000000000}
 ###############################################################################
 ### Parallelism configs
 ## Micro batch size per GPU
 ## Make sure that BATCH_SIZE <= GLOBAL_BATCH_SIZE*PP_SIZE*MP_SIZE/NUM_GPUS
-BATCH_SIZE=4
+BATCH_SIZE=${BATCH_SIZE:-4}
+ZERO_STAGE=${ZERO_STAGE:-0}
+PRESCALE_GRAD=${PRESCALE_GRAD:-true}
 
 ## Model parallelism, 1 is no MP
-MP_SIZE=1
+MP_SIZE=${MP_SIZE:-1}
 
 ## Pipeline parallelism
 ## Currently we don't support PP for MoE. To disable PP, set PP_SIZE
 ## to 1 and use the "--no-pipeline-parallel" arg.
-PP_SIZE=1
-NUM_GPUS=$(($(ds_ssh nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)-2))
-NUM_GPUS_PERNODE=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+PP_SIZE=${PP_SIZE:-1}
+NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
+NUM_GPUS_PERNODE=${NUM_GPUS_PERNODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 NUM_NODE=$(( ${NUM_GPUS} / ${NUM_GPUS_PERNODE} ))
 ###############################################################################
 ### MoE configs
 ## Number of experts. EP_SIZE 1 means dense model without MoE
 # EP_SIZE=1
-EP_SIZE=64
+EP_SIZE=${EP_SIZE:-64}
 
 if [[ $EP_SIZE -gt $NUM_GPUS ]]; then
     EP_PARALLEL_SIZE=$NUM_GPUS
@@ -139,26 +141,26 @@ fi
 ## For 1.3B MoE-128 model we used LR=1.2e-4 and MIN_LR=1.0e-6.
 ## For 350M MoE-128 model we used LR=2.0e-4 and MIN_LR=2.0e-6, but they are not
 ## heavily tuned.
-LR=4.5e-4
-MIN_LR=4.5e-06
+LR=${LR:-4.5e-4}
+MIN_LR=${MIN_LR:-4.5e-06}
 
 ## Coefficient for MoE loss. We find that 0.01 is a good value at least for
 ## 1.3B MoE-128 model
-MLC=0.01
+MLC=${MLC:-0.01}
 
 ## Below configs adjust the MoE expert token capacity limit during training and
 ## eval. To completely disable capacity limit, set MOE_DROP_TOKEN to false.
 ## Larger capacity factor or disabling capacity limit could improve training
 ## convergence, but will also reduce training throughput.
-MOE_TRAIN_CAP_FACTOR=1.0
-MOE_EVAL_CAP_FACTOR=1.0
-MOE_MIN_CAP=4
-MOE_DROP_TOKEN="true"
+MOE_TRAIN_CAP_FACTOR=${MOE_TRAIN_CAP_FACTOR:-1.0}
+MOE_EVAL_CAP_FACTOR=${MOE_EVAL_CAP_FACTOR:-1.0}
+MOE_MIN_CAP=${MOE_MIN_CAP:-4}
+MOE_DROP_TOKEN=${MOE_DROP_TOKEN:-"true"}
 # MOE_DROP_TOKEN="false"
 ###############################################################################
 ### Curriculum learning (CL) configs
 ## Enable/disable CL
-CL_ENABLED="false"
+CL_ENABLED=${CL_ENABLED:-"false"}
 ## Consult the tutorial https://www.deepspeed.ai/tutorials/curriculum-learning/
 ## for tuning the following configs
 CL_START_SEQLEN=80
@@ -168,10 +170,10 @@ CL_TOKENS=$((${CL_TOKENS} * 1000000000))
 CL_STEP=$(( ${CL_TOKENS} / (${GLOBAL_BATCH_SIZE} * ${CL_AVG_SEQLEN}) ))
 ###############################################################################
 ### Misc configs
-LOG_INTERVAL=10
-EVAL_ITERS=10
-EVAL_INTERVAL=100
-SAVE_INTERVAL=10000
+LOG_INTERVAL=${LOG_INTERVAL:-10}
+EVAL_ITERS=${EVAL_ITERS:-10}
+EVAL_INTERVAL=${EVAL_INTERVAL:-100}
+SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 
 ## Standard deviation for weight initialization
 ## We used 0.014 for 350M/1.3B dense/MoE models, and used 0.01 for 6.7B
@@ -180,7 +182,7 @@ INIT_STD=0.014
 # INIT_STD=0.01
 
 ## Activation checkpointing saves GPU memory, but reduces training speed
-ACTIVATION_CHECKPOINT="true"
+ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-"true"}
 # ACTIVATION_CHECKPOINT="false"
 ###############################################################################
 ### Output and data configs
@@ -194,7 +196,7 @@ if [ "${CL_ENABLED}" = "true" ]; then
     NAME="${NAME}-cl-${CL_START_SEQLEN}-${CL_STEP}"
 fi
 
-OUTPUT_BASEPATH=$DIR/output
+OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-$DIR/output}
 mkdir -p "${OUTPUT_BASEPATH}/tensorboard/"
 mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
 mkdir -p "${OUTPUT_BASEPATH}/log/"
@@ -203,6 +205,10 @@ mkdir -p ${TENSORBOARD_DIR}
 ## Note that for MoE model with billion-scale base model, the checkpoint can be
 ## as large as TB-scale which normal NFS cannot handle efficiently.
 CHECKPOINT_PATH="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
+CKPT_MEGATRON_OPTIONS=""
+if [ "${NO_MEGATRON_CKPT:-0}" != "1" ]; then
+    CKPT_MEGATRON_OPTIONS="--load ${CHECKPOINT_PATH} --save ${CHECKPOINT_PATH}"
+fi
 
 # USE_INTERNAL_DATA="true"
 USE_INTERNAL_DATA="false"
@@ -241,11 +247,11 @@ if [ "${USE_INTERNAL_DATA}" = "true" ]; then
     0.00208 ${NIH} 0.13017 ${CC2020} 0.09446 ${PCC} 0.15652 ${CC2021} \
     0.01359 ${ARX} 0.01588 ${GIT}"
 else
-    VOCAB_PATH=/data/the_pile_public_merged_nopreprocessing/gpt2-vocab.json
-    MERGE_PATH=/data/the_pile_public_merged_nopreprocessing/gpt2-merges.txt
+    VOCAB_PATH=${VOCAB_PATH:-/data/the_pile_public_merged_nopreprocessing/gpt2-vocab.json}
+    MERGE_PATH=${MERGE_PATH:-/data/the_pile_public_merged_nopreprocessing/gpt2-merges.txt}
     # Public the Pile dataset, can be downloaded at https://mystic.the-eye.eu/public/AI/pile_neox/
     # For cluster Azure-EastUS-V100-32GB-4, Lab-RR1-V100
-    DATA_PATH=/vc_data_blob/users/conglli/the_pile_public_merged_nopreprocessing/pile_text_document
+    DATA_PATH=${DATA_PATH:-/vc_data_blob/users/conglli/the_pile_public_merged_nopreprocessing/pile_text_document}
     # For cluster Azure-WestUS3-A100
     # DATA_PATH=/blob/data/the_pile_public_merged_nopreprocessing/pile_text_document
 fi
@@ -254,6 +260,7 @@ data_options=" \
          --vocab-file ${VOCAB_PATH} \
          --merge-file ${MERGE_PATH} \
          --data-path ${DATA_PATH} \
+         ${VALID_DATA_PATH:+--valid-data-path ${VALID_DATA_PATH}} \
          --data-impl mmap"
         
 megatron_options=" \
@@ -293,13 +300,13 @@ megatron_options=" \
         --hysteresis 2 \
         --num-workers 0 \
         --fp16 \
-        --load ${CHECKPOINT_PATH} \
-        --save ${CHECKPOINT_PATH} \
+        ${CKPT_MEGATRON_OPTIONS} \
         --tensorboard-queue-size 1 \
         --log-timers-to-tensorboard \
         --log-batch-size-to-tensorboard \
         --log-validation-ppl-to-tensorboard \
-        --tensorboard-dir ${TENSORBOARD_DIR}"
+        --tensorboard-dir ${TENSORBOARD_DIR} \
+        ${EXTRA_MEGATRON_FLAGS:-}"
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
 megatron_options="${megatron_options} \
@@ -316,13 +323,13 @@ megatron_options="${megatron_options} \
         --disable-moe-token-dropping"
 fi
 
-template_json="ds_config_gpt_TEMPLATE.json"
-config_json="ds_config_gpt_${NAME}.json"
+template_json="${DIR}/ds_config_gpt_TEMPLATE.json"
+config_json="${OUTPUT_BASEPATH}/ds_config_gpt_${NAME}.json"
 sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_MBSIZE/${BATCH_SIZE}/" \
     | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
-    | sed "s/ZERO_STAGE/0/" \
-    | sed "s/PRESCALE_GRAD/true/" \
+    | sed "s/ZERO_STAGE/${ZERO_STAGE}/" \
+    | sed "s/PRESCALE_GRAD/${PRESCALE_GRAD}/" \
     | sed "s/CONFIG_FP16_ENABLED/true/" \
     | sed "s/CONFIG_BF16_ENABLED/false/" \
     | sed "s/CONFIG_CL_ENABLED/${CL_ENABLED}/" \
@@ -350,23 +357,25 @@ fi
 ## When saving checkpoint to a storage with cache, their could be consistency
 ## issue of the pointer to latest checkpoint. Here we find the correct pointer
 ## and broadcast it to all nodes.
-ITERATION_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
-ITERATION_FILE_2="$CHECKPOINT_PATH/latest"
-ITERATION=0
-for (( node = 0; node <= NUM_NODE-1; node++ ))
-do
-    if $(ssh -q worker-"$node" "test -f \"$ITERATION_FILE\""); then
-        LOCAL_ITERATION=$(ssh -q worker-"$node" cat $ITERATION_FILE)
-        ITERATION=$(( ${LOCAL_ITERATION} > ${ITERATION} ? ${LOCAL_ITERATION} :  ${ITERATION} ))
+if [ "${NO_MEGATRON_CKPT:-0}" != "1" ]; then
+    ITERATION_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
+    ITERATION_FILE_2="$CHECKPOINT_PATH/latest"
+    ITERATION=0
+    for (( node = 0; node <= NUM_NODE-1; node++ ))
+    do
+        if $(ssh -q worker-"$node" "test -f \"$ITERATION_FILE\""); then
+            LOCAL_ITERATION=$(ssh -q worker-"$node" cat $ITERATION_FILE)
+            ITERATION=$(( ${LOCAL_ITERATION} > ${ITERATION} ? ${LOCAL_ITERATION} :  ${ITERATION} ))
+        fi
+    done
+    if [[ $ITERATION -gt 0 ]]; then
+        ITERATION_2="global_step${ITERATION}"
+        ds_ssh "echo $ITERATION > $ITERATION_FILE"
+        ds_ssh "echo $ITERATION_2 > $ITERATION_FILE_2"
     fi
-done
-if [[ $ITERATION -gt 0 ]]; then
-    ITERATION_2="global_step${ITERATION}"
-    ds_ssh "echo $ITERATION > $ITERATION_FILE"
-    ds_ssh "echo $ITERATION_2 > $ITERATION_FILE_2"
 fi
 
-run_cmd="deepspeed ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options} &> ${OUTPUT_BASEPATH}/log/${NAME}_${host}_${current_time}.log"
+run_cmd="deepspeed ${DEEPSPEED_LAUNCH_ARGS:-} ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options} ${EXTRA_DEEPSPEED_OPTIONS:-} &> ${OUTPUT_BASEPATH}/log/${NAME}_${host}_${current_time}.log"
 echo ${run_cmd}
 eval ${run_cmd}
 set +x

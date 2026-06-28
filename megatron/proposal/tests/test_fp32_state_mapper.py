@@ -1,6 +1,7 @@
 import torch
 
-from megatron.proposal.refresh.fp32_state import Fp32StateMapper
+from megatron.proposal.refresh.fp32_state import Fp32StateMapper, set_mapper
+from megatron.proposal.storage.recovery import _apply_zero12_partition_payload
 
 
 class _Engine:
@@ -36,6 +37,20 @@ class _HpMapping:
 
     def get_lp_grad_fragment(self, index_in_param_group):
         return self._grad_views[index_in_param_group]
+
+
+class _Zero12Candidate:
+    def __init__(self, params, partition_flat, params_in_partition, first_offset):
+        self.bit16_groups = [params]
+        self.single_partition_of_fp32_groups = [partition_flat]
+        self.params_in_partition = [params_in_partition]
+        self.first_offset = [first_offset]
+        self.partition_size = [int(partition_flat.numel())]
+        self.fp32_groups_gradients_flat = [torch.zeros_like(partition_flat)]
+        self.optimizer = torch.optim.SGD([partition_flat], lr=0.1)
+
+    def update_lp_params(self):
+        self.update_lp_called = True
 
 
 def test_mapper_skips_empty_fp16_candidate_and_uses_bf16_grad_flat():
@@ -102,3 +117,66 @@ def test_mapper_accepts_deepspeed_fp16_optimizer_with_bf16_params():
     assert view.dtype == torch.bfloat16
     view.fill_(2.0)
     assert torch.equal(p1.grad, torch.full_like(p1, 2.0))
+
+
+def test_zero12_local_fragments_follow_partition_not_tensor_boundary():
+    p0 = torch.nn.Parameter(torch.ones(4, dtype=torch.float16))
+    p1 = torch.nn.Parameter(torch.ones(6, dtype=torch.float16))
+    part = torch.arange(5, dtype=torch.float32)
+    candidate = _Zero12Candidate([p0, p1], part, [p1], first_offset=1)
+    mapper = Fp32StateMapper(candidate, candidate.optimizer, torch.nn.Module())
+
+    frags = mapper.zero12_local_fragments([("p0", p0), ("p1", p1)])
+
+    assert mapper.mode == "zero12"
+    assert len(frags) == 1
+    name, param, group_idx, local_offset, param_offset, numel = frags[0]
+    assert name == "p1"
+    assert param is p1
+    assert (group_idx, local_offset, param_offset, numel) == (0, 0, 1, 5)
+
+
+def test_zero12_partition_payload_recovery_updates_local_master_and_state():
+    p0 = torch.nn.Parameter(torch.ones(4, dtype=torch.float16))
+    p1 = torch.nn.Parameter(torch.ones(6, dtype=torch.float16))
+    part = torch.zeros(5, dtype=torch.float32)
+    candidate = _Zero12Candidate([p0, p1], part, [p1], first_offset=1)
+    candidate.optimizer.state[part]["exp_avg"] = torch.zeros_like(part)
+    candidate.optimizer.state[part]["exp_avg_sq"] = torch.zeros_like(part)
+    mapper = Fp32StateMapper(candidate, candidate.optimizer, torch.nn.Module())
+    set_mapper(mapper)
+    try:
+        _apply_zero12_partition_payload(
+            {
+                "frag0:param": torch.arange(10, 15, dtype=torch.float32),
+                "frag0:exp_avg": torch.arange(20, 25, dtype=torch.float32),
+                "frag0:exp_avg_sq": torch.arange(30, 35, dtype=torch.float32),
+            },
+            {
+                "payload_kind": "zero12_nonexpert_partition",
+                "owner_global_rank": 0,
+                "step": 7,
+                "fragments": [{
+                    "index": 0,
+                    "name": "p1",
+                    "group_idx": 0,
+                    "local_offset": 0,
+                    "param_offset": 1,
+                    "numel": 5,
+                    "shape": [6],
+                }],
+            },
+        )
+    finally:
+        set_mapper(None)
+
+    torch.testing.assert_close(part, torch.arange(10, 15, dtype=torch.float32))
+    torch.testing.assert_close(
+        candidate.optimizer.state[part]["exp_avg"],
+        torch.arange(20, 25, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        candidate.optimizer.state[part]["exp_avg_sq"],
+        torch.arange(30, 35, dtype=torch.float32),
+    )
+    assert getattr(candidate, "update_lp_called", False)

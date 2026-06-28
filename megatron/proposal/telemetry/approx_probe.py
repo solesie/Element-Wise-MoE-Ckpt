@@ -209,7 +209,18 @@ class ApproxProbeTelemetry:
         target = max(float(target_ratio), 1.0e-12)
         sampled_blocks = max(0.0, float(diag[6]))
         sampled_elements = sampled_blocks * float(pending["block_elements"])
+        try:
+            rank = int(os.environ.get("RANK", "0") or "0")
+            world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+            local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+        except ValueError:
+            rank = 0
+            world_size = 1
+            local_rank = 0
         record = {
+            "rank": rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
             "step": step,
             "tau": float(direct_feedback.get("tau", 0.0)),
             "approx_ratio": approx_ratio,
