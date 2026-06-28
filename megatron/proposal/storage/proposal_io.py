@@ -68,6 +68,18 @@ def backend_kind() -> str:
     return kind
 
 
+def _fdp_global_expert_id_for_read(expert: int) -> int:
+    if os.environ.get("PROPOSAL_FDP_EXPERT_IDS_GLOBAL", "").lower() in (
+        "1", "true", "yes",
+    ):
+        return int(expert)
+    ep_size = int(os.environ.get("PROPOSAL_FDP_EP_SIZE", "1") or "1")
+    if ep_size <= 1:
+        return int(expert)
+    base = int(os.environ.get("PROPOSAL_FDP_EXPERT_ID_BASE", "0") or "0")
+    return int(base) + int(expert)
+
+
 def _get_fdp():
     """Lazy-load and open the raw NVMe FDP backend session."""
     global _fdp_cext
@@ -867,6 +879,7 @@ def fdp_recovery_entries() -> Dict[str, Any]:
         raise RuntimeError("fdp_recovery_entries requires PROPOSAL_IO_BACKEND=fdp")
     raw = dict(_get_fdp().recovery_entries())
     raw["nefc"] = dict(raw.get("nefc", {}))
+    raw["nefc_shards"] = [dict(entry) for entry in raw.get("nefc_shards", [])]
     raw["lfcs"] = [dict(entry) for entry in raw.get("lfcs", [])]
     raw["lfsy"] = [dict(entry) for entry in raw.get("lfsy", [])]
     return raw
@@ -894,20 +907,49 @@ def _fdp_read_object_blob(
     return buf.narrow(0, 0, int(got))
 
 
-def fdp_read_nefc_blob(logical_bytes: Optional[int] = None) -> torch.Tensor:
+def fdp_read_nefc_blob(
+    logical_bytes: Optional[int] = None,
+    *,
+    shard_index: Optional[int] = None,
+) -> torch.Tensor:
     """Read the latest NEFC PRPTENS object from FDP chunks."""
     if backend_kind() != "fdp":
         raise RuntimeError("fdp_read_nefc_blob requires PROPOSAL_IO_BACKEND=fdp")
     if logical_bytes is None:
-        entry = fdp_recovery_entries()["nefc"]
+        entries = fdp_recovery_entries()
+        if shard_index is None:
+            entry = entries["nefc"]
+        else:
+            entry = next(
+                (
+                    e for e in entries.get("nefc_shards", [])
+                    if int(e.get("shard_index", -1)) == int(shard_index)
+                ),
+                None,
+            )
+            if entry is None:
+                raise RuntimeError(
+                    f"fdp_read_nefc_blob: NEFC shard {int(shard_index)} missing"
+                )
         if not bool(entry.get("valid", False)):
             raise RuntimeError("fdp_read_nefc_blob: NEFC entry is not valid")
         logical_bytes = int(entry["logical_bytes"])
     fdp = _get_fdp()
+    read_fn = (
+        fdp.read_nefc_into
+        if shard_index is None
+        else lambda addr, nbytes: fdp.read_nefc_shard_into(
+            int(shard_index), int(addr), int(nbytes)
+        )
+    )
     return _fdp_read_object_blob(
         int(logical_bytes),
-        fdp.read_nefc_into,
-        source="fdp_read_nefc_blob",
+        read_fn,
+        source=(
+            "fdp_read_nefc_blob"
+            if shard_index is None
+            else f"fdp_read_nefc_blob(shard={int(shard_index)})"
+        ),
     )
 
 
@@ -921,12 +963,13 @@ def fdp_read_lfcs_blob(
         raise RuntimeError("fdp_read_lfcs_blob requires PROPOSAL_IO_BACKEND=fdp")
     if logical_bytes is None:
         entries = fdp_recovery_entries()["lfcs"]
+        global_expert = _fdp_global_expert_id_for_read(int(expert))
         match = next(
             (
                 e for e in entries
                 if bool(e.get("valid", False))
                 and int(e.get("layer_id", -1)) == int(layer)
-                and int(e.get("expert_id", -1)) == int(expert)
+                and int(e.get("expert_id", -1)) == int(global_expert)
             ),
             None,
         )
@@ -955,12 +998,13 @@ def fdp_read_lfsy_blob(
         raise RuntimeError("fdp_read_lfsy_blob requires PROPOSAL_IO_BACKEND=fdp")
     if logical_bytes is None:
         entries = fdp_recovery_entries()["lfsy"]
+        global_expert = _fdp_global_expert_id_for_read(int(expert))
         match = next(
             (
                 e for e in entries
                 if bool(e.get("valid", False))
                 and int(e.get("layer_id", -1)) == int(layer)
-                and int(e.get("expert_id", -1)) == int(expert)
+                and int(e.get("expert_id", -1)) == int(global_expert)
             ),
             None,
         )

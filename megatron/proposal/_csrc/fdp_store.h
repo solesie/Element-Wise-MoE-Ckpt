@@ -30,6 +30,16 @@ struct FdpEnvConfig {
     uint32_t num_moe_layers = 0;
     uint32_t experts_per_layer = 0;
     uint32_t expert_slots = 0;
+    uint32_t dp_rank = 0;
+    uint32_t dp_size = 1;
+    uint32_t pp_rank = 0;
+    uint32_t pp_size = 1;
+    uint32_t ep_rank = 0;
+    uint32_t ep_size = 1;
+    uint32_t nefc_shard_index = 0;
+    uint32_t nefc_shard_count = 1;
+    uint32_t expert_id_base = 0;
+    bool expert_ids_global = false;
 
     uint32_t nefc_qd = 32;
     uint32_t expert_qd = 64;
@@ -69,6 +79,16 @@ struct FdpStatsSnapshot {
     uint32_t num_moe_layers = 0;
     uint32_t experts_per_layer = 0;
     uint32_t expert_slots = 0;
+    uint32_t dp_rank = 0;
+    uint32_t dp_size = 1;
+    uint32_t pp_rank = 0;
+    uint32_t pp_size = 1;
+    uint32_t ep_rank = 0;
+    uint32_t ep_size = 1;
+    uint32_t nefc_shard_index = 0;
+    uint32_t nefc_shard_count = 1;
+    uint32_t expert_id_base = 0;
+    bool expert_ids_global = false;
 
     uint32_t nefc_qd = 0;
     uint32_t expert_qd = 0;
@@ -97,6 +117,8 @@ struct MetadataSummary {
     uint64_t nefc_iter = 0;
     uint64_t nefc_logical_bytes = 0;
     uint32_t nefc_chunk_count = 0;
+    uint32_t nefc_shard_count = 1;
+    uint32_t nefc_valid_count = 0;
     uint32_t lfcs_valid_count = 0;
     uint32_t lfcs_total_chunks = 0;
     uint32_t lfcs_max_chunk_count = 0;
@@ -105,7 +127,11 @@ struct MetadataSummary {
 
 struct NefcEntrySnapshot {
     bool valid = false;
+    uint32_t shard_index = 0;
     uint32_t rank = 0;
+    uint32_t dp_rank = 0;
+    uint32_t pp_rank = 0;
+    uint32_t ep_rank = 0;
     uint64_t iter = 0;
     uint64_t logical_bytes = 0;
     uint32_t chunk_count = 0;
@@ -231,11 +257,15 @@ public:
     FdpStatsSnapshot stats() const;
     MetadataSummary debug_read_metadata_summary();
     NefcEntrySnapshot read_nefc_entry();
+    std::vector<NefcEntrySnapshot> read_nefc_entries();
     std::vector<LfcsEntrySnapshot> read_lfcs_entries();
     std::vector<LfsyEntrySnapshot> read_lfsy_entries();
     std::vector<LfsyEntrySnapshot> debug_read_lfsy_entries();
     bool debug_raw_write_read_smoke();
     size_t read_nefc_into(int64_t dst_addr, uint64_t dst_bytes);
+    size_t read_nefc_shard_into(uint32_t shard_index,
+                                int64_t dst_addr,
+                                uint64_t dst_bytes);
     size_t read_lfcs_into(uint32_t layer_id, uint32_t expert_id,
                           int64_t dst_addr, uint64_t dst_bytes);
     size_t read_lfsy_into(uint32_t layer_id, uint32_t expert_id,
@@ -259,6 +289,10 @@ private:
     void write_metadata_image();
     void read_metadata_image();
     void update_metadata_header(uint64_t iter, bool bump_seq);
+    void acquire_global_metadata_lock();
+    void release_global_metadata_lock();
+    bool global_metadata_lock_held() const;
+    void persist_metadata_image_locked(uint64_t iter, bool bump_seq);
     void validate_loaded_superblock(const SuperBlock& sb) const;
     void validate_metadata_range(uint64_t slba, uint64_t nlb,
                                  const char* where) const;
@@ -293,6 +327,8 @@ private:
                                 uint64_t dst_bytes,
                                 const char* where);
     uint32_t expert_slot(uint32_t layer_id, uint32_t expert_id) const;
+    uint32_t global_expert_id(uint32_t expert_id) const;
+    uint32_t current_nefc_shard() const;
     void stamp_header_into_pinned(int64_t pinned_addr,
                                   const std::string& header) const;
     void erase_lfsy_handles_for_slot(uint32_t slot);
@@ -307,6 +343,8 @@ private:
     const MetadataHeader* metadata_header() const;
     uint8_t* bitmap_bytes();
     const uint8_t* bitmap_bytes() const;
+    NefcEntry* nefc_entry(uint32_t shard);
+    const NefcEntry* nefc_entry(uint32_t shard) const;
     NefcEntry* nefc_entry();
     const NefcEntry* nefc_entry() const;
     LfcsEntry* lfcs_entry(uint32_t slot);
@@ -353,6 +391,10 @@ private:
     std::atomic<size_t> batch_owner_token_{0};
     std::atomic<size_t> nefc_batch_owner_token_{0};
     std::atomic<size_t> expert_batch_owner_token_{0};
+    std::string global_lock_path_;
+    int global_lock_fd_ = -1;
+    uint32_t global_lock_depth_ = 0;
+    mutable std::recursive_mutex global_lock_mutex_;
     bool open_ = false;
 };
 

@@ -1,6 +1,7 @@
 #include "fdp_store.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace proposal { namespace fdp {
 namespace {
@@ -76,6 +81,19 @@ bool ranges_overlap(uint64_t a_start, uint64_t a_len,
     const uint64_t a_end = a_start + a_len;
     const uint64_t b_end = b_start + b_len;
     return a_start < b_end && b_start < a_end;
+}
+
+std::string sanitize_lock_component(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '.' || ch == '-' || ch == '_') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? "device" : out;
 }
 
 uint32_t checked_u32(uint64_t v, const char* name) {
@@ -168,6 +186,15 @@ void FdpStore::load_config_from_env() {
         cfg_.metadata_nlb = parse_u64("PROPOSAL_FDP_METADATA_NLB", v);
         cfg_.metadata_nlb_explicit = true;
     }
+    if (const char* v = getenv_raw("PROPOSAL_FDP_LOCK_PATH")) {
+        global_lock_path_ = v;
+    } else {
+        std::ostringstream oss;
+        oss << "/tmp/proposal_fdp_"
+            << sanitize_lock_component(cfg_.device_path)
+            << "_m" << cfg_.metadata_start_lba << ".lock";
+        global_lock_path_ = oss.str();
+    }
 
     if (const char* v = getenv_raw("PROPOSAL_FDP_CHUNK_BYTES")) {
         cfg_.chunk_bytes = parse_u64("PROPOSAL_FDP_CHUNK_BYTES", v);
@@ -180,10 +207,31 @@ void FdpStore::load_config_from_env() {
                             "PROPOSAL_FDP_RANK");
     cfg_.world_size = checked_u32(env_u64_default("PROPOSAL_FDP_WORLD_SIZE", 1),
                                   "PROPOSAL_FDP_WORLD_SIZE");
-    if (cfg_.world_size != 1) {
-        throw std::runtime_error(
-            "FDP backend Phase 1 supports only PROPOSAL_FDP_WORLD_SIZE=1");
+    cfg_.dp_rank = checked_u32(env_u64_default("PROPOSAL_FDP_DP_RANK", 0),
+                               "PROPOSAL_FDP_DP_RANK");
+    cfg_.dp_size = checked_u32(env_u64_default("PROPOSAL_FDP_DP_SIZE", 1),
+                               "PROPOSAL_FDP_DP_SIZE");
+    cfg_.pp_rank = checked_u32(env_u64_default("PROPOSAL_FDP_PP_RANK", 0),
+                               "PROPOSAL_FDP_PP_RANK");
+    cfg_.pp_size = checked_u32(env_u64_default("PROPOSAL_FDP_PP_SIZE", 1),
+                               "PROPOSAL_FDP_PP_SIZE");
+    cfg_.ep_rank = checked_u32(env_u64_default("PROPOSAL_FDP_EP_RANK", 0),
+                               "PROPOSAL_FDP_EP_RANK");
+    cfg_.ep_size = checked_u32(env_u64_default("PROPOSAL_FDP_EP_SIZE", 1),
+                               "PROPOSAL_FDP_EP_SIZE");
+    if (cfg_.dp_size == 0 || cfg_.pp_size == 0 || cfg_.ep_size == 0) {
+        throw std::runtime_error("FDP topology sizes must be non-zero");
     }
+    if (cfg_.dp_rank >= cfg_.dp_size ||
+        cfg_.pp_rank >= cfg_.pp_size ||
+        cfg_.ep_rank >= cfg_.ep_size) {
+        throw std::runtime_error("FDP topology rank is out of range");
+    }
+    cfg_.expert_id_base = checked_u32(
+        env_u64_default("PROPOSAL_FDP_EXPERT_ID_BASE", 0),
+        "PROPOSAL_FDP_EXPERT_ID_BASE");
+    cfg_.expert_ids_global = env_bool_default(
+        "PROPOSAL_FDP_EXPERT_IDS_GLOBAL", false);
 
     cfg_.num_moe_layers = checked_u32(
         env_u64_default("PROPOSAL_FDP_NUM_MOE_LAYERS", 0),
@@ -202,6 +250,13 @@ void FdpStore::load_config_from_env() {
         throw std::runtime_error("FDP expert slot count exceeds kMaxExpertSlots");
     }
     cfg_.expert_slots = static_cast<uint32_t>(slots);
+    const uint64_t nefc_shards =
+        static_cast<uint64_t>(cfg_.pp_size) * static_cast<uint64_t>(cfg_.ep_size);
+    if (nefc_shards == 0 || nefc_shards > kMaxExpertSlots) {
+        throw std::runtime_error("FDP NEFC shard count is out of range");
+    }
+    cfg_.nefc_shard_count = static_cast<uint32_t>(nefc_shards);
+    cfg_.nefc_shard_index = current_nefc_shard();
 
     cfg_.nefc_qd = checked_u32(env_u64_default("PROPOSAL_FDP_NEFC_QD", 32),
                                "PROPOSAL_FDP_NEFC_QD");
@@ -281,7 +336,8 @@ void FdpStore::open_from_env() {
                                         "FDP data chunk count");
 
         layout_ = compute_metadata_layout(data_chunk_count_,
-                                          cfg_.expert_slots);
+                                          cfg_.expert_slots,
+                                          cfg_.nefc_shard_count);
         layout_.image_bytes = round_up_u64(layout_.image_bytes, ns_.lba_size);
         metadata_image_nlb_ = layout_.image_bytes / ns_.lba_size;
 
@@ -326,6 +382,18 @@ void FdpStore::close() {
         }
         expert_batch_lock_.unlock();
     }
+    while (global_lock_depth_ > 0) {
+        try {
+            release_global_metadata_lock();
+        } catch (...) {
+            global_lock_depth_ = 0;
+            break;
+        }
+    }
+    if (global_lock_fd_ >= 0) {
+        ::close(global_lock_fd_);
+        global_lock_fd_ = -1;
+    }
     open_ = false;
     nefc_data_ring_.close();
     expert_data_ring_.close();
@@ -348,6 +416,7 @@ void FdpStore::close() {
     next_lfsy_handle_ = 1;
     lfsy_handles_.clear();
     batch_owned_buffers_.clear();
+    global_lock_path_.clear();
 }
 
 bool FdpStore::is_open() const {
@@ -440,11 +509,14 @@ void FdpStore::validate_loaded_superblock(const SuperBlock& sb) const {
         sb.data_start_lba != cfg_.data_start_lba ||
         sb.data_nlb != cfg_.data_nlb ||
         sb.data_chunk_count != data_chunk_count_ ||
-        sb.rank != cfg_.rank ||
         sb.world_size != cfg_.world_size ||
         sb.num_moe_layers != cfg_.num_moe_layers ||
         sb.experts_per_layer != cfg_.experts_per_layer ||
-        sb.expert_slots != cfg_.expert_slots) {
+        sb.expert_slots != cfg_.expert_slots ||
+        sb.dp_size != cfg_.dp_size ||
+        sb.pp_size != cfg_.pp_size ||
+        sb.ep_size != cfg_.ep_size ||
+        sb.nefc_shard_count != cfg_.nefc_shard_count) {
         throw std::runtime_error(
             "FDP superblock does not match current environment layout");
     }
@@ -467,6 +539,7 @@ void FdpStore::load_existing_metadata(const SuperBlock& sb) {
         hdr->bitmap_bytes != layout_.bitmap_bytes ||
         hdr->bitmap_offset != layout_.bitmap_offset ||
         hdr->nefc_offset != layout_.nefc_offset ||
+        hdr->nefc_shard_count != cfg_.nefc_shard_count ||
         hdr->lfcs_offset != layout_.lfcs_offset ||
         hdr->lfsy_offset != layout_.lfsy_offset) {
         throw std::runtime_error("FDP metadata image layout mismatch");
@@ -502,6 +575,13 @@ void FdpStore::write_superblock() {
     sb->num_moe_layers = cfg_.num_moe_layers;
     sb->experts_per_layer = cfg_.experts_per_layer;
     sb->expert_slots = cfg_.expert_slots;
+    sb->dp_rank = cfg_.dp_rank;
+    sb->dp_size = cfg_.dp_size;
+    sb->pp_rank = cfg_.pp_rank;
+    sb->pp_size = cfg_.pp_size;
+    sb->ep_rank = cfg_.ep_rank;
+    sb->ep_size = cfg_.ep_size;
+    sb->nefc_shard_count = cfg_.nefc_shard_count;
     sb->max_chunks_nefc = kMaxChunksNefc;
     sb->max_chunks_lfcs = kMaxChunksLfcs;
     sb->max_chunks_lfsy = kMaxChunksLfsy;
@@ -543,12 +623,90 @@ void FdpStore::update_metadata_header(uint64_t iter, bool bump_seq) {
     hdr->num_moe_layers = cfg_.num_moe_layers;
     hdr->experts_per_layer = cfg_.experts_per_layer;
     hdr->expert_slots = cfg_.expert_slots;
+    hdr->nefc_shard_count = cfg_.nefc_shard_count;
     hdr->data_chunk_count = data_chunk_count_;
     hdr->bitmap_bytes = checked_u32(layout_.bitmap_bytes, "bitmap_bytes");
+    hdr->dp_size = cfg_.dp_size;
+    hdr->pp_size = cfg_.pp_size;
+    hdr->ep_size = cfg_.ep_size;
     hdr->bitmap_offset = layout_.bitmap_offset;
     hdr->nefc_offset = layout_.nefc_offset;
     hdr->lfcs_offset = layout_.lfcs_offset;
     hdr->lfsy_offset = layout_.lfsy_offset;
+}
+
+void FdpStore::acquire_global_metadata_lock() {
+    global_lock_mutex_.lock();
+    if (global_lock_depth_ > 0) {
+        ++global_lock_depth_;
+        return;
+    }
+    if (global_lock_path_.empty()) {
+        global_lock_mutex_.unlock();
+        throw std::runtime_error("FDP global lock path is empty");
+    }
+    if (global_lock_fd_ < 0) {
+        global_lock_fd_ = ::open(
+            global_lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (global_lock_fd_ < 0) {
+            global_lock_mutex_.unlock();
+            throw std::runtime_error(
+                std::string("open FDP global lock failed: ") +
+                std::strerror(errno));
+        }
+    }
+    if (::flock(global_lock_fd_, LOCK_EX) != 0) {
+        global_lock_mutex_.unlock();
+        throw std::runtime_error(
+            std::string("flock FDP global lock failed: ") +
+            std::strerror(errno));
+    }
+    global_lock_depth_ = 1;
+    try {
+        read_metadata_image();
+        allocated_chunks_ = recalc_allocated_chunks();
+        const MetadataHeader* hdr = metadata_header();
+        if (hdr->magic == kMetadataMagic) {
+            seq_ = hdr->seq;
+            last_flush_iter_ = hdr->last_flush_iter;
+        }
+    } catch (...) {
+        global_lock_depth_ = 0;
+        (void)::flock(global_lock_fd_, LOCK_UN);
+        global_lock_mutex_.unlock();
+        throw;
+    }
+}
+
+void FdpStore::release_global_metadata_lock() {
+    if (global_lock_depth_ == 0) {
+        return;
+    }
+    --global_lock_depth_;
+    if (global_lock_depth_ != 0) {
+        global_lock_mutex_.unlock();
+        return;
+    }
+    if (global_lock_fd_ >= 0 && ::flock(global_lock_fd_, LOCK_UN) != 0) {
+        global_lock_mutex_.unlock();
+        throw std::runtime_error(
+            std::string("unlock FDP global lock failed: ") +
+            std::strerror(errno));
+    }
+    global_lock_mutex_.unlock();
+}
+
+bool FdpStore::global_metadata_lock_held() const {
+    return global_lock_depth_ > 0;
+}
+
+void FdpStore::persist_metadata_image_locked(uint64_t iter, bool bump_seq) {
+    allocated_chunks_ = recalc_allocated_chunks();
+    update_metadata_header(iter, bump_seq);
+    write_metadata_image();
+    if (cfg_.nvme_flush) {
+        device_.flush(metadata_ring_, ns_.nsid);
+    }
 }
 
 void FdpStore::flush_metadata(uint64_t iter) {
@@ -557,11 +715,20 @@ void FdpStore::flush_metadata(uint64_t iter) {
     if (!open_) {
         throw std::runtime_error("flush_metadata: FDP session is not open");
     }
-    allocated_chunks_ = recalc_allocated_chunks();
-    update_metadata_header(iter, true);
-    write_metadata_image();
-    if (cfg_.nvme_flush) {
-        device_.flush(metadata_ring_, ns_.nsid);
+    const bool had_lock = global_metadata_lock_held();
+    if (!had_lock) {
+        acquire_global_metadata_lock();
+    }
+    try {
+        persist_metadata_image_locked(iter, true);
+    } catch (...) {
+        if (!had_lock) {
+            release_global_metadata_lock();
+        }
+        throw;
+    }
+    if (!had_lock) {
+        release_global_metadata_lock();
     }
 }
 
@@ -578,6 +745,7 @@ void FdpStore::begin_data_batch() {
     if (!open_) {
         throw std::runtime_error("begin_data_batch: FDP session is not open");
     }
+    acquire_global_metadata_lock();
     nefc_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(nefc_ring_mutex_);
     expert_batch_ring_lock_ =
@@ -590,6 +758,7 @@ void FdpStore::begin_data_batch() {
         (void)nefc_data_ring_.end_batch();
         nefc_batch_ring_lock_.unlock();
         expert_batch_ring_lock_.unlock();
+        release_global_metadata_lock();
         throw;
     }
     batch_owner_token_.store(current_thread_token(), std::memory_order_release);
@@ -606,6 +775,18 @@ std::vector<UcmdRingBatchStats> FdpStore::end_data_batch_stats() {
     }
     std::vector<UcmdRingBatchStats> out(2);
     std::exception_ptr first_error;
+    try {
+        persist_metadata_image_locked(last_flush_iter_, true);
+    } catch (...) {
+        first_error = std::current_exception();
+    }
+    try {
+        release_global_metadata_lock();
+    } catch (...) {
+        if (!first_error) {
+            first_error = std::current_exception();
+        }
+    }
     try {
         (void)nefc_data_ring_.end_batch();
         out[0] = nefc_data_ring_.last_batch_stats();
@@ -633,6 +814,9 @@ std::vector<UcmdRingBatchStats> FdpStore::end_data_batch_stats() {
     nefc_batch_ring_lock_.unlock();
     expert_batch_ring_lock_.unlock();
     batch_lock_.unlock();
+    if (first_error) {
+        std::rethrow_exception(first_error);
+    }
     return out;
 }
 
@@ -656,9 +840,16 @@ void FdpStore::begin_nefc_batch() {
     if (!open_) {
         throw std::runtime_error("begin_nefc_batch: FDP session is not open");
     }
+    acquire_global_metadata_lock();
     nefc_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(nefc_ring_mutex_);
-    nefc_data_ring_.begin_batch();
+    try {
+        nefc_data_ring_.begin_batch();
+    } catch (...) {
+        nefc_batch_ring_lock_.unlock();
+        release_global_metadata_lock();
+        throw;
+    }
     nefc_batch_owner_token_.store(current_thread_token(),
                                   std::memory_order_release);
     nefc_batch_lock_ = std::move(lock);
@@ -674,6 +865,19 @@ UcmdRingBatchStats FdpStore::end_nefc_batch_stats() {
             throw std::runtime_error("end_nefc_batch: FDP session is not open");
         }
     }
+    std::exception_ptr first_error;
+    try {
+        persist_metadata_image_locked(last_flush_iter_, true);
+    } catch (...) {
+        first_error = std::current_exception();
+    }
+    try {
+        release_global_metadata_lock();
+    } catch (...) {
+        if (!first_error) {
+            first_error = std::current_exception();
+        }
+    }
     try {
         (void)nefc_data_ring_.end_batch();
         const UcmdRingBatchStats stats = nefc_data_ring_.last_batch_stats();
@@ -681,6 +885,9 @@ UcmdRingBatchStats FdpStore::end_nefc_batch_stats() {
         nefc_batch_owner_token_.store(0, std::memory_order_release);
         nefc_batch_ring_lock_.unlock();
         nefc_batch_lock_.unlock();
+        if (first_error) {
+            std::rethrow_exception(first_error);
+        }
         return stats;
     } catch (...) {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
@@ -709,10 +916,17 @@ void FdpStore::begin_expert_batch() {
     if (!open_) {
         throw std::runtime_error("begin_expert_batch: FDP session is not open");
     }
+    acquire_global_metadata_lock();
     expert_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(expert_ring_mutex_);
     batch_owned_buffers_.clear();
-    expert_data_ring_.begin_batch();
+    try {
+        expert_data_ring_.begin_batch();
+    } catch (...) {
+        expert_batch_ring_lock_.unlock();
+        release_global_metadata_lock();
+        throw;
+    }
     expert_batch_owner_token_.store(current_thread_token(),
                                     std::memory_order_release);
     expert_batch_lock_ = std::move(lock);
@@ -729,6 +943,19 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
                 "end_expert_batch: FDP session is not open");
         }
     }
+    std::exception_ptr first_error;
+    try {
+        persist_metadata_image_locked(last_flush_iter_, true);
+    } catch (...) {
+        first_error = std::current_exception();
+    }
+    try {
+        release_global_metadata_lock();
+    } catch (...) {
+        if (!first_error) {
+            first_error = std::current_exception();
+        }
+    }
     try {
         (void)expert_data_ring_.end_batch();
         const UcmdRingBatchStats stats = expert_data_ring_.last_batch_stats();
@@ -737,6 +964,9 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
         expert_batch_owner_token_.store(0, std::memory_order_release);
         expert_batch_ring_lock_.unlock();
         expert_batch_lock_.unlock();
+        if (first_error) {
+            std::rethrow_exception(first_error);
+        }
         return stats;
     } catch (...) {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
@@ -760,12 +990,12 @@ size_t FdpStore::write_nefc(const std::string& object_name,
                             uint64_t iter) {
     std::shared_lock<std::shared_mutex> op_lock;
     const size_t thread_token = current_thread_token();
-    if (batch_owner_token_.load(std::memory_order_acquire) != thread_token &&
-        nefc_batch_owner_token_.load(std::memory_order_acquire) !=
-            thread_token) {
+    const bool owns_batch =
+        batch_owner_token_.load(std::memory_order_acquire) == thread_token ||
+        nefc_batch_owner_token_.load(std::memory_order_acquire) == thread_token;
+    if (!owns_batch) {
         op_lock = std::shared_lock<std::shared_mutex>(op_mutex_);
     }
-    std::lock_guard<std::recursive_mutex> ring_lock(nefc_ring_mutex_);
     (void)object_name;
     if (!open_) {
         throw std::runtime_error("write_nefc: FDP session is not open");
@@ -785,28 +1015,47 @@ size_t FdpStore::write_nefc(const std::string& object_name,
     const uint32_t needed = static_cast<uint32_t>(needed64);
 
     stamp_header_into_pinned(pinned_addr, header);
-    std::vector<FdpChunkId> chunks = allocate_chunks(needed);
+    std::vector<FdpChunkId> chunks;
+    if (!owns_batch) {
+        acquire_global_metadata_lock();
+    }
     try {
-        write_chunk_list(nefc_data_ring_, pinned_addr, chunks,
-                         total_padded_bytes, "write_nefc");
+        chunks = allocate_chunks(needed);
+        NefcEntry* entry = nefc_entry();
+        const NefcEntry old = *entry;
+        if (old.valid) {
+            free_chunks(old.chunks, old.chunk_count);
+        }
+        std::memset(entry, 0, sizeof(*entry));
+        entry->valid = 1;
+        entry->rank = cfg_.rank;
+        entry->dp_rank = cfg_.dp_rank;
+        entry->pp_rank = cfg_.pp_rank;
+        entry->ep_rank = cfg_.ep_rank;
+        entry->shard_index = cfg_.nefc_shard_index;
+        entry->iter = iter;
+        entry->logical_bytes = logical_bytes;
+        entry->chunk_count = needed;
+        for (uint32_t i = 0; i < needed; ++i) {
+            entry->chunks[i] = chunks[i];
+        }
+        if (owns_batch) {
+            update_metadata_header(iter, true);
+        } else {
+            persist_metadata_image_locked(iter, true);
+            release_global_metadata_lock();
+        }
     } catch (...) {
-        free_chunks(chunks.data(), static_cast<uint32_t>(chunks.size()));
+        if (!owns_batch) {
+            release_global_metadata_lock();
+        }
         throw;
     }
 
-    NefcEntry* entry = nefc_entry();
-    const NefcEntry old = *entry;
-    if (old.valid) {
-        free_chunks(old.chunks, old.chunk_count);
-    }
-    std::memset(entry, 0, sizeof(*entry));
-    entry->valid = 1;
-    entry->rank = cfg_.rank;
-    entry->iter = iter;
-    entry->logical_bytes = logical_bytes;
-    entry->chunk_count = needed;
-    for (uint32_t i = 0; i < needed; ++i) {
-        entry->chunks[i] = chunks[i];
+    {
+        std::lock_guard<std::recursive_mutex> ring_lock(nefc_ring_mutex_);
+        write_chunk_list(nefc_data_ring_, pinned_addr, chunks,
+                         total_padded_bytes, "write_nefc");
     }
     return static_cast<size_t>(total_padded_bytes);
 }
@@ -822,17 +1071,18 @@ size_t FdpStore::write_lfcs(const std::string& object_name,
                             uint64_t generation) {
     std::shared_lock<std::shared_mutex> op_lock;
     const size_t thread_token = current_thread_token();
-    if (batch_owner_token_.load(std::memory_order_acquire) != thread_token &&
-        expert_batch_owner_token_.load(std::memory_order_acquire) !=
-            thread_token) {
+    const bool owns_batch =
+        batch_owner_token_.load(std::memory_order_acquire) == thread_token ||
+        expert_batch_owner_token_.load(std::memory_order_acquire) == thread_token;
+    if (!owns_batch) {
         op_lock = std::shared_lock<std::shared_mutex>(op_mutex_);
     }
-    std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
     (void)object_name;
     if (!open_) {
         throw std::runtime_error("write_lfcs: FDP session is not open");
     }
     const uint32_t slot = expert_slot(layer_id, expert_id);
+    const uint32_t global_expert = global_expert_id(expert_id);
     const uint64_t logical_bytes = kHeaderBlockBytes + payload_bytes;
     if (logical_bytes > total_padded_bytes) {
         throw std::invalid_argument("write_lfcs: logical bytes exceed padded bytes");
@@ -848,41 +1098,56 @@ size_t FdpStore::write_lfcs(const std::string& object_name,
     const uint32_t needed = static_cast<uint32_t>(needed64);
 
     stamp_header_into_pinned(pinned_addr, header);
-    std::vector<FdpChunkId> chunks = allocate_chunks(needed);
+    std::vector<FdpChunkId> chunks;
+    if (!owns_batch) {
+        acquire_global_metadata_lock();
+    }
     try {
-        write_chunk_list(expert_data_ring_, pinned_addr, chunks,
-                         total_padded_bytes, "write_lfcs");
+        chunks = allocate_chunks(needed);
+        LfcsEntry* lfcs = lfcs_entry(slot);
+        LfsyEntry* lfsy = lfsy_entry(slot);
+        const LfcsEntry old_lfcs = *lfcs;
+        const LfsyEntry old_lfsy = *lfsy;
+        if (old_lfcs.valid) {
+            free_chunks(old_lfcs.chunks, old_lfcs.chunk_count);
+        }
+        if (old_lfsy.valid) {
+            free_chunks(old_lfsy.chunks, old_lfsy.chunk_count);
+        }
+        erase_lfsy_handles_for_slot(slot);
+
+        std::memset(lfcs, 0, sizeof(*lfcs));
+        lfcs->valid = 1;
+        lfcs->rank = cfg_.rank;
+        lfcs->layer_id = layer_id;
+        lfcs->expert_id = global_expert;
+        lfcs->generation = generation;
+        lfcs->iter = iter;
+        lfcs->logical_bytes = logical_bytes;
+        lfcs->chunk_count = needed;
+        for (uint32_t i = 0; i < needed; ++i) {
+            lfcs->chunks[i] = chunks[i];
+        }
+
+        std::memset(lfsy, 0, sizeof(*lfsy));
+        if (owns_batch) {
+            update_metadata_header(iter, true);
+        } else {
+            persist_metadata_image_locked(iter, true);
+            release_global_metadata_lock();
+        }
     } catch (...) {
-        free_chunks(chunks.data(), static_cast<uint32_t>(chunks.size()));
+        if (!owns_batch) {
+            release_global_metadata_lock();
+        }
         throw;
     }
 
-    LfcsEntry* lfcs = lfcs_entry(slot);
-    LfsyEntry* lfsy = lfsy_entry(slot);
-    const LfcsEntry old_lfcs = *lfcs;
-    const LfsyEntry old_lfsy = *lfsy;
-    if (old_lfcs.valid) {
-        free_chunks(old_lfcs.chunks, old_lfcs.chunk_count);
+    {
+        std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
+        write_chunk_list(expert_data_ring_, pinned_addr, chunks,
+                         total_padded_bytes, "write_lfcs");
     }
-    if (old_lfsy.valid) {
-        free_chunks(old_lfsy.chunks, old_lfsy.chunk_count);
-    }
-    erase_lfsy_handles_for_slot(slot);
-
-    std::memset(lfcs, 0, sizeof(*lfcs));
-    lfcs->valid = 1;
-    lfcs->rank = cfg_.rank;
-    lfcs->layer_id = layer_id;
-    lfcs->expert_id = expert_id;
-    lfcs->generation = generation;
-    lfcs->iter = iter;
-    lfcs->logical_bytes = logical_bytes;
-    lfcs->chunk_count = needed;
-    for (uint32_t i = 0; i < needed; ++i) {
-        lfcs->chunks[i] = chunks[i];
-    }
-
-    std::memset(lfsy, 0, sizeof(*lfsy));
     return static_cast<size_t>(total_padded_bytes);
 }
 
@@ -894,63 +1159,82 @@ int64_t FdpStore::open_lfsy(const std::string& object_name,
                             uint64_t generation) {
     std::shared_lock<std::shared_mutex> op_lock;
     const size_t thread_token = current_thread_token();
-    if (batch_owner_token_.load(std::memory_order_acquire) != thread_token &&
-        expert_batch_owner_token_.load(std::memory_order_acquire) !=
-            thread_token) {
+    const bool owns_batch =
+        batch_owner_token_.load(std::memory_order_acquire) == thread_token ||
+        expert_batch_owner_token_.load(std::memory_order_acquire) == thread_token;
+    if (!owns_batch) {
         op_lock = std::shared_lock<std::shared_mutex>(op_mutex_);
     }
-    std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
     (void)object_name;
     if (!open_) {
         throw std::runtime_error("open_lfsy: FDP session is not open");
     }
     const uint32_t slot = expert_slot(layer_id, expert_id);
-    LfsyEntry* entry = lfsy_entry(slot);
-    const LfsyEntry old = *entry;
+    const uint32_t global_expert = global_expert_id(expert_id);
+    const uint64_t start_iter_u64 =
+        start_iter < 0 ? 0 : static_cast<uint64_t>(start_iter);
 
-    std::vector<FdpChunkId> chunks = allocate_chunks(1);
     AlignedBuffer header_buf;
     header_buf.allocate(static_cast<size_t>(kHeaderBlockBytes), 4096);
     stamp_header_into_pinned(
         reinterpret_cast<int64_t>(header_buf.data()), header);
 
+    std::vector<FdpChunkId> chunks;
+    int64_t handle = 0;
+    if (!owns_batch) {
+        acquire_global_metadata_lock();
+    }
     try {
+        LfsyEntry* entry = lfsy_entry(slot);
+        const LfsyEntry old = *entry;
+        chunks = allocate_chunks(1);
+        if (old.valid) {
+            free_chunks(old.chunks, old.chunk_count);
+        }
+        erase_lfsy_handles_for_slot(slot);
+
+        std::memset(entry, 0, sizeof(*entry));
+        entry->valid = 1;
+        entry->rank = cfg_.rank;
+        entry->layer_id = layer_id;
+        entry->expert_id = global_expert;
+        entry->generation = generation;
+        entry->start_iter = start_iter_u64;
+        entry->logical_tail = kHeaderBlockBytes;
+        entry->chunk_count = 1;
+        entry->chunks[0] = chunks[0];
+
+        handle = next_lfsy_handle_++;
+        LfsyHandle h;
+        h.slot = slot;
+        h.layer_id = layer_id;
+        h.expert_id = expert_id;
+        h.generation = generation;
+        h.last_iter = entry->start_iter;
+        lfsy_handles_.emplace(handle, h);
+        if (owns_batch) {
+            update_metadata_header(entry->start_iter, true);
+        } else {
+            persist_metadata_image_locked(entry->start_iter, true);
+            release_global_metadata_lock();
+        }
+    } catch (...) {
+        if (!owns_batch) {
+            release_global_metadata_lock();
+        }
+        throw;
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
         const uint64_t header_nlb = kHeaderBlockBytes / ns_.lba_size;
         raw_write_data(expert_data_ring_, header_buf.data(),
                        data_chunk_lba(chunks[0]), header_nlb,
                        "open_lfsy");
-    } catch (...) {
-        free_chunks(chunks.data(), static_cast<uint32_t>(chunks.size()));
-        throw;
+        if (expert_data_ring_.is_batching()) {
+            batch_owned_buffers_.push_back(std::move(header_buf));
+        }
     }
-    if (expert_data_ring_.is_batching()) {
-        batch_owned_buffers_.push_back(std::move(header_buf));
-    }
-
-    if (old.valid) {
-        free_chunks(old.chunks, old.chunk_count);
-    }
-    erase_lfsy_handles_for_slot(slot);
-
-    std::memset(entry, 0, sizeof(*entry));
-    entry->valid = 1;
-    entry->rank = cfg_.rank;
-    entry->layer_id = layer_id;
-    entry->expert_id = expert_id;
-    entry->generation = generation;
-    entry->start_iter = start_iter < 0 ? 0 : static_cast<uint64_t>(start_iter);
-    entry->logical_tail = kHeaderBlockBytes;
-    entry->chunk_count = 1;
-    entry->chunks[0] = chunks[0];
-
-    const int64_t handle = next_lfsy_handle_++;
-    LfsyHandle h;
-    h.slot = slot;
-    h.layer_id = layer_id;
-    h.expert_id = expert_id;
-    h.generation = generation;
-    h.last_iter = entry->start_iter;
-    lfsy_handles_.emplace(handle, h);
     return handle;
 }
 
@@ -964,12 +1248,12 @@ size_t FdpStore::append_lfsy(int64_t handle,
                              uint64_t generation) {
     std::shared_lock<std::shared_mutex> op_lock;
     const size_t thread_token = current_thread_token();
-    if (batch_owner_token_.load(std::memory_order_acquire) != thread_token &&
-        expert_batch_owner_token_.load(std::memory_order_acquire) !=
-            thread_token) {
+    const bool owns_batch =
+        batch_owner_token_.load(std::memory_order_acquire) == thread_token ||
+        expert_batch_owner_token_.load(std::memory_order_acquire) == thread_token;
+    if (!owns_batch) {
         op_lock = std::shared_lock<std::shared_mutex>(op_mutex_);
     }
-    std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
     if (!open_) {
         throw std::runtime_error("append_lfsy: FDP session is not open");
     }
@@ -986,33 +1270,56 @@ size_t FdpStore::append_lfsy(int64_t handle,
         throw std::invalid_argument("append_lfsy: padded bytes are not LBA-aligned");
     }
 
-    LfsyHandle& h = checked_lfsy_handle(
-        handle, layer_id, expert_id, generation);
-    LfsyEntry* entry = lfsy_entry(h.slot);
-    const LfsyEntry old_entry = *entry;
-    const uint64_t old_tail = entry->logical_tail;
-    const uint64_t new_tail = old_tail + total_padded_bytes;
-    if (new_tail < old_tail) {
-        throw std::overflow_error("append_lfsy: logical tail overflow");
+    uint64_t old_tail = 0;
+    uint64_t new_tail = 0;
+    std::vector<FdpChunkId> chunks_for_write;
+    if (!owns_batch) {
+        acquire_global_metadata_lock();
     }
-    const uint64_t needed64 = div_round_up_u64(new_tail, cfg_.chunk_bytes);
-    if (needed64 == 0 || needed64 > kMaxChunksLfsy) {
-        throw std::runtime_error("append_lfsy: chunk count exceeds LFSY cap");
-    }
-    if (needed64 < entry->chunk_count) {
-        throw std::runtime_error("append_lfsy: corrupt logical tail/chunk_count");
-    }
-
-    std::vector<FdpChunkId> added_chunks;
-    if (needed64 > entry->chunk_count) {
-        added_chunks = allocate_chunks(
-            static_cast<uint32_t>(needed64 - entry->chunk_count));
-        for (FdpChunkId chunk : added_chunks) {
-            entry->chunks[entry->chunk_count++] = chunk;
-        }
-    }
-
     try {
+        LfsyHandle& h = checked_lfsy_handle(
+            handle, layer_id, expert_id, generation);
+        LfsyEntry* entry = lfsy_entry(h.slot);
+        old_tail = entry->logical_tail;
+        new_tail = old_tail + total_padded_bytes;
+        if (new_tail < old_tail) {
+            throw std::overflow_error("append_lfsy: logical tail overflow");
+        }
+        const uint64_t needed64 = div_round_up_u64(new_tail, cfg_.chunk_bytes);
+        if (needed64 == 0 || needed64 > kMaxChunksLfsy) {
+            throw std::runtime_error("append_lfsy: chunk count exceeds LFSY cap");
+        }
+        if (needed64 < entry->chunk_count) {
+            throw std::runtime_error(
+                "append_lfsy: corrupt logical tail/chunk_count");
+        }
+
+        if (needed64 > entry->chunk_count) {
+            std::vector<FdpChunkId> added_chunks = allocate_chunks(
+                static_cast<uint32_t>(needed64 - entry->chunk_count));
+            for (FdpChunkId chunk : added_chunks) {
+                entry->chunks[entry->chunk_count++] = chunk;
+            }
+        }
+
+        entry->logical_tail = new_tail;
+        h.last_iter = iter;
+        chunks_for_write.assign(entry->chunks, entry->chunks + entry->chunk_count);
+        if (owns_batch) {
+            update_metadata_header(iter, true);
+        } else {
+            persist_metadata_image_locked(iter, true);
+            release_global_metadata_lock();
+        }
+    } catch (...) {
+        if (!owns_batch) {
+            release_global_metadata_lock();
+        }
+        throw;
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
         const uint8_t* src = reinterpret_cast<const uint8_t*>(pinned_addr);
         uint64_t remaining = total_padded_bytes;
         uint64_t logical = old_tail;
@@ -1027,7 +1334,7 @@ size_t FdpStore::append_lfsy(int64_t handle,
                 throw std::runtime_error("append_lfsy: unaligned append range");
             }
             const FdpChunkId chunk_id =
-                entry->chunks[static_cast<uint32_t>(chunk_index)];
+                chunks_for_write.at(static_cast<size_t>(chunk_index));
             const uint64_t slba =
                 data_chunk_lba(chunk_id) + offset_in_chunk / ns_.lba_size;
             raw_write_data(expert_data_ring_, src + src_off, slba,
@@ -1036,17 +1343,7 @@ size_t FdpStore::append_lfsy(int64_t handle,
             src_off += len;
             remaining -= len;
         }
-    } catch (...) {
-        if (!added_chunks.empty()) {
-            free_chunks(added_chunks.data(),
-                        static_cast<uint32_t>(added_chunks.size()));
-        }
-        *entry = old_entry;
-        throw;
     }
-
-    entry->logical_tail = new_tail;
-    h.last_iter = iter;
     return static_cast<size_t>(total_padded_bytes);
 }
 
@@ -1111,16 +1408,24 @@ std::string FdpStore::debug_read_lfsy(uint32_t layer_id, uint32_t expert_id,
 }
 
 size_t FdpStore::read_nefc_into(int64_t dst_addr, uint64_t dst_bytes) {
+    return read_nefc_shard_into(cfg_.nefc_shard_index, dst_addr, dst_bytes);
+}
+
+size_t FdpStore::read_nefc_shard_into(uint32_t shard_index,
+                                      int64_t dst_addr,
+                                      uint64_t dst_bytes) {
     if (!open_) {
-        throw std::runtime_error("read_nefc_into: FDP session is not open");
+        throw std::runtime_error(
+            "read_nefc_shard_into: FDP session is not open");
     }
-    const NefcEntry* entry = nefc_entry();
+    const NefcEntry* entry = nefc_entry(shard_index);
     if (!entry->valid) {
-        throw std::runtime_error("read_nefc_into: NEFC entry is not valid");
+        throw std::runtime_error(
+            "read_nefc_shard_into: NEFC entry is not valid");
     }
     return read_chunk_list_into(nefc_data_ring_, entry->chunks,
                                 entry->chunk_count, entry->logical_bytes,
-                                dst_addr, dst_bytes, "read_nefc_into");
+                                dst_addr, dst_bytes, "read_nefc_shard_into");
 }
 
 size_t FdpStore::read_lfcs_into(uint32_t layer_id, uint32_t expert_id,
@@ -1266,13 +1571,30 @@ const uint8_t* FdpStore::bitmap_bytes() const {
     return metadata_bytes() + layout_.bitmap_offset;
 }
 
+NefcEntry* FdpStore::nefc_entry(uint32_t shard) {
+    if (shard >= cfg_.nefc_shard_count) {
+        throw std::out_of_range("nefc_entry: shard out of range");
+    }
+    return reinterpret_cast<NefcEntry*>(
+        metadata_bytes() + layout_.nefc_offset +
+        static_cast<uint64_t>(shard) * sizeof(NefcEntry));
+}
+
+const NefcEntry* FdpStore::nefc_entry(uint32_t shard) const {
+    if (shard >= cfg_.nefc_shard_count) {
+        throw std::out_of_range("nefc_entry: shard out of range");
+    }
+    return reinterpret_cast<const NefcEntry*>(
+        metadata_bytes() + layout_.nefc_offset +
+        static_cast<uint64_t>(shard) * sizeof(NefcEntry));
+}
+
 NefcEntry* FdpStore::nefc_entry() {
-    return reinterpret_cast<NefcEntry*>(metadata_bytes() + layout_.nefc_offset);
+    return nefc_entry(cfg_.nefc_shard_index);
 }
 
 const NefcEntry* FdpStore::nefc_entry() const {
-    return reinterpret_cast<const NefcEntry*>(
-        metadata_bytes() + layout_.nefc_offset);
+    return nefc_entry(cfg_.nefc_shard_index);
 }
 
 LfcsEntry* FdpStore::lfcs_entry(uint32_t slot) {
@@ -1521,15 +1843,38 @@ uint32_t FdpStore::expert_slot(uint32_t layer_id, uint32_t expert_id) const {
             "write_lfcs requires PROPOSAL_FDP_NUM_MOE_LAYERS and "
             "PROPOSAL_FDP_EXPERTS_PER_LAYER");
     }
-    if (expert_id >= cfg_.experts_per_layer) {
+    const uint32_t global_expert = global_expert_id(expert_id);
+    if (global_expert >= cfg_.experts_per_layer) {
         throw std::out_of_range("expert_slot: expert_id out of range");
     }
     const uint64_t slot = static_cast<uint64_t>(layer_id) *
-                          cfg_.experts_per_layer + expert_id;
+                          cfg_.experts_per_layer + global_expert;
     if (slot >= cfg_.expert_slots) {
         throw std::out_of_range("expert_slot: layer/expert out of range");
     }
     return static_cast<uint32_t>(slot);
+}
+
+uint32_t FdpStore::global_expert_id(uint32_t expert_id) const {
+    if (cfg_.expert_ids_global || cfg_.ep_size <= 1) {
+        return expert_id;
+    }
+    const uint64_t mapped =
+        static_cast<uint64_t>(cfg_.expert_id_base) + expert_id;
+    if (mapped > std::numeric_limits<uint32_t>::max()) {
+        throw std::out_of_range("global_expert_id: mapped id overflow");
+    }
+    return static_cast<uint32_t>(mapped);
+}
+
+uint32_t FdpStore::current_nefc_shard() const {
+    const uint64_t shard =
+        static_cast<uint64_t>(cfg_.pp_rank) * static_cast<uint64_t>(cfg_.ep_size) +
+        static_cast<uint64_t>(cfg_.ep_rank);
+    if (shard > std::numeric_limits<uint32_t>::max()) {
+        throw std::out_of_range("current_nefc_shard: shard overflow");
+    }
+    return static_cast<uint32_t>(shard);
 }
 
 void FdpStore::erase_lfsy_handles_for_slot(uint32_t slot) {
@@ -1552,13 +1897,14 @@ LfsyHandle& FdpStore::checked_lfsy_handle(int64_t handle,
     }
     LfsyHandle& h = it->second;
     const uint32_t slot = expert_slot(layer_id, expert_id);
+    const uint32_t global_expert = global_expert_id(expert_id);
     if (h.slot != slot || h.layer_id != layer_id ||
         h.expert_id != expert_id || h.generation != generation) {
         throw std::runtime_error("checked_lfsy_handle: stale LFSY handle");
     }
     LfsyEntry* entry = lfsy_entry(slot);
     if (!entry->valid || entry->generation != generation ||
-        entry->layer_id != layer_id || entry->expert_id != expert_id) {
+        entry->layer_id != layer_id || entry->expert_id != global_expert) {
         throw std::runtime_error("checked_lfsy_handle: stale LFSY metadata");
     }
     return h;
@@ -1664,12 +2010,27 @@ MetadataSummary FdpStore::debug_read_metadata_summary() {
     out.metadata_image_bytes = hdr->metadata_image_bytes;
     if (hdr->magic == kMetadataMagic &&
         hdr->nefc_offset + sizeof(NefcEntry) <= hdr->metadata_image_bytes) {
-        const NefcEntry* nefc = reinterpret_cast<const NefcEntry*>(
-            base + hdr->nefc_offset);
-        out.nefc_valid = nefc->valid != 0;
-        out.nefc_iter = nefc->iter;
-        out.nefc_logical_bytes = nefc->logical_bytes;
-        out.nefc_chunk_count = nefc->chunk_count;
+        const uint32_t nefc_count = std::max<uint32_t>(1, hdr->nefc_shard_count);
+        out.nefc_shard_count = nefc_count;
+        for (uint32_t shard = 0; shard < nefc_count; ++shard) {
+            const uint64_t nefc_off =
+                hdr->nefc_offset +
+                static_cast<uint64_t>(shard) * sizeof(NefcEntry);
+            if (nefc_off + sizeof(NefcEntry) > hdr->metadata_image_bytes) {
+                break;
+            }
+            const NefcEntry* nefc = reinterpret_cast<const NefcEntry*>(
+                base + nefc_off);
+            if (nefc->valid) {
+                ++out.nefc_valid_count;
+            }
+            if (shard == cfg_.nefc_shard_index) {
+                out.nefc_valid = nefc->valid != 0;
+                out.nefc_iter = nefc->iter;
+                out.nefc_logical_bytes = nefc->logical_bytes;
+                out.nefc_chunk_count = nefc->chunk_count;
+            }
+        }
     }
     if (hdr->magic == kMetadataMagic &&
         hdr->lfcs_offset < hdr->metadata_image_bytes &&
@@ -1707,11 +2068,38 @@ NefcEntrySnapshot FdpStore::read_nefc_entry() {
     const NefcEntry* entry = nefc_entry();
     NefcEntrySnapshot snap;
     snap.valid = entry->valid != 0;
+    snap.shard_index = cfg_.nefc_shard_index;
     snap.rank = entry->rank;
+    snap.dp_rank = entry->dp_rank;
+    snap.pp_rank = entry->pp_rank;
+    snap.ep_rank = entry->ep_rank;
     snap.iter = entry->iter;
     snap.logical_bytes = entry->logical_bytes;
     snap.chunk_count = entry->chunk_count;
     return snap;
+}
+
+std::vector<NefcEntrySnapshot> FdpStore::read_nefc_entries() {
+    if (!open_) {
+        throw std::runtime_error("read_nefc_entries: FDP session is not open");
+    }
+    std::vector<NefcEntrySnapshot> out;
+    out.reserve(cfg_.nefc_shard_count);
+    for (uint32_t shard = 0; shard < cfg_.nefc_shard_count; ++shard) {
+        const NefcEntry* entry = nefc_entry(shard);
+        NefcEntrySnapshot snap;
+        snap.valid = entry->valid != 0;
+        snap.shard_index = shard;
+        snap.rank = entry->rank;
+        snap.dp_rank = entry->dp_rank;
+        snap.pp_rank = entry->pp_rank;
+        snap.ep_rank = entry->ep_rank;
+        snap.iter = entry->iter;
+        snap.logical_bytes = entry->logical_bytes;
+        snap.chunk_count = entry->chunk_count;
+        out.push_back(std::move(snap));
+    }
+    return out;
 }
 
 std::vector<LfcsEntrySnapshot> FdpStore::read_lfcs_entries() {
@@ -1877,6 +2265,16 @@ FdpStatsSnapshot FdpStore::stats() const {
     out.num_moe_layers = cfg_.num_moe_layers;
     out.experts_per_layer = cfg_.experts_per_layer;
     out.expert_slots = cfg_.expert_slots;
+    out.dp_rank = cfg_.dp_rank;
+    out.dp_size = cfg_.dp_size;
+    out.pp_rank = cfg_.pp_rank;
+    out.pp_size = cfg_.pp_size;
+    out.ep_rank = cfg_.ep_rank;
+    out.ep_size = cfg_.ep_size;
+    out.nefc_shard_index = cfg_.nefc_shard_index;
+    out.nefc_shard_count = cfg_.nefc_shard_count;
+    out.expert_id_base = cfg_.expert_id_base;
+    out.expert_ids_global = cfg_.expert_ids_global;
     out.nefc_qd = cfg_.nefc_qd;
     out.expert_qd = cfg_.expert_qd;
     out.metadata_qd = cfg_.metadata_qd;

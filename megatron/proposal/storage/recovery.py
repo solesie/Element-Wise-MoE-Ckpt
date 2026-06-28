@@ -14,6 +14,7 @@ replay.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -261,6 +262,24 @@ def _apply_fc_payload_to_model(
     return int(scalars.get("step", rolling_step) or rolling_step)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return int(default)
+    return int(raw)
+
+
+def _fdp_global_expert_id(local_expert_id: int) -> int:
+    if os.environ.get("PROPOSAL_FDP_EXPERT_IDS_GLOBAL", "").lower() in (
+        "1", "true", "yes",
+    ):
+        return int(local_expert_id)
+    ep_size = _env_int("PROPOSAL_FDP_EP_SIZE", 1)
+    if ep_size <= 1:
+        return int(local_expert_id)
+    return _env_int("PROPOSAL_FDP_EXPERT_ID_BASE", 0) + int(local_expert_id)
+
+
 def _load_fc_payload_into(
     payload_path: Path,
     target_params: Dict[str, torch.nn.Parameter],
@@ -323,20 +342,55 @@ def _recover_from_fdp(
     _phase["scan_classify_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     _t0 = _time.perf_counter()
-    nefc = dict(entries.get("nefc", {}))
-    if not bool(nefc.get("valid", False)):
-        raise RuntimeError("FDP recovery: no valid NEFC entry in metadata")
-    ne_step = int(nefc.get("iter", -1))
-    if ne_step > int(t_fault):
-        raise RuntimeError(
-            f"FDP recovery: latest NEFC iter {ne_step} is newer than "
-            f"requested fault step {int(t_fault)}"
+    nefc_shards = [dict(e) for e in entries.get("nefc_shards", [])]
+    if not nefc_shards:
+        nefc_shards = [dict(entries.get("nefc", {}))]
+    cur_pp = _env_int("PROPOSAL_FDP_PP_RANK", 0)
+    ep_size = _env_int("PROPOSAL_FDP_EP_SIZE", 1)
+    valid_nefc = [
+        e for e in nefc_shards
+        if bool(e.get("valid", False))
+        and int(e.get("pp_rank", cur_pp)) == int(cur_pp)
+        and int(e.get("iter", -1)) <= int(t_fault)
+    ]
+    if not valid_nefc:
+        raise RuntimeError("FDP recovery: no valid NEFC shard in metadata")
+    best_ne_iter = max(int(e.get("iter", -1)) for e in valid_nefc)
+    best_nefc = [
+        e for e in valid_nefc if int(e.get("iter", -1)) == int(best_ne_iter)
+    ]
+    if ep_size > 1:
+        shard_seen = {int(e.get("ep_rank", -1)) for e in best_nefc}
+        missing = [i for i in range(int(ep_size)) if i not in shard_seen]
+        if missing:
+            raise RuntimeError(
+                f"FDP recovery: missing NEFC shard(s) at iter "
+                f"{best_ne_iter}: {missing}"
+            )
+    applied_steps: List[int] = []
+    for shard in sorted(
+        best_nefc,
+        key=lambda e: (int(e.get("ep_rank", 0)), int(e.get("shard_index", 0))),
+    ):
+        shard_index = int(shard.get("shard_index", 0))
+        ne_blob = fdp_read_nefc_blob(
+            int(shard["logical_bytes"]),
+            shard_index=shard_index,
         )
-    ne_blob = fdp_read_nefc_blob(int(nefc["logical_bytes"]))
-    ne_payload, _scalars = load_binary_blob(ne_blob, source="fdp:nefc")
-    _apply_payload_dict_to_model(ne_payload, non_expert_params, optimizer)
-    diag.nonexpert_fc_iter = int(ne_step)
-    diag.nonexpert_fc_path = "fdp:nefc"
+        ne_payload, ne_scalars = load_binary_blob(
+            ne_blob,
+            source=f"fdp:nefc_shard{shard_index}",
+        )
+        applied_steps.append(
+            int(_apply_fc_payload_to_model(
+                ne_payload, ne_scalars, non_expert_params, optimizer
+            ))
+        )
+    diag.nonexpert_fc_iter = int(best_ne_iter)
+    diag.nonexpert_fc_path = ",".join(
+        f"fdp:nefc_shard{int(e.get('shard_index', 0))}"
+        for e in sorted(best_nefc, key=lambda x: int(x.get("shard_index", 0)))
+    )
     _phase["nonexpert_fc_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     log_loaded: Dict[ExpertId, int] = {}
@@ -362,14 +416,18 @@ def _recover_from_fdp(
 
         eids_with_fdp_state = [
             eid for eid in by_expert_params
-            if eid in lfcs_by_eid or eid in lfsy_by_eid
+            if (
+                (eid[0], _fdp_global_expert_id(eid[1])) in lfcs_by_eid
+                or (eid[0], _fdp_global_expert_id(eid[1])) in lfsy_by_eid
+            )
         ]
 
         _t_read0 = _time.perf_counter()
         new_pair_data: Dict[ExpertId, Dict[str, Any]] = {}
         for L, E in eids_with_fdp_state:
-            lfcs = lfcs_by_eid.get((L, E))
-            lfsy = lfsy_by_eid.get((L, E))
+            global_eid = (L, _fdp_global_expert_id(E))
+            lfcs = lfcs_by_eid.get(global_eid)
+            lfsy = lfsy_by_eid.get(global_eid)
             lfcl_blob: Optional[torch.Tensor] = None
             lfsy_blob: Optional[torch.Tensor] = None
 
