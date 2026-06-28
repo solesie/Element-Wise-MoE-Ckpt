@@ -57,6 +57,7 @@ from megatron.proposal.hooks import (
     proposal_dispatch_post_iter,
     proposal_wait_d2h_before_optimizer,
     proposal_recover, proposal_simulate_fault, proposal_record_loss,
+    proposal_run_independent_oracle,
     proposal_shutdown,
     proposal_refresh_h_quantile, proposal_set_anchor_data_iter,
     proposal_vram_audit_iter_begin, proposal_vram_audit_iter_end,
@@ -1338,6 +1339,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 cur_loss_value = None
         if getattr(args, 'proposal_enable', False):
             proposal_record_loss(step=iteration, loss=cur_loss_value)
+            proposal_run_independent_oracle(model, valid_data_iterator, iteration)
 
         # H cache refresh for selection_mode='hessian'. Uses valid data so
         # it does not consume/advance the training data iterator. The first
@@ -1348,6 +1350,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             and h_refresh_every > 0
             and (iteration == 1 or iteration % h_refresh_every == 0)
         ):
+            # H-refresh runs immediately after this optimizer step, before the
+            # next-loop dispatch point.  Flush the current post-step checkpoint
+            # first so any grad-score lease from this step is consumed/released
+            # before the anchor backward starts.
+            proposal_dispatch_post_iter(model, iter_T=iteration)
             proposal_refresh_h_quantile(
                 model, forward_step_func, valid_data_iterator, iteration,
             )

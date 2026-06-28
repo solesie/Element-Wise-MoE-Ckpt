@@ -21,6 +21,7 @@ from ..runtime import CheckpointWorkerPool, WriteRecord, get_d2h_stream
 from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
 from ..refresh.fp32_state import get_mapper
 from .expert_writer import ExpertState, HEADER_BLOCK_BYTES
+from .zero12_nonexpert import Zero12NonExpertCollector
 
 
 def _fp32_param_live_view(p: torch.nn.Parameter) -> torch.Tensor:
@@ -37,6 +38,11 @@ def _fp32_param_live_view(p: torch.nn.Parameter) -> torch.Tensor:
         flat = getattr(m, "_fp32_flat", None)
         if coord is not None and flat is not None:
             group_idx, offset, numel = coord
+            if offset < 0 or offset + numel > int(flat[group_idx].numel()):
+                raise RuntimeError(
+                    "FP32 param is not fully local to this ZeRO partition; "
+                    "use the ZeRO partition-aware checkpoint path."
+                )
             out = flat[group_idx].narrow(0, offset, numel).view(p.shape)
             if out.dtype != torch.float32:
                 raise RuntimeError("FP32 mapper returned non-FP32 flat view")
@@ -47,6 +53,21 @@ def _fp32_param_live_view(p: torch.nn.Parameter) -> torch.Tensor:
         "expert LFCL requires an existing FP32 live param view; refusing "
         "to allocate a transient dtype-conversion staging tensor"
     )
+
+
+def _fp32_param_lfcl_source(p: torch.nn.Parameter) -> torch.Tensor:
+    """Return an FP32 source for full expert LFCL payloads."""
+
+    m = get_mapper()
+    if m is not None:
+        local = m.get_local_param_view(p)
+        if local is not None and int(local.numel()) == int(p.numel()):
+            return local
+        raise RuntimeError(
+            "expert LFCL requires a local full FP32 parameter view; refusing to "
+            "materialize a full ZeRO parameter copy on the checkpoint path."
+        )
+    return _fp32_param_live_view(p)
 
 
 def _fp32_opt_state_live_view(
@@ -61,6 +82,23 @@ def _fp32_opt_state_live_view(
         local = m.get_local_state_view(p, key)
         if local is not None:
             return local
+    return optimizer.state.get(p, {}).get(key)
+
+
+def _fp32_opt_state_lfcl_source(
+    optimizer: torch.optim.Optimizer,
+    p: torch.nn.Parameter,
+    key: str,
+) -> Optional[torch.Tensor]:
+    m = get_mapper()
+    if m is not None:
+        local = m.get_local_state_view(p, key)
+        if local is not None and int(local.numel()) == int(p.numel()):
+            return local
+        raise RuntimeError(
+            "expert LFCL requires a local full FP32 optimizer-state view; "
+            "refusing to materialize a full ZeRO state copy on the checkpoint path."
+        )
     return optimizer.state.get(p, {}).get(key)
 
 
@@ -152,7 +190,7 @@ class FCManager:
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         output_dir: Path,
-        num_experts,  # int or List[int] (PR-MoE: per-layer counts)
+        num_experts,  # int or List[int] for per-layer expert counts
         nonexpert_fc_W: int = 10,
         checkpoint_workers: Optional[CheckpointWorkerPool] = None,
         keep_last_per_expert: int = 1,
@@ -200,12 +238,15 @@ class FCManager:
                 "nonexpert_shard_rank must be < nonexpert_shard_count, "
                 f"got {self._nonexpert_shard_rank} / {self._nonexpert_shard_count}"
             )
-        if self._nonexpert_shard_count > 1:
+        if (
+            self._nonexpert_shard_count > 1
+            and getattr(get_mapper(), "mode", "") != "zero12"
+        ):
             self._apply_nonexpert_name_shard()
         self._sorted_layers: List[int] = sorted(self._expert_tensors_by_layer.keys())
         self._num_layers = len(self._sorted_layers)
 
-        # PR-MoE support: per-layer expert count from observed expert tensors.
+        # Per-layer expert count from observed expert tensors.
         # _all_expert_ids enumerates every (layer, expert_idx) tuple actually
         # present, giving a flat slot index that handles heterogeneous counts.
         self._all_expert_ids: List[ExpertId] = sorted(self._separated_tensors_by_slot.keys())
@@ -328,6 +369,7 @@ class FCManager:
                 "test_skip_nonexpert_d2h requires commit_nonexpert_fc=False; "
                 "it is only valid for write-excluded iter-time profiling."
             )
+        self._zero12_nonexpert_collector: Optional[Zero12NonExpertCollector] = None
         self._nonexpert_test_dram_payload: Optional[Dict[str, torch.Tensor]] = None
         self._nonexpert_test_dram_step: int = -1
         self._expert_state: Optional[ExpertState] = None
@@ -441,6 +483,15 @@ class FCManager:
 
         if self.test_skip_nonexpert_d2h or not self._non_expert_names:
             return
+        if getattr(get_mapper(), "mode", "") == "zero12":
+            self._zero12_nonexpert_collector = Zero12NonExpertCollector(
+                self.model,
+                self._non_expert_names,
+                cp_target=self.cp_target,
+                checkpoint_workers=self._checkpoint_workers,
+            )
+            self._zero12_nonexpert_collector.preallocate()
+            return
         named_params = self._named_params_cache
         if named_params is None:
             named_params = dict(self.model.named_parameters())
@@ -515,7 +566,10 @@ class FCManager:
                         "param": named_params[tname],
                         "shape": torch.Size(shape),
                         "numel": int(numel),
-                        "param_src": _fp32_param_live_view(named_params[tname]).detach(),
+                        "param_src": (
+                            None if getattr(get_mapper(), "mode", "") == "zero12"
+                            else _fp32_param_live_view(named_params[tname]).detach()
+                        ),
                         "exp_avg": None,
                         "exp_avg_sq": None,
                     }
@@ -549,6 +603,8 @@ class FCManager:
         field: Dict[str, Any],
         key: str,
     ) -> Optional[torch.Tensor]:
+        if getattr(get_mapper(), "mode", "") == "zero12":
+            return _fp32_opt_state_lfcl_source(self.optimizer, field["param"], key)
         src = field.get(key)
         if src is not None:
             return src
@@ -657,15 +713,21 @@ class FCManager:
                             "param": p,
                             "shape": torch.Size(p.shape),
                             "numel": int(p.numel()),
-                            "param_src": _fp32_param_live_view(p).detach(),
+                            "param_src": (
+                                None if getattr(get_mapper(), "mode", "") == "zero12"
+                                else _fp32_param_live_view(p).detach()
+                            ),
                             "exp_avg": None,
                             "exp_avg_sq": None,
                         })
                     self._lfcl_field_cache_by_expert[expert_id] = fields_for_expert
                 for field in fields_for_expert:
                     n = int(field["numel"])
+                    param_src = field.get("param_src")
+                    if param_src is None:
+                        param_src = _fp32_param_lfcl_source(field["param"]).detach()
                     fields: List[Tuple[str, Optional[torch.Tensor]]] = [
-                        ("param", field["param_src"]),
+                        ("param", param_src),
                         ("exp_avg", self._lfcl_cached_state_source(field, "exp_avg")),
                         ("exp_avg_sq", self._lfcl_cached_state_source(field, "exp_avg_sq")),
                     ]
@@ -749,6 +811,7 @@ class FCManager:
                 "pinned": pinned,
                 "ready_event": batch_ready,
                 "entries": batch_entries,
+                "source_leases": list(srcs),
                 "used_bytes": int(cursor_bytes),
                 "payload_bytes": int(total_payload_bytes),
                 "total_pinned_bytes": int(self._lfcl_batch_capacity_bytes),
@@ -1231,6 +1294,9 @@ class FCManager:
         *,
         ready_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
+        mapper = get_mapper()
+        if mapper is not None and getattr(mapper, "mode", "") == "zero12":
+            return self._collect_zero12_nonexpert_payload(ready_event=ready_event)
         # named_params=None: the callee will lazily build it ONLY if the
         # enum cache misses. Steady-state (cache hit) skips the
         # ~few-ms dict(model.named_parameters()) walk.
@@ -1240,6 +1306,29 @@ class FCManager:
             header_block_bytes=binary_io.HEADER_BLOCK_BYTES,
             chunk_pad_bytes=binary_io.PIN_CHUNK_BYTES,
         )
+
+    def _collect_zero12_nonexpert_payload(
+        self,
+        *,
+        ready_event: Optional["torch.cuda.Event"] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        if not hasattr(self, "_collect_tls"):
+            self._collect_tls = threading.local()
+        collector = self._zero12_nonexpert_collector
+        if collector is None:
+            collector = Zero12NonExpertCollector(
+                self.model,
+                self._non_expert_names,
+                cp_target=self.cp_target,
+                checkpoint_workers=self._checkpoint_workers,
+            )
+            self._zero12_nonexpert_collector = collector
+        result = collector.collect(ready_event=ready_event)
+        self._collect_tls.cuda_event = result.cuda_event
+        self._collect_tls.read_event = result.read_event
+        self._collect_tls.pinned_info = result.pinned_info
+        self._last_collect_sub_ms = dict(result.sub_ms)
+        return result.payload, int(result.payload_bytes)
 
     def _last_collect_pinned_info(self) -> Optional[Dict[str, Any]]:
         """Return the most recent ``_collect_param_payload`` pinned info
@@ -1303,7 +1392,7 @@ class FCManager:
         # EP replica into the same PP-local non_expert directory.
         if self._nonexpert_shard_count > 1:
             path = self.output_dir / (
-                f"fc_nonexpert_ep{self._nonexpert_shard_rank:02d}"
+                f"fc_nonexpert_shard{self._nonexpert_shard_rank:02d}"
                 f"of{self._nonexpert_shard_count:02d}_iter{step:08d}.bin"
             )
         else:
@@ -1363,9 +1452,11 @@ class FCManager:
         # Pre-build the header bytes on the training/owner thread — small
         # CPU work (~tens of µs). The writer thread does the stamp +
         # single os.write after syncing on the D2H read event.
+        header_scalars = {"step": int(step)}
+        header_scalars.update(dict(pinned_info.get("scalars", {})))
         header_bytes = binary_io.build_prptens_header_block(
             pinned_info["plan"],
-            scalars={"step": int(step)},
+            scalars=header_scalars,
         )
 
         def _do_save(
@@ -1455,6 +1546,9 @@ class FCManager:
                     return
                 elif self.cp_target == "test_dram":
                     self._nonexpert_test_dram_payload = dict(_payload)
+                    self._nonexpert_test_dram_payload["_prptens_scalars"] = dict(
+                        _pinned_info.get("scalars", {})
+                    )
                     self._nonexpert_test_dram_step = int(_step)
                 try:
                     _rec.file_bytes = int(_path.stat().st_size)

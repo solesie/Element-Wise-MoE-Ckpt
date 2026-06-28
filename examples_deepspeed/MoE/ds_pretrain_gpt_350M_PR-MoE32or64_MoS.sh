@@ -131,8 +131,8 @@ EP_PARALLEL_SIZE=$NUM_GPUS
 
 ## Original GPT-3 model always set min LR at 10% of max LR. For MoE model, we
 ## found that lower LR and min LR (than the base dense model) helps.
-## For 1.3B PR-MoE-64/128 model we used LR=1.2e-4 and MIN_LR=1.0e-6.
-## For 350M PR-MoE-32/64 model we used LR=3.0e-4 and MIN_LR=1.0e-6, but they are not
+## For the 1.3B heterogeneous MoE-64/128 model we used LR=1.2e-4 and MIN_LR=1.0e-6.
+## For the 350M heterogeneous MoE-32/64 model we used LR=3.0e-4 and MIN_LR=1.0e-6, but they are not
 ## heavily tuned.
 LR=3.0e-4
 MIN_LR=1.0e-06

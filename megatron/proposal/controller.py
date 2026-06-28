@@ -7,6 +7,7 @@ workers, and returns. Worker threads own all proposal GPU/D2H/file work.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -96,6 +97,14 @@ class ProposalController:
 
     def record_loss(self, step: int, loss: Optional[float]) -> None:
         proposal_record_loss(step, loss)
+
+    def run_independent_oracle(
+        self,
+        model: Any,
+        data_iterator: Any,
+        iteration: int,
+    ) -> None:
+        proposal_run_independent_oracle(model, data_iterator, iteration)
 
     def vram_audit_iter_begin(self, step: int) -> None:
         proposal_vram_audit_iter_begin(step)
@@ -298,7 +307,7 @@ def init_proposal(
     if torch.cuda.is_available() and get_controller()._dispatch_ready_event is None:
         get_controller()._dispatch_ready_event = torch.cuda.Event()
 
-    # PR-MoE support: args.num_experts may be a list of per-layer counts.
+    # args.num_experts may be a list of per-layer expert counts.
     # FCManager re-derives per-layer counts from observed expert tensors;
     # we pass the raw spec through and use max() as the scalar metadata for
     # checkpoint managers, which only use it for sizing/logging.
@@ -760,6 +769,62 @@ def proposal_record_loss(step: int, loss: Optional[float]) -> None:
         get_controller()._pending_fault_record["post_fault_loss"] = float(loss)
         _flush_fault_record(get_controller()._pending_fault_record)
         get_controller()._pending_fault_record = None
+
+
+def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> None:
+    """Run telemetry-only rollback oracle for the current checkpoint image."""
+
+    ctrl = get_controller()
+    if not ctrl._enabled or ctrl._lossy_cp is None or ctrl._proposal_config is None:
+        if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+            print(
+                "[proposal] independent_oracle skip: "
+                f"enabled={bool(ctrl._enabled)} "
+                f"lossy_cp={ctrl._lossy_cp is not None} "
+                f"config={ctrl._proposal_config is not None} "
+                f"iter={int(iteration)}",
+                flush=True,
+            )
+        return
+    try:
+        from .telemetry.independent_oracle import independent_oracle_enabled
+        if not independent_oracle_enabled(ctrl._proposal_config, int(iteration)):
+            if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+                iters = tuple(int(x) for x in getattr(ctrl._proposal_config, "independent_oracle_iters", ()) or ())
+                print(
+                    "[proposal] independent_oracle skip: "
+                    f"disabled_for_iter iter={int(iteration)} iters={iters}",
+                    flush=True,
+                )
+            return
+    except Exception as exc:
+        if _should_write():
+            print(f"[proposal] independent_oracle: enable check failed: {exc}", flush=True)
+        return
+    if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
+        print(f"[proposal] independent_oracle run: iter={int(iteration)}", flush=True)
+
+    # Normal V2 dispatches iter T at the beginning of iter T+1.  The oracle
+    # measures a fault at iter T, so make the current post-step image visible
+    # before evaluating rollback loss.
+    if int(iteration) > int(getattr(ctrl, "_last_dispatched_iter_T", -1)):
+        proposal_dispatch_post_iter(model, iter_T=int(iteration))
+    if ctrl._checkpoint_workers is not None:
+        ctrl._checkpoint_workers.drain()
+
+    try:
+        from .telemetry.independent_oracle import run_independent_oracle
+        run_independent_oracle(
+            model=model,
+            data_iterator=data_iterator,
+            iteration=int(iteration),
+            lossy_cp=ctrl._lossy_cp,
+            proposal_config=ctrl._proposal_config,
+        )
+    finally:
+        clear = getattr(ctrl._lossy_cp, "clear_independent_oracle_grad_cache", None)
+        if callable(clear):
+            clear()
 
 
 def _proposal_tracked_gpu_memory_breakdown() -> Tuple[float, List[Tuple[str, float]]]:

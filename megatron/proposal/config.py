@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 DEFAULT_LFCL_INTERVAL_ITERS = 1
@@ -65,6 +65,17 @@ class ProposalConfig:
     fault_warmup: int = 0
     fault_log: Optional[Path] = None
     test_expert_selection_only: bool = False
+
+    # Telemetry-only independent oracle. This is intentionally outside the
+    # production selection/write path.
+    independent_oracle_enable: bool = False
+    independent_oracle_iters: Tuple[int, ...] = ()
+    independent_oracle_log_dir: Optional[Path] = None
+    independent_oracle_rank_sample: int = 1048576
+    independent_oracle_rank_sample_seed: int = 20240625
+    independent_oracle_actual_batches: int = 4
+    independent_oracle_hvp_batches: int = 4
+    independent_oracle_batch_seed: int = 20240625
 
     @classmethod
     def from_args(cls, args, cp_root: str) -> "ProposalConfig":
@@ -143,6 +154,26 @@ class ProposalConfig:
             // max(1, int(getattr(args, "micro_batch_size", 1)))
         )
         n_anchor_batches = max(1, _mb_per_iter // 2)
+
+        def _parse_int_tuple(raw) -> Tuple[int, ...]:
+            if raw is None:
+                return ()
+            if isinstance(raw, (list, tuple)):
+                vals = raw
+            else:
+                vals = str(raw).replace(";", ",").split(",")
+            out = []
+            for item in vals:
+                text = str(item).strip()
+                if text:
+                    out.append(int(text))
+            return tuple(out)
+
+        independent_oracle_log_dir_raw = getattr(
+            args,
+            "proposal_independent_oracle_log_dir",
+            None,
+        )
 
         return cls(
             topk_ratio=topk_ratio,
@@ -237,5 +268,59 @@ class ProposalConfig:
             fault_log=Path(fault_log_raw) if fault_log_raw else None,
             test_expert_selection_only=bool(
                 getattr(args, "proposal_test_expert_selection_only", False)
+            ),
+            independent_oracle_enable=bool(
+                getattr(args, "proposal_independent_oracle_enable", False)
+            ),
+            independent_oracle_iters=_parse_int_tuple(
+                getattr(args, "proposal_independent_oracle_iters", "")
+            ),
+            independent_oracle_log_dir=(
+                Path(independent_oracle_log_dir_raw)
+                if independent_oracle_log_dir_raw else None
+            ),
+            independent_oracle_rank_sample=max(
+                0,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_rank_sample",
+                        1048576,
+                    ) or 0
+                ),
+            ),
+            independent_oracle_rank_sample_seed=int(
+                getattr(
+                    args,
+                    "proposal_independent_oracle_rank_sample_seed",
+                    20240625,
+                ) or 20240625
+            ),
+            independent_oracle_actual_batches=max(
+                1,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_actual_batches",
+                        4,
+                    ) or 4
+                ),
+            ),
+            independent_oracle_hvp_batches=max(
+                0,
+                int(
+                    getattr(
+                        args,
+                        "proposal_independent_oracle_hvp_batches",
+                        4,
+                    ) or 0
+                ),
+            ),
+            independent_oracle_batch_seed=int(
+                getattr(
+                    args,
+                    "proposal_independent_oracle_batch_seed",
+                    20240625,
+                ) or 20240625
             ),
         )

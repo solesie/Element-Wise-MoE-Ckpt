@@ -6,6 +6,7 @@ need that training-state view.
 """
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -38,30 +39,32 @@ def _should_write() -> bool:
     return torch.distributed.get_rank() == 0
 
 
-def _reset_zero_anchor_backward_state(ds_opt: Any) -> None:
-    """Drop ZeRO backward book-keeping produced by anchor-only backward passes."""
-
-    if ds_opt is None or not hasattr(ds_opt, "ipg_buckets"):
+def _zero12_clear_param_grad_refs(ds_opt: Any) -> None:
+    if ds_opt is None:
         return
     try:
-        for bucket in getattr(ds_opt, "ipg_buckets", {}).values():
-            try:
-                bucket.clear()
-            except Exception:
-                pass
-            try:
-                bucket.index = 0
-            except Exception:
-                pass
-        setattr(ds_opt, "ready_for_gradients", False)
-        setattr(ds_opt, "_epilogue_ran_this_backward", False)
-        for i in range(len(getattr(ds_opt, "params_already_reduced", ()))):
-            ds_opt.params_already_reduced[i] = False
-        prev = getattr(ds_opt, "previous_reduced_grads", None)
-        if prev is not None:
-            for grads in prev.values():
-                grads.clear()
-        for name in ("all_grad_tensors", "averaged_gradients"):
+        for group in getattr(ds_opt, "bit16_groups", ()):
+            for p in group:
+                p.grad = None
+                if hasattr(p, "grad_accum"):
+                    p.grad_accum = None
+    except Exception:
+        pass
+
+
+def _zero12_discard_anchor_grad_state(ds_opt: Any) -> None:
+    """Discard FD-H anchor gradients from ZeRO1/2's normal grad stores.
+
+    The anchor intentionally writes H estimates into DeepSpeed's ordinary
+    gradient-accumulation path.  After h_q is built, those values must not reach
+    optimizer.step().  Keep this cleanup narrow: do not reset ZeRO reducer
+    bookkeeping that the normal forward/backward lifecycle owns.
+    """
+
+    if ds_opt is None:
+        return
+    try:
+        for name in ("averaged_gradients", "all_grad_tensors"):
             table = getattr(ds_opt, name, None)
             if isinstance(table, dict):
                 for key in list(table.keys()):
@@ -69,11 +72,223 @@ def _reset_zero_anchor_backward_state(ds_opt: Any) -> None:
             elif isinstance(table, list):
                 for idx in range(len(table)):
                     table[idx] = None
-        reset = getattr(ds_opt, "reset_partition_gradient_structures", None)
-        if callable(reset):
-            reset()
-    except Exception as exc:
-        print(f"[proposal] anchor ZeRO state reset warning: {exc}", flush=True)
+        _zero12_clear_param_grad_refs(ds_opt)
+    except Exception:
+        pass
+
+
+def _zero12_expert_h_views_from_table(
+    ds_opt: Any,
+    table_name: str,
+    names: List[str],
+    params: List[torch.nn.Parameter],
+) -> Tuple[List[str], List[torch.Tensor]]:
+    table = getattr(ds_opt, table_name, None)
+    params_in_partition = getattr(ds_opt, "params_in_partition", None)
+    if not isinstance(table, dict) or not isinstance(params_in_partition, list):
+        return [], []
+    name_by_id = {id(p): str(n) for n, p in zip(names, params)}
+    out_names: List[str] = []
+    views: List[torch.Tensor] = []
+    for group_idx, group_params in enumerate(params_in_partition):
+        grad_list = table.get(group_idx)
+        if not isinstance(grad_list, list):
+            continue
+        for param, grad in zip(group_params, grad_list):
+            name = name_by_id.get(id(param))
+            if name is None or not isinstance(grad, torch.Tensor) or grad.numel() == 0:
+                continue
+            out_names.append(name)
+            views.append(grad.view(-1))
+    return out_names, views
+
+
+def _unwrap_engine(model: Any) -> Any:
+    if isinstance(model, (list, tuple)):
+        return model[0] if model else None
+    return model
+
+
+def _loss_scale_for_backward(engine: Any) -> float:
+    import math
+
+    opt = getattr(engine, "optimizer", None)
+    scale = getattr(opt, "loss_scale", 1.0)
+    try:
+        scale_f = float(scale)
+    except Exception:
+        scale_f = 1.0
+    if not math.isfinite(scale_f) or scale_f <= 0.0:
+        return 1.0
+    return scale_f
+
+
+def _gas_scale_for_backward(engine: Any) -> float:
+    getter = getattr(engine, "gradient_accumulation_steps", None)
+    if not callable(getter):
+        return 1.0
+    try:
+        gas = float(getter())
+    except Exception:
+        gas = 1.0
+    return gas if gas > 0.0 else 1.0
+
+
+def _capture_anchor_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "mpu": None,
+    }
+    try:
+        from megatron.core.tensor_parallel import get_cuda_rng_tracker
+        state["mpu"] = get_cuda_rng_tracker().get_states()
+    except Exception:
+        state["mpu"] = None
+    return state
+
+
+def _restore_anchor_rng_state(state: Optional[Dict[str, Any]]) -> None:
+    if not state:
+        return
+    try:
+        torch.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and state.get("cuda") is not None:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        if state.get("mpu") is not None:
+            try:
+                from megatron.core.tensor_parallel import get_cuda_rng_tracker
+                get_cuda_rng_tracker().set_states(state["mpu"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+class _DSGradAccumulationWindow:
+    """Match Megatron's no-pipeline DeepSpeed GAS boundary pattern."""
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+        self._setter = getattr(engine, "set_gradient_accumulation_boundary", None)
+        self._opt = getattr(engine, "optimizer", None)
+        self._old_engine = None
+        self._old_opt = None
+
+    def __enter__(self):
+        if not callable(self._setter):
+            return self
+        self._old_engine = getattr(self._engine, "_is_gradient_accumulation_boundary", None)
+        self._old_opt = getattr(self._opt, "is_gradient_accumulation_boundary", None)
+        self.set_boundary(False)
+        return self
+
+    def set_boundary(self, is_boundary: bool) -> None:
+        if callable(self._setter):
+            self._setter(bool(is_boundary))
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not callable(self._setter):
+            return
+        try:
+            self._engine._is_gradient_accumulation_boundary = self._old_engine
+        except Exception:
+            pass
+        if self._opt is not None:
+            try:
+                self._opt.is_gradient_accumulation_boundary = self._old_opt
+            except Exception:
+                pass
+
+
+def _collect_anchor_h_named_views(
+    mapper: Any,
+    names: List[str],
+    params: List[torch.nn.Parameter],
+    *,
+    allow_create: bool,
+) -> Tuple[List[str], List[torch.Tensor]]:
+    out_names: List[str] = []
+    views: List[torch.Tensor] = []
+    for name, param in zip(names, params):
+        try:
+            view = mapper.get_grad_accum_view(param).view(-1)
+        except Exception:
+            if allow_create:
+                raise
+            continue
+        if isinstance(view, torch.Tensor) and view.numel() > 0:
+            out_names.append(name)
+            views.append(view)
+    return out_names, views
+
+
+def _register_fd_grad_transform_hook(
+    param: torch.nn.Parameter,
+    *,
+    sign_scale: float,
+    global_offset: int,
+    rng_seed: int,
+    k: int,
+    scale_probe: Optional[Dict[str, Any]] = None,
+):
+    def _pre_accumulate_hook(raw_grad):
+        if scale_probe is not None and not bool(scale_probe.get("captured", False)):
+            try:
+                scale_probe["raw_abs_mean"] = float(raw_grad.detach().float().abs().mean().item())
+            except Exception:
+                scale_probe["raw_abs_mean"] = 0.0
+        out = _scale_grad_inplace_with_pcg_z(
+            raw_grad,
+            sign_scale=sign_scale,
+            global_offset=global_offset,
+            rng_seed=int(rng_seed),
+            k=int(k),
+        )
+        if scale_probe is not None and not bool(scale_probe.get("captured", False)):
+            try:
+                scale_probe["scaled_abs_mean"] = float(out.detach().float().abs().mean().item())
+            except Exception:
+                scale_probe["scaled_abs_mean"] = 0.0
+            scale_probe["captured"] = True
+        return out
+
+    return param.register_hook(_pre_accumulate_hook)
+
+
+def _trainable_params(model_or_engine: Any) -> List[torch.nn.Parameter]:
+    module = getattr(model_or_engine, "module", model_or_engine)
+    if isinstance(module, (list, tuple)):
+        modules = module
+    else:
+        modules = (module,)
+    params: List[torch.nn.Parameter] = []
+    seen = set()
+    for mod in modules:
+        if not hasattr(mod, "parameters"):
+            continue
+        for p in mod.parameters():
+            if not getattr(p, "requires_grad", False):
+                continue
+            ident = id(p)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            params.append(p)
+    return params
+
+
+class _ReplayDataIterator:
+    """Iterator that replays one raw dataset item without advancing data."""
+
+    def __init__(self, item: Any) -> None:
+        self._item = item
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._item
 
 
 def proposal_set_anchor_data_iter(it: Any) -> None:
@@ -181,6 +396,7 @@ def _refresh_h_quantile_from_finite_diff(
     if dedicated is not None:
         data_iterator = dedicated
     m0 = model[0] if isinstance(model, (list, tuple)) else model
+    _actual_pipeline_anchor = _is_pipeline_engine(m0)
 
     # Anchor/H refresh is an explicit training halt (§0.2 exception). It
     # must not overlap with an older lossy-AOS task, because that task
@@ -205,11 +421,6 @@ def _refresh_h_quantile_from_finite_diff(
         net = m0
     was_training = net.training
     net.train()
-    ds_engine = m0
-    prev_flag = getattr(ds_engine, "_running_engine_backward", False)
-    try: ds_engine._running_engine_backward = True
-    except Exception: pass
-
     def _restore_rng():
         try:
             torch.set_rng_state(_cpu_rng_state)
@@ -218,8 +429,6 @@ def _refresh_h_quantile_from_finite_diff(
         except Exception: pass
 
     def _finalize(ret):
-        try: ds_engine._running_engine_backward = prev_flag
-        except Exception: pass
         net.train(was_training); _restore_rng()
         return ret
 
@@ -234,7 +443,7 @@ def _refresh_h_quantile_from_finite_diff(
     # Audit: pre-anchor snapshot.
     from ..telemetry import diagnostics as _proposal_diagnostics
     _proposal_diagnostics.vram_audit_step("pre_anchor", dump_breakdown=True, lossy_cp=_lossy_cp)
-    # FD core accumulates hook-scaled per-element values into grad_flat.
+    # FD core accumulates hook-scaled per-element values into training grad storage.
     # K is fixed to one; robustness comes from the multi-batch anchor loop.
     _group_size_for_fd = max(1, int(getattr(_lossy_cp, "group_size", 1)))
 
@@ -309,28 +518,6 @@ def _refresh_h_quantile_from_finite_diff(
                     _ds_attr_snapshot[_attr] = getattr(_ds_engine_opt, _attr)
                 except Exception:
                     pass
-    _saved_grad_acc_hooks = None
-    _restore_grad_acc_hooks = False
-    _actual_pipeline_anchor = _is_pipeline_engine(m0)
-    if _ds_engine_opt is not None and hasattr(_ds_engine_opt, "_grad_acc_hooks"):
-        # BF16_Optimizer routes param grads into its own flat buffer via these
-        # hooks; detach them so the anchor's FD hooks own the grads. FP16/ZeRO
-        # optimizers have no such hooks (branch skipped).
-        # DeepSpeed PipelineEngine with BF16 commonly runs with
-        # immediate_grad_update=False and updates hp grads from the pipeline
-        # backward schedule instead of persistent per-param hooks. Recreating
-        # hooks in that mode installs the wrong contract and trips
-        # BF16_Optimizer.assert immediate_grad_update on the next train_batch.
-        _restore_grad_acc_hooks = (
-            (not _actual_pipeline_anchor)
-            or bool(getattr(_ds_engine_opt, "immediate_grad_update", True))
-        )
-        if _restore_grad_acc_hooks:
-            _saved_grad_acc_hooks = _ds_engine_opt._grad_acc_hooks
-            for _h in _saved_grad_acc_hooks:
-                try: _h.remove()
-                except Exception: pass
-            _ds_engine_opt._grad_acc_hooks = []
     try:
         # MULTI-BATCH ANCHOR: each batch's routing activates only ~67% of
         # experts; averaging over N batches (each with a different routing)
@@ -356,6 +543,21 @@ def _refresh_h_quantile_from_finite_diff(
             raise RuntimeError("H-quantile anchor requires Triton kernels")
         _get_mapper = get_mapper
         _mapper = _get_mapper()
+        if _use_freeze and getattr(_mapper, "_mode", "") == "zero12":
+            # ZeRO-1/2 reduces partitioned param grads from post-accumulate
+            # hooks. Routing-freeze replay can make the same expert param
+            # appear twice to that reducer under activation checkpointing,
+            # tripping DeepSpeed's duplicate-reduction invariant. Keep the
+            # normal backward path intact and rely on multi-batch averaging
+            # for routing noise in this layout.
+            _use_freeze = False
+            if _should_write() and not _config.get("_warned_zero12_no_routing_freeze", False):
+                print(
+                    "[proposal] finite_diff: routing freeze disabled for ZeRO1/2 "
+                    "anchor; using normal DeepSpeed backward with multi-batch FD.",
+                    flush=True,
+                )
+                _config["_warned_zero12_no_routing_freeze"] = True
         # Mode-aware FD accumulator: use the resident FP32 storage where
         # training normally accumulates gradients. The mapper locates each
         # expert's grad accumulation view for every supported layout
@@ -384,16 +586,29 @@ def _refresh_h_quantile_from_finite_diff(
         _grad_offsets = [0]
         for _n in _ne[:-1]:
             _grad_offsets.append(_grad_offsets[-1] + _n)
-        _grad_accum_views = []
-        for _p in _expert_ps_sorted:
-            _view = _mapper.get_grad_accum_view(_p).view(-1)
-            if _view.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                raise RuntimeError(f"unsupported grad accumulation storage dtype: {_view.dtype}")
-            if int(_view.numel()) != int(_p.numel()):
-                raise RuntimeError("grad accumulation view size mismatch")
-            _grad_accum_views.append(_view)
-        for _view in _grad_accum_views:
-            _view.zero_()
+        _zero12_mode = getattr(_mapper, "_mode", "") == "zero12"
+        if _zero12_mode:
+            _h_view_names = []
+            _grad_accum_views = []
+            _zero12_discard_anchor_grad_state(_ds_engine_opt)
+            for _p in _expert_ps_sorted:
+                _p.grad = None
+                if hasattr(_p, "grad_accum"):
+                    _p.grad_accum = None
+        else:
+            _h_view_names, _grad_accum_views = _collect_anchor_h_named_views(
+                _mapper,
+                _names_sorted,
+                _expert_ps_sorted,
+                allow_create=True,
+            )
+            if not _grad_accum_views:
+                raise RuntimeError("anchor could not locate training grad storage")
+            for _view in _grad_accum_views:
+                if _view.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                    raise RuntimeError(f"unsupported grad accumulation storage dtype: {_view.dtype}")
+            for _view in _grad_accum_views:
+                _view.zero_()
         # Per-tensor θ_0 snapshot (Task 1; pool reuses across anchor calls).
         # NOTE: use _expert_ps_sorted (matches fast-flat grad_offsets;
         # identical to expert_ps when fast-flat is disabled).
@@ -404,6 +619,8 @@ def _refresh_h_quantile_from_finite_diff(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         try:
+            _fd_passes_per_anchor_batch = max(1, int(fd_k_used)) * 2
+            _fd_total_backward_passes = int(_n_anchor_batches) * _fd_passes_per_anchor_batch
             for _bi in range(_n_anchor_batches):
                 if _mb_timing_on and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -417,6 +634,9 @@ def _refresh_h_quantile_from_finite_diff(
                     theta_snap_ref=_theta_snap_session,
                     grad_offsets=_grad_offsets,
                     grad_accum_views=_grad_accum_views,
+                    ds_pass_base=_bi * _fd_passes_per_anchor_batch,
+                    ds_total_backward_passes=_fd_total_backward_passes,
+                    final_grad_accum_boundary=True,
                 )
                 if _mb_timing_on and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -428,6 +648,26 @@ def _refresh_h_quantile_from_finite_diff(
                 _n_succ += 1
                 # FD hooks accumulate the signed z·(g₊−g₋)/(2εK) into the
                 # same FP32 grad storage training uses; _ret is just a success sentinel.
+            if _zero12_mode:
+                _final_names, _final_views = _zero12_expert_h_views_from_table(
+                    _ds_engine_opt,
+                    "averaged_gradients",
+                    _names_sorted,
+                    _expert_ps_sorted,
+                )
+                if _final_views:
+                    _h_view_names = _final_names
+                    _grad_accum_views = _final_views
+            else:
+                _final_names, _final_views = _collect_anchor_h_named_views(
+                    _mapper,
+                    _names_sorted,
+                    _expert_ps_sorted,
+                    allow_create=False,
+                )
+                if _final_views:
+                    _h_view_names = _final_names
+                    _grad_accum_views = _final_views
             # After all batches: divide by the success count and take abs in
             # place, then build h_q from the per-expert grad accumulation views.
             if _grad_accum_views and _n_succ > 0:
@@ -440,7 +680,7 @@ def _refresh_h_quantile_from_finite_diff(
                         step=int(iteration),
                         groups=getattr(_lossy_cp, "_groups", ()),
                         group_size=int(_group_size_for_fd),
-                        names=_names_sorted,
+                        names=_h_view_names,
                         signed_h_views=_grad_accum_views,
                         n_anchor_batches=int(_n_succ),
                     )
@@ -453,7 +693,7 @@ def _refresh_h_quantile_from_finite_diff(
                     _grad_accum_views,
                     refresh_step=int(iteration),
                 )
-                _fold_diag = _fold_h(_names_sorted, _grad_accum_views)
+                _fold_diag = _fold_h(_h_view_names, _grad_accum_views)
                 try:
                     import statistics as _st
                     _h_abs_means = [float(_h.mean().item()) for _h in _grad_accum_views]
@@ -466,14 +706,29 @@ def _refresh_h_quantile_from_finite_diff(
                     _h_scale_stats = None
                 fd_ret = []
         finally:
+            if _zero12_mode:
+                _zero12_discard_anchor_grad_state(_ds_engine_opt)
+                try:
+                    _final_views = None
+                except Exception:
+                    pass
             for _p in _expert_ps_sorted:
                 _p.grad = None
+                if hasattr(_p, "grad_accum"):
+                    _p.grad_accum = None
             # Restore θ_0 (grad accumulation storage is restored by
             # restore_training_state in the outer finally).
             with torch.no_grad():
                 for _p, _snap in zip(_expert_ps_sorted, _theta_snap_session):
                     _p.data.copy_(_snap)
             _grad_accum_views = None
+            _h_view_names = None
+            _final_names = None
+            _final_views = None
+            _view = None
+            _h = None
+            _h_abs_means = None
+            _h_abs_maxs = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         # Average
@@ -486,25 +741,6 @@ def _refresh_h_quantile_from_finite_diff(
         _proposal_diagnostics.vram_audit_step("inside_anchor_fd_peak", dump_breakdown=False)
     finally:
         _config["_in_anchor_refresh"] = False
-        # Re-register DS grad-acc hooks so next training iter's backward
-        # accumulates into the flat buffer again (BF16_Optimizer only).
-        if (
-            _ds_engine_opt is not None
-            and _saved_grad_acc_hooks is not None
-            and _restore_grad_acc_hooks
-        ):
-            try:
-                recreate = getattr(_ds_engine_opt, "create_grad_acc_hooks", None)
-                if not callable(recreate):
-                    recreate = getattr(
-                        _ds_engine_opt,
-                        "create_gradient_handling_hooks",
-                        None,
-                    )
-                if callable(recreate):
-                    recreate()
-            except Exception:
-                pass
         if _ds_engine_opt is not None:
             for _attr, _value in _ds_attr_snapshot.items():
                 try:
@@ -512,7 +748,7 @@ def _refresh_h_quantile_from_finite_diff(
                 except Exception:
                     pass
         restore_training_state(_config.get("_inner_opt"), _train_state_snap)
-        _reset_zero_anchor_backward_state(_ds_engine_opt)
+        _zero12_discard_anchor_grad_state(_ds_engine_opt)
         # Final belt-and-suspenders: force-clear any residual lp.grad.
         # model may be a list/tuple (Megatron DDP wrapper) — unwrap first.
         _m_clear = model[0] if isinstance(model, (list, tuple)) else model
@@ -520,6 +756,8 @@ def _refresh_h_quantile_from_finite_diff(
             for _p in _m_clear.parameters():
                 if _p.grad is not None:
                     _p.grad = None
+                if hasattr(_p, "grad_accum"):
+                    _p.grad_accum = None
         except Exception as _exc:
             print(f"[proposal] anchor grad clear err: {_exc}", flush=True)
         # DIFF report — print any state that changed across anchor.
@@ -550,7 +788,7 @@ def _refresh_h_quantile_from_finite_diff(
             print(f"[proposal] finite_diff failed @iter{iteration}", flush=True)
         return _finalize(None)
 
-    # _fold_h is now mainly diagnostic; h_q was built from grad_flat above.
+    # _fold_h is now mainly diagnostic; h_q was built from DS grad views above.
     if _fold_diag is None:
         _fold_diag = _fold_h(_names_sorted, [])
 
@@ -629,9 +867,13 @@ class HQuantileAnchor:
 def _backward_inplace(forward_fn: Callable[[], Any],
                       expert_ps: List[torch.nn.Parameter],
                       model_for_full_zero: Any,
-                      preserve_expert_grad_storage: bool = False) -> bool:
-    """Forward + backward; leaves expert grads alive in ``p.grad``.
-    Clears non-expert grads after backward. Returns True on success.
+                      preserve_expert_grad_storage: bool = False,
+                      use_engine_backward: bool = False) -> bool:
+    """Forward + backward for one FD phase.
+
+    With DeepSpeed engines this calls ``engine.backward`` so the normal
+    reducer/epilogue owns where the transformed grad lands. Non-engine fallback
+    leaves expert grads in ``p.grad``. Returns True on success.
 
     ``preserve_expert_grad_storage`` (fast-flat path): caller has assigned
     ``expert.grad`` as a view of a pre-allocated flat tensor. Do NOT set
@@ -650,7 +892,7 @@ def _backward_inplace(forward_fn: Callable[[], Any],
     _mfz = (model_for_full_zero[0]
             if isinstance(model_for_full_zero, (list, tuple))
             else model_for_full_zero) if model_for_full_zero is not None else None
-    if _mfz is not None:
+    if _mfz is not None and not use_engine_backward:
         _exp_ids = {id(p) for p in expert_ps} if preserve_expert_grad_storage else None
         try:
             for _p in _mfz.parameters():
@@ -662,11 +904,14 @@ def _backward_inplace(forward_fn: Callable[[], Any],
         except Exception:
             pass
     try:
-        loss.backward(retain_graph=False)
+        if use_engine_backward and _mfz is not None and callable(getattr(_mfz, "backward", None)):
+            _mfz.backward(loss, retain_graph=False, scale_wrt_gas=True)
+        else:
+            loss.backward(retain_graph=False)
     except Exception as exc:
         print(f"[proposal] finite_diff: backward failed: {exc}", flush=True)
         return False
-    if _mfz is not None:
+    if _mfz is not None and not use_engine_backward:
         _params_id = {id(p) for p in expert_ps}
         try:
             for _p in _mfz.parameters():
@@ -675,6 +920,53 @@ def _backward_inplace(forward_fn: Callable[[], Any],
         except Exception as _exc:
             print(f"[FD] non-expert grad clear err: {_exc}", flush=True)
     return True
+
+
+def _schedule_backward_inplace(
+    *,
+    forward_step_func: Callable,
+    data_iterator: Any,
+    model: Any,
+) -> bool:
+    """Run one no-pipeline Megatron microbatch through the normal schedule.
+
+    This is the anchor equivalent of the body used by
+    ``forward_backward_no_pipelining``: schedule.forward_step builds the loss,
+    and schedule.backward_step calls ``model.backward`` for DeepSpeed.
+    """
+
+    try:
+        from megatron.core.pipeline_parallel.schedules import (
+            backward_step as _schedule_backward_step,
+            forward_step as _schedule_forward_step,
+        )
+        from megatron.core.utils import get_model_config, get_model_type
+
+        config = get_model_config(model)
+        model_type = get_model_type(model)
+        forward_data_store: List[Any] = []
+        output_tensor = _schedule_forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            1,
+            None,
+            forward_data_store,
+            config,
+            False,
+        )
+        _schedule_backward_step(
+            None,
+            output_tensor,
+            None,
+            model_type,
+            config,
+            model,
+        )
+        return True
+    except Exception as exc:
+        print(f"[proposal] finite_diff: schedule backward failed: {exc}", flush=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -745,126 +1037,6 @@ def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
         k64 & 0xFFFFFFFF, (k64 >> 32) & 0xFFFFFFFF,
         BLOCK=BLOCK,
     )
-
-
-if _HAS_TRITON_HESSIAN:
-    @triton.jit
-    def _scale_grad_inplace_with_pcg_z_kernel(
-        grad_ptr,
-        n_elements,
-        sign_scale,
-        global_offset,
-        rng_seed_lo, rng_seed_hi,
-        k_lo, k_hi,
-        BLOCK: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        local_off = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = local_off < n_elements
-        global_elem_off = local_off + global_offset
-        grad = tl.load(grad_ptr + local_off, mask=mask, other=0.0).to(tl.float32)
-        x = global_elem_off.to(tl.uint32) * tl.full((), 0x9E3779B9, tl.uint32)
-        x = x ^ tl.full((), rng_seed_lo, tl.uint32)
-        x = x ^ (global_elem_off.to(tl.uint32) >> 16) * tl.full((), 0x85EBCA6B, tl.uint32)
-        x = x ^ tl.full((), k_lo, tl.uint32) * tl.full((), 0xC2B2AE35, tl.uint32)
-        x = x ^ (x >> 13)
-        x = x * tl.full((), 0x27D4EB2D, tl.uint32)
-        x = x ^ (x >> 16)
-        z = tl.where((x & tl.full((), 1, tl.uint32)) == 0, 1.0, -1.0)
-        tl.store(grad_ptr + local_off, grad * z * sign_scale, mask=mask)
-
-
-def _scale_grad_inplace_with_pcg_z(
-    grad: torch.Tensor,
-    *,
-    sign_scale: float,
-    global_offset: int,
-    rng_seed: int,
-    k: int,
-) -> torch.Tensor:
-    if not grad.is_contiguous():
-        raise RuntimeError("anchor grad hook requires contiguous grad")
-    n_total = int(grad.numel())
-    if n_total == 0:
-        return grad
-    if not _HAS_TRITON_HESSIAN:
-        raise RuntimeError("anchor grad scaling requires Triton")
-    BLOCK = 8192
-    n_progs = (n_total + BLOCK - 1) // BLOCK
-    seed64 = int(rng_seed) & ((1 << 64) - 1)
-    k64 = int(k) & ((1 << 64) - 1)
-    _scale_grad_inplace_with_pcg_z_kernel[(n_progs,)](
-        grad.reshape(-1), n_total, float(sign_scale),
-        int(global_offset),
-        seed64 & 0xFFFFFFFF, (seed64 >> 32) & 0xFFFFFFFF,
-        k64 & 0xFFFFFFFF, (k64 >> 32) & 0xFFFFFFFF,
-        BLOCK=BLOCK,
-    )
-    return grad
-
-
-if _HAS_TRITON_HESSIAN:
-    @triton.jit
-    def _accumulate_grad_to_fp32_with_pcg_z_kernel(
-        grad_ptr,
-        target_ptr,
-        n_elements,
-        sign_scale,
-        global_offset,
-        rng_seed_lo, rng_seed_hi,
-        k_lo, k_hi,
-        BLOCK: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        local_off = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = local_off < n_elements
-        global_elem_off = local_off + global_offset
-        grad = tl.load(grad_ptr + local_off, mask=mask, other=0.0).to(tl.float32)
-        prev = tl.load(target_ptr + local_off, mask=mask, other=0.0).to(tl.float32)
-        x = global_elem_off.to(tl.uint32) * tl.full((), 0x9E3779B9, tl.uint32)
-        x = x ^ tl.full((), rng_seed_lo, tl.uint32)
-        x = x ^ (global_elem_off.to(tl.uint32) >> 16) * tl.full((), 0x85EBCA6B, tl.uint32)
-        x = x ^ tl.full((), k_lo, tl.uint32) * tl.full((), 0xC2B2AE35, tl.uint32)
-        x = x ^ (x >> 13)
-        x = x * tl.full((), 0x27D4EB2D, tl.uint32)
-        x = x ^ (x >> 16)
-        z = tl.where((x & tl.full((), 1, tl.uint32)) == 0, 1.0, -1.0)
-        tl.store(target_ptr + local_off, prev + grad * z * sign_scale, mask=mask)
-
-
-def _accumulate_grad_to_fp32_with_pcg_z(
-    grad: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    sign_scale: float,
-    global_offset: int,
-    rng_seed: int,
-    k: int,
-) -> torch.Tensor:
-    """Accumulate one raw grad into a resident FP32 DS grad slice."""
-
-    if not grad.is_contiguous() or not target.is_contiguous():
-        raise RuntimeError("anchor grad hook requires contiguous grad and target")
-    n_total = int(grad.numel())
-    if n_total == 0:
-        return grad
-    if target.numel() != n_total or target.dtype != torch.float32:
-        raise RuntimeError("anchor fp32 grad target shape/dtype mismatch")
-    if not _HAS_TRITON_HESSIAN:
-        raise RuntimeError("anchor fp32 grad accumulation requires Triton")
-    BLOCK = 8192
-    n_progs = (n_total + BLOCK - 1) // BLOCK
-    seed64 = int(rng_seed) & ((1 << 64) - 1)
-    k64 = int(k) & ((1 << 64) - 1)
-    _accumulate_grad_to_fp32_with_pcg_z_kernel[(n_progs,)](
-        grad.reshape(-1), target.reshape(-1), n_total, float(sign_scale),
-        int(global_offset),
-        seed64 & 0xFFFFFFFF, (seed64 >> 32) & 0xFFFFFFFF,
-        k64 & 0xFFFFFFFF, (k64 >> 32) & 0xFFFFFFFF,
-        BLOCK=BLOCK,
-    )
-    grad.zero_()
-    return grad
 
 
 def _is_pipeline_engine(obj: Any) -> bool:
@@ -1002,20 +1174,24 @@ def _compute_fd_fast_flat(
     rng_seed: int,
     group_size: int,
     model_for_full_zero: Any,
-    grad_flat: torch.Tensor,
     grad_offsets: List[int],
     restore_src_list: List[torch.Tensor],
     grad_accum_views: List[torch.Tensor],
+    ds_pass_base: int = 0,
+    ds_total_backward_passes: Optional[int] = None,
     pipeline_engine: Optional[Any] = None,
     pipeline_microbatches: Optional[List[Any]] = None,
+    schedule_backward_fn: Optional[Callable[[], bool]] = None,
+    final_grad_accum_boundary: bool = True,
+    phase_rng_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[List[torch.Tensor]]:
-    """Fast FD with batched grad-flat stream + per-tensor hash-based perturb.
+    """Finite-difference anchor over the normal training backward path.
 
-    - Hooks accumulate directly into resident FP32 DS grad slices
-      (``grad_accum_views``), then zero raw grads.
+    - Proposal hooks transform the raw autograd grad in-place to
+      ``sign * z * grad / (2 eps K)`` before DeepSpeed consumes it.
+    - DeepSpeed/Megatron then reduce/accumulate that transformed grad using
+      the same storage and epilogue as a normal backward.
     - Perturb: per-expert Triton kernel using GLOBAL ``grad_offsets[i]``.
-    - Backward hook: scale raw grad by ``z * sign / (2 eps K)`` before it
-      accumulates into the caller-provided ``grad_flat`` view.
     - lp storage is per-expert (FP16_Optimizer / mixed groups); no lp_flat
       required. theta_snap is per-expert pinned (caller-managed).
     """
@@ -1059,10 +1235,46 @@ def _compute_fd_fast_flat(
                 _p.grad = None
 
     _tsum = {"perturb": 0.0, "hook": 0.0, "bwd": 0.0}
+    ds_engine = _unwrap_engine(model_for_full_zero)
+    use_engine_backward = (
+        pipeline_engine is None
+        and ds_engine is not None
+        and callable(getattr(ds_engine, "backward", None))
+        and getattr(ds_engine, "optimizer", None) is not None
+    )
+    ds_opt = getattr(ds_engine, "optimizer", None) if use_engine_backward else None
+    expert_param_ids = {id(p) for p in expert_ps}
+    nonexpert_params = [
+        p for p in _trainable_params(ds_engine if use_engine_backward else model_for_full_zero)
+        if id(p) not in expert_param_ids
+    ]
+    next_nonexpert_offset = sum(int(p.numel()) for p in expert_ps)
+    nonexpert_offsets: Dict[int, int] = {}
+    for p in nonexpert_params:
+        nonexpert_offsets[id(p)] = next_nonexpert_offset
+        next_nonexpert_offset += int(p.numel())
+    local_backward_passes = max(1, int(k_samples)) * 2
+    total_backward_passes = (
+        int(ds_total_backward_passes)
+        if ds_total_backward_passes is not None
+        else local_backward_passes
+    )
+    nonfinal_backward_context = nullcontext
+    if schedule_backward_fn is not None and ds_engine is not None:
+        try:
+            from megatron.core.utils import get_model_config
+            config = get_model_config(ds_engine)
+            no_sync_func = getattr(config, "no_sync_func", None)
+            if callable(no_sync_func):
+                nonfinal_backward_context = no_sync_func
+        except Exception:
+            nonfinal_backward_context = nullcontext
+    pass_idx = 0
     try:
         with (ctx_mgr if ctx_mgr is not None else nullcontext()):
             if ctx_mgr is not None:
                 try:
+                    _restore_anchor_rng_state(phase_rng_state)
                     if pipeline_engine is not None:
                         if pipeline_microbatches is None:
                             raise RuntimeError("pipeline FD missing cached microbatches")
@@ -1082,80 +1294,134 @@ def _compute_fd_fast_flat(
                     return None
             _sync()
             _t_loop = _time.perf_counter()
-            for k in range(max(1, int(k_samples))):
-                for sign in (+1.0, -1.0):
-                    _sync(); _t0 = _time.perf_counter()
-                    # Per-tensor perturb: copy snap → add sign×eps × z(global_off+i).
-                    with torch.no_grad():
-                        for i, p in enumerate(expert_ps):
-                            p.data.copy_(restore_src_list[i], non_blocking=True)
-                            _flat_z_perturb(
-                                p.data, sign * float(eps),
-                                global_offset=int(grad_offsets[i]),
-                                rng_seed=int(rng_seed), k=int(k),
-                            )
-                    _sync(); _t1 = _time.perf_counter()
-                    handles = []
-                    sign_scale = sign * inv_step * inv_k
-                    for hook_i, hook_param in enumerate(expert_ps):
-                        hook_global_offset = int(grad_offsets[hook_i])
-                        hook_target = grad_accum_views[hook_i]
-
-                        def _scale_hook(
-                            raw_grad,
-                            *,
-                            _global_offset=hook_global_offset,
-                            _target=hook_target,
-                            _sign_scale=sign_scale,
-                            _k=int(k),
-                        ):
-                            if _target.dtype == torch.float32:
-                                return _accumulate_grad_to_fp32_with_pcg_z(
-                                    raw_grad,
-                                    _target,
-                                    sign_scale=_sign_scale,
-                                    global_offset=_global_offset,
-                                    rng_seed=int(rng_seed),
-                                    k=_k,
+            ds_window_ctx = (
+                _DSGradAccumulationWindow(ds_engine)
+                if use_engine_backward and pipeline_engine is None
+                else nullcontext()
+            )
+            with ds_window_ctx as ds_window:
+                _scale_probe_on = str(os.environ.get("PROPOSAL_H_REFRESH_SCALE_PROBE", "0")).lower() in (
+                    "1", "true", "yes", "on",
+                )
+                _scale_probe_printed = False
+                for k in range(max(1, int(k_samples))):
+                    for sign in (+1.0, -1.0):
+                        pass_idx += 1
+                        global_pass_idx = int(ds_pass_base) + pass_idx
+                        is_last_backward = (
+                            bool(final_grad_accum_boundary)
+                            and global_pass_idx >= total_backward_passes
+                        )
+                        if is_last_backward and isinstance(ds_window, _DSGradAccumulationWindow):
+                            ds_window.set_boundary(True)
+                        _sync(); _t0 = _time.perf_counter()
+                        # Per-tensor perturb: copy snap → add sign×eps × z(global_off+i).
+                        with torch.no_grad():
+                            for i, p in enumerate(expert_ps):
+                                p.data.copy_(restore_src_list[i], non_blocking=True)
+                                _flat_z_perturb(
+                                    p.data, sign * float(eps),
+                                    global_offset=int(grad_offsets[i]),
+                                    rng_seed=int(rng_seed), k=int(k),
                                 )
-                            return _scale_grad_inplace_with_pcg_z(
-                                raw_grad,
-                                sign_scale=_sign_scale,
-                                global_offset=_global_offset,
-                                rng_seed=int(rng_seed),
-                                k=_k,
+                        _sync(); _t1 = _time.perf_counter()
+                        handles = []
+                        loss_scale = (
+                            _loss_scale_for_backward(ds_engine)
+                            if use_engine_backward else 1.0
+                        )
+                        gas_scale = (
+                            _gas_scale_for_backward(ds_engine)
+                            if use_engine_backward else 1.0
+                        )
+                        sign_scale = sign * inv_step * inv_k * float(gas_scale) / float(loss_scale)
+                        scale_probe = None
+                        if _scale_probe_on and not _scale_probe_printed:
+                            scale_probe = {
+                                "captured": False,
+                                "loss_scale": float(loss_scale),
+                                "gas_scale": float(gas_scale),
+                                "inv_step": float(inv_step),
+                                "inv_k": float(inv_k),
+                                "sign_scale": float(sign_scale),
+                            }
+                        for hook_i, hook_param in enumerate(expert_ps):
+                            hook_global_offset = int(grad_offsets[hook_i])
+                            handles.append(
+                                _register_fd_grad_transform_hook(
+                                    hook_param,
+                                    sign_scale=sign_scale,
+                                    global_offset=hook_global_offset,
+                                    rng_seed=int(rng_seed),
+                                    k=int(k),
+                                    scale_probe=scale_probe,
+                                )
                             )
-
-                        handles.append(hook_param.register_hook(_scale_hook))
-                    _sync(); _t_hook = _time.perf_counter()
-                    try:
-                        if pipeline_engine is not None:
-                            if pipeline_microbatches is None:
-                                raise RuntimeError("pipeline FD missing cached microbatches")
-                            _pipeline_exec_batch(
-                                pipeline_engine,
-                                pipeline_microbatches,
-                                backward=True,
+                        for hook_param in nonexpert_params:
+                            handles.append(
+                                _register_fd_grad_transform_hook(
+                                    hook_param,
+                                    sign_scale=sign_scale,
+                                    global_offset=int(nonexpert_offsets[id(hook_param)]),
+                                    rng_seed=int(rng_seed),
+                                    k=int(k),
+                                    scale_probe=scale_probe,
+                                )
                             )
-                            _clear_pipeline_grads()
-                        else:
-                            if not _backward_inplace(
-                                forward_loss_fn,
-                                expert_ps,
-                                model_for_full_zero,
-                                preserve_expert_grad_storage=preserve_param_grad_storage,
-                            ):
-                                return None
-                    finally:
-                        for handle in handles:
-                            handle.remove()
-                        if not preserve_param_grad_storage:
-                            for p in expert_ps:
-                                p.grad = None
-                    _sync(); _t2 = _time.perf_counter()
-                    _tsum["perturb"] += (_t1 - _t0)
-                    _tsum["hook"]    += (_t_hook - _t1)
-                    _tsum["bwd"]     += (_t2 - _t_hook)
+                        _sync(); _t_hook = _time.perf_counter()
+                        try:
+                            bwd_context = (
+                                nullcontext()
+                                if is_last_backward
+                                else nonfinal_backward_context()
+                            )
+                            with bwd_context:
+                                _restore_anchor_rng_state(phase_rng_state)
+                                if pipeline_engine is not None:
+                                    if pipeline_microbatches is None:
+                                        raise RuntimeError("pipeline FD missing cached microbatches")
+                                    _pipeline_exec_batch(
+                                        pipeline_engine,
+                                        pipeline_microbatches,
+                                        backward=True,
+                                    )
+                                    _clear_pipeline_grads()
+                                elif schedule_backward_fn is not None:
+                                    _ok = schedule_backward_fn()
+                                    if not _ok:
+                                        return None
+                                else:
+                                    if not _backward_inplace(
+                                        forward_loss_fn,
+                                        expert_ps,
+                                        model_for_full_zero,
+                                        preserve_expert_grad_storage=preserve_param_grad_storage,
+                                        use_engine_backward=use_engine_backward,
+                                    ):
+                                        return None
+                        finally:
+                            for handle in handles:
+                                handle.remove()
+                            if not preserve_param_grad_storage:
+                                for p in expert_ps:
+                                    p.grad = None
+                        _sync(); _t2 = _time.perf_counter()
+                        if scale_probe is not None and not _scale_probe_printed:
+                            print(
+                                "[proposal] h_refresh_scale_probe "
+                                f"loss_scale={scale_probe.get('loss_scale', 1.0):.6g} "
+                                f"gas={scale_probe.get('gas_scale', 1.0):.6g} "
+                                f"inv_step={scale_probe.get('inv_step', 0.0):.6g} "
+                                f"inv_k={scale_probe.get('inv_k', 0.0):.6g} "
+                                f"sign_scale={scale_probe.get('sign_scale', 0.0):.6e} "
+                                f"raw_abs_mean={scale_probe.get('raw_abs_mean', 0.0):.6e} "
+                                f"scaled_abs_mean={scale_probe.get('scaled_abs_mean', 0.0):.6e}",
+                                flush=True,
+                            )
+                            _scale_probe_printed = True
+                        _tsum["perturb"] += (_t1 - _t0)
+                        _tsum["hook"]    += (_t_hook - _t1)
+                        _tsum["bwd"]     += (_t2 - _t_hook)
             if _timing_on:
                 _sync()
                 _t_done = _time.perf_counter()
@@ -1171,7 +1437,8 @@ def _compute_fd_fast_flat(
               f"{_tb.format_exc()}", flush=True)
         return None
     # NB: lp left in stale -εz state; caller's finally restores from snaps.
-    # grad_flat or grad_accum_views carry the signed running sum across the multi-batch loop.
+    # DeepSpeed-owned grad accumulation views carry the signed running sum
+    # across the multi-batch loop.
     # The caller takes the final abs + quantile build after dividing by the
     # success count. Sentinel non-None return signals success.
     for view in grad_accum_views:
@@ -1191,25 +1458,27 @@ def compute_hessian_finite_diff_core(
     group_size: int = 1,
     model_for_full_zero: Any = None,
     theta_snap_ref: Optional[List[torch.Tensor]] = None,
-    grad_flat: Optional[torch.Tensor] = None,
     grad_offsets: Optional[List[int]] = None,
     grad_accum_views: Optional[List[torch.Tensor]] = None,
+    ds_pass_base: int = 0,
+    ds_total_backward_passes: Optional[int] = None,
     pipeline_engine: Optional[Any] = None,
     pipeline_microbatches: Optional[List[Any]] = None,
+    schedule_backward_fn: Optional[Callable[[], bool]] = None,
+    final_grad_accum_boundary: bool = True,
+    phase_rng_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[List[torch.Tensor]]:
-    """Accumulate one finite-difference batch into caller-owned ``grad_flat``.
+    """Accumulate one finite-difference batch through the normal backward path.
 
-    The anchor caller provides ``grad_flat`` plus per-expert offsets and a
-    theta snapshot. Hooks scale each raw grad by deterministic PCG ``z`` before
-    PyTorch accumulates into ``grad_flat``. The removed per-tensor group
-    accumulator path is intentionally not available.
+    The anchor caller provides per-expert offsets and a theta snapshot. Hooks
+    scale each raw grad by deterministic PCG ``z`` before DeepSpeed's existing
+    grad handling consumes it. The removed per-tensor group accumulator path is
+    intentionally not available.
     """
     if not expert_ps or eps <= 0:
         return None
-    # Fast-flat dispatch: caller provides (grad_flat, grad_offsets,
-    # theta_snap_ref). lp stays per-tensor (no constraint on DS optimizer
-    # layout); grad gets a contiguous flat backing and hooks scale raw grads
-    # before they accumulate into it.
+    # Fast dispatch: lp stays per-tensor (no constraint on DS optimizer
+    # layout); hooks scale raw grads before the normal DS reducer sees them.
     if (grad_offsets is not None
             and theta_snap_ref is not None
             and grad_accum_views is not None
@@ -1223,16 +1492,20 @@ def compute_hessian_finite_diff_core(
             rng_seed=rng_seed,
             group_size=group_size,
             model_for_full_zero=model_for_full_zero,
-            grad_flat=grad_flat,
             grad_offsets=grad_offsets,
             restore_src_list=theta_snap_ref,
             grad_accum_views=grad_accum_views,
+            ds_pass_base=ds_pass_base,
+            ds_total_backward_passes=ds_total_backward_passes,
             pipeline_engine=pipeline_engine,
             pipeline_microbatches=pipeline_microbatches,
+            schedule_backward_fn=schedule_backward_fn,
+            final_grad_accum_boundary=final_grad_accum_boundary,
+            phase_rng_state=phase_rng_state,
         )
 
     raise RuntimeError(
-        "H-quantile anchor refresh requires resident grad_flat, grad_offsets, "
+        "H-quantile anchor refresh requires grad_offsets, "
         "theta_snap_ref, and Triton kernels"
     )
 
@@ -1249,15 +1522,19 @@ def compute_hessian_finite_diff(
     rng_seed: int = 0xBADCAFE,
     group_size: int = 1,
     theta_snap_ref: Optional[List[torch.Tensor]] = None,
-    grad_flat: Optional[torch.Tensor] = None,
     grad_offsets: Optional[List[int]] = None,
     grad_accum_views: Optional[List[torch.Tensor]] = None,
+    ds_pass_base: int = 0,
+    ds_total_backward_passes: Optional[int] = None,
+    final_grad_accum_boundary: bool = True,
+    phase_rng_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
-    """Run one central finite-difference batch into caller-owned ``grad_flat``.
+    """Run one central finite-difference batch into training grad storage.
 
     The public compatibility wrapper still builds the cached batch and routing
     freeze context. Actual H-quantile construction happens outside this module:
-    the caller averages ``grad_flat``, takes ``abs()``, and refreshes ``h_q``.
+    the caller averages the DS grad views, takes ``abs()``, and refreshes
+    ``h_q``.
     """
     di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
     m0 = model[0] if isinstance(model, (list, tuple)) else model
@@ -1274,58 +1551,39 @@ def compute_hessian_finite_diff(
             return None
         batch = None
     else:
-        # ---- Load batch ONCE (Common Random Numbers). ----
-        # Capture (tokens, labels, mask, attn, pos) once via get_batch then
-        # run a custom forward that bypasses forward_step_func's iterator
-        # advance. Caller may also pre-capture and inject via batch_override.
+        # ---- Load raw batch ONCE (Common Random Numbers). ----
+        # Replay the raw dataset item through forward_step_func on every
+        # +/- phase.  This preserves the normal GPT loss path
+        # (labels=labels, vocab-parallel CE, MoE loss) without advancing the
+        # shared iterator or hand-building a different loss graph.
         if batch_override is not None:
-            batch = batch_override
+            raw_batch = batch_override
         else:
             try:
-                from pretrain_gpt import get_batch as _get_batch_gpt
+                raw_batch = next(di) if di is not None else None
             except Exception as exc:
-                print(f"[proposal] finite_diff: cannot import get_batch: {exc}", flush=True)
-                return None
-            try:
-                batch = _get_batch_gpt(di)
-            except Exception as exc:
-                print(f"[proposal] finite_diff: get_batch failed: {exc}", flush=True)
+                print(f"[proposal] finite_diff: raw batch capture failed: {exc}", flush=True)
                 return None
 
     if pipeline_engine is None:
-        tokens, labels, loss_mask, attention_mask, position_ids = batch[:5]
-
-        # Build a closure that re-runs the model forward + LM loss on the
-        # cached batch. Mirrors Megatron's training forward.
-        import torch.nn.functional as F
-
         def _forward_loss() -> Tuple[torch.Tensor, Dict[str, Any]]:
-            out = m0(tokens, position_ids, attention_mask)
-            logits = out[0] if isinstance(out, tuple) else out
-            if logits is None or not torch.is_tensor(logits):
-                raise RuntimeError("finite_diff: model returned non-tensor")
-            if logits.dim() >= 2:
-                V = logits.size(-1)
-                flat_logits = logits.reshape(-1, V)
-            else:
-                flat_logits = logits
-            flat_labels = labels.reshape(-1) if labels is not None else None
-            if flat_labels is None:
-                raise RuntimeError("finite_diff: labels missing")
-            if loss_mask is not None and loss_mask.numel() == flat_logits.size(0):
-                per_tok = F.cross_entropy(
-                    flat_logits.float(),
-                    flat_labels,
-                    reduction="none",
-                )
-                denom = loss_mask.view(-1).float().sum().clamp_min(1.0)
-                loss = (per_tok * loss_mask.view(-1).float()).sum() / denom
-            else:
-                loss = F.cross_entropy(flat_logits.float(), flat_labels, reduction="mean")
-            return loss, {}
+            output_tensor, loss_func = forward_step_func(
+                _ReplayDataIterator(raw_batch),
+                m0,
+            )
+            loss, loss_dict = loss_func(output_tensor)
+            return loss, loss_dict
+
+        def _schedule_backward() -> bool:
+            return _schedule_backward_inplace(
+                forward_step_func=forward_step_func,
+                data_iterator=_ReplayDataIterator(raw_batch),
+                model=m0,
+            )
     else:
         def _forward_loss() -> Tuple[torch.Tensor, Dict[str, Any]]:
             raise RuntimeError("pipeline FD uses PipelineEngine schedules")
+        _schedule_backward = None
 
     # ---- Routing freeze setup ----
     from .routing_freeze import identify_gate_modules_safe
@@ -1345,6 +1603,9 @@ def compute_hessian_finite_diff(
                   "without routing freeze", flush=True)
         else:
             gates_for_freeze = gates
+
+    if phase_rng_state is None:
+        phase_rng_state = _capture_anchor_rng_state()
 
     # ---- eps resolution ----
     # Default: 1e-3, validated on tiny (4-layer 256d) and production
@@ -1372,9 +1633,13 @@ def compute_hessian_finite_diff(
         group_size=group_size,
         model_for_full_zero=model,
         theta_snap_ref=theta_snap_ref,
-        grad_flat=grad_flat,
         grad_offsets=grad_offsets,
         grad_accum_views=grad_accum_views,
+        ds_pass_base=ds_pass_base,
+        ds_total_backward_passes=ds_total_backward_passes,
         pipeline_engine=pipeline_engine,
         pipeline_microbatches=pipeline_microbatches,
+        schedule_backward_fn=_schedule_backward,
+        final_grad_accum_boundary=final_grad_accum_boundary,
+        phase_rng_state=phase_rng_state,
     )

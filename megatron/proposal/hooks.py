@@ -27,6 +27,10 @@ def proposal_record_loss(step: int, loss: Optional[float]) -> None:
     get_controller().record_loss(step, loss)
 
 
+def proposal_run_independent_oracle(model: Any, data_iterator: Any, iteration: int) -> None:
+    get_controller().run_independent_oracle(model, data_iterator, iteration)
+
+
 def proposal_vram_audit_iter_begin(step: int) -> None:
     get_controller().vram_audit_iter_begin(step)
 
@@ -60,6 +64,7 @@ __all__ = [
     "proposal_dispatch_post_iter",
     "proposal_wait_d2h_before_optimizer",
     "proposal_record_loss",
+    "proposal_run_independent_oracle",
     "proposal_vram_audit_iter_begin",
     "proposal_vram_audit_iter_end",
     "proposal_refresh_h_quantile",

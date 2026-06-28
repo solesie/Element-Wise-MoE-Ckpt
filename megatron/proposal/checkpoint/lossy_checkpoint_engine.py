@@ -176,6 +176,7 @@ class LossyCheckpointPipeline(
         )
         self._grad_score_lease = None
         self._score_linear_release_pending = False
+        self._current_global_step_for_selection = -1
         # Production reads H through the quantile table. In hessian mode the
         # single hot-path score is the configured abs-H Taylor policy.  Probe
         # and direct emission must use the same helper/LUT snapshot; group-dg,
@@ -603,6 +604,16 @@ class LossyCheckpointPipeline(
                 if coord is not None:
                     g_idx = coord[0]
                     opt_elem_offset = int(coord[1])
+                elif getattr(mapper, "mode", "") in (
+                    "megatron_float16",
+                    "unfused_fp16",
+                ):
+                    # These optimizers keep one FP32 master tensor plus Adam
+                    # state per low-precision parameter, not a shared flat
+                    # group. Treat each tracked tensor as its own local group
+                    # so the hot path still gets zero-copy p/m/v views.
+                    g_idx = len(buckets)
+                    opt_elem_offset = 0
             b = buckets.setdefault(g_idx, {
                 "names": [], "sizes": [], "m_refs": [], "v_refs": [],
                 "p_refs": [], "opt_offsets": [],
@@ -955,7 +966,17 @@ class LossyCheckpointPipeline(
                   f"hist_i64={mem_hist:.3f}MB -> "
                   f"total={mem_total:.1f}MB",
                   flush=True)
-            for grp in self._groups:
+            preview_groups = list(self._groups)
+            if len(preview_groups) > 16:
+                hidden = len(preview_groups) - 12
+                preview_groups = preview_groups[:8] + preview_groups[-4:]
+                print(
+                    f"[proposal] bf16_group detail truncated: "
+                    f"showing 12/{len(self._groups)} groups "
+                    f"({hidden} omitted)",
+                    flush=True,
+                )
+            for grp in preview_groups:
                 print(f"[proposal] bf16_group g_idx={grp['g_idx']}: "
                       f"n_tensors={len(grp['names'])}, "
                       f"total={grp['total']}, "
@@ -976,6 +997,7 @@ class LossyCheckpointPipeline(
         self._score_linear_release_pending = bool(
             lease is not None and getattr(lease, "has_leases", False)
         )
+        cache_grad_for_oracle = bool(use_grad and self._independent_oracle_wants_grad_cache())
         for grp in getattr(self, "_groups", ()) or ():
             grp["score_linear_flat"] = None
             if lease is None:
@@ -993,6 +1015,22 @@ class LossyCheckpointPipeline(
             )
             if isinstance(view, torch.Tensor):
                 grp["score_linear_flat"] = view
+                if cache_grad_for_oracle:
+                    grp["g_score_flat"] = view.detach().clone()
+
+    def _independent_oracle_wants_grad_cache(self) -> bool:
+        cfg = getattr(self, "proposal_config", None)
+        if cfg is None or not bool(getattr(cfg, "independent_oracle_enable", False)):
+            return False
+        step = int(getattr(self, "_current_global_step_for_selection", -1))
+        if step < 0:
+            return False
+        iters = tuple(int(x) for x in getattr(cfg, "independent_oracle_iters", ()) or ())
+        return not iters or step in iters
+
+    def clear_independent_oracle_grad_cache(self) -> None:
+        for grp in getattr(self, "_groups", ()) or ():
+            grp.pop("g_score_flat", None)
 
     def _release_score_linear_after_event(
         self,
@@ -1136,6 +1174,7 @@ class LossyCheckpointPipeline(
         """
         import time as _time
         _t0_entry = _time.perf_counter()
+        self._current_global_step_for_selection = int(global_step)
         device = next(self.model.parameters()).device
         group_size = max(1, int(self.group_size))
         _t0_dispatch_start = _time.perf_counter()

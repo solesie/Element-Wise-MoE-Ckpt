@@ -176,4 +176,34 @@ def add_proposal_args(parser):
     group.add_argument("--proposal-fault-log", type=str, default=None,
                        help="Path to append JSON-per-line fault records "
                             "(iter, pre_fault_loss, post_fault_loss, recover_time_s).")
+    group.add_argument("--proposal-independent-oracle-enable", action="store_true",
+                       help="Telemetry-only: run independent rollback oracle "
+                            "at selected iterations. This does not change the "
+                            "production selection/write path.")
+    group.add_argument("--proposal-independent-oracle-iters", type=str, default="",
+                       help="Comma-separated iterations for independent oracle "
+                            "measurement. Empty means every iteration.")
+    group.add_argument("--proposal-independent-oracle-log-dir", type=str, default=None,
+                       help="Directory for independent oracle JSONL outputs.")
+    group.add_argument("--proposal-independent-oracle-rank-sample", type=int,
+                       default=1048576,
+                       help="Per-rank element sample count for rank/mass oracle "
+                            "metrics. Default 1048576.")
+    group.add_argument("--proposal-independent-oracle-rank-sample-seed", type=int,
+                       default=20240625,
+                       help="Deterministic sample seed for independent oracle "
+                            "rank/mass metrics.")
+    group.add_argument("--proposal-independent-oracle-actual-batches", type=int,
+                       default=4,
+                       help="Number of validation batches used for paired actual "
+                            "rollback loss. Default 4.")
+    group.add_argument("--proposal-independent-oracle-hvp-batches", type=int,
+                       default=4,
+                       help="Number of the same validation batches used for HVP "
+                            "quadratic term. Default 4.")
+    group.add_argument("--proposal-independent-oracle-batch-seed", type=int,
+                       default=20240625,
+                       help="Telemetry metadata seed for paired oracle batches. "
+                            "Runs still use the normal deterministic validation "
+                            "iterator.")
     return parser
