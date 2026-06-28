@@ -1110,6 +1110,49 @@ std::string FdpStore::debug_read_lfsy(uint32_t layer_id, uint32_t expert_id,
                             "debug_read_lfsy");
 }
 
+size_t FdpStore::read_nefc_into(int64_t dst_addr, uint64_t dst_bytes) {
+    if (!open_) {
+        throw std::runtime_error("read_nefc_into: FDP session is not open");
+    }
+    const NefcEntry* entry = nefc_entry();
+    if (!entry->valid) {
+        throw std::runtime_error("read_nefc_into: NEFC entry is not valid");
+    }
+    return read_chunk_list_into(nefc_data_ring_, entry->chunks,
+                                entry->chunk_count, entry->logical_bytes,
+                                dst_addr, dst_bytes, "read_nefc_into");
+}
+
+size_t FdpStore::read_lfcs_into(uint32_t layer_id, uint32_t expert_id,
+                                int64_t dst_addr, uint64_t dst_bytes) {
+    if (!open_) {
+        throw std::runtime_error("read_lfcs_into: FDP session is not open");
+    }
+    const uint32_t slot = expert_slot(layer_id, expert_id);
+    const LfcsEntry* entry = lfcs_entry(slot);
+    if (!entry->valid) {
+        throw std::runtime_error("read_lfcs_into: LFCS entry is not valid");
+    }
+    return read_chunk_list_into(expert_data_ring_, entry->chunks,
+                                entry->chunk_count, entry->logical_bytes,
+                                dst_addr, dst_bytes, "read_lfcs_into");
+}
+
+size_t FdpStore::read_lfsy_into(uint32_t layer_id, uint32_t expert_id,
+                                int64_t dst_addr, uint64_t dst_bytes) {
+    if (!open_) {
+        throw std::runtime_error("read_lfsy_into: FDP session is not open");
+    }
+    const uint32_t slot = expert_slot(layer_id, expert_id);
+    const LfsyEntry* entry = lfsy_entry(slot);
+    if (!entry->valid) {
+        throw std::runtime_error("read_lfsy_into: LFSY entry is not valid");
+    }
+    return read_chunk_list_into(expert_data_ring_, entry->chunks,
+                                entry->chunk_count, entry->logical_tail,
+                                dst_addr, dst_bytes, "read_lfsy_into");
+}
+
 void FdpStore::validate_metadata_range(uint64_t slba, uint64_t nlb,
                                        const char* where) const {
     const uint64_t end = checked_range_end(slba, nlb, where);
@@ -1423,6 +1466,55 @@ std::string FdpStore::read_chunk_bytes(UcmdRing& ring,
     return out;
 }
 
+size_t FdpStore::read_chunk_list_into(UcmdRing& ring,
+                                      const FdpChunkId* chunks,
+                                      uint32_t chunk_count,
+                                      uint64_t logical_bytes,
+                                      int64_t dst_addr,
+                                      uint64_t dst_bytes,
+                                      const char* where) {
+    if (logical_bytes == 0) {
+        return 0;
+    }
+    if (chunks == nullptr || chunk_count == 0) {
+        throw std::invalid_argument(std::string(where) + ": empty chunks");
+    }
+    if ((dst_addr & 4095ll) != 0) {
+        throw std::invalid_argument(std::string(where) +
+                                    ": destination ptr not 4KiB-aligned");
+    }
+    const uint64_t read_bytes = round_up_u64(logical_bytes, ns_.lba_size);
+    if (read_bytes > dst_bytes) {
+        throw std::invalid_argument(std::string(where) +
+                                    ": destination buffer too small");
+    }
+    if ((read_bytes % ns_.lba_size) != 0) {
+        throw std::invalid_argument(std::string(where) +
+                                    ": read length not LBA-aligned");
+    }
+    const uint64_t capacity =
+        static_cast<uint64_t>(chunk_count) * cfg_.chunk_bytes;
+    if (read_bytes > capacity) {
+        throw std::invalid_argument(std::string(where) +
+                                    ": chunk list too small");
+    }
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(dst_addr);
+    uint64_t remaining = read_bytes;
+    for (uint32_t i = 0; i < chunk_count && remaining > 0; ++i) {
+        const uint64_t len = std::min<uint64_t>(cfg_.chunk_bytes, remaining);
+        if ((len % ns_.lba_size) != 0) {
+            throw std::invalid_argument(std::string(where) +
+                                        ": chunk read length not LBA-aligned");
+        }
+        const uint64_t slba = data_chunk_lba(chunks[i]);
+        raw_read_data(ring, base + static_cast<uint64_t>(i) * cfg_.chunk_bytes,
+                      slba, len / ns_.lba_size, where);
+        remaining -= len;
+    }
+    return static_cast<size_t>(logical_bytes);
+}
+
 uint32_t FdpStore::expert_slot(uint32_t layer_id, uint32_t expert_id) const {
     if (cfg_.experts_per_layer == 0 || cfg_.expert_slots == 0) {
         throw std::runtime_error(
@@ -1604,6 +1696,78 @@ MetadataSummary FdpStore::debug_read_metadata_summary() {
                 if (lfsy->valid) ++out.lfsy_valid_count;
             }
         }
+    }
+    return out;
+}
+
+NefcEntrySnapshot FdpStore::read_nefc_entry() {
+    if (!open_) {
+        throw std::runtime_error("read_nefc_entry: FDP session is not open");
+    }
+    const NefcEntry* entry = nefc_entry();
+    NefcEntrySnapshot snap;
+    snap.valid = entry->valid != 0;
+    snap.rank = entry->rank;
+    snap.iter = entry->iter;
+    snap.logical_bytes = entry->logical_bytes;
+    snap.chunk_count = entry->chunk_count;
+    return snap;
+}
+
+std::vector<LfcsEntrySnapshot> FdpStore::read_lfcs_entries() {
+    if (!open_) {
+        throw std::runtime_error("read_lfcs_entries: FDP session is not open");
+    }
+    std::vector<LfcsEntrySnapshot> out;
+    out.reserve(cfg_.expert_slots);
+    for (uint32_t slot = 0; slot < cfg_.expert_slots; ++slot) {
+        const LfcsEntry* entry = lfcs_entry(slot);
+        LfcsEntrySnapshot snap;
+        snap.valid = entry->valid != 0;
+        snap.slot = slot;
+        snap.rank = entry->rank;
+        snap.layer_id = entry->layer_id;
+        snap.expert_id = entry->expert_id;
+        snap.generation = entry->generation;
+        snap.iter = entry->iter;
+        snap.logical_bytes = entry->logical_bytes;
+        snap.chunk_count = entry->chunk_count;
+        const uint32_t chunk_count =
+            std::min<uint32_t>(entry->chunk_count, kMaxChunksLfcs);
+        snap.chunks.reserve(chunk_count);
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            snap.chunks.push_back(entry->chunks[i]);
+        }
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+std::vector<LfsyEntrySnapshot> FdpStore::read_lfsy_entries() {
+    if (!open_) {
+        throw std::runtime_error("read_lfsy_entries: FDP session is not open");
+    }
+    std::vector<LfsyEntrySnapshot> out;
+    out.reserve(cfg_.expert_slots);
+    for (uint32_t slot = 0; slot < cfg_.expert_slots; ++slot) {
+        const LfsyEntry* entry = lfsy_entry(slot);
+        LfsyEntrySnapshot snap;
+        snap.valid = entry->valid != 0;
+        snap.slot = slot;
+        snap.rank = entry->rank;
+        snap.layer_id = entry->layer_id;
+        snap.expert_id = entry->expert_id;
+        snap.generation = entry->generation;
+        snap.start_iter = entry->start_iter;
+        snap.logical_tail = entry->logical_tail;
+        snap.chunk_count = entry->chunk_count;
+        const uint32_t chunk_count =
+            std::min<uint32_t>(entry->chunk_count, kMaxChunksLfsy);
+        snap.chunks.reserve(chunk_count);
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            snap.chunks.push_back(entry->chunks[i]);
+        }
+        out.push_back(std::move(snap));
     }
     return out;
 }

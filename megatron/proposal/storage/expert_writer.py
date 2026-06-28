@@ -1732,57 +1732,32 @@ class ExpertState:
 # ----------------------------------------------------------------------------
 # Recovery reader
 # ----------------------------------------------------------------------------
-def read_expert_state(
-    expert_dir: Path,
+def read_expert_state_from_blobs(
+    lfcl_blob: Optional[torch.Tensor],
+    lfsy_blob: Optional[torch.Tensor],
+    *,
     layer: int,
     expert: int,
+    source: str = "expert_state",
 ) -> Dict[str, Any]:
-    """Reconstruct one expert's state at the end of its current lossy FC
-    window. Returns a payload compatible with the recovery pipeline:
-
-        {"_rolling_step": int,
-         "{tname}:param":    fp32 tensor of shape meta["shape"],
-         "{tname}:exp_avg":  ...,
-         "{tname}:exp_avg_sq": ...}
-
-    Algorithm:
-      1. Read LFCL and LFSY at most once each through the C++ read helper.
-      2. Load LFCL into dense flat CPU tensors through a C++ memcpy helper.
-      3. Replay LFSY newest-to-oldest in C++ using a seen bitset, so each
-         element keeps only its latest record.
-      4. Slice the concatenated buffers back into per-tensor views.
-    """
-    expert_dir = Path(expert_dir)
-    lossless_path = expert_dir / _lossless_name(layer, expert)
-    lossy_path = expert_dir / _lossy_name(layer, expert)
-
-    def _read_full_file(path: Path, nbytes: int) -> torch.Tensor:
-        from .proposal_io import read_file_aligned
-
-        return read_file_aligned(path, int(nbytes))
+    """Reconstruct one expert from already-read LFCL/LFSY byte blobs."""
 
     def _header_bytes(blob: torch.Tensor) -> bytes:
         n = min(int(blob.numel()), int(HEADER_BLOCK_BYTES))
         return bytes(blob.narrow(0, 0, n).numpy().tobytes())
 
-    # ------------------------------------------------------------------
-    # 1) LFCL compaction baseline → dense (param, m, v) flat buffers.
-    # All file IO goes through proposal_io's C++ read helpers.
-    # ------------------------------------------------------------------
     from .proposal_io import (
-        file_size as _fsize,
         load_lfcl_payload_interleaved,
         replay_lfsy_log_into_dense,
     )
 
-    lfsy_blob: Optional[torch.Tensor] = None
-    lossless_size = _fsize(lossless_path)
-    if lossless_size >= 0:
-        lfcl_blob = _read_full_file(lossless_path, int(lossless_size))
+    if lfcl_blob is not None and int(lfcl_blob.numel()) > 0:
         header_block = _header_bytes(lfcl_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFCL:
-            raise ValueError(f"expected LFCL in {lossless_path}, got {magic!r}")
+            raise ValueError(
+                f"expected LFCL in {source} L{layer}/E{expert}, got {magic!r}"
+            )
         tensors_meta = meta["tensors"]
         total_numel = int(meta["total_numel"])
         p_flat = torch.empty(total_numel, dtype=torch.float32)
@@ -1801,12 +1776,9 @@ def read_expert_state(
             v_flat=v_flat,
         )
         base_step = int(meta.get("step", 0))
-    else:
-        # No LFCL compaction baseline yet — read schema from LFSY header only.
-        lossy_size_probe = _fsize(lossy_path)
-        if lossy_size_probe < 0:
-            return {"_rolling_step": 0}
-        lfsy_blob = _read_full_file(lossy_path, int(lossy_size_probe))
+    elif lfsy_blob is not None and int(lfsy_blob.numel()) > 0:
+        # No LFCL compaction baseline yet: recover schema from LFSY header and
+        # seed dense tensors with zeros before replaying sparse records.
         header_block = _header_bytes(lfsy_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
@@ -1817,15 +1789,11 @@ def read_expert_state(
         m_flat = torch.zeros(total_numel, dtype=torch.float32)
         v_flat = torch.zeros(total_numel, dtype=torch.float32)
         base_step = 0
+    else:
+        return {"_rolling_step": 0}
 
-    # ------------------------------------------------------------------
-    # 2) Replay lossy FC append log (if present).
-    # ------------------------------------------------------------------
     max_step = base_step
-    lossy_size = _fsize(lossy_path)
-    if lossy_size >= 0:
-        if lfsy_blob is None:
-            lfsy_blob = _read_full_file(lossy_path, int(lossy_size))
+    if lfsy_blob is not None and int(lfsy_blob.numel()) > 0:
         header_block = _header_bytes(lfsy_blob)
         magic, _ver, _meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
@@ -1840,9 +1808,6 @@ def read_expert_state(
         if int(replay.get("max_step", 0)) > max_step:
             max_step = int(replay["max_step"])
 
-    # ------------------------------------------------------------------
-    # 3) Slice flat buffers back into per-tensor views.
-    # ------------------------------------------------------------------
     payload: Dict[str, Any] = {"_rolling_step": int(max_step)}
     cursor = 0
     for entry in tensors_meta:
@@ -1854,3 +1819,33 @@ def read_expert_state(
         payload[f"{tname}:exp_avg_sq"] = v_flat.narrow(0, cursor, numel).view(shape)
         cursor += numel
     return payload
+
+
+def read_expert_state(
+    expert_dir: Path,
+    layer: int,
+    expert: int,
+) -> Dict[str, Any]:
+    """Reconstruct one expert's state from its filesystem LFCL/LFSY pair."""
+    expert_dir = Path(expert_dir)
+    lossless_path = expert_dir / _lossless_name(layer, expert)
+    lossy_path = expert_dir / _lossy_name(layer, expert)
+
+    from .proposal_io import file_size as _fsize, read_file_aligned
+
+    lfcl_blob: Optional[torch.Tensor] = None
+    lfsy_blob: Optional[torch.Tensor] = None
+    lossless_size = _fsize(lossless_path)
+    if lossless_size >= 0:
+        lfcl_blob = read_file_aligned(lossless_path, int(lossless_size))
+    lossy_size = _fsize(lossy_path)
+    if lossy_size >= 0:
+        lfsy_blob = read_file_aligned(lossy_path, int(lossy_size))
+
+    return read_expert_state_from_blobs(
+        lfcl_blob,
+        lfsy_blob,
+        layer=int(layer),
+        expert=int(expert),
+        source=str(expert_dir),
+    )

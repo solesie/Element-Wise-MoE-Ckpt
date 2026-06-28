@@ -174,6 +174,40 @@ def alloc_pinned_uint8_sector_aligned(nbytes: int) -> torch.Tensor:
     return t
 
 
+def alloc_cpu_uint8_sector_aligned(
+    nbytes: int,
+    *,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    """CPU uint8 buffer whose base ptr and length are both 4 KiB-aligned.
+
+    FDP recovery reads directly into this buffer from raw NVMe. It does not
+    require CUDA pinned memory, which keeps CPU-only smoke/recovery paths
+    usable on systems without a GPU.
+    """
+    n = int(nbytes)
+    padded = _round_up_sector(n)
+    try:
+        over = torch.empty(
+            padded + SECTOR_BYTES - 1,
+            dtype=torch.uint8,
+            pin_memory=bool(pin_memory),
+        )
+    except RuntimeError:
+        if pin_memory:
+            over = torch.empty(padded + SECTOR_BYTES - 1, dtype=torch.uint8)
+        else:
+            raise
+    base = int(over.data_ptr())
+    misalign = base & (SECTOR_BYTES - 1)
+    skip = 0 if misalign == 0 else (SECTOR_BYTES - misalign)
+    t = over.narrow(0, skip, padded)
+    assert (int(t.data_ptr()) & (SECTOR_BYTES - 1)) == 0, "aligned slice failed"
+    if padded > n:
+        t[n:].zero_()
+    return t
+
+
 def scatter_lossy_records_to_dense_by_intervals(
     aos_u8: torch.Tensor,
     record_byte_offset: int,
@@ -251,6 +285,61 @@ def is_binary_format(path: Path) -> bool:
     return bytes(blob.narrow(0, 0, len(MAGIC)).numpy().tobytes()) == MAGIC
 
 
+def load_binary_blob(
+    blob: torch.Tensor,
+    device: Optional[torch.device] = None,
+    *,
+    source: str = "<blob>",
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Parse one in-memory PRPTENS object. Returns (tensor_dict, scalars)."""
+    if blob.device.type != "cpu" or blob.dtype != torch.uint8:
+        raise ValueError(f"load_binary_blob: {source} must be a CPU uint8 tensor")
+    if not blob.is_contiguous():
+        raise ValueError(f"load_binary_blob: {source} must be contiguous")
+    got = int(blob.numel())
+    if got < HEADER_BLOCK_BYTES:
+        raise ValueError(f"load_binary_blob: header too short in {source}")
+    header_block = bytes(
+        blob.narrow(0, 0, min(int(blob.numel()), HEADER_BLOCK_BYTES))
+        .numpy()
+        .tobytes()
+    )
+    if header_block[:len(MAGIC)] != MAGIC:
+        raise ValueError(
+            f"load_binary_blob: bad magic in {source}; expected {MAGIC!r}")
+    version, header_len = struct.unpack("<II", header_block[8:16])
+    if version != VERSION:
+        raise ValueError(
+            "load_binary_blob: unsupported version "
+            f"{version} in {source} (expected {VERSION})"
+        )
+    header = json.loads(header_block[16:16 + header_len].decode("utf-8"))
+    entries = header["entries"]
+    scalars: Dict[str, Any] = dict(header.get("scalars", {}))
+    out: Dict[str, torch.Tensor] = {}
+    for e in entries:
+        off = int(e["offset"])
+        shape = tuple(int(x) for x in e["shape"])
+        dtype_str = e["dtype"]
+        nbytes = int(e["nbytes"])
+        data_off = HEADER_BLOCK_BYTES + off
+        if data_off < 0 or data_off + nbytes > int(blob.numel()):
+            raise ValueError(
+                f"load_binary_blob: truncated entry {e['name']!r} in {source}"
+            )
+        dtype = _STR_TO_TORCH_DTYPE.get(dtype_str)
+        if dtype is None:
+            raise ValueError(
+                f"load_binary_blob: no torch dtype mapping for {dtype_str!r}"
+            )
+        raw_u8 = blob.narrow(0, data_off, nbytes)
+        t = raw_u8.view(dtype).clone().view(shape)
+        if device is not None:
+            t = t.to(device)
+        out[e["name"]] = t
+    return out, scalars
+
+
 def load_binary(
     path: Path, device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -264,44 +353,7 @@ def load_binary(
     if nbytes_total < 16:
         raise ValueError(f"load_binary: header too short in {path}")
     blob = read_file_aligned(path_s, nbytes_total)
-    got = int(blob.numel())
-    if got < HEADER_BLOCK_BYTES:
-        raise ValueError(f"load_binary: header too short in {path}")
-    if got < nbytes_total:
-        blob = blob.narrow(0, 0, got)
-    header_block = bytes(
-        blob.narrow(0, 0, min(int(blob.numel()), HEADER_BLOCK_BYTES))
-        .numpy()
-        .tobytes()
-    )
-    if header_block[:len(MAGIC)] != MAGIC:
-        raise ValueError(
-            f"load_binary: bad magic in {path}; expected {MAGIC!r}")
-    version, header_len = struct.unpack("<II", header_block[8:16])
-    if version != VERSION:
-        raise ValueError(
-            f"load_binary: unsupported version {version} (expected {VERSION})")
-    header = json.loads(header_block[16:16 + header_len].decode("utf-8"))
-    entries = header["entries"]
-    scalars: Dict[str, Any] = dict(header.get("scalars", {}))
-    out: Dict[str, torch.Tensor] = {}
-    for e in entries:
-        off = int(e["offset"])
-        shape = tuple(int(x) for x in e["shape"])
-        dtype_str = e["dtype"]
-        nbytes = int(e["nbytes"])
-        data_off = HEADER_BLOCK_BYTES + off
-        if data_off < 0 or data_off + nbytes > int(blob.numel()):
-            raise ValueError(f"load_binary: truncated entry {e['name']!r} in {path}")
-        dtype = _STR_TO_TORCH_DTYPE.get(dtype_str)
-        if dtype is None:
-            raise ValueError(f"load_binary: no torch dtype mapping for {dtype_str!r}")
-        raw_u8 = blob.narrow(0, data_off, nbytes)
-        t = raw_u8.view(dtype).clone().view(shape)
-        if device is not None:
-            t = t.to(device)
-        out[e["name"]] = t
-    return out, scalars
+    return load_binary_blob(blob, device=device, source=path_s)
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +859,124 @@ def fdp_debug_read_lfsy_entries() -> List[Dict[str, Any]]:
     if backend_kind() != "fdp":
         return []
     return [dict(entry) for entry in _get_fdp().debug_read_lfsy_entries()]
+
+
+def fdp_recovery_entries() -> Dict[str, Any]:
+    """Return the latest FDP metadata entries needed by recovery."""
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_recovery_entries requires PROPOSAL_IO_BACKEND=fdp")
+    raw = dict(_get_fdp().recovery_entries())
+    raw["nefc"] = dict(raw.get("nefc", {}))
+    raw["lfcs"] = [dict(entry) for entry in raw.get("lfcs", [])]
+    raw["lfsy"] = [dict(entry) for entry in raw.get("lfsy", [])]
+    return raw
+
+
+def _fdp_read_object_blob(
+    logical_bytes: int,
+    read_fn,
+    *,
+    source: str,
+) -> torch.Tensor:
+    logical = int(logical_bytes)
+    if logical <= 0:
+        return torch.empty(0, dtype=torch.uint8)
+    padded = _round_up_sector(logical)
+    buf = alloc_cpu_uint8_sector_aligned(padded)
+    _require_cpu_aligned_buffer(
+        buf,
+        where=source,
+        total_padded=int(padded),
+    )
+    got = int(read_fn(int(buf.data_ptr()), int(padded)))
+    if got < 0 or got > padded:
+        raise RuntimeError(f"{source}: invalid read byte count {got}")
+    return buf.narrow(0, 0, int(got))
+
+
+def fdp_read_nefc_blob(logical_bytes: Optional[int] = None) -> torch.Tensor:
+    """Read the latest NEFC PRPTENS object from FDP chunks."""
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_read_nefc_blob requires PROPOSAL_IO_BACKEND=fdp")
+    if logical_bytes is None:
+        entry = fdp_recovery_entries()["nefc"]
+        if not bool(entry.get("valid", False)):
+            raise RuntimeError("fdp_read_nefc_blob: NEFC entry is not valid")
+        logical_bytes = int(entry["logical_bytes"])
+    fdp = _get_fdp()
+    return _fdp_read_object_blob(
+        int(logical_bytes),
+        fdp.read_nefc_into,
+        source="fdp_read_nefc_blob",
+    )
+
+
+def fdp_read_lfcs_blob(
+    layer: int,
+    expert: int,
+    logical_bytes: Optional[int] = None,
+) -> torch.Tensor:
+    """Read one LFCS/LFCL baseline object from FDP chunks."""
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_read_lfcs_blob requires PROPOSAL_IO_BACKEND=fdp")
+    if logical_bytes is None:
+        entries = fdp_recovery_entries()["lfcs"]
+        match = next(
+            (
+                e for e in entries
+                if bool(e.get("valid", False))
+                and int(e.get("layer_id", -1)) == int(layer)
+                and int(e.get("expert_id", -1)) == int(expert)
+            ),
+            None,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"fdp_read_lfcs_blob: LFCS entry missing for L{layer}/E{expert}"
+            )
+        logical_bytes = int(match["logical_bytes"])
+    fdp = _get_fdp()
+    return _fdp_read_object_blob(
+        int(logical_bytes),
+        lambda addr, nbytes: fdp.read_lfcs_into(
+            int(layer), int(expert), int(addr), int(nbytes)
+        ),
+        source=f"fdp_read_lfcs_blob(L{int(layer)}/E{int(expert)})",
+    )
+
+
+def fdp_read_lfsy_blob(
+    layer: int,
+    expert: int,
+    logical_bytes: Optional[int] = None,
+) -> torch.Tensor:
+    """Read one LFSY append log object from FDP chunks."""
+    if backend_kind() != "fdp":
+        raise RuntimeError("fdp_read_lfsy_blob requires PROPOSAL_IO_BACKEND=fdp")
+    if logical_bytes is None:
+        entries = fdp_recovery_entries()["lfsy"]
+        match = next(
+            (
+                e for e in entries
+                if bool(e.get("valid", False))
+                and int(e.get("layer_id", -1)) == int(layer)
+                and int(e.get("expert_id", -1)) == int(expert)
+            ),
+            None,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"fdp_read_lfsy_blob: LFSY entry missing for L{layer}/E{expert}"
+            )
+        logical_bytes = int(match["logical_tail"])
+    fdp = _get_fdp()
+    return _fdp_read_object_blob(
+        int(logical_bytes),
+        lambda addr, nbytes: fdp.read_lfsy_into(
+            int(layer), int(expert), int(addr), int(nbytes)
+        ),
+        source=f"fdp_read_lfsy_blob(L{int(layer)}/E{int(expert)})",
+    )
 
 
 def fdp_debug_raw_write_read_smoke() -> bool:

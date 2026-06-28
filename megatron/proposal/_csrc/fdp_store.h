@@ -103,6 +103,27 @@ struct MetadataSummary {
     uint32_t lfsy_valid_count = 0;
 };
 
+struct NefcEntrySnapshot {
+    bool valid = false;
+    uint32_t rank = 0;
+    uint64_t iter = 0;
+    uint64_t logical_bytes = 0;
+    uint32_t chunk_count = 0;
+};
+
+struct LfcsEntrySnapshot {
+    bool valid = false;
+    uint32_t slot = 0;
+    uint32_t rank = 0;
+    uint32_t layer_id = 0;
+    uint32_t expert_id = 0;
+    uint64_t generation = 0;
+    uint64_t iter = 0;
+    uint64_t logical_bytes = 0;
+    uint32_t chunk_count = 0;
+    std::vector<FdpChunkId> chunks;
+};
+
 struct LfsyEntrySnapshot {
     bool valid = false;
     uint32_t slot = 0;
@@ -209,8 +230,16 @@ public:
 
     FdpStatsSnapshot stats() const;
     MetadataSummary debug_read_metadata_summary();
+    NefcEntrySnapshot read_nefc_entry();
+    std::vector<LfcsEntrySnapshot> read_lfcs_entries();
+    std::vector<LfsyEntrySnapshot> read_lfsy_entries();
     std::vector<LfsyEntrySnapshot> debug_read_lfsy_entries();
     bool debug_raw_write_read_smoke();
+    size_t read_nefc_into(int64_t dst_addr, uint64_t dst_bytes);
+    size_t read_lfcs_into(uint32_t layer_id, uint32_t expert_id,
+                          int64_t dst_addr, uint64_t dst_bytes);
+    size_t read_lfsy_into(uint32_t layer_id, uint32_t expert_id,
+                          int64_t dst_addr, uint64_t dst_bytes);
     std::string debug_read_nefc(uint64_t offset, uint64_t nbytes);
     std::string debug_read_lfcs(uint32_t layer_id, uint32_t expert_id,
                                 uint64_t offset, uint64_t nbytes);
@@ -256,6 +285,13 @@ private:
                                  uint64_t offset,
                                  uint64_t nbytes,
                                  const char* where);
+    size_t read_chunk_list_into(UcmdRing& ring,
+                                const FdpChunkId* chunks,
+                                uint32_t chunk_count,
+                                uint64_t logical_bytes,
+                                int64_t dst_addr,
+                                uint64_t dst_bytes,
+                                const char* where);
     uint32_t expert_slot(uint32_t layer_id, uint32_t expert_id) const;
     void stamp_header_into_pinned(int64_t pinned_addr,
                                   const std::string& header) const;
