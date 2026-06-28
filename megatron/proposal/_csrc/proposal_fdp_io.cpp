@@ -32,6 +32,16 @@ py::dict stats_to_dict(const proposal::fdp::FdpStatsSnapshot& s) {
     d["num_moe_layers"] = s.num_moe_layers;
     d["experts_per_layer"] = s.experts_per_layer;
     d["expert_slots"] = s.expert_slots;
+    d["dp_rank"] = s.dp_rank;
+    d["dp_size"] = s.dp_size;
+    d["pp_rank"] = s.pp_rank;
+    d["pp_size"] = s.pp_size;
+    d["ep_rank"] = s.ep_rank;
+    d["ep_size"] = s.ep_size;
+    d["nefc_shard_index"] = s.nefc_shard_index;
+    d["nefc_shard_count"] = s.nefc_shard_count;
+    d["expert_id_base"] = s.expert_id_base;
+    d["expert_ids_global"] = s.expert_ids_global;
     d["nefc_qd"] = s.nefc_qd;
     d["expert_qd"] = s.expert_qd;
     d["metadata_qd"] = s.metadata_qd;
@@ -61,6 +71,8 @@ py::dict summary_to_dict(const proposal::fdp::MetadataSummary& s) {
     d["nefc_iter"] = s.nefc_iter;
     d["nefc_logical_bytes"] = s.nefc_logical_bytes;
     d["nefc_chunk_count"] = s.nefc_chunk_count;
+    d["nefc_shard_count"] = s.nefc_shard_count;
+    d["nefc_valid_count"] = s.nefc_valid_count;
     d["lfcs_valid_count"] = s.lfcs_valid_count;
     d["lfcs_total_chunks"] = s.lfcs_total_chunks;
     d["lfcs_max_chunk_count"] = s.lfcs_max_chunk_count;
@@ -77,6 +89,50 @@ py::dict batch_stats_to_dict(const proposal::fdp::UcmdRingBatchStats& s) {
     d["submit_lifetime_ns"] = s.submit_lifetime_ns;
     d["submit_lifetime_ms"] =
         static_cast<double>(s.submit_lifetime_ns) / 1000000.0;
+    return d;
+}
+
+py::dict nefc_entry_to_dict(const proposal::fdp::NefcEntrySnapshot& entry) {
+    py::dict d;
+    d["valid"] = entry.valid;
+    d["shard_index"] = entry.shard_index;
+    d["rank"] = entry.rank;
+    d["dp_rank"] = entry.dp_rank;
+    d["pp_rank"] = entry.pp_rank;
+    d["ep_rank"] = entry.ep_rank;
+    d["iter"] = entry.iter;
+    d["logical_bytes"] = entry.logical_bytes;
+    d["chunk_count"] = entry.chunk_count;
+    return d;
+}
+
+py::dict lfcs_entry_to_dict(const proposal::fdp::LfcsEntrySnapshot& entry) {
+    py::dict d;
+    d["valid"] = entry.valid;
+    d["slot"] = entry.slot;
+    d["rank"] = entry.rank;
+    d["layer_id"] = entry.layer_id;
+    d["expert_id"] = entry.expert_id;
+    d["generation"] = entry.generation;
+    d["iter"] = entry.iter;
+    d["logical_bytes"] = entry.logical_bytes;
+    d["chunk_count"] = entry.chunk_count;
+    d["chunks"] = entry.chunks;
+    return d;
+}
+
+py::dict lfsy_entry_to_dict(const proposal::fdp::LfsyEntrySnapshot& entry) {
+    py::dict d;
+    d["valid"] = entry.valid;
+    d["slot"] = entry.slot;
+    d["rank"] = entry.rank;
+    d["layer_id"] = entry.layer_id;
+    d["expert_id"] = entry.expert_id;
+    d["generation"] = entry.generation;
+    d["start_iter"] = entry.start_iter;
+    d["logical_tail"] = entry.logical_tail;
+    d["chunk_count"] = entry.chunk_count;
+    d["chunks"] = entry.chunks;
     return d;
 }
 
@@ -261,21 +317,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         }
         py::list out;
         for (const auto& entry : entries) {
-            py::dict d;
-            d["valid"] = entry.valid;
-            d["slot"] = entry.slot;
-            d["rank"] = entry.rank;
-            d["layer_id"] = entry.layer_id;
-            d["expert_id"] = entry.expert_id;
-            d["generation"] = entry.generation;
-            d["start_iter"] = entry.start_iter;
-            d["logical_tail"] = entry.logical_tail;
-            d["chunk_count"] = entry.chunk_count;
-            d["chunks"] = entry.chunks;
-            out.append(d);
+            out.append(lfsy_entry_to_dict(entry));
         }
         return out;
     });
+    m.def("recovery_entries", []() {
+        fdp::NefcEntrySnapshot nefc;
+        std::vector<fdp::NefcEntrySnapshot> nefc_entries;
+        std::vector<fdp::LfcsEntrySnapshot> lfcs;
+        std::vector<fdp::LfsyEntrySnapshot> lfsy;
+        {
+            py::gil_scoped_release rel;
+            nefc = fdp::global_store().read_nefc_entry();
+            nefc_entries = fdp::global_store().read_nefc_entries();
+            lfcs = fdp::global_store().read_lfcs_entries();
+            lfsy = fdp::global_store().read_lfsy_entries();
+        }
+        py::list nefc_out;
+        for (const auto& entry : nefc_entries) {
+            nefc_out.append(nefc_entry_to_dict(entry));
+        }
+        py::list lfcs_out;
+        for (const auto& entry : lfcs) {
+            lfcs_out.append(lfcs_entry_to_dict(entry));
+        }
+        py::list lfsy_out;
+        for (const auto& entry : lfsy) {
+            lfsy_out.append(lfsy_entry_to_dict(entry));
+        }
+        py::dict d;
+        d["nefc"] = nefc_entry_to_dict(nefc);
+        d["nefc_shards"] = nefc_out;
+        d["lfcs"] = lfcs_out;
+        d["lfsy"] = lfsy_out;
+        return d;
+    });
+    m.def("read_nefc_into", [](int64_t dst_addr, uint64_t dst_bytes) {
+        py::gil_scoped_release rel;
+        return fdp::global_store().read_nefc_into(dst_addr, dst_bytes);
+    }, py::arg("dst_addr"), py::arg("dst_bytes"));
+    m.def("read_nefc_shard_into", [](uint32_t shard_index,
+                                     int64_t dst_addr,
+                                     uint64_t dst_bytes) {
+        py::gil_scoped_release rel;
+        return fdp::global_store().read_nefc_shard_into(
+            shard_index, dst_addr, dst_bytes);
+    }, py::arg("shard_index"), py::arg("dst_addr"), py::arg("dst_bytes"));
+    m.def("read_lfcs_into", [](uint32_t layer_id, uint32_t expert_id,
+                               int64_t dst_addr, uint64_t dst_bytes) {
+        py::gil_scoped_release rel;
+        return fdp::global_store().read_lfcs_into(
+            layer_id, expert_id, dst_addr, dst_bytes);
+    }, py::arg("layer_id"), py::arg("expert_id"),
+       py::arg("dst_addr"), py::arg("dst_bytes"));
+    m.def("read_lfsy_into", [](uint32_t layer_id, uint32_t expert_id,
+                               int64_t dst_addr, uint64_t dst_bytes) {
+        py::gil_scoped_release rel;
+        return fdp::global_store().read_lfsy_into(
+            layer_id, expert_id, dst_addr, dst_bytes);
+    }, py::arg("layer_id"), py::arg("expert_id"),
+       py::arg("dst_addr"), py::arg("dst_bytes"));
     m.def("debug_raw_write_read_smoke", []() {
         py::gil_scoped_release rel;
         return fdp::global_store().debug_raw_write_read_smoke();
