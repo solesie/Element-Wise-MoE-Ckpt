@@ -78,7 +78,6 @@ class LossyRecordWriteInputs:
     tau_h_epoch: int = -1
     tau_source_step: int = -1
     tau_apply_from_step: int = -1
-    tau_lagged: bool = False
     tau_lr_over_bc1: float = 0.0
     direct_emission_enabled: bool = False
     direct_record_cursor: Optional[torch.Tensor] = None
@@ -103,6 +102,7 @@ class LossyRecordWriteInputs:
     age2bit_words: Optional[torch.Tensor] = None
     ehat_geom_lut: Optional[torch.Tensor] = None
     score_policy_id: int = 0
+    lfcl_fired_epoch: Optional[torch.Tensor] = None
 
 
 class LossyRecordWriter:
@@ -243,6 +243,7 @@ if _HAS_TRITON:
         total_th_ptr,
         adam_scalar_ptr,
         step_ptr,
+        lfcl_fired_epoch_ptr,
         record_out_i32_ptr,
         segment_entry_indices_ptr,
         segment_entry_counts_ptr,
@@ -261,6 +262,7 @@ if _HAS_TRITON:
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
         USE_ADAM_SCALAR_PTR: tl.constexpr,
+        HAS_LFCL_FIRED_MASK: tl.constexpr,
         WORKER_COUNT: tl.constexpr,
     ):
         BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
@@ -287,6 +289,15 @@ if _HAS_TRITON:
             entry_group_count = tl.load(entry_group_count_ptr + entry_id)
             entry_t_off = tl.load(entry_t_off_ptr + entry_id)
             expert_idx = tl.load(entry_expert_idx_ptr + entry_id)
+            step_value = tl.load(step_ptr).to(tl.int32)
+            expert_fired = tl.full((), False, tl.int1)
+            if HAS_LFCL_FIRED_MASK:
+                fired_epoch = tl.load(
+                    lfcl_fired_epoch_ptr + expert_idx,
+                    mask=expert_idx >= 0,
+                    other=-1,
+                )
+                expert_fired = fired_epoch == step_value
             expert_blob_byte_off = tl.load(aos_layout_offset_ptr + expert_idx)
             expert_capacity = tl.load(aos_layout_capacity_ptr + expert_idx)
             segment_lo = tl.cast(segment_byte_off, tl.int64)
@@ -314,6 +325,7 @@ if _HAS_TRITON:
                 (gid_local_2d < entry_group_count) & entry_active,
                 (BLOCK_SIZE,),
             )
+            selectable_mask = elem_mask & (~expert_fired)
 
             m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
             linear = tl.load(linear_ptr + elem_off, mask=elem_mask, other=0.0)
@@ -351,13 +363,12 @@ if _HAS_TRITON:
                 )
 
             th = tl.load(total_th_ptr)
-            step_value = tl.load(step_ptr).to(tl.int32)
             force = (age_code == 3) & _age2_phase_hit(
                 global_elem_idx_for_score, step_value, 128, 0x51ED270B,
-            ) & elem_mask
+            ) & selectable_mask
             if RANDOM_MODE:
                 force = tl.full((BLOCK_SIZE,), False, tl.int1)
-            elem_selected = ((elem_score >= th) | force) & elem_mask
+            elem_selected = ((elem_score >= th) | force) & selectable_mask
             elem_selected_i = elem_selected.to(tl.int64)
             elem_records_n = tl.sum(elem_selected_i, axis=0)
             elem_base = tl.atomic_add(
@@ -403,12 +414,19 @@ if _HAS_TRITON:
                 global_elem_idx_for_score, step_value, 96, 0xB5297A4D,
             )
             promoted = tl.minimum(age_code + 1, 3)
-            next_age_code = tl.where(
+            aged_code = tl.where(
                 elem_write_mask,
                 0,
                 tl.where(promote0 | promote1 | promote2, promoted, age_code),
             )
-            age_update_mask = elem_write_mask | promote0 | promote1 | promote2
+            next_age_code = tl.where(expert_fired, 0, aged_code)
+            age_update_mask = (
+                (elem_mask & expert_fired)
+                | elem_write_mask
+                | promote0
+                | promote1
+                | promote2
+            )
             _age2_store_code_atomic(
                 age_words_ptr,
                 global_elem_idx_for_score,
@@ -545,6 +563,7 @@ def launch_direct_records_for_segment_entry_workqueue(
     age2bit_words: Optional[torch.Tensor] = None,
     ehat_geom_lut: Optional[torch.Tensor] = None,
     score_policy_id: int = 0,
+    lfcl_fired_epoch: Optional[torch.Tensor] = None,
     step_device: Optional[torch.Tensor] = None,
 ) -> None:
     if not _HAS_TRITON:
@@ -563,6 +582,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         raise RuntimeError("direct emission requires Age2Bit state")
     if step_device is None:
         raise RuntimeError("direct emission requires step_device for Age2Bit aging")
+    has_lfcl_mask = lfcl_fired_epoch is not None
     use_adam_scalar_ptr = adam_scalar_device is not None
     if use_adam_scalar_ptr:
         if adam_scalar_device.dtype != torch.float32 or adam_scalar_device.numel() < 3:
@@ -598,6 +618,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         total_th,
         adam_scalar_device if adam_scalar_device is not None else total_th,
         step_device,
+        lfcl_fired_epoch if lfcl_fired_epoch is not None else step_device,
         record_out_i32,
         segment_entry_indices,
         segment_entry_counts,
@@ -618,6 +639,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=_triton_random_salt(random_mode, random_salt),
         USE_ADAM_SCALAR_PTR=bool(use_adam_scalar_ptr),
+        HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
         WORKER_COUNT=int(workers),
     )
 

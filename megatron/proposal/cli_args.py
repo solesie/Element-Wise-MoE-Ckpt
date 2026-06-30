@@ -75,23 +75,6 @@ def add_proposal_args(parser):
     group.add_argument("--proposal-adaptive-cutoff-retry-tolerance", type=float, default=0.04,
                        help="Relative selected-ratio slack used by adaptive cutoff "
                             "certification and guards. Default 0.04.")
-    group.add_argument("--proposal-pp-lagged-cutoff", action="store_true",
-                       help="PP test/production option: reuse a versioned adaptive "
-                            "tau snapshot for selection and skip same-iteration "
-                            "global probe/retry rendezvous. Strict cutoff remains "
-                            "the bootstrap and fallback path.")
-    group.add_argument("--proposal-pp-lagged-band-fraction", type=float, default=0.25,
-                       help="Allowed lagged selected-ratio band as a fraction of K. "
-                            "Default 0.25, so K=4%% accepts 3%%..5%%.")
-    group.add_argument("--proposal-pp-lagged-safety-lag", type=int, default=1,
-                       help="Minimum steps before a newly learned PP lagged tau "
-                            "snapshot becomes selectable. Default 1.")
-    group.add_argument("--proposal-pp-lagged-max-staleness", type=int, default=8,
-                       help="Maximum age in steps for a PP lagged tau snapshot "
-                            "before strict cutoff re-anchors. Default 8.")
-    group.add_argument("--proposal-pp-lagged-strict-after-bad", type=int, default=1,
-                       help="Consecutive out-of-band lagged feedbacks before "
-                            "strict cutoff fallback. Default 1.")
     group.add_argument("--proposal-n-q", type=int, default=4096,
                        help="Number of v/h quantile points. Default 4096.")
     group.add_argument("--proposal-h-lookup-lut-bins", type=int, default=8192,
@@ -135,11 +118,12 @@ def add_proposal_args(parser):
                             "isolates non-D2H proposal overhead and is invalid "
                             "for recovery/durability.")
     group.add_argument("--proposal-lfcl-plan-policy", type=str,
-                       default="round_robin",
+                       default="lossy_log_size",
                        choices=["round_robin", "lossy_log_size"],
-                       help="Expert LFCL compaction planner. round_robin is "
-                            "the V2 default; lossy_log_size compacts experts "
-                            "with the largest current LFSY files.")
+                       help="Expert LFCL compaction planner. lossy_log_size "
+                            "is the V2 default and compacts experts with the "
+                            "largest current LFSY files; round_robin is kept "
+                            "as a deterministic baseline.")
     group.add_argument("--proposal-nonexpert-fc-W", type=int, default=1,
                        help="Non-expert lossless FC interval (iters). Default 1 "
                             "(V2 spec: W=1, lossless non-expert FC every iter; DC removed).")

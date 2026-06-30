@@ -15,8 +15,17 @@ def init_proposal(model: Any, optimizer: Any, args: Any, cp_root: str) -> None:
     get_controller().init(model, optimizer, args, cp_root)
 
 
-def proposal_dispatch_post_iter(model: Any, iter_T: int) -> None:
-    get_controller().dispatch_post_step_task(model, iter_T)
+def proposal_dispatch_post_iter(
+    model: Any,
+    iter_T: int,
+    *,
+    sync_processes: bool = True,
+) -> None:
+    get_controller().dispatch_post_step_task(
+        model,
+        iter_T,
+        sync_processes=bool(sync_processes),
+    )
 
 
 def proposal_wait_d2h_before_optimizer() -> None:

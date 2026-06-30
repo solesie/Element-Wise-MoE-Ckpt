@@ -39,6 +39,22 @@ class _HpMapping:
         return self._grad_views[index_in_param_group]
 
 
+class _FragmentAddress:
+    def __init__(self, *, start, numel):
+        self.start = start
+        self.numel = numel
+
+
+class _PartitionHpMapping:
+    def __init__(self, *, hp_start, lp_start, numel, group_idx=0):
+        self.param_group_index = group_idx
+        self.lp_fragment_address = _FragmentAddress(start=lp_start, numel=numel)
+        self._hp_fragment_address = _FragmentAddress(start=hp_start, numel=numel)
+
+    def get_hp_fragment_address(self):
+        return self._hp_fragment_address
+
+
 class _Zero12Candidate:
     def __init__(self, params, partition_flat, params_in_partition, first_offset):
         self.bit16_groups = [params]
@@ -100,6 +116,30 @@ def test_mapper_searches_training_optimizer_chain_when_engine_has_no_optimizer()
     assert torch.equal(
         bf16_candidate.fp32_groups_gradients_flat[0],
         torch.tensor([3.0, 3.0, 3.0, 3.0]),
+    )
+
+
+def test_bf16_partition_fragments_use_hp_mapping():
+    p0 = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    p1 = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    p1._hp_mapping = _PartitionHpMapping(hp_start=0, lp_start=1, numel=3)
+    torch_opt = torch.optim.SGD([p0, p1], lr=0.1)
+    bf16_candidate = _Bf16Candidate([p0, p1])
+    bf16_candidate.fp32_groups_flat_partition = [torch.arange(3, dtype=torch.float32)]
+    engine = _Engine(_EmptyFp16Candidate(bf16_candidate))
+
+    mapper = Fp32StateMapper(engine, torch_opt, torch.nn.Module())
+    frags = mapper.zero12_local_fragments([("p1", p1)])
+
+    assert mapper.mode == "bf16_zero0"
+    assert len(frags) == 1
+    name, param, group_idx, local_offset, param_offset, numel = frags[0]
+    assert name == "p1"
+    assert param is p1
+    assert (group_idx, local_offset, param_offset, numel) == (0, 0, 1, 3)
+    assert torch.equal(
+        mapper.zero12_partition_view(group_idx, local_offset, numel),
+        torch.arange(3, dtype=torch.float32),
     )
 
 

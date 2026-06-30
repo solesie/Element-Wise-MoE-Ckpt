@@ -44,17 +44,6 @@ class CutoffOrchestrationMixin:
     def _score_source_name(self) -> str:
         return str(getattr(self, "score_linear_source", "grad"))
 
-    def _pp_lagged_cutoff_enabled(self, *, world_size: int) -> bool:
-        if int(world_size) <= 1:
-            return False
-        lagged = getattr(self, "_pp_lagged_tau", None)
-        if lagged is None:
-            return False
-        if str(getattr(self, "selection_mode", "hessian")) == "random":
-            return False
-        topology = getattr(self, "_topology", None)
-        return int(getattr(topology, "pp_size", 1) or 1) > 1
-
     def _set_selection_tau_meta(
         self,
         *,
@@ -62,7 +51,6 @@ class CutoffOrchestrationMixin:
         h_epoch: int,
         lr_over_bc1: Optional[float] = None,
         snapshot: Optional[Any] = None,
-        lagged: bool = False,
     ) -> None:
         self._selection_tau_meta = {
             "tau_version": int(getattr(snapshot, "version", -1)),
@@ -71,152 +59,8 @@ class CutoffOrchestrationMixin:
             "tau_apply_from_step": int(
                 getattr(snapshot, "apply_from_step", int(step))
             ),
-            "tau_lagged": bool(lagged),
             "tau_lr_over_bc1": float(lr_over_bc1 if lr_over_bc1 is not None else 0.0),
         }
-
-    def _emit_pp_lagged_tau_event(self, record: Dict[str, Any]) -> None:
-        path = os.environ.get("PROPOSAL_PP_LAGGED_TAU_LOG", "")
-        if not path:
-            return
-        import json
-
-        try:
-            rank = int(os.environ.get("RANK", "0") or "0")
-        except ValueError:
-            rank = 0
-        out = {"rank": int(rank), **record}
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(out, separators=(",", ":")) + "\n")
-
-    def _publish_pp_lagged_tau_from_feedback(
-        self,
-        *,
-        feedback: Dict[str, Any],
-        selected_ratio: float,
-        total_elems_global: int,
-        current_lr_over_bc1: Optional[float] = None,
-    ) -> None:
-        lagged = getattr(self, "_pp_lagged_tau", None)
-        if lagged is None:
-            return
-        h_epoch = int(feedback.get("tau_h_epoch", self._current_cutoff_h_epoch()))
-        current_h_epoch = self._current_cutoff_h_epoch()
-        n_global = max(1, int(total_elems_global))
-        selected_count = int(feedback.get("selected", 0))
-        written_count = int(feedback.get("written", 0))
-        overflow_count = int(feedback.get("overflow", 0))
-        band_lo, band_hi = lagged.band()
-        in_band = bool(float(band_lo) <= float(selected_ratio) <= float(band_hi))
-        feedback_metrics = {
-            "selected_count": int(selected_count),
-            "written_count": int(written_count),
-            "overflow_count": int(overflow_count),
-            "written_ratio": float(written_count) / float(n_global),
-            "overflow_ratio": float(overflow_count) / float(n_global),
-        }
-        if h_epoch != current_h_epoch:
-            self._emit_pp_lagged_tau_event({
-                "event": "feedback",
-                "step": int(feedback.get("step", -1)),
-                "tau": float(feedback.get("tau", 0.0)),
-                "selected_ratio": float(selected_ratio),
-                **feedback_metrics,
-                "in_band": bool(in_band),
-                "published": False,
-                "reason": "h_epoch_mismatch",
-                "h_epoch": int(h_epoch),
-                "current_h_epoch": int(current_h_epoch),
-            })
-            return
-        decision = self._adaptive_cutoff.decide(
-            step=int(feedback.get("step", 0)) + 1,
-        )
-        if bool(getattr(decision, "use_exact", False)):
-            self._emit_pp_lagged_tau_event({
-                "event": "feedback",
-                "step": int(feedback.get("step", -1)),
-                "tau": float(feedback.get("tau", 0.0)),
-                "selected_ratio": float(selected_ratio),
-                **feedback_metrics,
-                "in_band": bool(in_band),
-                "published": False,
-                "reason": str(getattr(decision, "reason", "exact_required")),
-                "h_epoch": int(h_epoch),
-            })
-            return
-        in_band = lagged.observe_ratio(float(selected_ratio))
-        publish_ready = lagged.observe_publish_readiness(
-            h_epoch=int(h_epoch),
-            in_band=bool(in_band),
-        )
-        if not bool(in_band) or not bool(publish_ready):
-            self._emit_pp_lagged_tau_event({
-                "event": "feedback",
-                "step": int(feedback.get("step", -1)),
-                "tau": float(feedback.get("tau", 0.0)),
-                "selected_ratio": float(selected_ratio),
-                **feedback_metrics,
-                "in_band": bool(in_band),
-                "published": False,
-                "reason": (
-                    "out_of_band" if not bool(in_band) else "epoch_warmup"
-                ),
-                "h_epoch": int(h_epoch),
-            })
-            return
-        feedback_tau = float(feedback.get("tau", 0.0))
-        lagged.observe_feedback_tau(
-            step=int(feedback.get("step", 0)),
-            tau=float(feedback_tau),
-            selected_ratio=float(selected_ratio),
-        )
-        lr_bridge = 1.0
-        feedback_lr = float(feedback.get("tau_lr_over_bc1", 0.0) or 0.0)
-        current_lr = float(current_lr_over_bc1 or 0.0)
-        if (
-            math.isfinite(feedback_lr)
-            and math.isfinite(current_lr)
-            and feedback_lr > 0.0
-            and current_lr > 0.0
-        ):
-            lr_bridge = min(max(current_lr / feedback_lr, 0.05), 20.0)
-        tau_proposed = float(self._initial_cutoff_center(decision)) * float(lr_bridge)
-        tau_trended = lagged.trend_adjusted_tau(
-            proposed_tau=float(tau_proposed),
-            source_step=int(feedback.get("step", 0)),
-        )
-        tau_next = lagged.bridge_guarded_tau(
-            proposed_tau=float(tau_trended),
-            feedback_tau=float(feedback_tau),
-            lr_bridge=float(lr_bridge),
-        )
-        snapshot = lagged.publish(
-            tau=float(tau_next),
-            source_step=int(feedback.get("step", 0)),
-            h_epoch=int(h_epoch),
-            score_source=self._score_source_name(),
-        )
-        self._emit_pp_lagged_tau_event({
-            "event": "feedback",
-            "step": int(feedback.get("step", -1)),
-            "tau": float(feedback.get("tau", 0.0)),
-            "selected_ratio": float(selected_ratio),
-            **feedback_metrics,
-            "in_band": bool(in_band),
-            "published": snapshot is not None,
-            "published_tau": float(snapshot.tau) if snapshot is not None else 0.0,
-            "published_version": (
-                int(snapshot.version) if snapshot is not None else -1
-            ),
-            "lr_bridge": float(lr_bridge),
-            "proposed_tau": float(tau_proposed),
-            "trended_tau": float(tau_trended),
-            "apply_from_step": (
-                int(snapshot.apply_from_step) if snapshot is not None else -1
-            ),
-            "h_epoch": int(h_epoch),
-        })
 
     def _stage_candidate_taus(
         self,
@@ -325,6 +169,7 @@ class CutoffOrchestrationMixin:
     def _cold_start_cutoff_bootstrap(
         self,
         *,
+        global_step: int,
         runtime_state: Any,
         hparams: Any,
         total_elems_global: int,
@@ -348,6 +193,7 @@ class CutoffOrchestrationMixin:
         age2bit_state = getattr(runtime_state, "age2bit", None)
         if age2bit_state is None:
             raise RuntimeError("Age2Bit state is required for cold-start cutoff")
+        lfcl_fired_epoch = getattr(self, "_lfcl_fired_epoch_device", None)
         launch_update_ehat_geom_lut(
             h_lut_values=runtime_state.quantiles.h_lut.values,
             h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
@@ -373,11 +219,17 @@ class CutoffOrchestrationMixin:
                 entry_elem_start=grp["entry_elem_start"],
                 entry_group_start=grp["entry_group_start"],
                 entry_group_count=grp["entry_group_count"],
+                entry_stratum_idx=grp.get("entry_stratum_idx"),
+                stratum_expert_idx=getattr(
+                    self, "_approx_probe_stratum_expert_idx_device", None
+                ),
+                lfcl_fired_epoch=lfcl_fired_epoch,
                 entry_block_entry_idx=grp["entry_block_entry_idx"],
                 entry_block_local_group_start=grp["entry_block_local_group_start"],
                 smin=smin,
                 smax=smax,
                 master_off_elem=int(grp["master_off"]) * int(group_size),
+                step=int(global_step),
                 group_size=int(group_size),
                 lr_over_bc1=float(hparams.lr_over_bc1),
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
@@ -425,12 +277,18 @@ class CutoffOrchestrationMixin:
                 entry_elem_start=grp["entry_elem_start"],
                 entry_group_start=grp["entry_group_start"],
                 entry_group_count=grp["entry_group_count"],
+                entry_stratum_idx=grp.get("entry_stratum_idx"),
+                stratum_expert_idx=getattr(
+                    self, "_approx_probe_stratum_expert_idx_device", None
+                ),
+                lfcl_fired_epoch=lfcl_fired_epoch,
                 entry_block_entry_idx=grp["entry_block_entry_idx"],
                 entry_block_local_group_start=grp["entry_block_local_group_start"],
                 hist=hist,
                 smin=smin,
                 smax=smax,
                 master_off_elem=int(grp["master_off"]) * int(group_size),
+                step=int(global_step),
                 group_size=int(group_size),
                 lr_over_bc1=float(hparams.lr_over_bc1),
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
@@ -524,13 +382,6 @@ class CutoffOrchestrationMixin:
             total_elems_global=int(n_global),
             cutoff_tolerance=float(self.cutoff_K_tolerance),
         )
-        self._publish_pp_lagged_tau_from_feedback(
-            feedback=feedback,
-            selected_ratio=float(ratio),
-            total_elems_global=int(n_global),
-            current_lr_over_bc1=current_lr_over_bc1,
-        )
-
     def _consume_direct_emission_feedback(
         self,
         *,
@@ -652,7 +503,6 @@ class CutoffOrchestrationMixin:
         cpu_process_group: Any,
         random_mode: bool,
         random_salt: int,
-        lagged_tau: bool = False,
     ) -> str:
         from ..cutoff.approx_probe_kernels import (
             launch_capacity_hint_from_probe,
@@ -710,6 +560,7 @@ class CutoffOrchestrationMixin:
                     step=int(global_step),
                     stream=telemetry_stream,
                 )
+        lfcl_fired_epoch = getattr(self, "_lfcl_fired_epoch_device", None)
 
         for grp in self._groups:
             group_blocks = int(grp.get("approx_entry_block_count", 0))
@@ -734,6 +585,8 @@ class CutoffOrchestrationMixin:
                 entry_group_start=grp["entry_group_start"],
                 entry_group_count=grp["entry_group_count"],
                 entry_stratum_idx=grp["entry_stratum_idx"],
+                stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
+                lfcl_fired_epoch=lfcl_fired_epoch,
                 entry_block_entry_idx=grp["entry_block_entry_idx"],
                 entry_block_local_group_start=grp["entry_block_local_group_start"],
                 candidate_taus=self._selection_candidate_taus,
@@ -761,50 +614,6 @@ class CutoffOrchestrationMixin:
                     step=int(global_step),
                     stream=telemetry_stream,
                 )
-
-        if bool(lagged_tau):
-            tau_used = float(
-                (getattr(self, "_selection_candidate_taus_host", (1.0,)) or (1.0,))[0]
-            )
-            launch_store_global_probe_decision(
-                total_th=runtime_state.scratch.total_th,
-                probe_reject=self._approx_probe_reject,
-                decision_code=self._approx_probe_decision_code,
-                sample_blocks_current=self._approx_probe_sample_blocks_current,
-                ci_shortfall_streak=self._approx_probe_ci_shortfall_streak,
-                sample_grow_hold=self._approx_probe_sample_grow_hold,
-                diagnostics=self._approx_probe_diagnostics,
-                chosen_tau=float(tau_used),
-                chosen_ratio=0.0,
-                chosen_se=0.0,
-                best_bound=0.0,
-                next_sample=int(self._approx_probe_sample_blocks_current.item()),
-                strict_accept=True,
-                sampled_blocks=float(self._approx_probe_sample_blocks_current.item()),
-                accept=True,
-                bracket_width=0.0,
-                decision=8,
-                stored_streak=int(self._approx_probe_ci_shortfall_streak.item()),
-                grow_hold_value=int(self._approx_probe_sample_grow_hold.item()),
-            )
-            launch_capacity_hint_from_probe(
-                candidate_taus=self._selection_candidate_taus,
-                sum_q=self._approx_probe_sum_q,
-                sum_q2=self._approx_probe_sum_q2,
-                n_blocks=self._approx_probe_n_blocks,
-                stratum_total_elems=self._approx_probe_stratum_total_elems_device,
-                stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
-                total_th=runtime_state.scratch.total_th,
-                capacity_demand_hint=self._approx_probe_capacity_demand_hint,
-                n_candidates=int(n_cand),
-            )
-            if telemetry_enabled:
-                for telemetry in telemetry_sinks:
-                    telemetry.record_decision_done(
-                        step=int(global_step),
-                        stream=telemetry_stream,
-                    )
-            return "pp_lagged_tau"
 
         use_cpu_global_probe = (
             int(world_size) > 1
@@ -1027,6 +836,8 @@ class CutoffOrchestrationMixin:
                     entry_group_start=grp["entry_group_start"],
                     entry_group_count=grp["entry_group_count"],
                     entry_stratum_idx=grp["entry_stratum_idx"],
+                    stratum_expert_idx=self._approx_probe_stratum_expert_idx_device,
+                    lfcl_fired_epoch=lfcl_fired_epoch,
                     entry_block_entry_idx=grp["entry_block_entry_idx"],
                     entry_block_local_group_start=grp["entry_block_local_group_start"],
                     candidate_taus=self._selection_candidate_taus,
@@ -1257,72 +1068,7 @@ class CutoffOrchestrationMixin:
             h_epoch=int(h_epoch),
             lr_over_bc1=float(hparams.lr_over_bc1),
             snapshot=None,
-            lagged=False,
         )
-        if self._pp_lagged_cutoff_enabled(world_size=int(world)):
-            lagged_state = getattr(self, "_pp_lagged_tau", None)
-            snapshot, lagged_reason = lagged_state.lookup(
-                step=int(global_step),
-                h_epoch=int(h_epoch),
-                score_source=self._score_source_name(),
-                exact_required=bool(getattr(cutoff_decision, "use_exact", False)),
-            )
-            self._emit_pp_lagged_tau_event({
-                "event": "select",
-                "step": int(global_step),
-                "mode": "lagged" if snapshot is not None else "strict",
-                "reason": str(lagged_reason),
-                "h_epoch": int(h_epoch),
-                "score_source": self._score_source_name(),
-                "tau_version": int(getattr(snapshot, "version", -1)),
-                "tau": float(getattr(snapshot, "tau", tau_center)),
-            })
-            if snapshot is not None:
-                tau_center = float(snapshot.tau)
-                candidates = [float(tau_center)]
-                n_candidates = self._stage_candidate_taus(
-                    candidates,
-                    tau_center=float(tau_center),
-                )
-                self._set_selection_tau_meta(
-                    step=int(global_step),
-                    h_epoch=int(h_epoch),
-                    lr_over_bc1=float(hparams.lr_over_bc1),
-                    snapshot=snapshot,
-                    lagged=True,
-                )
-                t_after_decide = time.perf_counter() if profile else 0.0
-                t_after_stage = time.perf_counter() if profile else 0.0
-                self._launch_gpu_approx_cutoff(
-                    global_step=int(global_step),
-                    runtime_state=runtime_state,
-                    hparams=hparams,
-                    n_candidates=int(n_candidates),
-                    total_elems_global=int(total_elems_global),
-                    group_size=int(group_size),
-                    cpu_process_group=cpu_pg,
-                    world_size=int(world),
-                    random_mode=bool(random_mode),
-                    random_salt=int(random_salt),
-                    lagged_tau=True,
-                )
-                t_after_probe = time.perf_counter() if profile else 0.0
-                self._selection_total_th_host = float(tau_center)
-                ev = self._acquire_ring_event("selection_count")
-                ev.record(stream if stream is not None else torch.cuda.current_stream())
-                if profile:
-                    print(
-                        f"[proposal] selection_phase_profile @iter{int(global_step)}: "
-                        f"global={((t_after_global - t_entry) * 1000.0):.1f}ms "
-                        f"feedback={((t_after_feedback - t_after_global) * 1000.0):.1f}ms "
-                        f"decide={((t_after_decide - t_after_feedback) * 1000.0):.1f}ms "
-                        f"stage={((t_after_stage - t_after_decide) * 1000.0):.1f}ms "
-                        f"probe={((t_after_probe - t_after_stage) * 1000.0):.1f}ms "
-                        f"telemetry=0.0ms candidates={int(n_candidates)} "
-                        f"pp_lagged_tau=1",
-                        flush=True,
-                    )
-                return ev
         cold_start_hist_iters = max(
             1, int(getattr(self, "_cold_start_hist_iters", 4))
         )
@@ -1333,6 +1079,7 @@ class CutoffOrchestrationMixin:
         )
         if use_cold_start_hist:
             cold_start = self._cold_start_cutoff_bootstrap(
+                global_step=int(global_step),
                 runtime_state=runtime_state,
                 hparams=hparams,
                 total_elems_global=int(total_elems_global),

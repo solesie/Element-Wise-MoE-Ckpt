@@ -83,6 +83,8 @@ if _HAS_TRITON:
         entry_group_start_ptr,
         entry_group_count_ptr,
         entry_stratum_idx_ptr,
+        stratum_expert_idx_ptr,
+        lfcl_fired_epoch_ptr,
         entry_block_entry_idx_ptr,
         entry_block_local_group_start_ptr,
         candidate_tau_ptr,
@@ -106,6 +108,7 @@ if _HAS_TRITON:
         MAX_SAMPLES_PER_GROUP: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
+        HAS_LFCL_FIRED_MASK: tl.constexpr,
         RUN_IF_DECISION_CODE: tl.constexpr,
     ):
         if RUN_IF_DECISION_CODE >= 0:
@@ -144,6 +147,15 @@ if _HAS_TRITON:
         stratum_idx = tl.load(entry_stratum_idx_ptr + entry_id)
         if stratum_idx < 0:
             return
+        expert_fired = tl.full((), False, tl.int1)
+        if HAS_LFCL_FIRED_MASK:
+            expert_idx = tl.load(stratum_expert_idx_ptr + stratum_idx)
+            fired_epoch = tl.load(
+                lfcl_fired_epoch_ptr + expert_idx,
+                mask=expert_idx >= 0,
+                other=-1,
+            )
+            expert_fired = fired_epoch == step_value
         block_group_start = tl.load(
             entry_block_local_group_start_ptr + entry_block_id,
         )
@@ -164,6 +176,7 @@ if _HAS_TRITON:
             (BLOCK_SIZE,),
         )
         elem_mask = tl.reshape(gid_local_2d < entry_group_count, (BLOCK_SIZE,))
+        selectable_mask = elem_mask & (~expert_fired)
         block_elem_count = tl.sum(elem_mask.to(tl.float32), axis=0)
 
         m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
@@ -189,7 +202,7 @@ if _HAS_TRITON:
         )
         force = (age_code == 3) & _age2_phase_hit(
             global_elem_idx, step_value, 128, 0x51ED270B,
-        ) & elem_mask
+        ) & selectable_mask
         if RANDOM_MODE:
             elem_score = _random_unit_from_index(global_elem_idx, RANDOM_SALT)
             force = tl.full((BLOCK_SIZE,), False, tl.int1)
@@ -197,7 +210,7 @@ if _HAS_TRITON:
         for cand_i in tl.static_range(0, MAX_CANDIDATES):
             enabled = cand_i < n_candidates
             th = tl.load(candidate_tau_ptr + cand_i, mask=enabled, other=float("inf"))
-            elem_selected = ((elem_score >= th) | force) & elem_mask & enabled
+            elem_selected = ((elem_score >= th) | force) & selectable_mask & enabled
             selected_n = tl.sum(elem_selected.to(tl.float32), axis=0)
             q = selected_n / tl.maximum(block_elem_count, 1.0)
             off = stratum_idx * STRATUM_STRIDE + cand_i
@@ -816,6 +829,8 @@ def launch_generated_block_probe_for_group(
     entry_group_start: torch.Tensor,
     entry_group_count: torch.Tensor,
     entry_stratum_idx: torch.Tensor,
+    stratum_expert_idx: torch.Tensor,
+    lfcl_fired_epoch: Optional[torch.Tensor],
     entry_block_entry_idx: torch.Tensor,
     entry_block_local_group_start: torch.Tensor,
     candidate_taus: torch.Tensor,
@@ -848,6 +863,13 @@ def launch_generated_block_probe_for_group(
     gpb = _groups_per_program(group_size)
     max_samples = max(1, min(int(max_samples_per_group), int(n_entry_blocks)))
     guard = decision_code_guard if decision_code_guard is not None else sample_blocks_current
+    has_lfcl_mask = stratum_expert_idx is not None and lfcl_fired_epoch is not None
+    stratum_expert_idx_t = (
+        stratum_expert_idx if stratum_expert_idx is not None else entry_stratum_idx
+    )
+    lfcl_fired_epoch_t = (
+        lfcl_fired_epoch if lfcl_fired_epoch is not None else entry_stratum_idx
+    )
     _generated_probe_entries_kernel[(max_samples,)](
         m_flat,
         score_linear_flat if score_linear_flat is not None else m_flat,
@@ -861,6 +883,8 @@ def launch_generated_block_probe_for_group(
         entry_group_start,
         entry_group_count,
         entry_stratum_idx,
+        stratum_expert_idx_t,
+        lfcl_fired_epoch_t,
         entry_block_entry_idx,
         entry_block_local_group_start,
         candidate_taus,
@@ -886,6 +910,7 @@ def launch_generated_block_probe_for_group(
         MAX_SAMPLES_PER_GROUP=max_samples,
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
+        HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
         RUN_IF_DECISION_CODE=int(run_if_decision_code),
     )
 

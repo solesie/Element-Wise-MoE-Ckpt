@@ -224,8 +224,10 @@ def _apply_zero12_partition_payload(
         if int(owner) != int(cur_rank):
             return int(scalars.get("step", 0) or 0)
     mapper = get_mapper()
-    if mapper is None or getattr(mapper, "mode", "") != "zero12":
-        raise RuntimeError("ZeRO partition PRPTENS payload requires zero12 mapper")
+    if mapper is None:
+        raise RuntimeError(
+            "partition PRPTENS payload requires an active FP32 mapper"
+        )
     fragments = list(scalars.get("fragments", []) or [])
     for frag in fragments:
         frag_idx = int(frag["index"])

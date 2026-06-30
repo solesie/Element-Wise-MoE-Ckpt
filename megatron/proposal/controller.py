@@ -37,6 +37,10 @@ class PostStepCheckpointTask:
 
     cuda_event: Optional["torch.cuda.Event"]
     iter_T: int
+    sync_processes: bool = True
+    dispatch_release_ready: threading.Event = field(
+        default_factory=threading.Event,
+    )
     submitted_at: float = field(default_factory=time.perf_counter)
     non_expert_read_ready: threading.Event = field(default_factory=threading.Event)
     expert_read_ready: threading.Event = field(default_factory=threading.Event)
@@ -69,12 +73,24 @@ class ProposalController:
         self._config = {}
         self._pending_fault_record = None
         self._dispatch_ready_event = None
+        self._proposal_cpu_pg = None
+        self._proposal_world_size = 1
 
     def init(self, model: Any, optimizer: Any, args: Any, cp_root: str) -> None:
         init_proposal(model, optimizer, args, cp_root)
 
-    def dispatch_post_step_task(self, model: Any, iter_T: int) -> None:
-        proposal_dispatch_post_iter(model, iter_T)
+    def dispatch_post_step_task(
+        self,
+        model: Any,
+        iter_T: int,
+        *,
+        sync_processes: bool = True,
+    ) -> None:
+        proposal_dispatch_post_iter(
+            model,
+            iter_T,
+            sync_processes=bool(sync_processes),
+        )
 
     def step(
         self,
@@ -530,6 +546,15 @@ def init_proposal(
                         flush=True,
                     )
     except Exception as _exc:
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and int(torch.distributed.get_world_size()) > 1
+        ):
+            raise RuntimeError(
+                "proposal: multi-rank mode requires proposal CPU process "
+                "groups for global LFCL planning and strict tau."
+            ) from _exc
         _proposal_pg = None
         _proposal_cpu_pg = None
         _proposal_world_size = 1
@@ -544,6 +569,8 @@ def init_proposal(
         get_controller()._lossy_cp._proposal_cpu_pg = _proposal_cpu_pg
         get_controller()._lossy_cp._proposal_world_size = _proposal_world_size
         get_controller()._lossy_cp._topology = topology
+    get_controller()._proposal_cpu_pg = _proposal_cpu_pg
+    get_controller()._proposal_world_size = int(_proposal_world_size)
 
     topk_ratio = float(
         get_controller()._proposal_config.topk_ratio,
@@ -572,13 +599,10 @@ def init_proposal(
                 )
                 global_selection_elems = int(count_t.item())
             except Exception as _cap_exc:
-                global_selection_elems = int(local_selection_elems)
-                if _should_write():
-                    print(
-                        "[proposal] global AOS capacity sizing failed; "
-                        f"using local K capacity: {_cap_exc}",
-                        flush=True,
-                    )
+                raise RuntimeError(
+                    "proposal: failed to compute global selection element "
+                    "count for multi-rank strict tau/capacity sizing."
+                ) from _cap_exc
         setattr(
             get_controller()._lossy_cp,
             "_local_selection_element_count_host",
@@ -808,7 +832,11 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
     # measures a fault at iter T, so make the current post-step image visible
     # before evaluating rollback loss.
     if int(iteration) > int(getattr(ctrl, "_last_dispatched_iter_T", -1)):
-        proposal_dispatch_post_iter(model, iter_T=int(iteration))
+        proposal_dispatch_post_iter(
+            model,
+            iter_T=int(iteration),
+            sync_processes=False,
+        )
     if ctrl._checkpoint_workers is not None:
         ctrl._checkpoint_workers.drain()
 
@@ -949,6 +977,7 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
 
     try:
         task.non_expert_started_at = time.perf_counter()
+        task.dispatch_release_ready.wait()
         if get_controller()._fc is not None:
             get_controller()._fc.fire_nonexpert_fc_if_due(
                 step=task.iter_T,
@@ -967,14 +996,10 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
 def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
     """Body of the host_writer_expert worker task.
 
-    Two responsibilities, both single-threaded on this worker:
-      * fire the schedule-due expert LFCL compactions (layer-RR in sequential
-        mode, planner-selected 1% per iter in proposal mode). ``ExpertLosslessFC.fire_if_due``
-        internally launches the D2H copies on ``d2h_stream``.
-      * when expert lossy checkpointing is enabled, run
-        ``LossyCheckpointPipeline.step``. This dispatches this iter's lossy
-        records after scoring on ``compute_stream``. The expert worker owns
-        the whole path, so single-thread invariants hold without locks.
+    The worker first plans LFCL compaction, publishes the fired-expert mask to
+    lossy selection, then runs lossy direct emission and finally materializes
+    the dense LFCL payloads.  The expert worker owns the whole path, so
+    single-thread invariants hold without locks.
     """
     def _mark_expert_d2h_event(
         d2h_event: Optional["torch.cuda.Event"],
@@ -982,47 +1007,64 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
         task.expert_d2h_event = d2h_event
 
     try:
+        ctrl = get_controller()
         task.expert_started_at = time.perf_counter()
+        try:
+            if bool(getattr(task, "sync_processes", True)):
+                _sync_post_iter_dispatch(task.iter_T)
+        finally:
+            task.dispatch_release_ready.set()
+        fired_experts: List[Tuple[int, int]] = []
+        if ctrl._expert_lossless_fc is not None:
+            fired_experts = ctrl._expert_lossless_fc.plan_if_due(
+                task.iter_T,
+                process_group=getattr(ctrl._lossy_cp, "_proposal_cpu_pg", None),
+                world_size=int(getattr(ctrl._lossy_cp, "_proposal_world_size", 1)),
+            )
+        if ctrl._lossy_cp is not None:
+            publish_fired = getattr(ctrl._lossy_cp, "publish_lfcl_fired_experts", None)
+            if callable(publish_fired):
+                publish_fired(step=int(task.iter_T), expert_ids=fired_experts)
         if (
-            get_controller()._config.get("expert_lossy_enabled", True)
-            and get_controller()._lossy_cp is not None
+            ctrl._config.get("expert_lossy_enabled", True)
+            and ctrl._lossy_cp is not None
         ):
-            inner_opt = get_controller()._config.get("_inner_opt")
+            inner_opt = ctrl._config.get("_inner_opt")
             if inner_opt is not None:
-                get_controller().step(
+                ctrl.step(
                     inner_opt,
                     global_step=task.iter_T,
                     ready_event=task.cuda_event,
                     d2h_event_callback=_mark_expert_d2h_event,
                 )
-        fired_experts: List[Tuple[int, int]] = []
-        if get_controller()._expert_lossless_fc is not None:
-            fired_experts = get_controller()._expert_lossless_fc.fire_if_due(
+        if ctrl._expert_lossless_fc is not None:
+            fired_experts = ctrl._expert_lossless_fc.fire_planned(
                 task.iter_T,
+                fired_experts,
                 ready_event=task.cuda_event,
             )
             lfcl_d2h_event = getattr(
-                get_controller()._expert_lossless_fc,
+                ctrl._expert_lossless_fc,
                 "last_d2h_event",
                 None,
             )
             if lfcl_d2h_event is not None:
                 _mark_expert_d2h_event(lfcl_d2h_event)
-        if get_controller()._lossy_cp is not None:
+        if ctrl._lossy_cp is not None:
             fired_by_step = getattr(
-                get_controller()._lossy_cp,
+                ctrl._lossy_cp,
                 "_lfcl_fired_experts_by_step",
                 None,
             )
             if fired_by_step is None:
                 fired_by_step = {}
                 setattr(
-                    get_controller()._lossy_cp,
+                    ctrl._lossy_cp,
                     "_lfcl_fired_experts_by_step",
                     fired_by_step,
                 )
             fired_by_step[int(task.iter_T)] = list(fired_experts)
-        get_controller()._config["_last_fired_experts"] = fired_experts
+        ctrl._config["_last_fired_experts"] = fired_experts
         task.expert_ready_at = time.perf_counter()
         task.expert_read_ready.set()
     except BaseException as exc:
@@ -1067,29 +1109,58 @@ def proposal_wait_d2h_before_optimizer() -> None:
             get_controller()._latest_post_step_checkpoint_task = None
 
 
+def _sync_post_iter_dispatch(iter_T: int) -> None:
+    """Release all proposal owner ranks at the same post-optimizer boundary."""
+
+    ctrl = get_controller()
+    world_size = int(getattr(ctrl, "_proposal_world_size", 1) or 1)
+    if world_size <= 1:
+        return
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        raise RuntimeError(
+            "proposal: synchronized dispatch requires initialized distributed "
+            f"state (iter={int(iter_T)})"
+        )
+    cpu_pg = getattr(ctrl, "_proposal_cpu_pg", None)
+    if cpu_pg is None:
+        raise RuntimeError(
+            "proposal: synchronized dispatch requires proposal CPU process "
+            f"group (iter={int(iter_T)})"
+        )
+    torch.distributed.barrier(group=cpu_pg)
+
+
 def _submit_post_step_checkpoint_task(task: PostStepCheckpointTask) -> None:
     """Submit a post-step checkpoint task to the proposal workers."""
 
     if get_controller()._checkpoint_workers is None:
-        _execute_non_expert_post_iter(task)
         _execute_expert_post_iter(task)
+        _execute_non_expert_post_iter(task)
         return
     if (
         get_controller().aos_cuda_graph_capture_required()
         and not get_controller().aos_cuda_graph_ready()
     ):
+        get_controller()._checkpoint_workers.submit_expert(_execute_expert_post_iter, task)
+        get_controller()._checkpoint_workers.drain_expert()
         get_controller()._checkpoint_workers.submit_non_expert(
             _execute_non_expert_post_iter, task,
         )
         get_controller()._checkpoint_workers.drain_non_expert()
-        get_controller()._checkpoint_workers.submit_expert(_execute_expert_post_iter, task)
-        get_controller()._checkpoint_workers.drain_expert()
         return
     get_controller()._checkpoint_workers.submit_non_expert(_execute_non_expert_post_iter, task)
     get_controller()._checkpoint_workers.submit_expert(_execute_expert_post_iter, task)
 
 
-def proposal_dispatch_post_iter(model, iter_T: int) -> None:
+def proposal_dispatch_post_iter(
+    model,
+    iter_T: int,
+    *,
+    sync_processes: bool = True,
+) -> None:
     """Submit iter ``T`` checkpoint work before next forward.
 
     The caller invokes this as the first action of iteration ``T+1`` after
@@ -1108,7 +1179,10 @@ def proposal_dispatch_post_iter(model, iter_T: int) -> None:
     task = PostStepCheckpointTask(
         cuda_event=event,
         iter_T=iter_T,
+        sync_processes=bool(sync_processes),
     )
+    if not bool(sync_processes):
+        task.dispatch_release_ready.set()
     get_controller()._latest_post_step_checkpoint_task = task
     _submit_post_step_checkpoint_task(task)
     get_controller()._last_dispatched_iter_T = iter_T
@@ -1220,7 +1294,11 @@ def _simulate_fault_impl(
     # the current post-step state here so the fault experiment measures the
     # same checkpoint visibility as old end-of-iter ETC runs.
     if int(step) > int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
-        proposal_dispatch_post_iter(model, iter_T=int(step))
+        proposal_dispatch_post_iter(
+            model,
+            iter_T=int(step),
+            sync_processes=False,
+        )
     if get_controller()._checkpoint_workers is not None:
         get_controller()._checkpoint_workers.drain()
 

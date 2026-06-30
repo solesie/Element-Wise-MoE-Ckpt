@@ -387,6 +387,7 @@ def emit_segment_direct_from_plan(
                 age2bit_words=lossy_state.age2bit_words,
                 ehat_geom_lut=lossy_state.ehat_geom_lut,
                 score_policy_id=int(lossy_state.score_policy_id),
+                lfcl_fired_epoch=getattr(lossy_state, "lfcl_fired_epoch", None),
                 step_device=lossy_state.step_device,
             )
             continue

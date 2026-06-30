@@ -249,7 +249,6 @@ class ExpertState:
         self._direct_feedback_tau_h_epoch: int = -1
         self._direct_feedback_tau_source_step: int = -1
         self._direct_feedback_tau_apply_from_step: int = -1
-        self._direct_feedback_tau_lagged: bool = False
         self._direct_feedback_tau_lr_over_bc1: float = 0.0
         self._direct_feedback_expert_ids: List[ExpertId] = []
         self._latest_direct_feedback: Optional[Dict[str, Any]] = None
@@ -1301,9 +1300,6 @@ class ExpertState:
         self._direct_feedback_tau_apply_from_step = int(
             getattr(lossy_state, "tau_apply_from_step", -1)
         )
-        self._direct_feedback_tau_lagged = bool(
-            getattr(lossy_state, "tau_lagged", False)
-        )
         self._direct_feedback_tau_lr_over_bc1 = float(
             getattr(lossy_state, "tau_lr_over_bc1", 0.0)
         )
@@ -1354,7 +1350,6 @@ class ExpertState:
             "tau_apply_from_step": int(
                 getattr(self, "_direct_feedback_tau_apply_from_step", -1)
             ),
-            "tau_lagged": bool(getattr(self, "_direct_feedback_tau_lagged", False)),
             "tau_lr_over_bc1": float(
                 getattr(self, "_direct_feedback_tau_lr_over_bc1", 0.0)
             ),

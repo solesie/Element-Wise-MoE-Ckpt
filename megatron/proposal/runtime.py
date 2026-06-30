@@ -15,8 +15,8 @@ Two layers:
   via the pipeline immediately before the next forward (§1.-1).
 
 Domains (AGENTS.md §3.1):
-  * ``ne_writer``        — non-expert lossless FC (GPU→pinned D2H handoff).
-  * ``ne_commit_writer`` — non-expert file write/fsync/retention cleanup.
+  * ``ne_writer``        — non-expert lossless FC (GPU→pinned D2H handoff
+                           and disk commit).
   * ``expert_launcher``  — per-iter selection/emission/D2H launches + segment drive.
   * ``expert_writer``    — Stage 4 LFSY/LFCL disk commit or test-DRAM commit.
 
@@ -236,14 +236,14 @@ class CheckpointWorker:
 
 
 # ---------------------------------------------------------------------------
-# Three-domain worker pool.
+# Checkpoint-domain worker pool.
 # ---------------------------------------------------------------------------
 class CheckpointWorkerPool:
-    """Three checkpoint-domain workers, one clear responsibility each
+    """Checkpoint-domain workers, one clear responsibility each
     See module docstring / §3.1.
 
-    * ``ne_writer``       — non-expert lossless FC (GPU→pinned D2H + file write).
-    * ``ne_commit_writer`` — non-expert durable fsync/retention cleanup.
+    * ``ne_writer``       — non-expert lossless FC
+                            (GPU→pinned D2H + file write/fsync).
     * ``expert_launcher`` — per-iter selection/emission/D2H launches; forwards the
                             heavy commit to ``expert_writer`` so the next
                             iter's score can launch on time.
@@ -257,15 +257,11 @@ class CheckpointWorkerPool:
         non_expert_queue_size: int = 1,
         expert_queue_size: int = 1,
         expert_writer_queue_size: int = 2,
-        non_expert_commit_queue_size: int = 0,
     ) -> None:
         if device is None and torch.cuda.is_available():
             device = torch.cuda.current_device()
         self.ne_writer = CheckpointWorker(
             "ne_writer", device, non_expert_queue_size,
-        )
-        self.ne_commit_writer = CheckpointWorker(
-            "ne_commit_writer", device, non_expert_commit_queue_size,
         )
         self.expert_launcher = CheckpointWorker(
             "expert_launcher", device, expert_queue_size,
@@ -277,9 +273,6 @@ class CheckpointWorkerPool:
     def submit_non_expert(self, fn: Callable[..., None], *args: Any) -> None:
         self.ne_writer.submit(fn, *args)
 
-    def submit_non_expert_commit(self, fn: Callable[..., None], *args: Any) -> None:
-        self.ne_commit_writer.submit(fn, *args)
-
     def submit_expert(self, fn: Callable[..., None], *args: Any) -> None:
         self.expert_launcher.submit(fn, *args)
 
@@ -288,7 +281,6 @@ class CheckpointWorkerPool:
 
     def drain_non_expert(self) -> None:
         self.ne_writer.drain()
-        self.ne_commit_writer.drain()
 
     def drain_expert(self) -> None:
         self.expert_launcher.drain()
@@ -298,20 +290,17 @@ class CheckpointWorkerPool:
 
     def drain(self) -> None:
         self.ne_writer.drain()
-        self.ne_commit_writer.drain()
         self.expert_launcher.drain()
         self.expert_writer.drain()
 
     def shutdown(self) -> None:
         self.ne_writer.shutdown()
-        self.ne_commit_writer.shutdown()
         self.expert_launcher.shutdown()
         self.expert_writer.shutdown()
 
     def summary(self) -> Dict[str, dict]:
         return {
             "ne_writer": self.ne_writer.summary(),
-            "ne_commit_writer": self.ne_commit_writer.summary(),
             "expert_launcher": self.expert_launcher.summary(),
             "expert_writer": self.expert_writer.summary(),
         }

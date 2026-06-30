@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 
 DEFAULT_LFCL_INTERVAL_ITERS = 1
 DEFAULT_LFCL_FRACTION_PCT = 1.0
+DEFAULT_LFCL_PLAN_POLICY = "lossy_log_size"
 
 
 @dataclass(frozen=True)
@@ -30,11 +31,6 @@ class ProposalConfig:
     adaptive_cutoff_warmup_iters: int = 0
     adaptive_cutoff_skip_warmup_iters: int = 0
     adaptive_cutoff_retry_tolerance: float = 0.04
-    pp_lagged_cutoff: bool = False
-    pp_lagged_band_fraction: float = 0.25
-    pp_lagged_safety_lag: int = 1
-    pp_lagged_max_staleness: int = 8
-    pp_lagged_strict_after_bad: int = 1
     # Quantile tables.
     n_q: int = 4096
     n_bins_quantile_log: int = 1024
@@ -48,7 +44,7 @@ class ProposalConfig:
     # FC schedule. Expert LFCL is fixed by V2: every iter, 1% of expert slots.
     lfcl_interval_iters: int = DEFAULT_LFCL_INTERVAL_ITERS
     lfcl_fraction_pct: float = DEFAULT_LFCL_FRACTION_PCT
-    lfcl_plan_policy: str = "round_robin"
+    lfcl_plan_policy: str = DEFAULT_LFCL_PLAN_POLICY
     nonexpert_fc_w: int = 1
 
     # Storage.
@@ -118,7 +114,11 @@ class ProposalConfig:
                 "proposal_cp_target must be 'disk' or 'test_dram', "
                 f"got {cp_target!r}"
             )
-        lfcl_plan_policy = getattr(args, "proposal_lfcl_plan_policy", "round_robin")
+        lfcl_plan_policy = getattr(
+            args,
+            "proposal_lfcl_plan_policy",
+            DEFAULT_LFCL_PLAN_POLICY,
+        )
         if lfcl_plan_policy not in ("round_robin", "lossy_log_size"):
             raise ValueError(
                 "proposal_lfcl_plan_policy must be "
@@ -215,28 +215,6 @@ class ProposalConfig:
                         0.04,
                     ) or 0.04
                 ),
-            ),
-            pp_lagged_cutoff=bool(
-                getattr(args, "proposal_pp_lagged_cutoff", False)
-            ),
-            pp_lagged_band_fraction=max(
-                0.0,
-                float(
-                    getattr(args, "proposal_pp_lagged_band_fraction", 0.25)
-                    or 0.25
-                ),
-            ),
-            pp_lagged_safety_lag=max(
-                1,
-                int(getattr(args, "proposal_pp_lagged_safety_lag", 1) or 1),
-            ),
-            pp_lagged_max_staleness=max(
-                1,
-                int(getattr(args, "proposal_pp_lagged_max_staleness", 8) or 8),
-            ),
-            pp_lagged_strict_after_bad=max(
-                1,
-                int(getattr(args, "proposal_pp_lagged_strict_after_bad", 1) or 1),
             ),
             n_q=int(getattr(args, "proposal_n_q", 4096)),
             h_lookup_lut_bins=int(

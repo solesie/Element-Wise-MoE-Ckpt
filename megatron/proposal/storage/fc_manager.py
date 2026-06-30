@@ -227,6 +227,7 @@ class FCManager:
         self._checkpoint_workers = checkpoint_workers
         self.keep_last_per_expert = int(keep_last_per_expert)
         self.keep_last_nonexpert = int(keep_last_nonexpert)
+        self._named_params_cache: Optional[Dict[str, torch.nn.Parameter]] = None
 
         self._expert_tensors_by_layer: Dict[int, List[str]] = {}
         self._non_expert_names: List[str] = []
@@ -238,10 +239,8 @@ class FCManager:
                 "nonexpert_shard_rank must be < nonexpert_shard_count, "
                 f"got {self._nonexpert_shard_rank} / {self._nonexpert_shard_count}"
             )
-        if (
-            self._nonexpert_shard_count > 1
-            and getattr(get_mapper(), "mode", "") != "zero12"
-        ):
+        self._nonexpert_partition_payload = self._detect_nonexpert_partition_payload()
+        if self._nonexpert_shard_count > 1 and not self._nonexpert_partition_payload:
             self._apply_nonexpert_name_shard()
         self._sorted_layers: List[int] = sorted(self._expert_tensors_by_layer.keys())
         self._num_layers = len(self._sorted_layers)
@@ -373,7 +372,6 @@ class FCManager:
         self._nonexpert_test_dram_payload: Optional[Dict[str, torch.Tensor]] = None
         self._nonexpert_test_dram_step: int = -1
         self._expert_state: Optional[ExpertState] = None
-        self._named_params_cache: Optional[Dict[str, torch.nn.Parameter]] = None
         if enable_expert_state:
             named_params = dict(self.model.named_parameters())
             self._named_params_cache = named_params
@@ -473,6 +471,25 @@ class FCManager:
             name for name in self._non_expert_names if name in selected
         ]
 
+    def _detect_nonexpert_partition_payload(self) -> bool:
+        mapper = get_mapper()
+        if mapper is None or not self._non_expert_names:
+            return False
+        if getattr(mapper, "mode", "") == "zero12":
+            return True
+        named_params = self._named_params_cache
+        if named_params is None:
+            named_params = dict(self.model.named_parameters())
+            self._named_params_cache = named_params
+        for name in self._non_expert_names:
+            p = named_params[name]
+            if getattr(p, "_hp_mapping", None) is None:
+                continue
+            local = mapper.get_local_param_view(p)
+            if local is None or int(local.numel()) != int(p.numel()):
+                return True
+        return False
+
     def _init_nonexpert_pinned_buffers(self) -> None:
         """Allocate non-expert FC pinned destination buffers before training.
 
@@ -483,7 +500,7 @@ class FCManager:
 
         if self.test_skip_nonexpert_d2h or not self._non_expert_names:
             return
-        if getattr(get_mapper(), "mode", "") == "zero12":
+        if self._nonexpert_partition_payload:
             self._zero12_nonexpert_collector = Zero12NonExpertCollector(
                 self.model,
                 self._non_expert_names,
@@ -1295,7 +1312,7 @@ class FCManager:
         ready_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         mapper = get_mapper()
-        if mapper is not None and getattr(mapper, "mode", "") == "zero12":
+        if mapper is not None and self._nonexpert_partition_payload:
             return self._collect_zero12_nonexpert_payload(ready_event=ready_event)
         # named_params=None: the callee will lazily build it ONLY if the
         # enum cache misses. Steady-state (cache hit) skips the
@@ -1518,14 +1535,8 @@ class FCManager:
                 _release_ready_event()
 
             try:
-                if (
-                    self.cp_target == "disk"
-                    and _ready_event is not None
-                    and self._checkpoint_workers is not None
-                ):
-                    self._checkpoint_workers.submit_non_expert_commit(
-                        _write_from_leased_slot,
-                    )
+                if self.cp_target == "disk" and _ready_event is not None:
+                    _write_from_leased_slot()
                     return
                 if _cuda_event is not None:
                     _cuda_event.synchronize()
@@ -1537,12 +1548,7 @@ class FCManager:
                         step=_step,
                     )
                     _rec.file_bytes = int(padded_bytes)
-                    if self._checkpoint_workers is not None:
-                        self._checkpoint_workers.submit_non_expert_commit(
-                            _finish_durable_write, int(fd),
-                        )
-                    else:
-                        _finish_durable_write(int(fd))
+                    _finish_durable_write(int(fd))
                     return
                 elif self.cp_target == "test_dram":
                     self._nonexpert_test_dram_payload = dict(_payload)
@@ -1566,13 +1572,10 @@ class FCManager:
             _release_ready_event()
 
         # Run inline. ``_fire_nonexpert_fc`` is invoked either from the
-        # host_writer_non_expert worker (new arch) or from the training
-        # thread directly (no-writer fallback). In the worker
-        # case we already own the CUDA context and the FIFO ordering
-        # guarantees the previous fire fully completed; submitting back
-        # to our own queue would self-join during ``drain_non_expert``
-        # callers downstream, so we just synchronously synchronise on
-        # the cuda_event and call save_fn here.
+        # non-expert worker or from the training thread directly
+        # (no-writer fallback). The non-expert worker owns both the D2H
+        # launch and the durable commit so there is no second commit queue
+        # or self-submit path.
         _do_save()
         self._nonexpert_fc_files[-1] = (path, rec)
         self.write_log.append(stats)

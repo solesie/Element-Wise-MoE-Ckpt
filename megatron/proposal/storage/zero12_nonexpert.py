@@ -82,8 +82,8 @@ def build_zero12_nonexpert_payload(
     """
 
     mapper = get_mapper()
-    if mapper is None or getattr(mapper, "mode", "") != "zero12":
-        raise RuntimeError("zero12 non-expert payload requested without mapper")
+    if mapper is None:
+        raise RuntimeError("partitioned non-expert payload requested without mapper")
 
     fragments = mapper.zero12_local_fragments(
         (name, named_params[name]) for name in non_expert_names
@@ -181,7 +181,7 @@ class Zero12NonExpertCollector:
             named_params = dict(self.model.named_parameters())
             self._named_params_cache = named_params
         mapper = get_mapper()
-        if mapper is None or getattr(mapper, "mode", "") != "zero12":
+        if mapper is None:
             return
         fragments = mapper.zero12_local_fragments(
             (name, named_params[name]) for name in self.non_expert_names

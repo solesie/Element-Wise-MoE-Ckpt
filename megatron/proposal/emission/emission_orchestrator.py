@@ -264,7 +264,6 @@ class EmissionOrchestrationMixin:
                 tau_h_epoch=int(pending.get("tau_h_epoch", -1)),
                 tau_source_step=int(pending.get("tau_source_step", -1)),
                 tau_apply_from_step=int(pending.get("tau_apply_from_step", -1)),
-                tau_lagged=bool(pending.get("tau_lagged", False)),
                 tau_lr_over_bc1=float(pending.get("tau_lr_over_bc1", 0.0)),
                 direct_emission_enabled=bool(
                     pending.get("direct_emission_enabled", False)
@@ -293,6 +292,7 @@ class EmissionOrchestrationMixin:
                     age2bit_state.ehat_geom_lut if age2bit_state is not None else None
                 ),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                lfcl_fired_epoch=getattr(self, "_lfcl_fired_epoch_device", None),
             )
 
             # Phase 3: compute_event = end-of-Phase-A + metadata handoff

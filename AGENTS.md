@@ -1,7 +1,7 @@
 # Element-Wise MoE Checkpoint Redesign
 
 본 문서는 proposal checkpoint Redesign 의 활성 아키텍처 및 구현 계약이다. 알고리즘 본질 — **element-wise importance**, **rho/e_hat 기반 abs-H Taylor 단일 K-budget
-경쟁**, **v_t→H quantile matching**, **non-expert lossless + expert lossy + round-robin LFCL(default)** —
+경쟁**, **v_t→H quantile matching**, **non-expert lossless + expert lossy + LFSY-size LFCL(default)** —
 은 그대로 유지하고, **구현 우회 장치** (sample-sort, multi-pool 별도 walk, 1-iter lag,
 snapshot, anchor h_ratio rescale, 4-stream, 2525-라인 cp_hooks) 만 정리한다.
 CPU의 동작은 최소로 한다.

@@ -350,16 +350,14 @@ class Fp32StateMapper:
         self,
         named_params: Iterable[Tuple[str, torch.nn.Parameter]],
     ) -> List[LocalPartitionFragment]:
-        """Return ZeRO-1/2 local partition fragments for the requested params.
+        """Return local FP32 partition fragments for the requested params.
 
-        DeepSpeed's ZeRO-1/2 fp32 master is partitioned by flat element range,
-        not by tensor object.  A non-expert tensor can straddle a partition
-        boundary, so checkpoint code must use these local fragments instead of
-        treating ``single_partition_of_fp32_groups`` as a full-param flat.
+        DeepSpeed's ZeRO-1/2 and BF16 optimizer fp32 master can be partitioned
+        by flat element range, not by tensor object.  A non-expert tensor can
+        straddle a partition boundary, so checkpoint code must use these local
+        fragments instead of treating the fp32 partition as a full-param flat.
         """
 
-        if self._mode != "zero12" or self._fp32_flat is None:
-            return []
         wanted: Dict[int, Tuple[str, torch.nn.Parameter]] = {
             id(p): (name, p) for name, p in named_params
         }
@@ -367,6 +365,29 @@ class Fp32StateMapper:
             return []
 
         fragments: List[LocalPartitionFragment] = []
+        if self._mode != "zero12":
+            for name, p in wanted.values():
+                hp_mapping = getattr(p, "_hp_mapping", None)
+                if hp_mapping is None:
+                    continue
+                try:
+                    hp_addr = hp_mapping.get_hp_fragment_address()
+                    lp_addr = hp_mapping.lp_fragment_address
+                    group_idx = int(hp_mapping.param_group_index)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                fragments.append((
+                    str(name),
+                    p,
+                    group_idx,
+                    int(hp_addr.start),
+                    int(lp_addr.start),
+                    int(hp_addr.numel),
+                ))
+            return fragments
+
+        if self._fp32_flat is None:
+            return []
         n_groups = min(len(self._zero_params_in_partition), len(self._fp32_flat))
         for group_idx in range(n_groups):
             part_size = (
@@ -414,7 +435,8 @@ class Fp32StateMapper:
         state_key: Optional[str] = None,
     ) -> Optional[torch.Tensor]:
         if self._mode != "zero12" or self._fp32_flat is None:
-            return None
+            if self._fp32_flat is None:
+                return None
         group_idx = int(group_idx)
         local_offset = int(local_offset)
         numel = int(numel)
@@ -457,13 +479,26 @@ class Fp32StateMapper:
         dst.copy_(value.reshape(-1).to(device=dst.device, dtype=dst.dtype))
 
     def sync_zero12_fp32_to_lp(self) -> None:
-        """Refresh ZeRO low-precision model weights from local fp32 partitions."""
+        """Refresh low-precision model weights from local fp32 partitions."""
 
-        if self._mode != "zero12":
-            return
         update_lp = getattr(self._engine_opt, "update_lp_params", None)
         if callable(update_lp):
             update_lp()
+            return
+        # BF16_Optimizer links each low-precision param to its local hp
+        # fragment.  Only locally-owned fragments are updated here.
+        seen: set[int] = set()
+        for groups in (getattr(self._engine_opt, "bf16_groups", None),):
+            for group in groups or []:
+                for param in group:
+                    hp_mapping = getattr(param, "_hp_mapping", None)
+                    if hp_mapping is None or id(hp_mapping) in seen:
+                        continue
+                    seen.add(id(hp_mapping))
+                    try:
+                        hp_mapping.update_lp()
+                    except AttributeError:
+                        continue
 
     def get_grad_accum_view(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Return the FP32 storage where training normally accumulates grad."""

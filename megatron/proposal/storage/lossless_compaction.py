@@ -10,17 +10,20 @@ Separated from fc_manager to keep checkpoint responsibilities split:
     weight + m + v snapshot.
 
 Per-expert post-fire actions:
-  1. collect plan-target live GPU p/m/v into a pinned LFCL payload
-  2. submit LFCL payload commit to ExpertState
-  3. rotate that expert's lossy FC log after the LFCL write
-  3. leave lossy selection state untouched.
+  1. plan fired experts before lossy selection
+  2. publish the fired-expert mask so lossy probe/write skips them
+  3. collect plan-target live GPU p/m/v into a pinned LFCL payload
+  4. submit LFCL payload commit to ExpertState and rotate that expert's lossy log
 """
 from __future__ import annotations
 
+import heapq
 import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+import torch
 
 from .lfcl_plan import (
     LFCLPlanner,
@@ -34,10 +37,10 @@ ExpertId = Tuple[int, int]  # (layer, expert_idx) — same shape as fc_manager
 class ExpertLosslessFC:
     """Expert LFCL compaction scheduler + fire-er.
 
-    Initialise once after fc_manager has enumerated expert tensors. Call
-    ``fire_if_due(step)`` after the lossy checkpoint step has submitted the current
-    iter's lossy persist task. V2 LFCL does not mask lossy selection/write
-    or reset accumulated deltas.
+    Initialise once after fc_manager has enumerated expert tensors. The hot path
+    calls ``plan_if_due(step)`` before lossy selection, publishes that plan as a
+    fired mask, and then calls ``fire_planned(...)`` to materialize dense LFCL
+    payloads.
     """
 
     def __init__(
@@ -94,7 +97,66 @@ class ExpertLosslessFC:
         return self._experts_per_lfcl_event
 
     # ------------------------------------------------------------------
-    def _select_fired_experts(self, step: int) -> List[ExpertId]:
+    def _local_lossy_log_bytes(self) -> Dict[ExpertId, int]:
+        lossy_log_bytes: Dict[ExpertId, int] = {}
+        if self._expert_state is None:
+            return lossy_log_bytes
+        get_size = getattr(self._expert_state, "lossy_log_bytes", None)
+        if not callable(get_size):
+            return lossy_log_bytes
+        for eid in self._all_expert_ids:
+            lossy_log_bytes[eid] = int(get_size(eid))
+        return lossy_log_bytes
+
+    def _select_global_lossy_log_size_plan(
+        self,
+        *,
+        step: int,
+        process_group: Any,
+    ) -> List[ExpertId]:
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return self._select_fired_experts(step)
+        rank = int(torch.distributed.get_rank())
+        local_records = [
+            (rank, idx, int(eid[0]), int(eid[1]), int(nbytes))
+            for idx, (eid, nbytes) in enumerate(self._local_lossy_log_bytes().items())
+        ]
+        gathered: List[List[Tuple[int, int, int, int, int]]] = [
+            [] for _ in range(int(torch.distributed.get_world_size(group=process_group)))
+        ]
+        torch.distributed.all_gather_object(
+            gathered,
+            local_records,
+            group=process_group,
+        )
+        flat = [record for records in gathered for record in records]
+        if not flat or self.lfcl_fraction_pct <= 0:
+            return []
+        n_to_fire = max(
+            1,
+            math.ceil(len(flat) * float(self.lfcl_fraction_pct) / 100.0),
+        )
+        winners = heapq.nsmallest(
+            min(int(n_to_fire), len(flat)),
+            flat,
+            key=lambda item: (-int(item[4]), int(item[2]), int(item[3]), int(item[0])),
+        )
+        return [
+            (int(layer), int(expert))
+            for winner_rank, _idx, layer, expert, _nbytes in winners
+            if int(winner_rank) == rank
+        ]
+
+    def _select_fired_experts(
+        self,
+        step: int,
+        *,
+        process_group: Any = None,
+        world_size: int = 1,
+    ) -> List[ExpertId]:
         """Pure host work — decide which experts fire this iter."""
         fired: List[ExpertId] = []
         if step <= 0:
@@ -110,12 +172,12 @@ class ExpertLosslessFC:
                 fired = [eid for eid in self._all_expert_ids if eid[0] == layer]
                 self._layer_rr_tick += 1
         else:
-            if (
-                self._num_expert_slots > 0
-                and self._experts_per_lfcl_event > 0
-                and step % max(self.interval_iters, 1) == 0
-            ):
-                lossy_log_bytes: Dict[ExpertId, int] = {}
+            due = step % max(self.interval_iters, 1) == 0
+            can_fire_local = (
+                self._num_expert_slots > 0 and self._experts_per_lfcl_event > 0
+            )
+            participates_global = int(world_size) > 1 and process_group is not None
+            if due and (can_fire_local or participates_global):
                 needs_log_bytes = bool(
                     getattr(
                         self._planner,
@@ -123,11 +185,18 @@ class ExpertLosslessFC:
                         lambda: True,
                     )()
                 )
-                if needs_log_bytes and self._expert_state is not None:
-                    for eid in self._all_expert_ids:
-                        get_size = getattr(self._expert_state, "lossy_log_bytes", None)
-                        if callable(get_size):
-                            lossy_log_bytes[eid] = int(get_size(eid))
+                if (
+                    needs_log_bytes
+                    and int(world_size) > 1
+                    and process_group is not None
+                ):
+                    return self._select_global_lossy_log_size_plan(
+                        step=int(step),
+                        process_group=process_group,
+                    )
+                lossy_log_bytes = (
+                    self._local_lossy_log_bytes() if needs_log_bytes else {}
+                )
                 fired = self._planner.select(
                     PlannerState(
                         expert_ids=list(self._all_expert_ids),
@@ -139,14 +208,28 @@ class ExpertLosslessFC:
         return fired
 
     # ------------------------------------------------------------------
-    def fire_if_due(
+    def plan_if_due(
         self,
         step: int,
+        *,
+        process_group: Any = None,
+        world_size: int = 1,
+    ) -> List[ExpertId]:
+        """Return experts due this iter without collecting payloads."""
+        return self._select_fired_experts(
+            int(step),
+            process_group=process_group,
+            world_size=int(world_size),
+        )
+
+    def fire_planned(
+        self,
+        step: int,
+        fired: List[ExpertId],
         ready_event: Optional["Any"] = None,
     ) -> List[ExpertId]:
-        """Fire any experts due this iter; returns the list."""
+        """Materialize the already planned experts; returns the fired list."""
         _t0 = time.perf_counter()
-        fired = self._select_fired_experts(step)
         self.last_d2h_event = None
         sub: Dict[str, float] = {
             "n_experts_fired": float(len(fired)),
@@ -212,3 +295,12 @@ class ExpertLosslessFC:
                 flush=True,
             )
         return fired
+
+    def fire_if_due(
+        self,
+        step: int,
+        ready_event: Optional["Any"] = None,
+    ) -> List[ExpertId]:
+        """Compatibility wrapper for callers that do not need pre-selection."""
+        fired = self.plan_if_due(int(step))
+        return self.fire_planned(int(step), fired, ready_event=ready_event)

@@ -300,10 +300,7 @@ def pack_direct_feedback_counts(
         counts[8] = local_h_epoch
         counts[9] = local_h_epoch * local_h_epoch
     if int(counts.numel()) >= 14:
-        counts[10] = (
-            1 if (feedback is not None and bool(feedback.get("tau_lagged", False)))
-            else 0
-        )
+        counts[10] = 0
         counts[11] = int(feedback.get("tau_source_step", -1)) if feedback else -1
         counts[12] = int(feedback.get("tau_apply_from_step", -1)) if feedback else -1
         counts[13] = 0

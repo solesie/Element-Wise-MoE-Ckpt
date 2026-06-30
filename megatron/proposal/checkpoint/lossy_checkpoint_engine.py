@@ -128,24 +128,6 @@ class LossyCheckpointPipeline(
                 ),
             )
         )
-        self._pp_lagged_tau = None
-        if bool(getattr(proposal_config, "pp_lagged_cutoff", False)):
-            from ..cutoff.pp_lagged_tau import PPLaggedTauState
-            self._pp_lagged_tau = PPLaggedTauState(
-                target_ratio=float(topk_ratio),
-                band_fraction=float(
-                    getattr(proposal_config, "pp_lagged_band_fraction", 0.25)
-                ),
-                safety_lag=int(
-                    getattr(proposal_config, "pp_lagged_safety_lag", 1)
-                ),
-                max_staleness=int(
-                    getattr(proposal_config, "pp_lagged_max_staleness", 8)
-                ),
-                strict_after_bad=int(
-                    getattr(proposal_config, "pp_lagged_strict_after_bad", 2)
-                ),
-            )
         from ..telemetry.approx_probe import ApproxProbeTelemetry
         self._approx_probe_telemetry = ApproxProbeTelemetry.from_env()
         from ..telemetry.sparse_cache_shadow import SparseCacheShadowTelemetry
@@ -327,6 +309,43 @@ class LossyCheckpointPipeline(
         """
         self._expert_state = expert_state
 
+    def publish_lfcl_fired_experts(
+        self,
+        *,
+        step: int,
+        expert_ids: Iterable[Tuple[int, int]],
+    ) -> None:
+        """Publish LFCL-fired local experts for the current lossy pass.
+
+        The device mask is epoch based, so old fired entries do not need a
+        per-iter clear.  Kernels only skip entries whose epoch equals ``step``.
+        """
+
+        host = getattr(self, "_lfcl_fired_epoch_host", None)
+        device = getattr(self, "_lfcl_fired_epoch_device", None)
+        local_idx = getattr(self, "_local_expert_to_idx", {})
+        if host is None or device is None or not local_idx:
+            return
+        wrote = False
+        for eid_raw in expert_ids:
+            eid = (int(eid_raw[0]), int(eid_raw[1]))
+            idx = local_idx.get(eid)
+            if idx is None:
+                continue
+            host[int(idx)] = int(step)
+            wrote = True
+        if wrote:
+            if device.is_cuda and torch.cuda.is_available():
+                if self._compute_stream is None:
+                    from ..runtime import get_compute_stream
+                    self._compute_stream = get_compute_stream()
+                stream = self._compute_stream
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        device.copy_(host, non_blocking=True)
+                    return
+            device.copy_(host, non_blocking=True)
+
     def aos_cuda_graph_ready(self) -> bool:
         expert_state = getattr(self, "_expert_state", None)
         return bool(
@@ -342,9 +361,12 @@ class LossyCheckpointPipeline(
         contiguous entry-block population of each optimizer flat group.
         """
 
-        eid_to_expert_idx = {
-            eid: idx for idx, eid in enumerate(sorted(set(self._tname_to_eid.values())))
+        local_expert_ids = sorted(set(self._tname_to_eid.values()))
+        self._local_expert_ids = tuple(local_expert_ids)
+        self._local_expert_to_idx = {
+            eid: idx for idx, eid in enumerate(local_expert_ids)
         }
+        eid_to_expert_idx = self._local_expert_to_idx
         stratum_total_elems: List[int] = []
         stratum_total_blocks: List[int] = []
         stratum_expert_idx: List[int] = []
@@ -414,6 +436,18 @@ class LossyCheckpointPipeline(
         self._approx_probe_stratum_expert_idx_device = descriptor_arena.tensor(
             stratum_expert_idx_token,
         )
+        n_local_experts = max(1, len(local_expert_ids))
+        self._lfcl_fired_epoch_device = torch.zeros(
+            n_local_experts, dtype=torch.int32, device=device,
+        )
+        try:
+            self._lfcl_fired_epoch_host = torch.zeros(
+                n_local_experts, dtype=torch.int32, pin_memory=True,
+            )
+        except RuntimeError:
+            self._lfcl_fired_epoch_host = torch.zeros(
+                n_local_experts, dtype=torch.int32,
+            )
         self._static_descriptor_host_refs.extend(descriptor_arena.host_refs)
         self._approx_probe_sum_q = torch.zeros(
             (n_strata, cand_cap), dtype=torch.float32, device=device,

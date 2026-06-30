@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass, field
 from typing import Dict, List, Protocol, Tuple
 
@@ -52,9 +53,13 @@ class LossyLogSizeBasedPlan:
     def select(self, planner_state: PlannerState, n_to_fire: int) -> List[ExpertId]:
         if n_to_fire <= 0:
             return []
+        n = min(int(n_to_fire), len(planner_state.lossy_log_bytes))
+        if n <= 0:
+            return []
         return [
-            eid for eid, _size in sorted(
+            eid for eid, _size in heapq.nsmallest(
+                n,
                 planner_state.lossy_log_bytes.items(),
                 key=lambda kv: (-int(kv[1]), kv[0]),
-            )[: int(n_to_fire)]
+            )
         ]

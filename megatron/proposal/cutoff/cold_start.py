@@ -52,10 +52,14 @@ if _HAS_TRITON:
         entry_elem_start_ptr,
         entry_group_start_ptr,
         entry_group_count_ptr,
+        entry_stratum_idx_ptr,
+        stratum_expert_idx_ptr,
+        lfcl_fired_epoch_ptr,
         entry_block_entry_idx_ptr,
         entry_block_local_group_start_ptr,
         entry_block_id,
         master_base_elem,
+        step_value,
         lr_over_bc1, sqrt_bc2_inv, eps,
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
@@ -63,9 +67,24 @@ if _HAS_TRITON:
         SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
+        HAS_LFCL_FIRED_MASK: tl.constexpr,
     ):
         BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
         entry_id = tl.load(entry_block_entry_idx_ptr + entry_block_id)
+        expert_fired = tl.full((), False, tl.int1)
+        if HAS_LFCL_FIRED_MASK:
+            stratum_idx = tl.load(entry_stratum_idx_ptr + entry_id)
+            expert_idx = tl.load(
+                stratum_expert_idx_ptr + stratum_idx,
+                mask=stratum_idx >= 0,
+                other=-1,
+            )
+            fired_epoch = tl.load(
+                lfcl_fired_epoch_ptr + expert_idx,
+                mask=expert_idx >= 0,
+                other=-1,
+            )
+            expert_fired = fired_epoch == step_value
         block_group_start = tl.load(entry_block_local_group_start_ptr + entry_block_id)
         entry_elem_start = tl.load(entry_elem_start_ptr + entry_id)
         entry_group_start = tl.load(entry_group_start_ptr + entry_id)
@@ -84,6 +103,7 @@ if _HAS_TRITON:
             (BLOCK_SIZE,),
         )
         elem_mask = tl.reshape(gid_local_2d < entry_group_count, (BLOCK_SIZE,))
+        selectable_mask = elem_mask & (~expert_fired)
         m = tl.load(m_ptr + elem_off, mask=elem_mask, other=0.0)
         linear = tl.load(linear_ptr + elem_off, mask=elem_mask, other=0.0)
         v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
@@ -107,7 +127,7 @@ if _HAS_TRITON:
         )
         if RANDOM_MODE:
             score = _random_unit_from_index(global_elem_idx, RANDOM_SALT)
-        return score, elem_mask
+        return score, selectable_mask
 
     @triton.jit
     def _reduce_score_minmax_entries_kernel(
@@ -117,12 +137,16 @@ if _HAS_TRITON:
         entry_elem_start_ptr,
         entry_group_start_ptr,
         entry_group_count_ptr,
+        entry_stratum_idx_ptr,
+        stratum_expert_idx_ptr,
+        lfcl_fired_epoch_ptr,
         entry_block_entry_idx_ptr,
         entry_block_local_group_start_ptr,
         smin_ptr,
         smax_ptr,
         n_entry_blocks,
         master_base_elem,
+        step_value,
         lr_over_bc1, sqrt_bc2_inv, eps,
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
@@ -130,6 +154,7 @@ if _HAS_TRITON:
         SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
+        HAS_LFCL_FIRED_MASK: tl.constexpr,
     ):
         entry_block_id = tl.program_id(axis=0)
         if entry_block_id >= n_entry_blocks:
@@ -141,10 +166,14 @@ if _HAS_TRITON:
             entry_elem_start_ptr,
             entry_group_start_ptr,
             entry_group_count_ptr,
+            entry_stratum_idx_ptr,
+            stratum_expert_idx_ptr,
+            lfcl_fired_epoch_ptr,
             entry_block_entry_idx_ptr,
             entry_block_local_group_start_ptr,
             entry_block_id,
             master_base_elem,
+            step_value,
             lr_over_bc1, sqrt_bc2_inv, eps,
             G,
             GROUPS_PER_BLOCK,
@@ -152,6 +181,7 @@ if _HAS_TRITON:
             SCORE_POLICY,
             RANDOM_MODE,
             RANDOM_SALT,
+            HAS_LFCL_FIRED_MASK,
         )
         positive = mask & (score > 0.0) & (score == score)
         block_min = tl.min(tl.where(positive, score, float("inf")), axis=0)
@@ -167,6 +197,9 @@ if _HAS_TRITON:
         entry_elem_start_ptr,
         entry_group_start_ptr,
         entry_group_count_ptr,
+        entry_stratum_idx_ptr,
+        stratum_expert_idx_ptr,
+        lfcl_fired_epoch_ptr,
         entry_block_entry_idx_ptr,
         entry_block_local_group_start_ptr,
         hist_ptr,
@@ -175,6 +208,7 @@ if _HAS_TRITON:
         n_bins,
         n_entry_blocks,
         master_base_elem,
+        step_value,
         lr_over_bc1, sqrt_bc2_inv, eps,
         G: tl.constexpr,
         GROUPS_PER_BLOCK: tl.constexpr,
@@ -182,6 +216,7 @@ if _HAS_TRITON:
         SCORE_POLICY: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
+        HAS_LFCL_FIRED_MASK: tl.constexpr,
     ):
         entry_block_id = tl.program_id(axis=0)
         if entry_block_id >= n_entry_blocks:
@@ -193,10 +228,14 @@ if _HAS_TRITON:
             entry_elem_start_ptr,
             entry_group_start_ptr,
             entry_group_count_ptr,
+            entry_stratum_idx_ptr,
+            stratum_expert_idx_ptr,
+            lfcl_fired_epoch_ptr,
             entry_block_entry_idx_ptr,
             entry_block_local_group_start_ptr,
             entry_block_id,
             master_base_elem,
+            step_value,
             lr_over_bc1, sqrt_bc2_inv, eps,
             G,
             GROUPS_PER_BLOCK,
@@ -204,6 +243,7 @@ if _HAS_TRITON:
             SCORE_POLICY,
             RANDOM_MODE,
             RANDOM_SALT,
+            HAS_LFCL_FIRED_MASK,
         )
         lo = tl.load(smin_ptr)
         hi = tl.load(smax_ptr)
@@ -238,11 +278,15 @@ def launch_reduce_score_minmax_for_group(
     entry_elem_start: torch.Tensor,
     entry_group_start: torch.Tensor,
     entry_group_count: torch.Tensor,
+    entry_stratum_idx: Optional[torch.Tensor] = None,
+    stratum_expert_idx: Optional[torch.Tensor] = None,
+    lfcl_fired_epoch: Optional[torch.Tensor] = None,
     entry_block_entry_idx: torch.Tensor,
     entry_block_local_group_start: torch.Tensor,
     smin: torch.Tensor,
     smax: torch.Tensor,
     master_off_elem: int,
+    step: int,
     group_size: int,
     lr_over_bc1: float,
     sqrt_bc2_inv: float,
@@ -256,6 +300,14 @@ def launch_reduce_score_minmax_for_group(
     n_entry_blocks = int(entry_block_entry_idx.numel())
     if n_entry_blocks <= 0:
         return
+    has_lfcl_mask = (
+        entry_stratum_idx is not None
+        and stratum_expert_idx is not None
+        and lfcl_fired_epoch is not None
+    )
+    entry_stratum_idx_t = entry_stratum_idx if entry_stratum_idx is not None else entry_block_entry_idx
+    stratum_expert_idx_t = stratum_expert_idx if stratum_expert_idx is not None else entry_block_entry_idx
+    lfcl_fired_epoch_t = lfcl_fired_epoch if lfcl_fired_epoch is not None else entry_block_entry_idx
     _reduce_score_minmax_entries_kernel[(n_entry_blocks,)](
         m_flat,
         score_linear_flat if score_linear_flat is not None else m_flat,
@@ -268,12 +320,16 @@ def launch_reduce_score_minmax_for_group(
         entry_elem_start,
         entry_group_start,
         entry_group_count,
+        entry_stratum_idx_t,
+        stratum_expert_idx_t,
+        lfcl_fired_epoch_t,
         entry_block_entry_idx,
         entry_block_local_group_start,
         smin,
         smax,
         int(n_entry_blocks),
         int(master_off_elem),
+        int(step),
         float(lr_over_bc1),
         float(sqrt_bc2_inv),
         float(eps),
@@ -283,6 +339,7 @@ def launch_reduce_score_minmax_for_group(
         SCORE_POLICY=int(score_policy_id),
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
+        HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
     )
 
 
@@ -299,12 +356,16 @@ def launch_build_score_log_hist_for_group(
     entry_elem_start: torch.Tensor,
     entry_group_start: torch.Tensor,
     entry_group_count: torch.Tensor,
+    entry_stratum_idx: Optional[torch.Tensor] = None,
+    stratum_expert_idx: Optional[torch.Tensor] = None,
+    lfcl_fired_epoch: Optional[torch.Tensor] = None,
     entry_block_entry_idx: torch.Tensor,
     entry_block_local_group_start: torch.Tensor,
     hist: torch.Tensor,
     smin: torch.Tensor,
     smax: torch.Tensor,
     master_off_elem: int,
+    step: int,
     group_size: int,
     lr_over_bc1: float,
     sqrt_bc2_inv: float,
@@ -318,6 +379,14 @@ def launch_build_score_log_hist_for_group(
     n_entry_blocks = int(entry_block_entry_idx.numel())
     if n_entry_blocks <= 0 or int(hist.numel()) <= 1:
         return
+    has_lfcl_mask = (
+        entry_stratum_idx is not None
+        and stratum_expert_idx is not None
+        and lfcl_fired_epoch is not None
+    )
+    entry_stratum_idx_t = entry_stratum_idx if entry_stratum_idx is not None else entry_block_entry_idx
+    stratum_expert_idx_t = stratum_expert_idx if stratum_expert_idx is not None else entry_block_entry_idx
+    lfcl_fired_epoch_t = lfcl_fired_epoch if lfcl_fired_epoch is not None else entry_block_entry_idx
     _build_score_log_hist_entries_kernel[(n_entry_blocks,)](
         m_flat,
         score_linear_flat if score_linear_flat is not None else m_flat,
@@ -330,6 +399,9 @@ def launch_build_score_log_hist_for_group(
         entry_elem_start,
         entry_group_start,
         entry_group_count,
+        entry_stratum_idx_t,
+        stratum_expert_idx_t,
+        lfcl_fired_epoch_t,
         entry_block_entry_idx,
         entry_block_local_group_start,
         hist,
@@ -338,6 +410,7 @@ def launch_build_score_log_hist_for_group(
         int(hist.numel()),
         int(n_entry_blocks),
         int(master_off_elem),
+        int(step),
         float(lr_over_bc1),
         float(sqrt_bc2_inv),
         float(eps),
@@ -347,4 +420,5 @@ def launch_build_score_log_hist_for_group(
         SCORE_POLICY=int(score_policy_id),
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
+        HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
     )

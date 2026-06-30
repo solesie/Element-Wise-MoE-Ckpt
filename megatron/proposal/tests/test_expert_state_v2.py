@@ -480,7 +480,65 @@ def test_direct_emission_resets_age_only_for_actual_written(tmp_path: Path):
         state.shutdown()
 
 
-def test_lfcl_compaction_does_not_touch_selection_state(tmp_path: Path):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
+    expert_map = {(0, 0): [("mlp.w", torch.Size([16]), 16)]}
+    state = ExpertState(
+        expert_map,
+        output_dir=tmp_path,
+        fresh=True,
+        cp_target="test_dram",
+    )
+    device = torch.device("cuda")
+    group_size = 4
+    m = torch.ones(16, dtype=torch.float32, device=device)
+    v = torch.ones(16, dtype=torch.float32, device=device)
+    p = torch.arange(16, dtype=torch.float32, device=device) + 40.0
+    h_lut_values = torch.ones(8, dtype=torch.float32, device=device)
+    h_lut_log_v_min = torch.zeros((), dtype=torch.float32, device=device)
+    h_lut_inv_log_v_width = torch.ones((), dtype=torch.float32, device=device)
+    total_th = torch.tensor(0.0, dtype=torch.float32, device=device)
+    hp = AdamHParams(lr_over_bc1=1.0, sqrt_bc2_inv=1.0, eps=1.0e-8)
+    fired_epoch = torch.tensor([9], dtype=torch.int32, device=device)
+
+    lossy_state = LossyRecordWriteInputs(
+        bf16_groups_mvph=[(m, v, p, 0)],
+        name_list=["mlp.w"],
+        group_size=group_size,
+        within_off_per_name=[0],
+        group_count_per_name=[4],
+        h_lut_values=h_lut_values,
+        h_lut_log_v_min=h_lut_log_v_min,
+        h_lut_inv_log_v_width=h_lut_inv_log_v_width,
+        total_th=total_th,
+        adam_hparams=hp,
+        direct_emission_enabled=True,
+        lfcl_fired_epoch=fired_epoch,
+    )
+    age = _attach_age2bit(lossy_state, 16, device)
+    age.age_words.fill_(-1)
+    lossy_state.step_device.fill_(9)
+    try:
+        state.write_for_iter(
+            step=9,
+            per_expert_updates={(0, 0): [("mlp.w", 0, 0, 16)]},
+            compute_event=None,
+            gpu_refs=[
+                m, v, p, h_lut_values, total_th,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
+                fired_epoch,
+            ],
+            lossy_state=lossy_state,
+        )
+        torch.cuda.synchronize()
+        assert state._direct_record_cursor_device is not None
+        assert int(state._direct_record_cursor_device[0].item()) == 0
+        assert int(age.age_words[0].item()) == 0
+    finally:
+        state.shutdown()
+
+
+def test_lfcl_compaction_payload_commit_is_writer_local(tmp_path: Path):
     state = ExpertState(
         _tiny_expert_map(),
         output_dir=tmp_path,
