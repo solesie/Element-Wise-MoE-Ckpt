@@ -14,6 +14,7 @@ replay.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -263,6 +264,24 @@ def _apply_fc_payload_to_model(
     return int(scalars.get("step", rolling_step) or rolling_step)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return int(default)
+    return int(raw)
+
+
+def _fdp_global_expert_id(local_expert_id: int) -> int:
+    if os.environ.get("PROPOSAL_FDP_EXPERT_IDS_GLOBAL", "").lower() in (
+        "1", "true", "yes",
+    ):
+        return int(local_expert_id)
+    ep_size = _env_int("PROPOSAL_FDP_EP_SIZE", 1)
+    if ep_size <= 1:
+        return int(local_expert_id)
+    return _env_int("PROPOSAL_FDP_EXPERT_ID_BASE", 0) + int(local_expert_id)
+
+
 def _load_fc_payload_into(
     payload_path: Path,
     target_params: Dict[str, torch.nn.Parameter],
@@ -290,6 +309,182 @@ def _load_fc_payload_into(
         data = tensor_dict
         return _apply_fc_payload_to_model(data, scalars, target_params, optimizer)
     return _apply_payload_dict_to_model(data, target_params, optimizer)
+
+
+def _recover_from_fdp(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    t_fault: int,
+    load_expert_fcs: bool,
+    diag: RecoveryDiagnostics,
+    t_all0: float,
+) -> RecoveryDiagnostics:
+    """Recover from the raw FDP backend's latest metadata image.
+
+    FDP metadata is latest-only in the current implementation. If the latest
+    durable object is newer than ``t_fault``, this path fails explicitly rather
+    than silently recovering a future state.
+    """
+    import time as _time
+
+    _phase: Dict[str, float] = {}
+
+    _t0 = _time.perf_counter()
+    non_expert_params, by_expert_params = _classify_params(model)
+    from .proposal_io import (
+        fdp_read_lfcs_blob,
+        fdp_read_lfsy_blob,
+        fdp_read_nefc_blob,
+        fdp_recovery_entries,
+        load_binary_blob,
+    )
+
+    entries = fdp_recovery_entries()
+    _phase["scan_classify_ms"] = (_time.perf_counter() - _t0) * 1000.0
+
+    _t0 = _time.perf_counter()
+    nefc_shards = [dict(e) for e in entries.get("nefc_shards", [])]
+    if not nefc_shards:
+        nefc_shards = [dict(entries.get("nefc", {}))]
+    cur_pp = _env_int("PROPOSAL_FDP_PP_RANK", 0)
+    ep_size = _env_int("PROPOSAL_FDP_EP_SIZE", 1)
+    valid_nefc = [
+        e for e in nefc_shards
+        if bool(e.get("valid", False))
+        and int(e.get("pp_rank", cur_pp)) == int(cur_pp)
+        and int(e.get("iter", -1)) <= int(t_fault)
+    ]
+    if not valid_nefc:
+        raise RuntimeError("FDP recovery: no valid NEFC shard in metadata")
+    best_ne_iter = max(int(e.get("iter", -1)) for e in valid_nefc)
+    best_nefc = [
+        e for e in valid_nefc if int(e.get("iter", -1)) == int(best_ne_iter)
+    ]
+    if ep_size > 1:
+        shard_seen = {int(e.get("ep_rank", -1)) for e in best_nefc}
+        missing = [i for i in range(int(ep_size)) if i not in shard_seen]
+        if missing:
+            raise RuntimeError(
+                f"FDP recovery: missing NEFC shard(s) at iter "
+                f"{best_ne_iter}: {missing}"
+            )
+    applied_steps: List[int] = []
+    for shard in sorted(
+        best_nefc,
+        key=lambda e: (int(e.get("ep_rank", 0)), int(e.get("shard_index", 0))),
+    ):
+        shard_index = int(shard.get("shard_index", 0))
+        ne_blob = fdp_read_nefc_blob(
+            int(shard["logical_bytes"]),
+            shard_index=shard_index,
+        )
+        ne_payload, ne_scalars = load_binary_blob(
+            ne_blob,
+            source=f"fdp:nefc_shard{shard_index}",
+        )
+        applied_steps.append(
+            int(_apply_fc_payload_to_model(
+                ne_payload, ne_scalars, non_expert_params, optimizer
+            ))
+        )
+    diag.nonexpert_fc_iter = int(best_ne_iter)
+    diag.nonexpert_fc_path = ",".join(
+        f"fdp:nefc_shard{int(e.get('shard_index', 0))}"
+        for e in sorted(best_nefc, key=lambda x: int(x.get("shard_index", 0)))
+    )
+    _phase["nonexpert_fc_ms"] = (_time.perf_counter() - _t0) * 1000.0
+
+    log_loaded: Dict[ExpertId, int] = {}
+    _t0 = _time.perf_counter()
+    if load_expert_fcs:
+        from .expert_writer import read_expert_state_from_blobs
+
+        lfcs_by_eid: Dict[ExpertId, Dict[str, Any]] = {}
+        for raw in entries.get("lfcs", []):
+            e = dict(raw)
+            if not bool(e.get("valid", False)):
+                continue
+            eid = (int(e.get("layer_id", -1)), int(e.get("expert_id", -1)))
+            lfcs_by_eid[eid] = e
+
+        lfsy_by_eid: Dict[ExpertId, Dict[str, Any]] = {}
+        for raw in entries.get("lfsy", []):
+            e = dict(raw)
+            if not bool(e.get("valid", False)):
+                continue
+            eid = (int(e.get("layer_id", -1)), int(e.get("expert_id", -1)))
+            lfsy_by_eid[eid] = e
+
+        eids_with_fdp_state = [
+            eid for eid in by_expert_params
+            if (
+                (eid[0], _fdp_global_expert_id(eid[1])) in lfcs_by_eid
+                or (eid[0], _fdp_global_expert_id(eid[1])) in lfsy_by_eid
+            )
+        ]
+
+        _t_read0 = _time.perf_counter()
+        new_pair_data: Dict[ExpertId, Dict[str, Any]] = {}
+        for L, E in eids_with_fdp_state:
+            global_eid = (L, _fdp_global_expert_id(E))
+            lfcs = lfcs_by_eid.get(global_eid)
+            lfsy = lfsy_by_eid.get(global_eid)
+            lfcl_blob: Optional[torch.Tensor] = None
+            lfsy_blob: Optional[torch.Tensor] = None
+
+            if lfcs is not None:
+                lfcs_iter = int(lfcs.get("iter", -1))
+                if lfcs_iter > int(t_fault):
+                    raise RuntimeError(
+                        "FDP recovery: latest LFCS "
+                        f"L{L}/E{E} iter {lfcs_iter} is newer than "
+                        f"requested fault step {int(t_fault)}"
+                    )
+                lfcl_blob = fdp_read_lfcs_blob(
+                    L, E, int(lfcs["logical_bytes"])
+                )
+            if lfsy is not None:
+                lfsy_blob = fdp_read_lfsy_blob(
+                    L, E, int(lfsy["logical_tail"])
+                )
+
+            new_pair_data[(L, E)] = read_expert_state_from_blobs(
+                lfcl_blob,
+                lfsy_blob,
+                layer=L,
+                expert=E,
+                source="fdp",
+            )
+        _phase["expert_read_ms"] = (_time.perf_counter() - _t_read0) * 1000.0
+
+        _t_apply0 = _time.perf_counter()
+        for eid in eids_with_fdp_state:
+            data = new_pair_data[eid]
+            log_step = _apply_payload_dict_to_model(
+                data, by_expert_params[eid], optimizer
+            )
+            if log_step > int(t_fault):
+                raise RuntimeError(
+                    f"FDP recovery: expert L{eid[0]}/E{eid[1]} recovered "
+                    f"step {log_step} is newer than requested fault step "
+                    f"{int(t_fault)}"
+                )
+            log_loaded[eid] = int(log_step)
+            diag.expert_fc_iters[eid] = int(log_step)
+        _phase["expert_apply_ms"] = (_time.perf_counter() - _t_apply0) * 1000.0
+
+        diag.rolling_experts_loaded = len(log_loaded)
+        diag.expert_fc_count = len(log_loaded)
+        if diag.expert_fc_count == 0:
+            raise RuntimeError("FDP recovery: no expert LFCS/LFSY state found")
+    _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
+
+    diag.min_fc_iter = int(diag.nonexpert_fc_iter)
+    _phase["total_ms"] = (_time.perf_counter() - t_all0) * 1000.0
+    diag.summary.update(_phase)
+    _print_recovery_phases(_phase, diag)
+    return diag
 
 
 def recover(
@@ -321,6 +516,19 @@ def recover(
     _t_all0 = _time.perf_counter()
     diag = RecoveryDiagnostics()
     _ensure_optimizer_state(model, optimizer)
+
+    if expert_state_image is None and nonexpert_state_image is None:
+        from .proposal_io import backend_kind
+
+        if backend_kind() == "fdp":
+            return _recover_from_fdp(
+                model,
+                optimizer,
+                t_fault=int(t_fault),
+                load_expert_fcs=bool(load_expert_fcs),
+                diag=diag,
+                t_all0=_t_all0,
+            )
 
     cp_dir = Path(cp_dir)
     _t0 = _time.perf_counter()

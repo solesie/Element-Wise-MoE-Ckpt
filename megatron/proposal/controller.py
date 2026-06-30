@@ -339,6 +339,37 @@ def init_proposal(
 
     topology = topology_from_args(args)
     get_controller()._topology = topology
+    if os.environ.get("PROPOSAL_IO_BACKEND", "").lower() == "fdp":
+        os.environ.setdefault("PROPOSAL_FDP_RANK", str(int(topology.global_rank)))
+        os.environ.setdefault("PROPOSAL_FDP_WORLD_SIZE", str(int(topology.world_size)))
+        os.environ.setdefault("PROPOSAL_FDP_DP_RANK", str(int(topology.dp_rank)))
+        os.environ.setdefault("PROPOSAL_FDP_DP_SIZE", str(int(topology.dp_size)))
+        os.environ.setdefault("PROPOSAL_FDP_PP_RANK", str(int(topology.pp_rank)))
+        os.environ.setdefault("PROPOSAL_FDP_PP_SIZE", str(int(topology.pp_size)))
+        os.environ.setdefault("PROPOSAL_FDP_EP_RANK", str(int(topology.ep_rank)))
+        os.environ.setdefault("PROPOSAL_FDP_EP_SIZE", str(int(topology.ep_size)))
+        _fdp_num_layers = int(getattr(args, "num_layers", 0) or 0)
+        if _fdp_num_layers > 0:
+            os.environ.setdefault(
+                "PROPOSAL_FDP_NUM_MOE_LAYERS",
+                str(_fdp_num_layers),
+            )
+        os.environ.setdefault(
+            "PROPOSAL_FDP_EXPERTS_PER_LAYER",
+            str(int(num_experts_scalar)),
+        )
+        if int(topology.ep_size) > 1 and int(num_experts_scalar) > 0:
+            if int(num_experts_scalar) % int(topology.ep_size) != 0:
+                raise RuntimeError(
+                    "FDP global expert-slot mapping requires num_experts to be "
+                    "divisible by ep_size unless PROPOSAL_FDP_EXPERT_ID_BASE "
+                    "is set explicitly."
+                )
+            local_experts = int(num_experts_scalar) // int(topology.ep_size)
+            os.environ.setdefault(
+                "PROPOSAL_FDP_EXPERT_ID_BASE",
+                str(int(topology.ep_rank) * int(local_experts)),
+            )
 
     # B3: guard unsupported configs.
     zero_stage = int(getattr(args, "zero_stage", 0) or 0)

@@ -19,6 +19,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 import pickle
 import re
@@ -284,6 +285,14 @@ def _assert_bytes_equal(label: str, got: bytes, expected: bytes) -> None:
     )
 
 
+def _tensor_slice_bytes(tensor, offset: int, nbytes: int) -> bytes:
+    return bytes(
+        tensor.narrow(0, int(offset), int(nbytes))
+        .numpy()
+        .tobytes()
+    )
+
+
 def _set_fdp_env(args: argparse.Namespace) -> Dict[str, str]:
     geometry_device = args.geometry_device or _infer_block_device(args.device)
     uring_device = args.device if args.no_auto_ng else _infer_uring_device(args.device)
@@ -521,9 +530,24 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
             lfsy_expected[eid] = bytes(header)
         expected_cmds["expert"] += data_write_cmds(len(header))
 
+    lfcs_slots_per_iter = 1
+    if args.round_robin_scope == "slot":
+        explicit_slots = int(args.train_like_lfcs_slots_per_iter)
+        if explicit_slots > 0:
+            lfcs_slots_per_iter = explicit_slots
+        elif float(args.train_like_lfcs_fraction_pct) > 0.0:
+            lfcs_slots_per_iter = int(math.ceil(
+                len(slots) * float(args.train_like_lfcs_fraction_pct) / 100.0
+            ))
+        lfcs_slots_per_iter = max(1, min(lfcs_slots_per_iter, len(slots)))
+
     def lossless_eids_for_step(step: int):
         if args.round_robin_scope == "slot":
-            return [slots[(int(step) - 1) % len(slots)]]
+            start = ((int(step) - 1) * int(lfcs_slots_per_iter)) % len(slots)
+            return [
+                slots[(start + i) % len(slots)]
+                for i in range(int(lfcs_slots_per_iter))
+            ]
         expert = (int(step) - 1) % experts_per_layer
         return [(layer, expert) for layer in range(layers)]
 
@@ -551,6 +575,7 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
         "[fdp-smoke] train-like mode: "
         f"iters={args.train_like_iters} slots={len(slots)} "
         f"scope={rr_desc} "
+        f"lfcs_slots_per_iter={len(lossless_eids_for_step(1))} "
         f"writers={'two-thread' if args.two_writer_threads else 'single-thread'} "
         "payload_mode=prebuilt-per-iter "
         f"nefc_payload={nefc_desc} "
@@ -1232,28 +1257,29 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
 
     if not args.skip_readback:
         print("[fdp-smoke] verifying train-like payload readback")
+        nefc_blob = proposal_io.fdp_read_nefc_blob()
         _assert_bytes_equal(
             "NEFC payload",
-            proposal_io.fdp_debug_read_nefc(
-                header_bytes, len(final_nefc_payload)
+            _tensor_slice_bytes(
+                nefc_blob, header_bytes, len(final_nefc_payload)
             ),
             final_nefc_payload,
         )
         for eid in slots:
             layer, expert = eid
             if eid in lfcs_payloads:
+                lfcs_blob = proposal_io.fdp_read_lfcs_blob(layer, expert)
                 _assert_bytes_equal(
                     f"LFCS L{layer:02d}/E{expert:02d}",
-                    proposal_io.fdp_debug_read_lfcs(
-                        layer, expert, header_bytes, len(lfcs_payloads[eid])
+                    _tensor_slice_bytes(
+                        lfcs_blob, header_bytes, len(lfcs_payloads[eid])
                     ),
                     lfcs_payloads[eid],
                 )
+            lfsy_blob = proposal_io.fdp_read_lfsy_blob(layer, expert)
             _assert_bytes_equal(
                 f"LFSY L{layer:02d}/E{expert:02d}",
-                proposal_io.fdp_debug_read_lfsy(
-                    layer, expert, 0, len(lfsy_expected[eid])
-                ),
+                _tensor_slice_bytes(lfsy_blob, 0, len(lfsy_expected[eid])),
                 lfsy_expected[eid],
             )
 
@@ -1421,25 +1447,26 @@ def run_smoke(args: argparse.Namespace) -> None:
 
     if not args.skip_readback:
         print("[fdp-smoke] verifying payload readback")
+        nefc_blob = proposal_io.fdp_read_nefc_blob()
         _assert_bytes_equal(
             "NEFC payload",
-            proposal_io.fdp_debug_read_nefc(
-                header_bytes, len(nefc_payload_bytes)
+            _tensor_slice_bytes(
+                nefc_blob, header_bytes, len(nefc_payload_bytes)
             ),
             nefc_payload_bytes,
         )
+        lfcs_blob = proposal_io.fdp_read_lfcs_blob(layer_id, expert_id)
         _assert_bytes_equal(
             "LFCS payload",
-            proposal_io.fdp_debug_read_lfcs(
-                layer_id, expert_id, header_bytes, len(lfcs_payload_bytes)
+            _tensor_slice_bytes(
+                lfcs_blob, header_bytes, len(lfcs_payload_bytes)
             ),
             lfcs_payload_bytes,
         )
+        lfsy_blob = proposal_io.fdp_read_lfsy_blob(layer_id, expert_id)
         _assert_bytes_equal(
             "LFSY header",
-            proposal_io.fdp_debug_read_lfsy(
-                layer_id, expert_id, 0, len(lfsy_header)
-            ),
+            _tensor_slice_bytes(lfsy_blob, 0, len(lfsy_header)),
             lfsy_header,
         )
         lfsy_offset = header_bytes
@@ -1447,9 +1474,7 @@ def run_smoke(args: argparse.Namespace) -> None:
             expected = raw_blob + b"\x00" * (int(padded_written) - len(raw_blob))
             _assert_bytes_equal(
                 f"LFSY append step={step}",
-                proposal_io.fdp_debug_read_lfsy(
-                    layer_id, expert_id, lfsy_offset, int(padded_written)
-                ),
+                _tensor_slice_bytes(lfsy_blob, lfsy_offset, int(padded_written)),
                 expected,
             )
             lfsy_offset += int(padded_written)
@@ -1483,10 +1508,26 @@ def parse_args() -> argparse.Namespace:
                    default="expert",
                    help=("LFCS selection for train-like mode: expert selects "
                          "the same expert index across all layers; slot "
-                         "selects one flattened layer/expert slot"))
+                         "selects flattened layer/expert slots"))
+    p.add_argument("--train-like-lfcs-slots-per-iter", type=int, default=0,
+                   help=("when --round-robin-scope=slot, select this many "
+                         "flattened layer/expert slots for LFCS per iter; "
+                         "0 falls back to --train-like-lfcs-fraction-pct or 1"))
+    p.add_argument("--train-like-lfcs-fraction-pct", type=float, default=0.0,
+                   help=("when --round-robin-scope=slot and explicit slot "
+                         "count is 0, select ceil(total_slots * pct / 100) "
+                         "LFCS slots per iter"))
     p.add_argument("--preset-2g-iter", action="store_true",
                    help=("set train-like payload sizes to roughly 2GiB of "
                          "data-region writes per iteration"))
+    p.add_argument("--preset-192-slot-1pct", action="store_true",
+                   help=("set train-like shape to 12 layers * 16 experts, "
+                         "slot round-robin 1%% LFCS = 2 slots/iter, "
+                         "NEFC=2048MiB, LFCS=70MiB/file, "
+                         "LFSY=1.84MiB/file"))
+    p.add_argument("--preset-768-slot-1pct", action="store_true",
+                   help=("deprecated alias for --preset-192-slot-1pct; "
+                         "kept for old command compatibility"))
     p.add_argument("--train-like-lossy-records", type=int, default=5,
                    help="base LFSY record count per lossy expert append")
     p.add_argument("--train-like-nefc-mib", type=float, default=0.0,
@@ -1545,6 +1586,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yes", action="store_true",
                    help="required with --run")
     args = p.parse_args()
+    slot_1pct_preset = (
+        bool(args.preset_192_slot_1pct) or bool(args.preset_768_slot_1pct)
+    )
+    if slot_1pct_preset and args.preset_2g_iter:
+        raise SystemExit(
+            "--preset-192-slot-1pct/--preset-768-slot-1pct and "
+            "--preset-2g-iter cannot be used together"
+        )
+    if slot_1pct_preset:
+        args.layers = 12
+        args.experts_per_layer = 16
+        args.round_robin_scope = "slot"
+        args.train_like_lfcs_slots_per_iter = 2
+        args.train_like_lfcs_fraction_pct = 1.0
+        args.train_like_nefc_mib = 2048.0
+        args.train_like_lfcs_mib = 70.0
+        args.train_like_lossy_mib = 1.84
     if args.preset_2g_iter:
         args.train_like_nefc_mib = 256.0
         args.train_like_lfcs_mib = 256.0

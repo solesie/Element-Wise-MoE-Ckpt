@@ -22,7 +22,7 @@ constexpr uint64_t make_magic8(char a, char b, char c, char d,
 
 constexpr uint64_t kSuperMagic = make_magic8('F', 'D', 'P', 'C', 'P', 'S', 'B', '1');
 constexpr uint64_t kMetadataMagic = make_magic8('F', 'D', 'P', 'C', 'P', 'M', 'D', '1');
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;
 constexpr uint64_t kDefaultChunkBytes = 64ull * 1024ull * 1024ull;
 constexpr uint32_t kMetadataHeaderBytes = 4096;
 
@@ -69,6 +69,15 @@ struct SuperBlock {
     uint32_t experts_per_layer;
     uint32_t expert_slots;
 
+    uint32_t dp_rank;
+    uint32_t dp_size;
+    uint32_t pp_rank;
+    uint32_t pp_size;
+    uint32_t ep_rank;
+    uint32_t ep_size;
+    uint32_t nefc_shard_count;
+    uint32_t reserved_topology0;
+
     uint32_t max_chunks_nefc;
     uint32_t max_chunks_lfcs;
     uint32_t max_chunks_lfsy;
@@ -98,9 +107,12 @@ struct MetadataHeader {
     uint32_t num_moe_layers;
     uint32_t experts_per_layer;
     uint32_t expert_slots;
+    uint32_t nefc_shard_count;
     uint32_t data_chunk_count;
     uint32_t bitmap_bytes;
-    uint32_t reserved0;
+    uint32_t dp_size;
+    uint32_t pp_size;
+    uint32_t ep_size;
 
     uint64_t bitmap_offset;
     uint64_t nefc_offset;
@@ -113,6 +125,10 @@ struct NefcEntry {
     uint8_t valid;
     uint8_t reserved0[3];
     uint32_t rank;
+    uint32_t dp_rank;
+    uint32_t pp_rank;
+    uint32_t ep_rank;
+    uint32_t shard_index;
     uint64_t iter;
     uint64_t logical_bytes;
     uint32_t chunk_count;
@@ -155,20 +171,23 @@ struct MetadataLayout {
     uint64_t bitmap_offset = 0;
     uint64_t bitmap_bytes = 0;
     uint64_t nefc_offset = 0;
+    uint32_t nefc_count = 1;
     uint64_t lfcs_offset = 0;
     uint64_t lfsy_offset = 0;
 };
 
 inline MetadataLayout compute_metadata_layout(uint32_t data_chunk_count,
-                                              uint32_t expert_slots) {
+                                              uint32_t expert_slots,
+                                              uint32_t nefc_count = 1) {
     MetadataLayout out;
     out.bitmap_offset = kMetadataHeaderBytes;
     out.bitmap_bytes = div_round_up_u64(data_chunk_count, 8);
+    out.nefc_count = nefc_count == 0 ? 1 : nefc_count;
 
     uint64_t cursor = out.bitmap_offset + out.bitmap_bytes;
     cursor = round_up_u64(cursor, 64);
     out.nefc_offset = cursor;
-    cursor += sizeof(NefcEntry);
+    cursor += static_cast<uint64_t>(out.nefc_count) * sizeof(NefcEntry);
 
     cursor = round_up_u64(cursor, 64);
     out.lfcs_offset = cursor;
@@ -192,4 +211,3 @@ inline uint32_t checked_chunk_count(uint64_t data_nlb,
 }
 
 }}  // namespace proposal::fdp
-
