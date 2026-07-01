@@ -15,13 +15,39 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace proposal { namespace fdp {
 namespace {
 
 constexpr uint64_t kHeaderBlockBytes = 65536;
+constexpr uint64_t kSharedMetadataMagic =
+    make_magic8('F', 'D', 'P', 'M', 'M', 'A', 'P', '1');
+constexpr uint32_t kSharedMetadataVersion = 1;
+
+struct SharedMetadataControl {
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint32_t header_bytes = 0;
+    uint64_t layout_fingerprint = 0;
+    uint64_t metadata_image_bytes = 0;
+    uint32_t world_size = 1;
+    uint32_t rank_count = 1;
+    pthread_mutex_t metadata_mutex;
+    uint64_t active_iter = 0;
+    uint32_t expected_processes = 1;
+    uint32_t completed_processes = 0;
+    uint32_t flush_started = 0;
+    uint32_t flush_done = 1;
+    uint32_t flush_owner_rank = 0;
+    uint32_t error_rank = 0xffffffffu;
+    uint64_t metadata_flush_count = 0;
+    uint64_t reserved[16] = {};
+};
 
 const char* getenv_raw(const char* name) {
     const char* v = std::getenv(name);
@@ -177,6 +203,8 @@ void FdpStore::load_config_from_env() {
     cfg_.device_path = device;
     cfg_.nsid = checked_u32(env_u64_required("PROPOSAL_FDP_NSID"),
                             "PROPOSAL_FDP_NSID");
+    cfg_.metadata_mmap = env_bool_default(
+        "PROPOSAL_FDP_METADATA_MMAP", false);
     cfg_.metadata_start_lba =
         env_u64_required("PROPOSAL_FDP_METADATA_START_LBA");
     cfg_.data_start_lba = env_u64_required("PROPOSAL_FDP_DATA_START_LBA");
@@ -194,6 +222,19 @@ void FdpStore::load_config_from_env() {
             << sanitize_lock_component(cfg_.device_path)
             << "_m" << cfg_.metadata_start_lba << ".lock";
         global_lock_path_ = oss.str();
+    }
+    if (const char* v = getenv_raw("PROPOSAL_FDP_MMAP_NAME")) {
+        shared_mmap_name_ = v;
+        if (shared_mmap_name_.empty() || shared_mmap_name_[0] != '/') {
+            shared_mmap_name_.insert(shared_mmap_name_.begin(), '/');
+        }
+    } else {
+        std::ostringstream oss;
+        oss << "/proposal_fdp_"
+            << sanitize_lock_component(cfg_.device_path)
+            << "_m" << cfg_.metadata_start_lba
+            << "_v" << kFormatVersion;
+        shared_mmap_name_ = oss.str();
     }
 
     if (const char* v = getenv_raw("PROPOSAL_FDP_CHUNK_BYTES")) {
@@ -348,6 +389,9 @@ void FdpStore::open_from_env() {
 
         allocate_metadata_image();
         format_or_load();
+        if (cfg_.metadata_mmap) {
+            open_or_create_shared_metadata_mmap();
+        }
         open_ = true;
     } catch (...) {
         close();
@@ -394,6 +438,7 @@ void FdpStore::close() {
         ::close(global_lock_fd_);
         global_lock_fd_ = -1;
     }
+    close_shared_metadata_mmap();
     open_ = false;
     nefc_data_ring_.close();
     expert_data_ring_.close();
@@ -416,7 +461,14 @@ void FdpStore::close() {
     next_lfsy_handle_ = 1;
     lfsy_handles_.clear();
     batch_owned_buffers_.clear();
+    nefc_batch_plans_.clear();
+    expert_batch_plans_.clear();
     global_lock_path_.clear();
+    shared_mmap_name_.clear();
+    local_iter_ = 0;
+    local_nonexpert_done_ = false;
+    local_expert_done_ = false;
+    local_process_done_reported_ = false;
 }
 
 bool FdpStore::is_open() const {
@@ -596,7 +648,7 @@ void FdpStore::write_superblock() {
 }
 
 void FdpStore::write_metadata_image() {
-    raw_write_metadata(metadata_image_.data(), metadata_image_lba_,
+    raw_write_metadata(metadata_bytes(), metadata_image_lba_,
                        metadata_image_nlb_, "write_metadata_image");
 }
 
@@ -604,6 +656,180 @@ void FdpStore::read_metadata_image() {
     std::memset(metadata_image_.data(), 0, metadata_image_.bytes());
     raw_read_metadata(metadata_image_.data(), metadata_image_lba_,
                       metadata_image_nlb_, "read_metadata_image");
+}
+
+uint64_t FdpStore::metadata_layout_fingerprint() const {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(kFormatVersion);
+    mix(ns_.lba_size);
+    mix(ns_.namespace_nlb);
+    mix(cfg_.metadata_start_lba);
+    mix(cfg_.metadata_nlb);
+    mix(metadata_image_lba_);
+    mix(metadata_image_nlb_);
+    mix(layout_.image_bytes);
+    mix(cfg_.data_start_lba);
+    mix(cfg_.data_nlb);
+    mix(cfg_.chunk_bytes);
+    mix(chunk_lba_count_);
+    mix(data_chunk_count_);
+    mix(cfg_.world_size);
+    mix(cfg_.num_moe_layers);
+    mix(cfg_.experts_per_layer);
+    mix(cfg_.expert_slots);
+    mix(cfg_.dp_size);
+    mix(cfg_.pp_size);
+    mix(cfg_.ep_size);
+    mix(cfg_.nefc_shard_count);
+    return h;
+}
+
+void FdpStore::open_or_create_shared_metadata_mmap() {
+    if (!cfg_.metadata_mmap) {
+        return;
+    }
+    const uint64_t control_bytes =
+        round_up_u64(sizeof(SharedMetadataControl), 4096);
+    shared_mmap_bytes_ = control_bytes + layout_.image_bytes;
+    if (shared_mmap_bytes_ >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("shared metadata mmap is too large");
+    }
+
+    if (global_lock_fd_ < 0) {
+        global_lock_fd_ = ::open(
+            global_lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (global_lock_fd_ < 0) {
+            throw std::runtime_error(
+                std::string("open FDP mmap init lock failed: ") +
+                std::strerror(errno));
+        }
+    }
+    if (::flock(global_lock_fd_, LOCK_EX) != 0) {
+        throw std::runtime_error(
+            std::string("flock FDP mmap init lock failed: ") +
+            std::strerror(errno));
+    }
+
+    try {
+        shared_mmap_fd_ = ::shm_open(
+            shared_mmap_name_.c_str(), O_CREAT | O_RDWR, 0600);
+        if (shared_mmap_fd_ < 0) {
+            throw std::runtime_error(
+                std::string("shm_open FDP metadata failed: ") +
+                std::strerror(errno));
+        }
+        if (::ftruncate(shared_mmap_fd_,
+                        static_cast<off_t>(shared_mmap_bytes_)) != 0) {
+            throw std::runtime_error(
+                std::string("ftruncate FDP metadata mmap failed: ") +
+                std::strerror(errno));
+        }
+        shared_mmap_base_ = ::mmap(
+            nullptr, static_cast<size_t>(shared_mmap_bytes_),
+            PROT_READ | PROT_WRITE, MAP_SHARED, shared_mmap_fd_, 0);
+        if (shared_mmap_base_ == MAP_FAILED) {
+            shared_mmap_base_ = nullptr;
+            throw std::runtime_error(
+                std::string("mmap FDP metadata failed: ") +
+                std::strerror(errno));
+        }
+        shared_control_ = shared_mmap_base_;
+        shared_metadata_bytes_ =
+            static_cast<uint8_t*>(shared_mmap_base_) + control_bytes;
+
+        auto* ctrl =
+            static_cast<SharedMetadataControl*>(shared_control_);
+        const uint64_t fingerprint = metadata_layout_fingerprint();
+        const bool valid =
+            ctrl->magic == kSharedMetadataMagic &&
+            ctrl->version == kSharedMetadataVersion &&
+            ctrl->header_bytes == sizeof(SharedMetadataControl) &&
+            ctrl->layout_fingerprint == fingerprint &&
+            ctrl->metadata_image_bytes == layout_.image_bytes &&
+            ctrl->world_size == cfg_.world_size;
+        const bool force_reset_safe =
+            cfg_.force_format &&
+            (!valid ||
+             (ctrl->active_iter == 0 &&
+              ctrl->completed_processes == 0 &&
+              ctrl->flush_done != 0));
+        if (!valid || force_reset_safe) {
+            std::memset(shared_mmap_base_, 0,
+                        static_cast<size_t>(shared_mmap_bytes_));
+            pthread_mutexattr_t attr;
+            if (::pthread_mutexattr_init(&attr) != 0) {
+                throw std::runtime_error("pthread_mutexattr_init failed");
+            }
+            if (::pthread_mutexattr_setpshared(
+                    &attr, PTHREAD_PROCESS_SHARED) != 0) {
+                ::pthread_mutexattr_destroy(&attr);
+                throw std::runtime_error(
+                    "pthread_mutexattr_setpshared failed");
+            }
+            if (::pthread_mutex_init(&ctrl->metadata_mutex, &attr) != 0) {
+                ::pthread_mutexattr_destroy(&attr);
+                throw std::runtime_error("pthread_mutex_init failed");
+            }
+            ::pthread_mutexattr_destroy(&attr);
+
+            ctrl->magic = kSharedMetadataMagic;
+            ctrl->version = kSharedMetadataVersion;
+            ctrl->header_bytes = sizeof(SharedMetadataControl);
+            ctrl->layout_fingerprint = fingerprint;
+            ctrl->metadata_image_bytes = layout_.image_bytes;
+            ctrl->world_size = cfg_.world_size;
+            ctrl->rank_count = cfg_.world_size;
+            ctrl->active_iter = 0;
+            ctrl->expected_processes = cfg_.world_size;
+            ctrl->completed_processes = 0;
+            ctrl->flush_started = 0;
+            ctrl->flush_done = 1;
+            ctrl->flush_owner_rank = 0;
+            ctrl->error_rank = 0xffffffffu;
+            ctrl->metadata_flush_count = 0;
+            std::memcpy(shared_metadata_bytes_, metadata_image_.data(),
+                        static_cast<size_t>(layout_.image_bytes));
+        }
+
+        const MetadataHeader* hdr =
+            reinterpret_cast<const MetadataHeader*>(shared_metadata_bytes_);
+        if (hdr->magic != kMetadataMagic ||
+            hdr->version != kFormatVersion) {
+            throw std::runtime_error(
+                "FDP shared metadata image header mismatch");
+        }
+        seq_ = hdr->seq;
+        last_flush_iter_ = hdr->last_flush_iter;
+        allocated_chunks_ = recalc_allocated_chunks();
+    } catch (...) {
+        (void)::flock(global_lock_fd_, LOCK_UN);
+        throw;
+    }
+    if (::flock(global_lock_fd_, LOCK_UN) != 0) {
+        throw std::runtime_error(
+            std::string("unlock FDP mmap init lock failed: ") +
+            std::strerror(errno));
+    }
+}
+
+void FdpStore::close_shared_metadata_mmap() {
+    if (shared_mmap_base_ != nullptr) {
+        ::munmap(shared_mmap_base_,
+                 static_cast<size_t>(shared_mmap_bytes_));
+    }
+    if (shared_mmap_fd_ >= 0) {
+        ::close(shared_mmap_fd_);
+    }
+    shared_mmap_fd_ = -1;
+    shared_mmap_base_ = nullptr;
+    shared_mmap_bytes_ = 0;
+    shared_control_ = nullptr;
+    shared_metadata_bytes_ = nullptr;
 }
 
 void FdpStore::update_metadata_header(uint64_t iter, bool bump_seq) {
@@ -639,6 +865,28 @@ void FdpStore::acquire_global_metadata_lock() {
     global_lock_mutex_.lock();
     if (global_lock_depth_ > 0) {
         ++global_lock_depth_;
+        return;
+    }
+    if (cfg_.metadata_mmap) {
+        if (shared_control_ == nullptr) {
+            global_lock_mutex_.unlock();
+            throw std::runtime_error("FDP mmap metadata is not attached");
+        }
+        auto* ctrl = static_cast<SharedMetadataControl*>(shared_control_);
+        const int rc = ::pthread_mutex_lock(&ctrl->metadata_mutex);
+        if (rc != 0) {
+            global_lock_mutex_.unlock();
+            throw std::runtime_error(
+                std::string("pthread_mutex_lock FDP metadata failed: ") +
+                std::strerror(rc));
+        }
+        global_lock_depth_ = 1;
+        allocated_chunks_ = recalc_allocated_chunks();
+        const MetadataHeader* hdr = metadata_header();
+        if (hdr->magic == kMetadataMagic) {
+            seq_ = hdr->seq;
+            last_flush_iter_ = hdr->last_flush_iter;
+        }
         return;
     }
     if (global_lock_path_.empty()) {
@@ -685,6 +933,17 @@ void FdpStore::release_global_metadata_lock() {
     --global_lock_depth_;
     if (global_lock_depth_ != 0) {
         global_lock_mutex_.unlock();
+        return;
+    }
+    if (cfg_.metadata_mmap) {
+        auto* ctrl = static_cast<SharedMetadataControl*>(shared_control_);
+        const int rc = ::pthread_mutex_unlock(&ctrl->metadata_mutex);
+        global_lock_mutex_.unlock();
+        if (rc != 0) {
+            throw std::runtime_error(
+                std::string("pthread_mutex_unlock FDP metadata failed: ") +
+                std::strerror(rc));
+        }
         return;
     }
     if (global_lock_fd_ >= 0 && ::flock(global_lock_fd_, LOCK_UN) != 0) {
@@ -745,7 +1004,9 @@ void FdpStore::begin_data_batch() {
     if (!open_) {
         throw std::runtime_error("begin_data_batch: FDP session is not open");
     }
-    acquire_global_metadata_lock();
+    if (!cfg_.metadata_mmap) {
+        acquire_global_metadata_lock();
+    }
     nefc_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(nefc_ring_mutex_);
     expert_batch_ring_lock_ =
@@ -758,7 +1019,9 @@ void FdpStore::begin_data_batch() {
         (void)nefc_data_ring_.end_batch();
         nefc_batch_ring_lock_.unlock();
         expert_batch_ring_lock_.unlock();
-        release_global_metadata_lock();
+        if (!cfg_.metadata_mmap) {
+            release_global_metadata_lock();
+        }
         throw;
     }
     batch_owner_token_.store(current_thread_token(), std::memory_order_release);
@@ -775,16 +1038,25 @@ std::vector<UcmdRingBatchStats> FdpStore::end_data_batch_stats() {
     }
     std::vector<UcmdRingBatchStats> out(2);
     std::exception_ptr first_error;
-    try {
-        persist_metadata_image_locked(last_flush_iter_, true);
-    } catch (...) {
-        first_error = std::current_exception();
-    }
-    try {
-        release_global_metadata_lock();
-    } catch (...) {
-        if (!first_error) {
+    if (cfg_.metadata_mmap) {
+        try {
+            prepare_io_plans(nefc_batch_plans_);
+            prepare_io_plans(expert_batch_plans_);
+        } catch (...) {
             first_error = std::current_exception();
+        }
+    } else {
+        try {
+            persist_metadata_image_locked(last_flush_iter_, true);
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+        try {
+            release_global_metadata_lock();
+        } catch (...) {
+            if (!first_error) {
+                first_error = std::current_exception();
+            }
         }
     }
     try {
@@ -803,6 +1075,8 @@ std::vector<UcmdRingBatchStats> FdpStore::end_data_batch_stats() {
     }
     if (first_error) {
         batch_owned_buffers_.clear();
+        nefc_batch_plans_.clear();
+        expert_batch_plans_.clear();
         batch_owner_token_.store(0, std::memory_order_release);
         nefc_batch_ring_lock_.unlock();
         expert_batch_ring_lock_.unlock();
@@ -810,6 +1084,8 @@ std::vector<UcmdRingBatchStats> FdpStore::end_data_batch_stats() {
         std::rethrow_exception(first_error);
     }
     batch_owned_buffers_.clear();
+    nefc_batch_plans_.clear();
+    expert_batch_plans_.clear();
     batch_owner_token_.store(0, std::memory_order_release);
     nefc_batch_ring_lock_.unlock();
     expert_batch_ring_lock_.unlock();
@@ -840,14 +1116,18 @@ void FdpStore::begin_nefc_batch() {
     if (!open_) {
         throw std::runtime_error("begin_nefc_batch: FDP session is not open");
     }
-    acquire_global_metadata_lock();
+    if (!cfg_.metadata_mmap) {
+        acquire_global_metadata_lock();
+    }
     nefc_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(nefc_ring_mutex_);
     try {
         nefc_data_ring_.begin_batch();
     } catch (...) {
         nefc_batch_ring_lock_.unlock();
-        release_global_metadata_lock();
+        if (!cfg_.metadata_mmap) {
+            release_global_metadata_lock();
+        }
         throw;
     }
     nefc_batch_owner_token_.store(current_thread_token(),
@@ -866,16 +1146,24 @@ UcmdRingBatchStats FdpStore::end_nefc_batch_stats() {
         }
     }
     std::exception_ptr first_error;
-    try {
-        persist_metadata_image_locked(last_flush_iter_, true);
-    } catch (...) {
-        first_error = std::current_exception();
-    }
-    try {
-        release_global_metadata_lock();
-    } catch (...) {
-        if (!first_error) {
+    if (cfg_.metadata_mmap) {
+        try {
+            prepare_io_plans(nefc_batch_plans_);
+        } catch (...) {
             first_error = std::current_exception();
+        }
+    } else {
+        try {
+            persist_metadata_image_locked(last_flush_iter_, true);
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+        try {
+            release_global_metadata_lock();
+        } catch (...) {
+            if (!first_error) {
+                first_error = std::current_exception();
+            }
         }
     }
     try {
@@ -883,6 +1171,7 @@ UcmdRingBatchStats FdpStore::end_nefc_batch_stats() {
         const UcmdRingBatchStats stats = nefc_data_ring_.last_batch_stats();
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
         nefc_batch_owner_token_.store(0, std::memory_order_release);
+        nefc_batch_plans_.clear();
         nefc_batch_ring_lock_.unlock();
         nefc_batch_lock_.unlock();
         if (first_error) {
@@ -892,6 +1181,7 @@ UcmdRingBatchStats FdpStore::end_nefc_batch_stats() {
     } catch (...) {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
         nefc_batch_owner_token_.store(0, std::memory_order_release);
+        nefc_batch_plans_.clear();
         nefc_batch_ring_lock_.unlock();
         nefc_batch_lock_.unlock();
         throw;
@@ -916,7 +1206,9 @@ void FdpStore::begin_expert_batch() {
     if (!open_) {
         throw std::runtime_error("begin_expert_batch: FDP session is not open");
     }
-    acquire_global_metadata_lock();
+    if (!cfg_.metadata_mmap) {
+        acquire_global_metadata_lock();
+    }
     expert_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(expert_ring_mutex_);
     batch_owned_buffers_.clear();
@@ -924,7 +1216,9 @@ void FdpStore::begin_expert_batch() {
         expert_data_ring_.begin_batch();
     } catch (...) {
         expert_batch_ring_lock_.unlock();
-        release_global_metadata_lock();
+        if (!cfg_.metadata_mmap) {
+            release_global_metadata_lock();
+        }
         throw;
     }
     expert_batch_owner_token_.store(current_thread_token(),
@@ -944,16 +1238,24 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
         }
     }
     std::exception_ptr first_error;
-    try {
-        persist_metadata_image_locked(last_flush_iter_, true);
-    } catch (...) {
-        first_error = std::current_exception();
-    }
-    try {
-        release_global_metadata_lock();
-    } catch (...) {
-        if (!first_error) {
+    if (cfg_.metadata_mmap) {
+        try {
+            prepare_io_plans(expert_batch_plans_);
+        } catch (...) {
             first_error = std::current_exception();
+        }
+    } else {
+        try {
+            persist_metadata_image_locked(last_flush_iter_, true);
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+        try {
+            release_global_metadata_lock();
+        } catch (...) {
+            if (!first_error) {
+                first_error = std::current_exception();
+            }
         }
     }
     try {
@@ -961,6 +1263,7 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
         const UcmdRingBatchStats stats = expert_data_ring_.last_batch_stats();
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
         batch_owned_buffers_.clear();
+        expert_batch_plans_.clear();
         expert_batch_owner_token_.store(0, std::memory_order_release);
         expert_batch_ring_lock_.unlock();
         expert_batch_lock_.unlock();
@@ -971,6 +1274,7 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
     } catch (...) {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
         batch_owned_buffers_.clear();
+        expert_batch_plans_.clear();
         expert_batch_owner_token_.store(0, std::memory_order_release);
         expert_batch_ring_lock_.unlock();
         expert_batch_lock_.unlock();
@@ -980,6 +1284,135 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
 
 uint32_t FdpStore::end_expert_batch() {
     return end_expert_batch_stats().commands;
+}
+
+void FdpStore::begin_checkpoint_iter(uint64_t iter) {
+    if (!cfg_.metadata_mmap) {
+        return;
+    }
+    if (!open_) {
+        throw std::runtime_error(
+            "begin_checkpoint_iter: FDP session is not open");
+    }
+
+    {
+        std::lock_guard<std::mutex> local_lock(local_iter_mutex_);
+        if (local_iter_ != iter) {
+            local_iter_ = iter;
+            local_nonexpert_done_ = false;
+            local_expert_done_ = false;
+            local_process_done_reported_ = false;
+        }
+    }
+
+    acquire_global_metadata_lock();
+    try {
+        auto* ctrl = static_cast<SharedMetadataControl*>(shared_control_);
+        if (ctrl == nullptr) {
+            throw std::runtime_error(
+                "begin_checkpoint_iter: FDP mmap metadata is not attached");
+        }
+        if (ctrl->active_iter != iter) {
+            if (ctrl->flush_done == 0 && ctrl->completed_processes != 0) {
+                std::ostringstream oss;
+                oss << "begin_checkpoint_iter: previous iteration "
+                    << ctrl->active_iter << " has incomplete metadata flush";
+                throw std::runtime_error(oss.str());
+            }
+            ctrl->active_iter = iter;
+            ctrl->expected_processes = cfg_.world_size;
+            ctrl->completed_processes = 0;
+            ctrl->flush_started = 0;
+            ctrl->flush_done = 0;
+            ctrl->flush_owner_rank = 0xffffffffu;
+            ctrl->error_rank = 0xffffffffu;
+        }
+        release_global_metadata_lock();
+    } catch (...) {
+        release_global_metadata_lock();
+        throw;
+    }
+}
+
+bool FdpStore::mark_process_done_locked(uint64_t iter) {
+    auto* ctrl = static_cast<SharedMetadataControl*>(shared_control_);
+    if (ctrl == nullptr) {
+        throw std::runtime_error(
+            "mark_process_done_locked: FDP mmap metadata is not attached");
+    }
+    if (ctrl->active_iter != iter) {
+        std::ostringstream oss;
+        oss << "mark_process_done_locked: active iter "
+            << ctrl->active_iter << " does not match " << iter;
+        throw std::runtime_error(oss.str());
+    }
+    if (ctrl->completed_processes >= ctrl->expected_processes) {
+        return false;
+    }
+
+    ctrl->completed_processes += 1;
+    if (ctrl->completed_processes != ctrl->expected_processes ||
+        ctrl->flush_started != 0) {
+        return false;
+    }
+
+    ctrl->flush_started = 1;
+    ctrl->flush_owner_rank = cfg_.rank;
+    persist_metadata_image_locked(iter, true);
+    ctrl->metadata_flush_count += 1;
+    ctrl->flush_done = 1;
+    return true;
+}
+
+bool FdpStore::mark_writer_done(uint64_t iter,
+                                const std::string& writer_kind) {
+    if (!cfg_.metadata_mmap) {
+        return false;
+    }
+    if (!open_) {
+        throw std::runtime_error(
+            "mark_writer_done: FDP session is not open");
+    }
+
+    bool report_process_done = false;
+    {
+        std::lock_guard<std::mutex> local_lock(local_iter_mutex_);
+        if (local_iter_ != iter) {
+            local_iter_ = iter;
+            local_nonexpert_done_ = false;
+            local_expert_done_ = false;
+            local_process_done_reported_ = false;
+        }
+        if (writer_kind == "nonexpert" || writer_kind == "nefc") {
+            local_nonexpert_done_ = true;
+        } else if (writer_kind == "expert") {
+            local_expert_done_ = true;
+        } else if (writer_kind == "all") {
+            local_nonexpert_done_ = true;
+            local_expert_done_ = true;
+        } else {
+            throw std::invalid_argument(
+                "mark_writer_done: writer_kind must be nonexpert, nefc, expert, or all");
+        }
+        if (local_nonexpert_done_ && local_expert_done_ &&
+            !local_process_done_reported_) {
+            local_process_done_reported_ = true;
+            report_process_done = true;
+        }
+    }
+    if (!report_process_done) {
+        return false;
+    }
+
+    acquire_global_metadata_lock();
+    try {
+        const bool did_flush = mark_process_done_locked(iter);
+        release_global_metadata_lock();
+        return did_flush;
+    } catch (...) {
+        release_global_metadata_lock();
+        throw;
+    }
 }
 
 size_t FdpStore::write_nefc(const std::string& object_name,
@@ -1016,7 +1449,8 @@ size_t FdpStore::write_nefc(const std::string& object_name,
 
     stamp_header_into_pinned(pinned_addr, header);
     std::vector<FdpChunkId> chunks;
-    if (!owns_batch) {
+    const bool metadata_lock_here = cfg_.metadata_mmap || !owns_batch;
+    if (metadata_lock_here) {
         acquire_global_metadata_lock();
     }
     try {
@@ -1039,17 +1473,31 @@ size_t FdpStore::write_nefc(const std::string& object_name,
         for (uint32_t i = 0; i < needed; ++i) {
             entry->chunks[i] = chunks[i];
         }
-        if (owns_batch) {
+        if (owns_batch || cfg_.metadata_mmap) {
             update_metadata_header(iter, true);
         } else {
             persist_metadata_image_locked(iter, true);
+        }
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
     } catch (...) {
-        if (!owns_batch) {
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
         throw;
+    }
+
+    if (cfg_.metadata_mmap && owns_batch) {
+        FdpIoPlan plan;
+        plan.kind = FdpIoPlanKind::ChunkListWrite;
+        plan.ring = FdpIoPlanRing::Nefc;
+        plan.pinned_addr = pinned_addr;
+        plan.total_padded_bytes = total_padded_bytes;
+        plan.chunks = std::move(chunks);
+        plan.where = "write_nefc";
+        enqueue_io_plan(std::move(plan));
+        return static_cast<size_t>(total_padded_bytes);
     }
 
     {
@@ -1099,7 +1547,8 @@ size_t FdpStore::write_lfcs(const std::string& object_name,
 
     stamp_header_into_pinned(pinned_addr, header);
     std::vector<FdpChunkId> chunks;
-    if (!owns_batch) {
+    const bool metadata_lock_here = cfg_.metadata_mmap || !owns_batch;
+    if (metadata_lock_here) {
         acquire_global_metadata_lock();
     }
     try {
@@ -1130,17 +1579,31 @@ size_t FdpStore::write_lfcs(const std::string& object_name,
         }
 
         std::memset(lfsy, 0, sizeof(*lfsy));
-        if (owns_batch) {
+        if (owns_batch || cfg_.metadata_mmap) {
             update_metadata_header(iter, true);
         } else {
             persist_metadata_image_locked(iter, true);
+        }
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
     } catch (...) {
-        if (!owns_batch) {
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
         throw;
+    }
+
+    if (cfg_.metadata_mmap && owns_batch) {
+        FdpIoPlan plan;
+        plan.kind = FdpIoPlanKind::ChunkListWrite;
+        plan.ring = FdpIoPlanRing::Expert;
+        plan.pinned_addr = pinned_addr;
+        plan.total_padded_bytes = total_padded_bytes;
+        plan.chunks = std::move(chunks);
+        plan.where = "write_lfcs";
+        enqueue_io_plan(std::move(plan));
+        return static_cast<size_t>(total_padded_bytes);
     }
 
     {
@@ -1181,7 +1644,8 @@ int64_t FdpStore::open_lfsy(const std::string& object_name,
 
     std::vector<FdpChunkId> chunks;
     int64_t handle = 0;
-    if (!owns_batch) {
+    const bool metadata_lock_here = cfg_.metadata_mmap || !owns_batch;
+    if (metadata_lock_here) {
         acquire_global_metadata_lock();
     }
     try {
@@ -1212,17 +1676,32 @@ int64_t FdpStore::open_lfsy(const std::string& object_name,
         h.generation = generation;
         h.last_iter = entry->start_iter;
         lfsy_handles_.emplace(handle, h);
-        if (owns_batch) {
+        if (owns_batch || cfg_.metadata_mmap) {
             update_metadata_header(entry->start_iter, true);
         } else {
             persist_metadata_image_locked(entry->start_iter, true);
+        }
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
     } catch (...) {
-        if (!owns_batch) {
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
         throw;
+    }
+
+    if (cfg_.metadata_mmap && owns_batch) {
+        FdpIoPlan plan;
+        plan.kind = FdpIoPlanKind::ChunkListWrite;
+        plan.ring = FdpIoPlanRing::Expert;
+        plan.total_padded_bytes = kHeaderBlockBytes;
+        plan.chunks = chunks;
+        plan.where = "open_lfsy";
+        plan.owned_buffer = std::move(header_buf);
+        plan.pinned_addr = reinterpret_cast<int64_t>(plan.owned_buffer.data());
+        enqueue_io_plan(std::move(plan));
+        return handle;
     }
 
     {
@@ -1273,7 +1752,8 @@ size_t FdpStore::append_lfsy(int64_t handle,
     uint64_t old_tail = 0;
     uint64_t new_tail = 0;
     std::vector<FdpChunkId> chunks_for_write;
-    if (!owns_batch) {
+    const bool metadata_lock_here = cfg_.metadata_mmap || !owns_batch;
+    if (metadata_lock_here) {
         acquire_global_metadata_lock();
     }
     try {
@@ -1305,17 +1785,32 @@ size_t FdpStore::append_lfsy(int64_t handle,
         entry->logical_tail = new_tail;
         h.last_iter = iter;
         chunks_for_write.assign(entry->chunks, entry->chunks + entry->chunk_count);
-        if (owns_batch) {
+        if (owns_batch || cfg_.metadata_mmap) {
             update_metadata_header(iter, true);
         } else {
             persist_metadata_image_locked(iter, true);
+        }
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
     } catch (...) {
-        if (!owns_batch) {
+        if (metadata_lock_here) {
             release_global_metadata_lock();
         }
         throw;
+    }
+
+    if (cfg_.metadata_mmap && owns_batch) {
+        FdpIoPlan plan;
+        plan.kind = FdpIoPlanKind::LfsyAppend;
+        plan.ring = FdpIoPlanRing::Expert;
+        plan.pinned_addr = pinned_addr;
+        plan.total_padded_bytes = total_padded_bytes;
+        plan.logical_offset = old_tail;
+        plan.chunks = std::move(chunks_for_write);
+        plan.where = "append_lfsy";
+        enqueue_io_plan(std::move(plan));
+        return static_cast<size_t>(total_padded_bytes);
     }
 
     {
@@ -1548,10 +2043,16 @@ void FdpStore::raw_read_data(UcmdRing& ring, void* buffer,
 }
 
 uint8_t* FdpStore::metadata_bytes() {
+    if (cfg_.metadata_mmap && shared_metadata_bytes_ != nullptr) {
+        return shared_metadata_bytes_;
+    }
     return static_cast<uint8_t*>(metadata_image_.data());
 }
 
 const uint8_t* FdpStore::metadata_bytes() const {
+    if (cfg_.metadata_mmap && shared_metadata_bytes_ != nullptr) {
+        return shared_metadata_bytes_;
+    }
     return static_cast<const uint8_t*>(metadata_image_.data());
 }
 
@@ -1725,6 +2226,69 @@ void FdpStore::write_chunk_list(UcmdRing& ring, int64_t pinned_addr,
                        slba, nlb, where);
         remaining -= len;
     }
+}
+
+void FdpStore::enqueue_io_plan(FdpIoPlan&& plan) {
+    if (plan.ring == FdpIoPlanRing::Nefc) {
+        nefc_batch_plans_.push_back(std::move(plan));
+    } else {
+        expert_batch_plans_.push_back(std::move(plan));
+    }
+}
+
+void FdpStore::prepare_io_plan(const FdpIoPlan& plan) {
+    UcmdRing& ring =
+        plan.ring == FdpIoPlanRing::Nefc ? nefc_data_ring_ : expert_data_ring_;
+    const char* where =
+        plan.where.empty() ? "fdp_io_plan" : plan.where.c_str();
+    if (plan.kind == FdpIoPlanKind::ChunkListWrite) {
+        write_chunk_list(ring, plan.pinned_addr, plan.chunks,
+                         plan.total_padded_bytes, where);
+        return;
+    }
+    if (plan.kind == FdpIoPlanKind::LfsyAppend) {
+        if ((plan.pinned_addr & 4095ll) != 0) {
+            throw std::invalid_argument(
+                std::string(where) + ": pinned ptr not 4KiB-aligned");
+        }
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(plan.pinned_addr);
+        uint64_t remaining = plan.total_padded_bytes;
+        uint64_t logical = plan.logical_offset;
+        uint64_t src_off = 0;
+        while (remaining > 0) {
+            const uint64_t chunk_index = logical / cfg_.chunk_bytes;
+            const uint64_t offset_in_chunk = logical % cfg_.chunk_bytes;
+            const uint64_t chunk_left = cfg_.chunk_bytes - offset_in_chunk;
+            const uint64_t len = std::min<uint64_t>(remaining, chunk_left);
+            if ((offset_in_chunk % ns_.lba_size) != 0 ||
+                (len % ns_.lba_size) != 0) {
+                throw std::runtime_error(
+                    std::string(where) + ": unaligned append range");
+            }
+            if (chunk_index >= plan.chunks.size()) {
+                throw std::runtime_error(
+                    std::string(where) + ": chunk index exceeds plan");
+            }
+            const FdpChunkId chunk_id =
+                plan.chunks[static_cast<size_t>(chunk_index)];
+            const uint64_t slba =
+                data_chunk_lba(chunk_id) + offset_in_chunk / ns_.lba_size;
+            raw_write_data(ring, src + src_off, slba,
+                           len / ns_.lba_size, where);
+            logical += len;
+            src_off += len;
+            remaining -= len;
+        }
+        return;
+    }
+    throw std::runtime_error("unknown FDP IO plan kind");
+}
+
+void FdpStore::prepare_io_plans(std::vector<FdpIoPlan>& plans) {
+    for (const FdpIoPlan& plan : plans) {
+        prepare_io_plan(plan);
+    }
+    plans.clear();
 }
 
 std::string FdpStore::read_chunk_bytes(UcmdRing& ring,
@@ -2281,6 +2845,11 @@ FdpStatsSnapshot FdpStore::stats() const {
     out.max_io_nlb = max_io_nlb_;
     out.max_io_bytes = static_cast<uint64_t>(max_io_nlb_) * ns_.lba_size;
     out.write_fua = cfg_.write_fua;
+    out.metadata_mmap = cfg_.metadata_mmap;
+    if (cfg_.metadata_mmap && shared_control_ != nullptr) {
+        auto* ctrl = static_cast<const SharedMetadataControl*>(shared_control_);
+        out.metadata_flush_count = ctrl->metadata_flush_count;
+    }
     out.seq = seq_;
     out.last_flush_iter = last_flush_iter_;
     return out;

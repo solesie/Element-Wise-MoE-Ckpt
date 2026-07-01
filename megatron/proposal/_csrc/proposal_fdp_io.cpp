@@ -48,6 +48,8 @@ py::dict stats_to_dict(const proposal::fdp::FdpStatsSnapshot& s) {
     d["max_io_nlb"] = s.max_io_nlb;
     d["max_io_bytes"] = s.max_io_bytes;
     d["write_fua"] = s.write_fua;
+    d["metadata_mmap"] = s.metadata_mmap;
+    d["metadata_flush_count"] = s.metadata_flush_count;
     d["seq"] = s.seq;
     d["last_flush_iter"] = s.last_flush_iter;
     return d;
@@ -164,6 +166,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::gil_scoped_release rel;
         fdp::global_store().flush_metadata(iter);
     }, py::arg("iter") = 0);
+    m.def("begin_checkpoint_iter", [](uint64_t iter) {
+        py::gil_scoped_release rel;
+        fdp::global_store().begin_checkpoint_iter(iter);
+    }, py::arg("iter"));
+    m.def("mark_writer_done", [](uint64_t iter,
+                                 const std::string& writer_kind) {
+        py::gil_scoped_release rel;
+        return fdp::global_store().mark_writer_done(iter, writer_kind);
+    }, py::arg("iter"), py::arg("writer_kind"));
     m.def("begin_data_batch", []() {
         py::gil_scoped_release rel;
         fdp::global_store().begin_data_batch();
