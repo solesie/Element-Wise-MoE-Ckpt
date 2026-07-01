@@ -1015,6 +1015,8 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
                 ready_event=task.cuda_event,
                 d2h_event_callback=_mark_non_expert_read_ready,
             )
+        from .storage import proposal_io as _proposal_io
+        _proposal_io.fdp_mark_writer_done(task.iter_T, "nonexpert")
     except BaseException as exc:
         task.non_expert_error = exc
         raise
@@ -1096,6 +1098,17 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
                 )
             fired_by_step[int(task.iter_T)] = list(fired_experts)
         ctrl._config["_last_fired_experts"] = fired_experts
+        from .storage import proposal_io as _proposal_io
+        expert_state = (
+            getattr(ctrl._fc, "expert_state", None)
+            if ctrl._fc is not None else None
+        )
+        has_pending = (
+            callable(getattr(expert_state, "fdp_has_pending_writes", None))
+            and expert_state.fdp_has_pending_writes(task.iter_T)
+        )
+        if not has_pending:
+            _proposal_io.fdp_mark_writer_done(task.iter_T, "expert")
         task.expert_ready_at = time.perf_counter()
         task.expert_read_ready.set()
     except BaseException as exc:
@@ -1204,6 +1217,8 @@ def proposal_dispatch_post_iter(
     iter_T = int(iter_T)
     if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
         return
+    from .storage import proposal_io as _proposal_io
+    _proposal_io.fdp_begin_checkpoint_iter(iter_T)
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
         event.record()

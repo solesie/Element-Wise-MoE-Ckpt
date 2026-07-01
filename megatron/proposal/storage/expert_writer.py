@@ -62,6 +62,10 @@ from .proposal_io import (
     append_lossy_log_from_pinned,
     backend_kind,
     close_fd,
+    fdp_begin_expert_batch,
+    fdp_end_expert_batch_stats,
+    fdp_mark_writer_done,
+    fdp_metadata_mmap_enabled,
     fsync_fd,
     open_lossy_log_for_append,
     scatter_lossy_records_to_dense_by_intervals,
@@ -220,6 +224,9 @@ class ExpertState:
         self.cp_target = cp_target
         self.commit_lossy_records = bool(commit_lossy_records)
         self.test_skip_d2h = bool(test_skip_d2h)
+        self._fdp_pending_lock = threading.Lock()
+        self._fdp_pending_writes_by_step: Dict[int, int] = {}
+        self._fdp_done_marked_steps: Set[int] = set()
         if self.test_skip_d2h and self.commit_lossy_records:
             raise ValueError(
                 "test_skip_d2h requires commit_lossy_records=False; "
@@ -616,6 +623,38 @@ class ExpertState:
         else:
             fn(*args)
 
+    def _fdp_note_expert_write_scheduled(self, step: int) -> None:
+        if not fdp_metadata_mmap_enabled():
+            return
+        with self._fdp_pending_lock:
+            step_i = int(step)
+            self._fdp_pending_writes_by_step[step_i] = (
+                int(self._fdp_pending_writes_by_step.get(step_i, 0)) + 1
+            )
+
+    def _fdp_note_expert_write_done(self, step: int) -> None:
+        if not fdp_metadata_mmap_enabled():
+            return
+        mark = False
+        step_i = int(step)
+        with self._fdp_pending_lock:
+            left = int(self._fdp_pending_writes_by_step.get(step_i, 0)) - 1
+            if left > 0:
+                self._fdp_pending_writes_by_step[step_i] = left
+            else:
+                self._fdp_pending_writes_by_step.pop(step_i, None)
+                if step_i not in self._fdp_done_marked_steps:
+                    self._fdp_done_marked_steps.add(step_i)
+                    mark = True
+        if mark:
+            fdp_mark_writer_done(step_i, "expert")
+
+    def fdp_has_pending_writes(self, step: int) -> bool:
+        if not fdp_metadata_mmap_enabled():
+            return False
+        with self._fdp_pending_lock:
+            return int(self._fdp_pending_writes_by_step.get(int(step), 0)) > 0
+
     def _acquire_pinned_aos(self) -> Tuple[torch.Tensor, threading.Event]:
         ready = self._pinned_aos_ready
         ready.wait()
@@ -721,6 +760,7 @@ class ExpertState:
         }
         header = _pack_header(MAGIC_LFCL, header_meta)
         L, E = ent.expert_id
+        self._fdp_note_expert_write_scheduled(int(step))
         self._dispatch(
             self._do_compact_lossy_recovery_image_from_pinned,
             ent,
@@ -748,6 +788,7 @@ class ExpertState:
             if ready_event is not None:
                 ready_event.set()
             return
+        self._fdp_note_expert_write_scheduled(int(step))
         self._dispatch(
             self._do_compact_lossy_recovery_images_from_pinned_batch,
             int(step),
@@ -787,37 +828,51 @@ class ExpertState:
         step: int,
         pinned_info: Dict[str, Any],
         header: Optional[bytes] = None,
+        fdp_batch_active: bool = False,
     ) -> None:
-        if ent.lossy_fd is not None:
-            close_fd(ent.lossy_fd)
-            ent.lossy_fd = None
-        pinned = pinned_info["pinned"]
-        _require_pinned_cpu_tensor(
-            pinned,
-            name="LFCL pinned payload source",
-            dtype=torch.float32,
-        )
-        payload_offset_bytes = int(pinned_info.get("payload_offset_bytes", 0))
-        payload_bytes = int(pinned_info["payload_bytes"])
-        if payload_offset_bytes < HEADER_BLOCK_BYTES:
-            raise RuntimeError(
-                "LFCL pinned payload must reserve a leading header block"
+        fdp_batch = bool(fdp_metadata_mmap_enabled()) and not bool(fdp_batch_active)
+        if fdp_batch:
+            fdp_begin_expert_batch()
+        try:
+            if ent.lossy_fd is not None:
+                close_fd(ent.lossy_fd)
+                ent.lossy_fd = None
+            pinned = pinned_info["pinned"]
+            _require_pinned_cpu_tensor(
+                pinned,
+                name="LFCL pinned payload source",
+                dtype=torch.float32,
             )
-        self._write_pinned_lfcl_file(
-            ent,
-            header if header is not None else self._lfcl_header_for_entry(ent, int(step)),
-            pinned,
-            payload_offset_bytes,
-            payload_bytes,
-            step=int(step),
-        )
-        ent.lossless_step = int(step)
-        ent.step = int(step)
-        from .proposal_io import unlink_path as _unlink
-        _unlink(ent.lossy_path)
-        self._fsync_parent_dir(ent.lossy_path)
-        self._set_lossy_log_bytes(ent.expert_id, 0)
-        self._open_fresh_lossy(ent, step=int(step))
+            payload_offset_bytes = int(pinned_info.get("payload_offset_bytes", 0))
+            payload_bytes = int(pinned_info["payload_bytes"])
+            if payload_offset_bytes < HEADER_BLOCK_BYTES:
+                raise RuntimeError(
+                    "LFCL pinned payload must reserve a leading header block"
+                )
+            self._write_pinned_lfcl_file(
+                ent,
+                header if header is not None else self._lfcl_header_for_entry(ent, int(step)),
+                pinned,
+                payload_offset_bytes,
+                payload_bytes,
+                step=int(step),
+            )
+            ent.lossless_step = int(step)
+            ent.step = int(step)
+            from .proposal_io import unlink_path as _unlink
+            _unlink(ent.lossy_path)
+            self._fsync_parent_dir(ent.lossy_path)
+            self._set_lossy_log_bytes(ent.expert_id, 0)
+            self._open_fresh_lossy(ent, step=int(step))
+            if fdp_batch:
+                fdp_end_expert_batch_stats()
+        except BaseException:
+            if fdp_batch:
+                try:
+                    fdp_end_expert_batch_stats()
+                except BaseException:
+                    pass
+            raise
 
     def _do_compact_lossy_recovery_image_from_pinned(
         self,
@@ -828,6 +883,7 @@ class ExpertState:
         cuda_event: Optional["torch.cuda.Event"],
     ) -> None:
         ready_event = pinned_info.get("ready_event")
+        success = False
         try:
             if cuda_event is not None:
                 cuda_event.synchronize()
@@ -837,9 +893,12 @@ class ExpertState:
                 pinned_info,
                 header=header,
             )
+            success = True
         finally:
             if ready_event is not None:
                 ready_event.set()
+            if success:
+                self._fdp_note_expert_write_done(int(step))
 
     def _do_compact_lossy_recovery_images_from_pinned_batch(
         self,
@@ -849,11 +908,19 @@ class ExpertState:
         commit_payload: bool,
     ) -> None:
         ready_event = batch_info.get("ready_event")
+        success = False
+        fdp_batch = False
         try:
             if not commit_payload:
+                success = True
                 return
             if cuda_event is not None:
                 cuda_event.synchronize()
+            fdp_batch = (
+                bool(fdp_metadata_mmap_enabled()) and self.cp_target != "test_dram"
+            )
+            if fdp_batch:
+                fdp_begin_expert_batch()
             for item in list(batch_info.get("entries", [])):
                 expert_id = tuple(item.get("expert_id"))  # type: ignore[arg-type]
                 ent = self._entries.get(expert_id)
@@ -870,10 +937,22 @@ class ExpertState:
                         ent,
                         int(step),
                         pinned_info,
+                        fdp_batch_active=fdp_batch,
                     )
+            if fdp_batch:
+                fdp_end_expert_batch_stats()
+                fdp_batch = False
+            success = True
         finally:
+            if fdp_batch:
+                try:
+                    fdp_end_expert_batch_stats()
+                except BaseException:
+                    pass
             if ready_event is not None:
                 ready_event.set()
+            if success:
+                self._fdp_note_expert_write_done(int(step))
 
     def _do_compact_lossy_recovery_image_test_dram_from_pinned(
         self,
@@ -1217,6 +1296,7 @@ class ExpertState:
             # reusable slab is redundant and can delay PP runs.
             pinned_aos_ready.set()
             return
+        self._fdp_note_expert_write_scheduled(int(step))
         self._dispatch(
             self._persist_lossy_aos_from_pinned,
             int(step), expert_specs, prepared, pinned_aos,
@@ -1404,6 +1484,7 @@ class ExpertState:
         _t_ready = (
             _time_profile.perf_counter() if _profile and _time_profile is not None else 0.0
         )
+        success = False
         try:
             if not self.commit_lossy_records and self.test_skip_d2h:
                 if _profile and _time_profile is not None:
@@ -1454,46 +1535,60 @@ class ExpertState:
                         flush=True,
                 )
                 return
-            for row in layout_mirror.rows():
-                if int(row.aos_byte_off) < 0:
-                    continue
-                ent = self._entries.get(row.expert_id)
-                if ent is None:
-                    raise RuntimeError(
-                        f"missing expert entry for AOS layout row "
-                        f"{row.expert_id}"
+            fdp_batch = bool(fdp_metadata_mmap_enabled())
+            if fdp_batch:
+                fdp_begin_expert_batch()
+            try:
+                for row in layout_mirror.rows():
+                    if int(row.aos_byte_off) < 0:
+                        continue
+                    ent = self._entries.get(row.expert_id)
+                    if ent is None:
+                        raise RuntimeError(
+                            f"missing expert entry for AOS layout row "
+                            f"{row.expert_id}"
+                        )
+                    count = read_lfsy_prefix_count(
+                        pinned_aos,
+                        aos_byte_off=row.aos_byte_off,
+                        record_capacity=row.record_capacity,
+                        prefix_bytes=BLOCK_PREFIX_BYTES,
                     )
-                count = read_lfsy_prefix_count(
-                    pinned_aos,
-                    aos_byte_off=row.aos_byte_off,
-                    record_capacity=row.record_capacity,
-                    prefix_bytes=BLOCK_PREFIX_BYTES,
-                )
-                if count <= 0:
-                    continue
-                append_nbytes = self._lossy_blob_padded_bytes_for_count(count)
-                if int(row.blob_padded_bytes) > 0 and append_nbytes > int(row.blob_padded_bytes):
-                    raise RuntimeError(
-                        f"GPU-stamped count exceeds reserved blob: "
-                        f"expert={ent.expert_id} count={count} "
-                        f"append={append_nbytes} reserved={row.blob_padded_bytes}"
+                    if count <= 0:
+                        continue
+                    append_nbytes = self._lossy_blob_padded_bytes_for_count(count)
+                    if int(row.blob_padded_bytes) > 0 and append_nbytes > int(row.blob_padded_bytes):
+                        raise RuntimeError(
+                            f"GPU-stamped count exceeds reserved blob: "
+                            f"expert={ent.expert_id} count={count} "
+                            f"append={append_nbytes} reserved={row.blob_padded_bytes}"
+                        )
+                    if ent.lossy_fd is None:
+                        self._open_fresh_lossy(
+                            ent, step=int(step), reset_counter=False,
+                        )
+                    blob = pinned_aos.narrow(0, row.aos_byte_off, append_nbytes)
+                    L, E = ent.expert_id
+                    append_lossy_log_from_pinned(
+                        int(ent.lossy_fd), blob, int(append_nbytes),
+                        layer=int(L), expert=int(E), step=int(step),
+                        generation=max(0, int(ent.lossless_step)),
                     )
-                if ent.lossy_fd is None:
-                    self._open_fresh_lossy(
-                        ent, step=int(step), reset_counter=False,
+                    fsync_fd(int(ent.lossy_fd))
+                    self._add_lossy_log_bytes_from_writer(
+                        ent.expert_id,
+                        int(append_nbytes),
                     )
-                blob = pinned_aos.narrow(0, row.aos_byte_off, append_nbytes)
-                L, E = ent.expert_id
-                append_lossy_log_from_pinned(
-                    int(ent.lossy_fd), blob, int(append_nbytes),
-                    layer=int(L), expert=int(E), step=int(step),
-                    generation=max(0, int(ent.lossless_step)),
-                )
-                fsync_fd(int(ent.lossy_fd))
-                self._add_lossy_log_bytes_from_writer(
-                    ent.expert_id,
-                    int(append_nbytes),
-                )
+                if fdp_batch:
+                    fdp_end_expert_batch_stats()
+                    fdp_batch = False
+            except BaseException:
+                if fdp_batch:
+                    try:
+                        fdp_end_expert_batch_stats()
+                    except BaseException:
+                        pass
+                raise
             if _profile and _time_profile is not None:
                 _t_done = _time_profile.perf_counter()
                 print(
@@ -1503,8 +1598,11 @@ class ExpertState:
                     f"target=disk",
                     flush=True,
                 )
+            success = True
         finally:
             pinned_aos_ready.set()
+            if success:
+                self._fdp_note_expert_write_done(int(step))
 
     def _lossy_blob_padded_bytes_for_count(self, count: int) -> int:
         raw = BLOCK_PREFIX_BYTES + max(0, int(count)) * RECORD_BYTES

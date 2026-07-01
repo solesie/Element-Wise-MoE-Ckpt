@@ -91,8 +91,8 @@ def _get_fdp():
                 str(_src_dir / "fdp_passthru.cpp"),
                 str(_src_dir / "proposal_fdp_io.cpp"),
             ],
-            extra_cflags=["-O3", "-std=c++17", "-fopenmp"],
-            extra_ldflags=["-lgomp", "-luring"],
+            extra_cflags=["-O3", "-std=c++17", "-fopenmp", "-pthread"],
+            extra_ldflags=["-lgomp", "-luring", "-pthread"],
             extra_include_paths=[str(_src_dir)],
             verbose=False,
         )
@@ -122,6 +122,17 @@ def round_up_to_chunk(nbytes: int, chunk: int = PIN_CHUNK_BYTES) -> int:
 def _round_up_sector(nbytes: int) -> int:
     n = int(nbytes)
     return ((n + SECTOR_BYTES - 1) // SECTOR_BYTES) * SECTOR_BYTES
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def fdp_metadata_mmap_enabled() -> bool:
+    return backend_kind() == "fdp" and _env_bool("PROPOSAL_FDP_METADATA_MMAP")
 
 
 def _require_pinned_aligned_buffer(
@@ -408,7 +419,7 @@ def write_prptens_from_pinned(
             int(total_padded),
             int(step),
         ))
-        if bool(fsync):
+        if bool(fsync) and not fdp_metadata_mmap_enabled():
             fdp.flush_metadata(int(step))
         return written
     _require_pinned_aligned_buffer(
@@ -665,6 +676,8 @@ def fsync_fd(fd: int) -> None:
     if backend_kind() == "fdp":
         if int(fd) == _FDP_COMPLETED_FD:
             return
+        if fdp_metadata_mmap_enabled():
+            return
         _get_fdp().fsync_handle(int(fd))
         return
     _cext.fsync_fd(int(fd))
@@ -779,6 +792,22 @@ def flush_metadata(iter: int = 0) -> None:
     """Flush the FDP metadata image when the FDP backend is active."""
     if backend_kind() == "fdp":
         _get_fdp().flush_metadata(int(iter))
+
+
+def fdp_begin_checkpoint_iter(iter: int) -> None:
+    if backend_kind() != "fdp":
+        return
+    if not fdp_metadata_mmap_enabled():
+        return
+    _get_fdp().begin_checkpoint_iter(int(iter))
+
+
+def fdp_mark_writer_done(iter: int, writer_kind: str) -> bool:
+    if backend_kind() != "fdp":
+        return False
+    if not fdp_metadata_mmap_enabled():
+        return False
+    return bool(_get_fdp().mark_writer_done(int(iter), str(writer_kind)))
 
 
 def fdp_begin_data_batch() -> None:

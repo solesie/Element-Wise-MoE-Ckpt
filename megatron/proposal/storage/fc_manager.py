@@ -1514,6 +1514,9 @@ class FCManager:
             def _write_from_leased_slot() -> None:
                 write_start = time.perf_counter()
                 _rec.queue_delay_ms = (write_start - _rec.submit_time) * 1000.0
+                fdp_batch = bool(binary_io.fdp_metadata_mmap_enabled())
+                if fdp_batch:
+                    binary_io.fdp_begin_nefc_batch()
                 try:
                     if _cuda_event is not None:
                         _cuda_event.synchronize()
@@ -1523,7 +1526,15 @@ class FCManager:
                         _path, pinned_tensor, _header, payload_bytes_local,
                         step=_step, fsync=True,
                     ))
+                    if fdp_batch:
+                        binary_io.fdp_end_nefc_batch_stats()
+                        fdp_batch = False
                 except Exception as exc:
+                    if fdp_batch:
+                        try:
+                            binary_io.fdp_end_nefc_batch_stats()
+                        except Exception:
+                            pass
                     _rec.error = f"{type(exc).__name__}: {exc}"
                 _rec.write_time_ms = (time.perf_counter() - write_start) * 1000.0
                 _rec.done = True
@@ -1543,10 +1554,24 @@ class FCManager:
                 pinned_tensor = _pinned_info["pinned"]
                 payload_bytes_local = _pinned_info["payload_bytes"]
                 if self.cp_target == "disk":
-                    fd, padded_bytes = binary_io.write_prptens_from_pinned_keep_open(
-                        _path, pinned_tensor, _header, payload_bytes_local,
-                        step=_step,
-                    )
+                    fdp_batch = bool(binary_io.fdp_metadata_mmap_enabled())
+                    if fdp_batch:
+                        binary_io.fdp_begin_nefc_batch()
+                    try:
+                        fd, padded_bytes = binary_io.write_prptens_from_pinned_keep_open(
+                            _path, pinned_tensor, _header, payload_bytes_local,
+                            step=_step,
+                        )
+                        if fdp_batch:
+                            binary_io.fdp_end_nefc_batch_stats()
+                            fdp_batch = False
+                    except Exception:
+                        if fdp_batch:
+                            try:
+                                binary_io.fdp_end_nefc_batch_stats()
+                            except Exception:
+                                pass
+                        raise
                     _rec.file_bytes = int(padded_bytes)
                     _finish_durable_write(int(fd))
                     return

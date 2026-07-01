@@ -50,6 +50,7 @@ struct FdpEnvConfig {
     bool force_format = false;
     bool nvme_flush = true;
     bool write_fua = false;
+    bool metadata_mmap = false;
 };
 
 struct FdpStatsSnapshot {
@@ -96,6 +97,8 @@ struct FdpStatsSnapshot {
     uint32_t max_io_nlb = 0;
     uint64_t max_io_bytes = 0;
     bool write_fua = false;
+    bool metadata_mmap = false;
+    uint64_t metadata_flush_count = 0;
     uint64_t seq = 0;
     uint64_t last_flush_iter = 0;
 };
@@ -199,6 +202,27 @@ private:
     size_t bytes_;
 };
 
+enum class FdpIoPlanKind {
+    ChunkListWrite,
+    LfsyAppend,
+};
+
+enum class FdpIoPlanRing {
+    Nefc,
+    Expert,
+};
+
+struct FdpIoPlan {
+    FdpIoPlanKind kind = FdpIoPlanKind::ChunkListWrite;
+    FdpIoPlanRing ring = FdpIoPlanRing::Expert;
+    int64_t pinned_addr = 0;
+    uint64_t total_padded_bytes = 0;
+    uint64_t logical_offset = 0;
+    std::vector<FdpChunkId> chunks;
+    AlignedBuffer owned_buffer;
+    std::string where;
+};
+
 class FdpStore {
 public:
     FdpStore();
@@ -222,6 +246,8 @@ public:
     void begin_expert_batch();
     uint32_t end_expert_batch();
     UcmdRingBatchStats end_expert_batch_stats();
+    void begin_checkpoint_iter(uint64_t iter);
+    bool mark_writer_done(uint64_t iter, const std::string& writer_kind);
     size_t write_nefc(const std::string& object_name,
                       int64_t pinned_addr,
                       const std::string& header,
@@ -288,6 +314,13 @@ private:
     void write_superblock();
     void write_metadata_image();
     void read_metadata_image();
+    void open_or_create_shared_metadata_mmap();
+    void close_shared_metadata_mmap();
+    uint64_t metadata_layout_fingerprint() const;
+    void prepare_io_plan(const FdpIoPlan& plan);
+    void prepare_io_plans(std::vector<FdpIoPlan>& plans);
+    void enqueue_io_plan(FdpIoPlan&& plan);
+    bool mark_process_done_locked(uint64_t iter);
     void update_metadata_header(uint64_t iter, bool bump_seq);
     void acquire_global_metadata_lock();
     void release_global_metadata_lock();
@@ -377,6 +410,8 @@ private:
     int64_t next_lfsy_handle_ = 1;
     std::unordered_map<int64_t, LfsyHandle> lfsy_handles_;
     std::vector<AlignedBuffer> batch_owned_buffers_;
+    std::vector<FdpIoPlan> nefc_batch_plans_;
+    std::vector<FdpIoPlan> expert_batch_plans_;
     mutable std::recursive_mutex mutex_;
     mutable std::shared_mutex op_mutex_;
     mutable std::recursive_mutex bitmap_mutex_;
@@ -395,6 +430,17 @@ private:
     int global_lock_fd_ = -1;
     uint32_t global_lock_depth_ = 0;
     mutable std::recursive_mutex global_lock_mutex_;
+    std::string shared_mmap_name_;
+    int shared_mmap_fd_ = -1;
+    void* shared_mmap_base_ = nullptr;
+    uint64_t shared_mmap_bytes_ = 0;
+    void* shared_control_ = nullptr;
+    uint8_t* shared_metadata_bytes_ = nullptr;
+    uint64_t local_iter_ = 0;
+    bool local_nonexpert_done_ = false;
+    bool local_expert_done_ = false;
+    bool local_process_done_reported_ = false;
+    mutable std::mutex local_iter_mutex_;
     bool open_ = false;
 };
 
