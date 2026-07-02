@@ -37,6 +37,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch.utils.cpp_extension import load
 
+from ..telemetry.fdp_readback_validation import FdpReadbackValidator
+
 
 # ---------------------------------------------------------------------------
 # C++ extension load (no Python fallback — these are hot paths).
@@ -129,6 +131,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return bool(default)
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def fdp_readback_validation_enabled() -> bool:
+    return backend_kind() == "fdp" and _env_bool("PROPOSAL_FDP_VALIDATE_READBACK")
 
 
 def fdp_metadata_mmap_enabled() -> bool:
@@ -229,6 +235,15 @@ def alloc_cpu_uint8_sector_aligned(
     if padded > n:
         t[n:].zero_()
     return t
+
+
+_fdp_readback_validator = FdpReadbackValidator(
+    header_block_bytes=HEADER_BLOCK_BYTES,
+    sector_bytes=SECTOR_BYTES,
+    enabled=fdp_readback_validation_enabled,
+    get_fdp=_get_fdp,
+    alloc_cpu_u8=alloc_cpu_uint8_sector_aligned,
+)
 
 
 def scatter_lossy_records_to_dense_by_intervals(
@@ -419,6 +434,11 @@ def write_prptens_from_pinned(
             int(total_padded),
             int(step),
         ))
+        _fdp_readback_validator.queue_nefc(
+            pinned_tensor=pinned_tensor,
+            logical_bytes=int(HEADER_BLOCK_BYTES + int(payload_bytes)),
+            context=f"{Path(final_path).name}@iter{int(step)}",
+        )
         if bool(fsync) and not fdp_metadata_mmap_enabled():
             fdp.flush_metadata(int(step))
         return written
@@ -501,7 +521,7 @@ def write_lfcs_from_pinned(
             total_padded=int(total_padded),
         )
         del mode
-        return int(_get_fdp().write_lfcs(
+        written = int(_get_fdp().write_lfcs(
             str(Path(final_path).name),
             int(pinned_tensor.data_ptr()),
             header_bytes,
@@ -512,6 +532,17 @@ def write_lfcs_from_pinned(
             int(step),
             int(generation),
         ))
+        _fdp_readback_validator.queue_lfcs(
+            pinned_tensor=pinned_tensor,
+            logical_bytes=int(HEADER_BLOCK_BYTES + int(payload_bytes)),
+            layer=int(layer),
+            expert=int(expert),
+            context=(
+                f"{Path(final_path).name}@iter{int(step)}"
+                f":L{int(layer)}/E{int(expert)}"
+            ),
+        )
+        return written
     _require_pinned_aligned_buffer(
         pinned_tensor,
         where="write_lfcs_from_pinned",
@@ -612,7 +643,7 @@ def open_lossy_log_for_append(
         del mode
         if layer is None or expert is None or generation is None:
             raise RuntimeError("FDP LFSY open requires layer/expert/generation")
-        return int(_get_fdp().open_lfsy(
+        fd = int(_get_fdp().open_lfsy(
             str(Path(path).name),
             header_bytes,
             int(layer),
@@ -620,6 +651,17 @@ def open_lossy_log_for_append(
             int(step if step is not None else -1),
             int(generation),
         ))
+        _fdp_readback_validator.queue_lfsy_header(
+            header=bytes(header_bytes),
+            layer=int(layer),
+            expert=int(expert),
+            context=(
+                f"{Path(path).name}@iter"
+                f"{int(step if step is not None else -1)}"
+                f":L{int(layer)}/E{int(expert)}:gen{int(generation)}"
+            ),
+        )
+        return fd
     hdr_pin = alloc_pinned_uint8_sector_aligned(HEADER_BLOCK_BYTES)
     return int(_cext.open_lossy_log_for_append(
         str(Path(path)), int(hdr_pin.data_ptr()),
@@ -641,7 +683,9 @@ def append_lossy_log_from_pinned(
     SECTOR_BYTES multiple — the pad tail in pinned_tensor is already
     zero-filled."""
     if pinned_tensor.dtype != torch.uint8 or not pinned_tensor.is_contiguous():
-        raise ValueError("append_lossy_log_from_pinned: tensor must be contiguous uint8")
+        raise ValueError(
+            "append_lossy_log_from_pinned: tensor must be contiguous uint8"
+        )
     total_padded = _round_up_sector(total_bytes)
     if backend_kind() == "fdp":
         _require_cpu_aligned_buffer(
@@ -651,7 +695,7 @@ def append_lossy_log_from_pinned(
         )
         if generation is None:
             raise RuntimeError("FDP LFSY append requires generation")
-        return int(_get_fdp().append_lfsy(
+        written = int(_get_fdp().append_lfsy(
             int(fd),
             int(pinned_tensor.data_ptr()),
             int(total_bytes),
@@ -661,6 +705,17 @@ def append_lossy_log_from_pinned(
             int(step),
             int(generation),
         ))
+        _fdp_readback_validator.queue_lfsy_append(
+            pinned_tensor=pinned_tensor,
+            nbytes=int(total_padded),
+            layer=int(layer),
+            expert=int(expert),
+            context=(
+                f"lfsy@iter{int(step)}:L{int(layer)}/E{int(expert)}"
+                f":gen{int(generation)}"
+            ),
+        )
+        return written
     _require_pinned_aligned_buffer(
         pinned_tensor,
         where="append_lossy_log_from_pinned",
@@ -827,7 +882,9 @@ def fdp_end_data_batch_stats() -> Dict[str, Any]:
         raise RuntimeError(
             "fdp_end_data_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
-    return dict(_get_fdp().end_data_batch_stats())
+    stats = dict(_get_fdp().end_data_batch_stats())
+    _fdp_readback_validator.validate_all()
+    return stats
 
 
 def fdp_begin_nefc_batch() -> None:
@@ -839,7 +896,9 @@ def fdp_begin_nefc_batch() -> None:
 def fdp_end_nefc_batch() -> int:
     if backend_kind() != "fdp":
         raise RuntimeError("fdp_end_nefc_batch requires PROPOSAL_IO_BACKEND=fdp")
-    return int(_get_fdp().end_nefc_batch())
+    out = int(_get_fdp().end_nefc_batch())
+    _fdp_readback_validator.validate_nefc()
+    return out
 
 
 def fdp_end_nefc_batch_stats() -> Dict[str, Any]:
@@ -847,7 +906,9 @@ def fdp_end_nefc_batch_stats() -> Dict[str, Any]:
         raise RuntimeError(
             "fdp_end_nefc_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
-    return dict(_get_fdp().end_nefc_batch_stats())
+    stats = dict(_get_fdp().end_nefc_batch_stats())
+    _fdp_readback_validator.validate_nefc()
+    return stats
 
 
 def fdp_begin_expert_batch() -> None:
@@ -861,7 +922,9 @@ def fdp_begin_expert_batch() -> None:
 def fdp_end_expert_batch() -> int:
     if backend_kind() != "fdp":
         raise RuntimeError("fdp_end_expert_batch requires PROPOSAL_IO_BACKEND=fdp")
-    return int(_get_fdp().end_expert_batch())
+    out = int(_get_fdp().end_expert_batch())
+    _fdp_readback_validator.validate_expert()
+    return out
 
 
 def fdp_end_expert_batch_stats() -> Dict[str, Any]:
@@ -869,7 +932,9 @@ def fdp_end_expert_batch_stats() -> Dict[str, Any]:
         raise RuntimeError(
             "fdp_end_expert_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
-    return dict(_get_fdp().end_expert_batch_stats())
+    stats = dict(_get_fdp().end_expert_batch_stats())
+    _fdp_readback_validator.validate_expert()
+    return stats
 
 
 def fdp_stats() -> Dict[str, Any]:

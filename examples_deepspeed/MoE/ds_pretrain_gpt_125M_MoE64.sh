@@ -118,8 +118,8 @@ PRESCALE_GRAD=${PRESCALE_GRAD:-true}
 MP_SIZE=${MP_SIZE:-1}
 
 ## Pipeline parallelism
-## Currently we don't support PP for MoE. To disable PP, set PP_SIZE
-## to 1 and use the "--no-pipeline-parallel" arg.
+## PP_SIZE=1 keeps Megatron's no-pipeline path.  PP_SIZE>1 uses DeepSpeed
+## PipelineEngine; this is required for MoE+PP smoke/proposal telemetry tests.
 PP_SIZE=${PP_SIZE:-1}
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 NUM_GPUS_PERNODE=${NUM_GPUS_PERNODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
@@ -130,7 +130,9 @@ NUM_NODE=$(( ${NUM_GPUS} / ${NUM_GPUS_PERNODE} ))
 # EP_SIZE=1
 EP_SIZE=${EP_SIZE:-64}
 
-if [[ $EP_SIZE -gt $NUM_GPUS ]]; then
+if [[ -n "${MOE_EXPERT_PARALLEL_SIZE:-}" ]]; then
+    EP_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE}
+elif [[ $EP_SIZE -gt $NUM_GPUS ]]; then
     EP_PARALLEL_SIZE=$NUM_GPUS
 else
     EP_PARALLEL_SIZE=$EP_SIZE
@@ -343,8 +345,8 @@ deepspeed_options=" \
 		    --deepspeed_config ${config_json} \
 		    --pipeline-model-parallel-size ${PP_SIZE}"
 
-# Currently MoE is not compatible with pipeline parallel
-if [[ $EP_SIZE -gt 1 ]]; then
+# Keep the non-pipeline implementation when no PP split is requested.
+if [[ $PP_SIZE -le 1 ]]; then
 deepspeed_options="${deepspeed_options} \
         --no-pipeline-parallel"
 fi

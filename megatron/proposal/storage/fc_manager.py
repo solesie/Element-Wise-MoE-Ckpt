@@ -209,6 +209,7 @@ class FCManager:
         test_skip_nonexpert_d2h: bool = False,
         nonexpert_shard_rank: int = 0,
         nonexpert_shard_count: int = 1,
+        lfcl_capacity_world_size: int = 1,
     ) -> None:
         if nonexpert_fc_W < 1:
             raise ValueError(f"nonexpert_fc_W must be ≥1, got {nonexpert_fc_W}")
@@ -272,6 +273,7 @@ class FCManager:
         # Proposal LFCL is fixed by V2: every iter, 1% expert slots by planner.
         self._rr_cursor = 0
         self.lfcl_fraction_pct = float(lfcl_fraction_pct)
+        self._lfcl_capacity_world_size = max(1, int(lfcl_capacity_world_size))
         if self._num_expert_slots > 0 and self.lfcl_fraction_pct > 0:
             self._experts_per_lfcl_event = max(
                 1,
@@ -444,7 +446,7 @@ class FCManager:
             self._non_expert_names.append(name)
 
     def _apply_nonexpert_name_shard(self) -> None:
-        """Keep only this EP replica's size-balanced non-expert tensor shard."""
+        """Keep only this rank's size-balanced non-expert tensor-name shard."""
         if not self._non_expert_names:
             return
         named_params = dict(self.model.named_parameters())
@@ -603,7 +605,19 @@ class FCManager:
                     sum(1 for eid in self._all_expert_ids if eid[0] == layer),
                 )
         else:
-            max_fired = int(self._experts_per_lfcl_event)
+            # The default lossy_log_size planner selects a global 1% quota.
+            # Ties or hot experts can legitimately place that whole global
+            # quota on one rank, so the local pinned batch slab must be sized
+            # for that burst rather than the local 1% average.
+            max_fired = max(
+                int(self._experts_per_lfcl_event),
+                math.ceil(
+                    self._num_expert_slots
+                    * self.lfcl_fraction_pct
+                    * self._lfcl_capacity_world_size
+                    / 100.0
+                ),
+            )
         max_fired = max(0, min(max_fired, len(per_expert_slot_bytes)))
         if max_fired <= 0:
             return
@@ -1404,9 +1418,9 @@ class FCManager:
                     f"copy_cmds={int(sub.get('d2h_copy_cmds', 0))}",
                     flush=True,
                 )
-        # Raw-binary format (PRPTENS magic).  Single-rank keeps the historical
-        # filename.  Multi-EP disk mode writes one disjoint tensor-name shard per
-        # EP replica into the same PP-local non_expert directory.
+        # Raw-binary format (PRPTENS magic).  Single-shard keeps the historical
+        # filename.  Multi-rank disk mode writes one disjoint tensor-name shard
+        # per DP×EP replica into the same PP-local non_expert directory.
         if self._nonexpert_shard_count > 1:
             path = self.output_dir / (
                 f"fc_nonexpert_shard{self._nonexpert_shard_rank:02d}"

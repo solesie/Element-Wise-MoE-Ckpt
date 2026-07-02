@@ -45,6 +45,26 @@ def score_policy_id(name: str) -> int:
 if _HAS_TRITON:
 
     @triton.jit
+    def _lookup_h_from_lut(
+        v_fp32,
+        h_lut_ptr,
+        log_v_min_ptr,
+        inv_log_v_width_ptr,
+        H_LUT_BINS: tl.constexpr,
+    ):
+        log_v_min = tl.load(log_v_min_ptr)
+        inv_width = tl.load(inv_log_v_width_ptr)
+        log_v = tl.log(tl.maximum(v_fp32, 1.0e-30))
+        pos = (log_v - log_v_min) * inv_width
+        pos = tl.maximum(tl.minimum(pos, H_LUT_BINS - 1.0), 0.0)
+        idx_lo = pos.to(tl.int32)
+        idx_hi = tl.minimum(idx_lo + 1, H_LUT_BINS - 1)
+        frac = pos - idx_lo.to(tl.float32)
+        h_lo = tl.load(h_lut_ptr + idx_lo)
+        h_hi = tl.load(h_lut_ptr + idx_hi)
+        return h_lo + frac * (h_hi - h_lo)
+
+    @triton.jit
     def _lookup_h_and_geom_from_lut(
         v_fp32,
         age_code,
@@ -106,6 +126,32 @@ if _HAS_TRITON:
         if SCORE_POLICY == 1:
             return second_order
         first_order = -linear * e_hat
+        return tl.maximum(first_order + 0.5 * second_order, 0.0)
+
+    @triton.jit
+    def _proposal_element_score_from_theta_cp(
+        linear,
+        v,
+        p,
+        theta_cp,
+        h_lut_ptr,
+        log_v_min_ptr,
+        inv_log_v_width_ptr,
+        H_LUT_BINS: tl.constexpr,
+        SCORE_POLICY: tl.constexpr,
+    ):
+        h_abs = _lookup_h_from_lut(
+            v.to(tl.float32),
+            h_lut_ptr,
+            log_v_min_ptr,
+            inv_log_v_width_ptr,
+            H_LUT_BINS,
+        )
+        e = p.to(tl.float32) - theta_cp.to(tl.float32)
+        second_order = h_abs * e * e
+        if SCORE_POLICY == 1:
+            return second_order
+        first_order = -linear * e
         return tl.maximum(first_order + 0.5 * second_order, 0.0)
 
     @triton.jit

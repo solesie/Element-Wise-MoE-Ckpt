@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -10,6 +11,42 @@ from typing import Optional, Tuple
 DEFAULT_LFCL_INTERVAL_ITERS = 1
 DEFAULT_LFCL_FRACTION_PCT = 1.0
 DEFAULT_LFCL_PLAN_POLICY = "lossy_log_size"
+
+
+def _ceil_div(num: int, den: int) -> int:
+    return (max(0, int(num)) + max(1, int(den)) - 1) // max(1, int(den))
+
+
+def lr_warmup_iters_from_args(args) -> int:
+    warmup_tokens = getattr(args, "lr_warmup_tokens", None)
+    if warmup_tokens is not None and int(warmup_tokens or 0) > 0:
+        tokens_per_iter = (
+            max(1, int(getattr(args, "global_batch_size", 1) or 1))
+            * max(1, int(getattr(args, "seq_length", 1) or 1))
+        )
+        return _ceil_div(int(warmup_tokens), tokens_per_iter)
+
+    warmup_iters = int(getattr(args, "lr_warmup_iters", 0) or 0)
+    if warmup_iters > 0:
+        return warmup_iters
+
+    warmup_samples = int(getattr(args, "lr_warmup_samples", 0) or 0)
+    if warmup_samples > 0:
+        return _ceil_div(
+            warmup_samples,
+            max(1, int(getattr(args, "global_batch_size", 1) or 1)),
+        )
+
+    warmup_fraction = getattr(args, "lr_warmup_fraction", None)
+    if warmup_fraction is not None:
+        decay_iters = int(
+            getattr(args, "lr_decay_iters", None)
+            or getattr(args, "train_iters", 0)
+            or 0
+        )
+        return int(math.ceil(float(warmup_fraction) * max(0, decay_iters)))
+
+    return 0
 
 
 @dataclass(frozen=True)
@@ -22,6 +59,7 @@ class ProposalConfig:
     selection_mode: str
     score_policy: str
     score_linear_source: str
+    e_hat_proxy: bool = True
 
     # Selection cutoff search.
     n_bins_cutoff: int = 4096
@@ -38,7 +76,9 @@ class ProposalConfig:
 
     # Anchor.
     finite_diff_eps: float = 1e-3
-    h_refresh_every: int = 100
+    h_refresh_every: int = 50
+    h_refresh_warmup_every: int = 20
+    h_refresh_warmup_iters: int = 0
     n_anchor_batches: Optional[int] = None
 
     # FC schedule. Expert LFCL is fixed by V2: every iter, 1% of expert slots.
@@ -129,7 +169,10 @@ class ProposalConfig:
         if finite_diff_eps is None:
             finite_diff_eps = 1e-3
         h_refresh_every = int(
-            getattr(args, "proposal_hessian_refresh_every", 100) or 0
+            getattr(args, "proposal_hessian_refresh_every", 50) or 0
+        )
+        h_refresh_warmup_every = int(
+            getattr(args, "proposal_hessian_refresh_warmup_every", 20) or 0
         )
 
         fault_interval_raw = int(getattr(args, "proposal_fault_interval", 0) or 0)
@@ -145,7 +188,7 @@ class ProposalConfig:
             "proposal_adaptive_cutoff_warmup_iters",
             0,
         )
-        skip_warmup_iters = getattr(args, "lr_warmup_iters", 0)
+        skip_warmup_iters = lr_warmup_iters_from_args(args)
 
         # Anchor processes half of one iteration's micro-batches (mb_per_iter/2):
         # empirically ≥0.93 H coverage while under half the fwd+bwd budget.
@@ -181,6 +224,9 @@ class ProposalConfig:
             selection_mode=str(selection_mode),
             score_policy=str(score_policy),
             score_linear_source=str(score_linear_source),
+            e_hat_proxy=not bool(
+                getattr(args, "proposal_e_hat_proxy_off", False)
+            ),
             n_bins_cutoff=int(getattr(args, "proposal_n_bins_cutoff", 4096)),
             cutoff_K_tolerance=float(
                 getattr(args, "proposal_cutoff_k_tolerance", 0.04)
@@ -222,6 +268,8 @@ class ProposalConfig:
             ),
             finite_diff_eps=float(finite_diff_eps),
             h_refresh_every=h_refresh_every,
+            h_refresh_warmup_every=max(0, h_refresh_warmup_every),
+            h_refresh_warmup_iters=max(0, int(skip_warmup_iters or 0)),
             n_anchor_batches=n_anchor_batches,
             lfcl_interval_iters=DEFAULT_LFCL_INTERVAL_ITERS,
             lfcl_fraction_pct=DEFAULT_LFCL_FRACTION_PCT,

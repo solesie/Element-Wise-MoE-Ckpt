@@ -44,6 +44,7 @@ class EmissionOrchestrationMixin:
         }
 
         mvph: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+        theta_cp_groups: List[Optional[torch.Tensor]] = []
         gpu_refs: List[torch.Tensor] = []
         for grp in self._groups:
             p_flat_g = grp.get("p_flat")
@@ -56,7 +57,11 @@ class EmissionOrchestrationMixin:
                 grp["m_flat"], grp["v_flat"], p_flat_g,
                 int(grp["master_off"]) * group_size,
             ))
+            theta_cp_g = grp.get("theta_cp_flat")
+            theta_cp_groups.append(theta_cp_g)
             gpu_refs.extend((p_flat_g, grp["m_flat"], grp["v_flat"]))
+            if theta_cp_g is not None:
+                gpu_refs.append(theta_cp_g)
 
         element_within_off_host: List[int] = []
         group_count_per_name_host: List[int] = []
@@ -76,6 +81,7 @@ class EmissionOrchestrationMixin:
             "name_list": name_list,
             "per_expert_batch": per_expert_batch,
             "mvph": tuple(mvph),
+            "theta_cp_groups": tuple(theta_cp_groups),
             "within_off_per_name": tuple(element_within_off_host),
             "group_count_per_name": tuple(group_count_per_name_host),
             "gpu_refs": tuple(gpu_refs),
@@ -244,6 +250,7 @@ class EmissionOrchestrationMixin:
                 score_linear_groups=tuple(
                     grp.get("score_linear_flat") for grp in self._groups
                 ),
+                theta_cp_groups=static_inputs["theta_cp_groups"],
                 score_linear_release=getattr(
                     self,
                     "_release_score_linear_after_event",
@@ -291,6 +298,7 @@ class EmissionOrchestrationMixin:
                 ehat_geom_lut=(
                     age2bit_state.ehat_geom_lut if age2bit_state is not None else None
                 ),
+                use_e_hat_proxy=bool(getattr(self, "e_hat_proxy", True)),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
                 lfcl_fired_epoch=getattr(self, "_lfcl_fired_epoch_device", None),
             )

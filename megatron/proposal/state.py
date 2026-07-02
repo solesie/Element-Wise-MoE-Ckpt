@@ -16,6 +16,7 @@ class BF16OptGroupView:
     v_flat: torch.Tensor
     p_flat: torch.Tensor
     master_off_elem: int
+    theta_cp_flat: Optional[torch.Tensor] = None
     score_linear_flat: Optional[torch.Tensor] = None
     name_start: int = 0
     name_end: int = 0
@@ -59,7 +60,9 @@ class LossyCpState:
     quantiles: "QuantileRefs"
     scratch: CutoffSearchScratch
     age2bit: Optional["Age2BitScoreState"] = None
+    theta_cp: Optional["ThetaCpScoreState"] = None
 
 
 from .refresh.quantile import QuantileRefs  # noqa: E402  (typing cycle only)
 from .cutoff.age2bit import Age2BitScoreState  # noqa: E402  (typing cycle only)
+from .cutoff.theta_cp import ThetaCpScoreState  # noqa: E402  (typing cycle only)

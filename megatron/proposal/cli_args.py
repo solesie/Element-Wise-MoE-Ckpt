@@ -50,6 +50,13 @@ def add_proposal_args(parser):
                             "gradients when available and falls back to "
                             "momentum otherwise. 'momentum' preserves the "
                             "legacy -m*e_hat term.")
+    group.add_argument("--proposal-e-hat-proxy-off",
+                       "--proposal-ehat-proxy-off",
+                       dest="proposal_e_hat_proxy_off",
+                       action="store_true",
+                       help="Use a persistent 2-byte expert theta_cp snapshot "
+                            "for residual scoring instead of the default "
+                            "age/Adam e_hat proxy.")
     group.add_argument("--proposal-n-bins-cutoff", type=int, default=4096,
                        help="Selection cutoff-search histogram bins. Default 4096.")
     group.add_argument("--proposal-cutoff-k-tolerance", type=float, default=0.04,
@@ -84,11 +91,14 @@ def add_proposal_args(parser):
                             "Default None → 1e-3 (validated on production exp_etc, "
                             "BF16 + MoE). Override via this flag or PROPOSAL_FD_EPS "
                             "env if a very different scale ever proves the default unsafe.")
-    group.add_argument("--proposal-hessian-refresh-every", type=int, default=100,
+    group.add_argument("--proposal-hessian-refresh-every", type=int, default=50,
                        help="With --proposal-selection-mode=hessian: re-estimate "
                             "|H_diag| every N iters and overwrite the cached H. "
-                            "Default 100 (prodsim verified: 50-iter staleness has "
-                            "zero rank-quality impact). Set 0 to disable.")
+                            "Default 50 after LR warmup. Set 0 to disable.")
+    group.add_argument("--proposal-hessian-refresh-warmup-every", type=int, default=20,
+                       help="During LR warmup, refresh |H_diag| every N iters. "
+                            "Default 20. Ignored when "
+                            "--proposal-hessian-refresh-every=0.")
     group.add_argument("--proposal-test-skip-expert-commit", action="store_true",
                        help="Test/profiling only: run expert selection, AOS "
                             "materialization, and D2H, then skip CPU dense "

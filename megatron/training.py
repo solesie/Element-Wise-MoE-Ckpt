@@ -52,6 +52,7 @@ from megatron.utils import report_memory, throughput_calculator, checkpoint_thro
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
+from megatron.proposal.config import lr_warmup_iters_from_args
 from megatron.proposal.hooks import (
     init_proposal,
     proposal_dispatch_post_iter,
@@ -76,6 +77,20 @@ def print_datetime(string):
     torch.distributed.barrier()
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
+
+
+def _proposal_h_refresh_every_for_iter(args, iteration):
+    h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
+    if h_refresh_every <= 0:
+        return 0
+
+    warmup_every = int(
+        getattr(args, 'proposal_hessian_refresh_warmup_every', 20) or 0
+    )
+    if warmup_every > 0 and int(iteration) <= lr_warmup_iters_from_args(args):
+        return warmup_every
+
+    return h_refresh_every
 
 '''
 Since v0.9.0, deepspeed.initialize() has forbidden simultaneous setting of args.deepspeed_config (Path) and ds_config dict.
@@ -1344,7 +1359,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # H cache refresh for selection_mode='hessian'. Uses valid data so
         # it does not consume/advance the training data iterator. The first
         # refresh happens at iter=1 so lossy selection has a populated H cache.
-        h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
+        h_refresh_every = _proposal_h_refresh_every_for_iter(args, iteration)
         if (
             getattr(args, 'proposal_enable', False)
             and h_refresh_every > 0

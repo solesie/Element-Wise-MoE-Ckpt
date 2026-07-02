@@ -24,6 +24,7 @@ from .ideal_oracle import (
     _capture_rng_state,
     _eval_loss,
     _eval_loss_bank,
+    _is_pipeline_engine,
     _restore_rng_state,
 )
 
@@ -63,6 +64,10 @@ def run_independent_oracle(
 
     actual_batches = max(1, int(getattr(proposal_config, "independent_oracle_actual_batches", 4) or 4))
     hvp_batches = max(0, int(getattr(proposal_config, "independent_oracle_hvp_batches", 1) or 0))
+    requested_hvp_batches = int(hvp_batches)
+    m0 = model[0] if isinstance(model, (list, tuple)) else model
+    pipeline_engine = bool(_is_pipeline_engine(m0))
+    hvp_skip_reason = None
     score_source = str(getattr(proposal_config, "score_linear_source", "grad"))
     self_linear_key = "g_score_flat" if score_source == "grad" else "m_flat"
     self_linear_name = "g" if score_source == "grad" else "m_t"
@@ -92,11 +97,16 @@ def run_independent_oracle(
 
         live_snapshot = _LiveParamSnapshot.capture(lossy_cp)
         setattr(lossy_cp, _SNAPSHOT_ATTR, live_snapshot)
-        loss_base, loss_base_batches = _eval_loss_bank_values(loss_bank)
+        proposal_group = getattr(lossy_cp, "_proposal_cpu_pg", None)
+        loss_base, loss_base_batches = _eval_loss_bank_values(
+            loss_bank,
+            group=proposal_group,
+        )
         loss_policy, loss_policy_batches = _eval_checkpoint_loss_values(
             lossy_cp=lossy_cp,
             model=model,
             loss_bank=loss_bank,
+            group=proposal_group,
         )
         actual_remaining = float(loss_policy) - float(loss_base)
         actual_delta_stats = _paired_delta_stats(
@@ -210,6 +220,9 @@ def run_independent_oracle(
             "g_score_available": bool(_linear_key_available(lossy_cp, "g_score_flat")),
             "actual_batches": int(len(loss_bank)),
             "hvp_batches": int(min(hvp_batches, len(loss_bank))),
+            "requested_hvp_batches": int(requested_hvp_batches),
+            "hvp_skip_reason": hvp_skip_reason,
+            "pipeline_engine": bool(pipeline_engine),
         }
         _append_jsonl(log_dir / f"independent_loss_rank{rank:03d}.jsonl", row)
         for oneshot_row in oneshot_rows:
@@ -227,44 +240,57 @@ def run_independent_oracle(
             _append_jsonl(log_dir / f"independent_rank_rank{rank:03d}.jsonl", rank_row)
 
         if _env_flag("PROPOSAL_INDEPENDENT_ORACLE_AUTOGRAD_GOLD"):
-            from .autograd_gold import collect_autograd_gold_sample
+            if pipeline_engine:
+                _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", {
+                    "mode": "independent_autograd_gold_status",
+                    "step": int(iteration),
+                    "rank": int(rank),
+                    "world": int(world),
+                    "score_linear_source": score_source,
+                    "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
+                    "enabled": True,
+                    "status": "skip",
+                    "reason": "pipeline_engine_not_supported",
+                })
+            else:
+                from .autograd_gold import collect_autograd_gold_sample
 
-            specs = _tensor_specs(lossy_cp)
-            gold = collect_autograd_gold_sample(
-                lossy_cp=lossy_cp,
-                model=model,
-                specs=specs,
-                sample=sample,
-                sample_payload=sample_payload,
-                loss_bank=loss_bank,
-                checkpoint_tensor_for_name=_checkpoint_tensor_for_name,
-                restore_current_params=_restore_current_params,
-                restore_rng_state=_restore_rng_state,
-                linear_key=self_linear_key,
-                linear_name=self_linear_name,
-                iteration=int(iteration),
-                rank=rank,
-            )
-            _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", {
-                "mode": "independent_autograd_gold_status",
-                "step": int(iteration),
-                "rank": int(rank),
-                "world": int(world),
-                "score_linear_source": score_source,
-                "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
-                **gold.meta,
-            })
-            for gold_row in _autograd_gold_rank_rows(
-                gold_arrays=gold.arrays,
-                sample_payload=sample_payload,
-                proposal_config=proposal_config,
-                iteration=int(iteration),
-                rank=rank,
-                world=world,
-                score_source=score_source,
-                linear_name=self_linear_name,
-            ):
-                _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", gold_row)
+                specs = _tensor_specs(lossy_cp)
+                gold = collect_autograd_gold_sample(
+                    lossy_cp=lossy_cp,
+                    model=model,
+                    specs=specs,
+                    sample=sample,
+                    sample_payload=sample_payload,
+                    loss_bank=loss_bank,
+                    checkpoint_tensor_for_name=_checkpoint_tensor_for_name,
+                    restore_current_params=_restore_current_params,
+                    restore_rng_state=_restore_rng_state,
+                    linear_key=self_linear_key,
+                    linear_name=self_linear_name,
+                    iteration=int(iteration),
+                    rank=rank,
+                )
+                _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", {
+                    "mode": "independent_autograd_gold_status",
+                    "step": int(iteration),
+                    "rank": int(rank),
+                    "world": int(world),
+                    "score_linear_source": score_source,
+                    "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
+                    **gold.meta,
+                })
+                for gold_row in _autograd_gold_rank_rows(
+                    gold_arrays=gold.arrays,
+                    sample_payload=sample_payload,
+                    proposal_config=proposal_config,
+                    iteration=int(iteration),
+                    rank=rank,
+                    world=world,
+                    score_source=score_source,
+                    linear_name=self_linear_name,
+                ):
+                    _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", gold_row)
 
         timing = {
             "mode": "independent_oracle_timing",
@@ -273,6 +299,9 @@ def run_independent_oracle(
             "elapsed_ms": float((time.perf_counter() - t0) * 1000.0),
             "actual_batches": int(len(loss_bank)),
             "hvp_batches": int(min(hvp_batches, len(loss_bank))),
+            "requested_hvp_batches": int(requested_hvp_batches),
+            "hvp_skip_reason": hvp_skip_reason,
+            "pipeline_engine": bool(pipeline_engine),
             "sample_elements": int(sample_payload["e"].size),
         }
         _append_jsonl(log_dir / f"independent_timing_rank{rank:03d}.jsonl", timing)
@@ -369,13 +398,15 @@ class _LiveParamSnapshot:
 @torch.no_grad()
 def _eval_loss_bank_values(
     loss_bank: Sequence[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]],
+    *,
+    group: Any = None,
 ) -> Tuple[float, List[float]]:
     if not loss_bank:
         return 0.0, []
     values: List[float] = []
     for forward_loss, rng_state in loss_bank:
         local = float(_eval_loss(forward_loss, rng_state=rng_state))
-        values.append(float(_all_reduce_mean_float(local)))
+        values.append(float(_all_reduce_mean_float(local, group=group)))
     mean = float(sum(values) / float(max(1, len(values))))
     return mean, values
 
@@ -386,12 +417,54 @@ def _eval_checkpoint_loss_values(
     lossy_cp: Any,
     model: Any,
     loss_bank: Sequence[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]],
+    group: Any = None,
 ) -> Tuple[float, List[float]]:
     try:
         _set_params_to_checkpoint(lossy_cp)
-        return _eval_loss_bank_values(loss_bank)
+        return _eval_loss_bank_values(loss_bank, group=group)
     finally:
         _restore_current_params(lossy_cp)
+
+
+def _pipeline_forward_loss_state(
+    forward_loss: Callable[[], Tuple[torch.Tensor, Dict[str, Any]]],
+) -> Optional[Tuple[Any, Tuple[Any, ...]]]:
+    engine = getattr(forward_loss, "_proposal_pipeline_engine", None)
+    cached = getattr(forward_loss, "_proposal_pipeline_cached", None)
+    if engine is None or cached is None or not _is_pipeline_engine(engine):
+        return None
+    return engine, tuple(cached)
+
+
+def _pipeline_backward_from_cached(engine: Any, cached_microbatches: Sequence[Any]) -> None:
+    from ..refresh.hessian_refresh import _pipeline_exec_batch
+
+    _pipeline_exec_batch(
+        engine,
+        list(cached_microbatches),
+        backward=True,
+    )
+
+
+def _backward_from_forward_loss(
+    *,
+    model: Any,
+    forward_loss: Callable[[], Tuple[torch.Tensor, Dict[str, Any]]],
+) -> None:
+    pipeline_state = _pipeline_forward_loss_state(forward_loss)
+    if pipeline_state is not None:
+        engine, cached = pipeline_state
+        _pipeline_backward_from_cached(engine, cached)
+        return
+
+    module = model[0] if isinstance(model, (list, tuple)) else model
+    loss, _ = forward_loss()
+    if loss.dim() > 0:
+        loss = loss.mean()
+    if hasattr(module, "backward") and hasattr(module, "optimizer"):
+        module.backward(loss)
+    else:
+        loss.backward(retain_graph=False)
 
 
 def _paired_delta_stats(
@@ -461,7 +534,12 @@ def _eval_checkpoint_loss(
 ) -> float:
     try:
         _set_params_to_checkpoint(lossy_cp)
-        return float(_eval_loss_bank(loss_bank))
+        return float(
+            _eval_loss_bank(
+                loss_bank,
+                group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+            )
+        )
     finally:
         _restore_current_params(lossy_cp)
 
@@ -1350,13 +1428,7 @@ def _backward_grad_cpu_tensors(
 
         handles.append(param.register_hook(_hook))
     try:
-        loss, _ = forward_loss()
-        if loss.dim() > 0:
-            loss = loss.mean()
-        if hasattr(module, "backward") and hasattr(module, "optimizer"):
-            module.backward(loss)
-        else:
-            loss.backward(retain_graph=False)
+        _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     finally:
@@ -1831,13 +1903,7 @@ def _backward_grad_tensors(
 
         handles.append(param.register_hook(_hook))
     try:
-        loss, _ = forward_loss()
-        if loss.dim() > 0:
-            loss = loss.mean()
-        if hasattr(module, "backward") and hasattr(module, "optimizer"):
-            module.backward(loss)
-        else:
-            loss.backward(retain_graph=False)
+        _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     finally:
@@ -2033,7 +2099,10 @@ def _eval_gpu_policy_loss(
             )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        loss, loss_batches = _eval_loss_bank_values(loss_bank)
+        loss, loss_batches = _eval_loss_bank_values(
+            loss_bank,
+            group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+        )
     finally:
         _restore_current_params(lossy_cp)
     group = getattr(lossy_cp, "_proposal_cpu_pg", None)
@@ -2310,13 +2379,7 @@ def _backward_grad_parts(
 
         handles.append(param.register_hook(_hook))
     try:
-        loss, _ = forward_loss()
-        if loss.dim() > 0:
-            loss = loss.mean()
-        if hasattr(module, "backward") and hasattr(module, "optimizer"):
-            module.backward(loss)
-        else:
-            loss.backward(retain_graph=False)
+        _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     finally:
@@ -2362,13 +2425,7 @@ def _backward_dot_direction(
 
         handles.append(param.register_hook(_hook))
     try:
-        loss, _ = forward_loss()
-        if loss.dim() > 0:
-            loss = loss.mean()
-        if hasattr(module, "backward") and hasattr(module, "optimizer"):
-            module.backward(loss)
-        else:
-            loss.backward(retain_graph=False)
+        _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return float(torch.stack(dot_tensors).sum().detach().item()) if dot_tensors else 0.0
@@ -2571,7 +2628,7 @@ def _all_gather_float_arrays(arr: np.ndarray, *, group: Any) -> List[np.ndarray]
     arr = np.asarray(arr, dtype=np.float32).reshape(-1)
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return [arr]
-    _, world = _rank_world()
+    world = int(torch.distributed.get_world_size(group=group))
     local_n = int(arr.size)
     lengths = [torch.zeros(1, dtype=torch.int64, device="cpu") for _ in range(world)]
     local_len_t = torch.tensor([local_n], dtype=torch.int64, device="cpu")
@@ -2595,7 +2652,8 @@ def _tie_quota_for_rank(local_equal: int, ties_needed: int, *, group: Any) -> in
         return 0
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return min(int(local_equal), int(ties_needed))
-    rank, world = _rank_world()
+    rank = int(torch.distributed.get_rank(group=group))
+    world = int(torch.distributed.get_world_size(group=group))
     counts = [torch.zeros(1, dtype=torch.int64, device="cpu") for _ in range(world)]
     local = torch.tensor([int(local_equal)], dtype=torch.int64, device="cpu")
     torch.distributed.all_gather(counts, local, group=group)
@@ -2678,7 +2736,12 @@ def _eval_selected_masks_loss(
             param.data.copy_(value.view(param.shape).to(device=param.device, dtype=param.dtype), non_blocking=True)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        return float(_eval_loss_bank(loss_bank))
+        return float(
+            _eval_loss_bank(
+                loss_bank,
+                group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+            )
+        )
     finally:
         _restore_current_params(lossy_cp)
 
@@ -2775,13 +2838,7 @@ def _backward_dot_and_sample(
             handles.append(param.register_hook(_hook))
             local_off += n
     try:
-        loss, _ = forward_loss()
-        if loss.dim() > 0:
-            loss = loss.mean()
-        if hasattr(module, "backward") and hasattr(module, "optimizer"):
-            module.backward(loss)
-        else:
-            loss.backward(retain_graph=False)
+        _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         local_dot = float(torch.stack(dot_tensors).sum().detach().item()) if dot_tensors else 0.0

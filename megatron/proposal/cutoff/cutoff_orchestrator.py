@@ -193,24 +193,28 @@ class CutoffOrchestrationMixin:
         age2bit_state = getattr(runtime_state, "age2bit", None)
         if age2bit_state is None:
             raise RuntimeError("Age2Bit state is required for cold-start cutoff")
+        use_e_hat_proxy = bool(getattr(self, "e_hat_proxy", True))
         lfcl_fired_epoch = getattr(self, "_lfcl_fired_epoch_device", None)
-        launch_update_ehat_geom_lut(
-            h_lut_values=runtime_state.quantiles.h_lut.values,
-            h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
-            h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
-            ehat_geom_lut=age2bit_state.ehat_geom_lut,
-            lr_over_bc1=float(hparams.lr_over_bc1),
-            sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
-            eps=float(hparams.eps),
-            beta1=float(getattr(hparams, "beta1", 0.9)),
-        )
+        if use_e_hat_proxy:
+            launch_update_ehat_geom_lut(
+                h_lut_values=runtime_state.quantiles.h_lut.values,
+                h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+                h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
+                lr_over_bc1=float(hparams.lr_over_bc1),
+                sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+                eps=float(hparams.eps),
+                beta1=float(getattr(hparams, "beta1", 0.9)),
+            )
         smin.fill_(float("inf"))
         smax.zero_()
         for grp in self._groups:
             launch_reduce_score_minmax_for_group(
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
+                p_flat=grp["p_flat"],
                 score_linear_flat=grp.get("score_linear_flat"),
+                theta_cp_flat=grp.get("theta_cp_flat"),
                 age2bit_words=age2bit_state.age_words,
                 ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
@@ -235,6 +239,7 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                use_e_hat_proxy=use_e_hat_proxy,
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
@@ -268,7 +273,9 @@ class CutoffOrchestrationMixin:
             launch_build_score_log_hist_for_group(
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
+                p_flat=grp["p_flat"],
                 score_linear_flat=grp.get("score_linear_flat"),
+                theta_cp_flat=grp.get("theta_cp_flat"),
                 age2bit_words=age2bit_state.age_words,
                 ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
@@ -294,6 +301,7 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                use_e_hat_proxy=use_e_hat_proxy,
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
             )
@@ -522,6 +530,7 @@ class CutoffOrchestrationMixin:
         age2bit_state = getattr(runtime_state, "age2bit", None)
         if age2bit_state is None:
             raise RuntimeError("Age2Bit state is required for production cutoff")
+        use_e_hat_proxy = bool(getattr(self, "e_hat_proxy", True))
 
         profile = os.environ.get("PROPOSAL_APPROX_LAUNCH_PROFILE", "") in (
             "1", "true", "TRUE",
@@ -534,16 +543,17 @@ class CutoffOrchestrationMixin:
         self._approx_probe_reject.zero_()
         self._approx_probe_decision_code.zero_()
         self._approx_probe_diagnostics.zero_()
-        launch_update_ehat_geom_lut(
-            h_lut_values=runtime_state.quantiles.h_lut.values,
-            h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
-            h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
-            ehat_geom_lut=age2bit_state.ehat_geom_lut,
-            lr_over_bc1=float(hparams.lr_over_bc1),
-            sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
-            eps=float(hparams.eps),
-            beta1=float(getattr(hparams, "beta1", 0.9)),
-        )
+        if use_e_hat_proxy:
+            launch_update_ehat_geom_lut(
+                h_lut_values=runtime_state.quantiles.h_lut.values,
+                h_lut_log_v_min=runtime_state.quantiles.h_lut.log_v_min,
+                h_lut_inv_log_v_width=runtime_state.quantiles.h_lut.inv_log_v_width,
+                ehat_geom_lut=age2bit_state.ehat_geom_lut,
+                lr_over_bc1=float(hparams.lr_over_bc1),
+                sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
+                eps=float(hparams.eps),
+                beta1=float(getattr(hparams, "beta1", 0.9)),
+            )
         t_after_zero = time.perf_counter() if profile else 0.0
         telemetry_sinks = [
             telemetry
@@ -576,6 +586,8 @@ class CutoffOrchestrationMixin:
                 m_flat=grp["m_flat"],
                 score_linear_flat=grp.get("score_linear_flat"),
                 v_flat=grp["v_flat"],
+                p_flat=grp["p_flat"],
+                theta_cp_flat=grp.get("theta_cp_flat"),
                 age2bit_words=age2bit_state.age_words,
                 ehat_geom_lut=age2bit_state.ehat_geom_lut,
                 h_lut_values=runtime_state.quantiles.h_lut.values,
@@ -602,6 +614,7 @@ class CutoffOrchestrationMixin:
                 eps=float(hparams.eps),
                 step=int(global_step),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                use_e_hat_proxy=use_e_hat_proxy,
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
                 n_candidates=int(n_cand),
@@ -827,6 +840,8 @@ class CutoffOrchestrationMixin:
                     m_flat=grp["m_flat"],
                     score_linear_flat=grp.get("score_linear_flat"),
                     v_flat=grp["v_flat"],
+                    p_flat=grp["p_flat"],
+                    theta_cp_flat=grp.get("theta_cp_flat"),
                     age2bit_words=age2bit_state.age_words,
                     ehat_geom_lut=age2bit_state.ehat_geom_lut,
                     h_lut_values=runtime_state.quantiles.h_lut.values,
@@ -853,6 +868,7 @@ class CutoffOrchestrationMixin:
                     eps=float(hparams.eps),
                     step=int(global_step),
                     score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                    use_e_hat_proxy=use_e_hat_proxy,
                     random_mode=bool(random_mode),
                     random_salt=int(random_salt),
                     n_candidates=int(retry_n_cand),

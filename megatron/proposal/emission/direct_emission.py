@@ -344,6 +344,13 @@ def emit_segment_direct_from_plan(
             and 0 <= int(group_plan.bf16_group_idx) < len(score_linear_groups)
         ):
             score_linear_view = score_linear_groups[group_plan.bf16_group_idx]
+        theta_cp_view = None
+        theta_cp_groups = getattr(lossy_state, "theta_cp_groups", None)
+        if (
+            theta_cp_groups is not None
+            and 0 <= int(group_plan.bf16_group_idx) < len(theta_cp_groups)
+        ):
+            theta_cp_view = theta_cp_groups[group_plan.bf16_group_idx]
         if (
             group_plan.segment_entry_indices is not None
             and group_plan.segment_entry_counts is not None
@@ -386,6 +393,10 @@ def emit_segment_direct_from_plan(
                 random_salt=int(lossy_state.random_salt),
                 age2bit_words=lossy_state.age2bit_words,
                 ehat_geom_lut=lossy_state.ehat_geom_lut,
+                theta_cp_view=theta_cp_view,
+                use_e_hat_proxy=bool(
+                    getattr(lossy_state, "use_e_hat_proxy", True)
+                ),
                 score_policy_id=int(lossy_state.score_policy_id),
                 lfcl_fired_epoch=getattr(lossy_state, "lfcl_fired_epoch", None),
                 step_device=lossy_state.step_device,

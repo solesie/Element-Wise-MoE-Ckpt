@@ -137,6 +137,8 @@ class ProposalController:
     def aos_cuda_graph_capture_required(self) -> bool:
         if self._lossy_cp is None:
             return False
+        if not bool(self._config.get("writes_expert", True)):
+            return False
         return not bool(getattr(self._lossy_cp, "test_expert_selection_only", False))
 
     def refresh_h_quantile(self, *args: Any, **kwargs: Any) -> Any:
@@ -463,6 +465,7 @@ def init_proposal(
     get_controller()._config = {
         "selection_mode": get_controller()._proposal_config.selection_mode,
         "topk_ratio": get_controller()._proposal_config.topk_ratio,
+        "e_hat_proxy": get_controller()._proposal_config.e_hat_proxy,
         "lfcl_interval_iters": get_controller()._proposal_config.lfcl_interval_iters,
         "lfcl_fraction_pct": get_controller()._proposal_config.lfcl_fraction_pct,
         "nonexpert_fc_W": get_controller()._proposal_config.nonexpert_fc_w,
@@ -508,6 +511,7 @@ def init_proposal(
         )
     get_controller()._config["expert_lossy_enabled"] = (
         get_controller()._config["cp_mode"] != "sequential"
+        and bool(topology.writes_expert)
     )
     cp_target = str(get_controller()._proposal_config.cp_target)
     get_controller()._config["expert_lossy_commit_enabled"] = (
@@ -654,10 +658,9 @@ def init_proposal(
                     flush=True,
                 )
 
-    # CP layout: split non-expert + expert into separate subdirectories
-    # so they can be mounted on different devices.
-    #   <cp>/non_expert/  — non-expert full FC (W-scheduled)
-    #   <cp>/expert/      — expert rolling LFSY + LFCL compaction
+    # CP layout: split non-expert + expert into separate subdirectories.
+    # DP>1 stores non-expert shards in a PP-common directory, while expert
+    # shards use the canonical dp0 namespace just like DeepSpeed MoE.
     # H_g is GPU-only (BF16 in ``_h_quantile_values``). Recovery
     # rebuilds it on the next FD refresh; no disk persist path.
     _nonexpert_cp_dir = topology.nonexpert_dir(get_controller()._cp_dir)
@@ -686,7 +689,7 @@ def init_proposal(
         cp_target=cp_target,
         pinned_aos_capacity_ratio=float(pinned_aos_capacity_ratio),
         pinned_aos_capacity_tolerance=float(pinned_aos_capacity_tolerance),
-        enable_expert_state=True,
+        enable_expert_state=bool(topology.writes_expert),
         commit_expert_lossy_records=(
             get_controller()._config["expert_lossy_commit_enabled"]
         ),
@@ -698,19 +701,23 @@ def init_proposal(
             _test_skip_nonexpert_d2h
             or (not topology.writes_nonexpert and cp_target != "test_dram")
         ),
+        lfcl_capacity_world_size=int(_proposal_world_size),
         nonexpert_shard_rank=(
-            int(topology.ep_rank) if cp_target != "test_dram" else 0
+            int(topology.nonexpert_shard_rank) if cp_target != "test_dram" else 0
         ),
         nonexpert_shard_count=(
-            int(topology.ep_size) if cp_target != "test_dram" else 1
+            int(topology.nonexpert_shard_count) if cp_target != "test_dram" else 1
         ),
     )
     # Wire the ExpertState sink into the lossy checkpoint path. Each proposal
     # step then routes selected expert records into ExpertState.write_for_iter.
     # Sequential mode never calls the lossy path, so it skips this wiring.
-    if get_controller()._config["cp_mode"] != "sequential":
+    if get_controller()._config["expert_lossy_enabled"]:
         get_controller().attach_expert_state(get_controller()._fc.expert_state)
-        if torch.cuda.is_available():
+        if (
+            get_controller()._fc.expert_state is not None
+            and torch.cuda.is_available()
+        ):
             get_controller()._fc.expert_state.warmup_record_pipeline(
                 next(inner_model.parameters()).device,
             )
@@ -747,7 +754,7 @@ def init_proposal(
     # Expert LFCL compaction materializes plan-target live GPU p/m/v into a
     # pinned LFCL payload; ExpertState owns durable file commit.
     # ``fc_manager.fire_nonexpert_fc_if_due()`` only handles non-expert FC.
-    if _test_skip_expert_d2h:
+    if _test_skip_expert_d2h or not bool(topology.writes_expert):
         get_controller()._expert_lossless_fc = None
     else:
         from .storage.lossless_compaction import ExpertLosslessFC
@@ -1042,6 +1049,13 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
     try:
         ctrl = get_controller()
         task.expert_started_at = time.perf_counter()
+        if not bool(ctrl._config.get("writes_expert", True)):
+            task.dispatch_release_ready.set()
+            from .storage import proposal_io as _proposal_io
+            _proposal_io.fdp_mark_writer_done(task.iter_T, "expert")
+            task.expert_ready_at = time.perf_counter()
+            task.expert_read_ready.set()
+            return
         try:
             if bool(getattr(task, "sync_processes", True)):
                 _sync_post_iter_dispatch(task.iter_T)
@@ -1218,6 +1232,19 @@ def proposal_dispatch_post_iter(
     if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
         return
     from .storage import proposal_io as _proposal_io
+    _prev_iter_T = int(getattr(get_controller(), "_last_dispatched_iter_T", -1))
+    if (
+        _prev_iter_T >= 0
+        and _proposal_io.backend_kind() == "fdp"
+        and _proposal_io.fdp_metadata_mmap_enabled()
+    ):
+        if get_controller()._checkpoint_workers is not None:
+            get_controller()._checkpoint_workers.drain_non_expert()
+            get_controller()._checkpoint_workers.drain_expert()
+            get_controller()._checkpoint_workers.drain_expert_write()
+        _proposal_io.fdp_mark_writer_done(_prev_iter_T, "all")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
     _proposal_io.fdp_begin_checkpoint_iter(iter_T)
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
@@ -1362,6 +1389,9 @@ def _simulate_fault_impl(
                 flush=True,
             )
             flushed_paths = []
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     t0 = time.perf_counter()
     inner_model = get_controller()._config["_inner_model"]

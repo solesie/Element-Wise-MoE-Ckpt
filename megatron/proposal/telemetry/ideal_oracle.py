@@ -125,7 +125,8 @@ def run_ideal_oracle_from_anchor(
     forward_loss, paired_rng_state = actual_loss_bank[0]
 
     _restore_theta(records)
-    loss_base_global = _eval_loss_bank(actual_loss_bank)
+    proposal_group = getattr(lossy_cp, "_proposal_cpu_pg", None)
+    loss_base_global = _eval_loss_bank(actual_loss_bank, group=proposal_group)
     if bool(int(os.environ.get("PROPOSAL_IDEAL_ORACLE_MEASURE_NOISE", "0") or "0")):
         _measure_loss_noise(
             model=model,
@@ -135,6 +136,7 @@ def run_ideal_oracle_from_anchor(
             iteration=int(iteration),
             base_loss=float(loss_base_global),
             rank=rank,
+            group=proposal_group,
         )
 
     _restore_theta(records)
@@ -298,7 +300,10 @@ def _run_selection_oracle_v2(
     e_true_parts = [rec.e_full for rec in records]
     _restore_theta(records)
     _set_theta_minus_e(records, e_true_parts)
-    loss_no_save = _eval_loss_bank(actual_loss_bank)
+    loss_no_save = _eval_loss_bank(
+        actual_loss_bank,
+        group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+    )
     actual_no_save = float(loss_no_save) - float(loss_base)
     _restore_theta(records)
 
@@ -508,7 +513,10 @@ def _run_selection_oracle_v2(
                     e_remaining_true = _remaining_true_parts(records, selected_masks)
                     _restore_theta(records)
                     _set_theta_minus_e(records, e_remaining_true)
-                    loss_rb = _eval_loss_bank(actual_loss_bank)
+                    loss_rb = _eval_loss_bank(
+                        actual_loss_bank,
+                        group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+                    )
                     actual_remaining = float(loss_rb) - float(loss_base)
                     actual_captured = float(actual_no_save) - float(actual_remaining)
 
@@ -1180,6 +1188,12 @@ def _build_forward_loss_bank(
 ) -> List[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]]:
     di = data_iterator[0] if isinstance(data_iterator, (list, tuple)) else data_iterator
     m0 = model[0] if isinstance(model, (list, tuple)) else model
+    if _is_pipeline_engine(m0):
+        return _build_pipeline_forward_loss_bank(
+            engine=m0,
+            data_iterator=di,
+            n_batches=n_batches,
+        )
     try:
         from pretrain_gpt import get_batch as _get_batch_gpt
     except Exception as exc:
@@ -1201,6 +1215,108 @@ def _build_forward_loss_bank(
                 flush=True,
             )
     return bank
+
+
+def _build_pipeline_forward_loss_bank(
+    *,
+    engine: Any,
+    data_iterator: Any,
+    n_batches: int,
+) -> List[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]]:
+    bank: List[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]] = []
+    for batch_idx in range(max(1, int(n_batches))):
+        try:
+            cached = tuple(_pipeline_cached_microbatches(engine, data_iterator))
+        except Exception as exc:
+            if not bank:
+                print(
+                    f"[proposal] ideal_oracle: pipeline batch cache failed: {exc}",
+                    flush=True,
+                )
+            break
+
+        def _forward_loss(
+            _engine: Any = engine,
+            _cached: Tuple[Any, ...] = cached,
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+            return _pipeline_eval_loss_from_cached(_engine, _cached), {}
+
+        setattr(_forward_loss, "_proposal_pipeline_engine", engine)
+        setattr(_forward_loss, "_proposal_pipeline_cached", cached)
+        bank.append((_forward_loss, _capture_rng_state()))
+        if batch_idx == 0 or (batch_idx + 1) == int(n_batches):
+            print(
+                f"[proposal] ideal_oracle pipeline eval bank: "
+                f"built {batch_idx + 1}/{int(n_batches)} batches",
+                flush=True,
+            )
+    return bank
+
+
+def _pipeline_cached_microbatches(engine: Any, data_iterator: Any) -> List[Any]:
+    n_micro = max(1, int(getattr(engine, "micro_batches", 1)))
+    return [next(data_iterator) for _ in range(n_micro)]
+
+
+def _pipeline_replay_iterator(cached: Sequence[Any]):
+    for item in cached:
+        yield item
+
+
+def _pipeline_eval_loss_from_cached(engine: Any, cached_microbatches: Sequence[Any]) -> torch.Tensor:
+    from deepspeed.runtime.pipe import schedule as _ds_schedule
+
+    micro_batches = max(1, int(len(cached_microbatches)))
+    sched = _ds_schedule.InferenceSchedule(
+        micro_batches=micro_batches,
+        stages=int(getattr(engine, "num_stages", 1)),
+        stage_id=int(getattr(engine, "stage_id", 0)),
+    )
+    old_iter = getattr(engine, "data_iterator", None)
+    old_total_loss = getattr(engine, "total_loss", None)
+    old_total_additional = getattr(engine, "total_additional_losses", None)
+    old_compute_loss = getattr(engine, "_compute_loss", True)
+    old_eval_return_logits = getattr(engine, "eval_return_logits", False)
+    old_outputs = getattr(engine, "outputs", None)
+    old_fwd_outputs = getattr(engine, "fwd_outputs", None)
+    old_training = bool(getattr(engine.module, "training", True))
+    device = getattr(engine, "device", None)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        engine.set_dataiterator(_pipeline_replay_iterator(cached_microbatches))
+        engine.module.train(old_training)
+        engine.total_loss = None
+        engine.total_additional_losses = None
+        engine._compute_loss = True
+        engine.eval_return_logits = False
+        engine._exec_schedule(sched)
+        if engine.is_last_stage():
+            outputs = getattr(engine, "fwd_outputs", None) or []
+            if not outputs:
+                raise RuntimeError("pipeline oracle produced no forward loss outputs")
+            reduced = engine._reduce_outputs(
+                outputs,
+                reduce="avg",
+                reduce_dp=False,
+                micro_batches=micro_batches,
+            )
+            if isinstance(reduced, (list, tuple)):
+                reduced = reduced[0]
+            reduced = reduced.detach().reshape(())
+        else:
+            reduced = torch.zeros((), device=device, dtype=torch.float32)
+        loss = engine._bcast_pipe_scalar(reduced, dtype=torch.float32)
+        return loss.detach().reshape(())
+    finally:
+        engine.set_dataiterator(old_iter)
+        engine.total_loss = old_total_loss
+        engine.total_additional_losses = old_total_additional
+        engine._compute_loss = old_compute_loss
+        engine.eval_return_logits = old_eval_return_logits
+        engine.outputs = old_outputs
+        engine.fwd_outputs = old_fwd_outputs
+        engine.module.train(old_training)
 
 
 def _forward_loss_from_batch(model_obj: Any, batch: Any) -> Callable[[], Tuple[torch.Tensor, Dict[str, Any]]]:
@@ -1292,6 +1408,8 @@ def _eval_loss(
 @torch.no_grad()
 def _eval_loss_bank(
     loss_bank: Sequence[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]],
+    *,
+    group: Any = None,
 ) -> float:
     if not loss_bank:
         return 0.0
@@ -1299,7 +1417,7 @@ def _eval_loss_bank(
     for forward_loss, rng_state in loss_bank:
         local_sum += float(_eval_loss(forward_loss, rng_state=rng_state))
     local_mean = local_sum / float(max(1, len(loss_bank)))
-    return _all_reduce_mean_float(local_mean)
+    return _all_reduce_mean_float(local_mean, group=group)
 
 
 def _run_backward_to_cpu_arrays(
@@ -1845,6 +1963,7 @@ def _measure_loss_noise(
     iteration: int,
     base_loss: float,
     rank: int,
+    group: Any = None,
 ) -> Dict[str, Any]:
     n_batches = int(os.environ.get("PROPOSAL_IDEAL_ORACLE_NOISE_BATCHES", "4") or "4")
     losses = [float(base_loss)]
@@ -1861,7 +1980,10 @@ def _measure_loss_noise(
         try:
             batch = _get_batch_gpt(di)
             loss_fn = _forward_loss_from_batch(m0, batch)
-            losses.append(_all_reduce_mean_float(_eval_loss(loss_fn)))
+            losses.append(_all_reduce_mean_float(
+                _eval_loss(loss_fn),
+                group=group,
+            ))
         except Exception:
             break
     if len(losses) <= 1:
@@ -2024,12 +2146,12 @@ def _all_reduce_sum_int(value: int, group: Any = None) -> int:
     return int(tensor.item())
 
 
-def _all_reduce_mean_float(value: float) -> float:
+def _all_reduce_mean_float(value: float, group: Any = None) -> float:
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return float(value)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     tensor = torch.tensor([float(value), 1.0], dtype=torch.float64, device=device)
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
     denom = max(float(tensor[1].item()), 1.0)
     return float(tensor[0].item()) / denom
 

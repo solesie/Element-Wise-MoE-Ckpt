@@ -423,6 +423,77 @@ def test_direct_emission_count_matches_selection_predicate(tmp_path: Path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_theta_cp_mode_selects_by_residual_and_updates_written(tmp_path: Path):
+    expert_map = {(0, 0): [("mlp.w", torch.Size([16]), 16)]}
+    state = ExpertState(
+        expert_map,
+        output_dir=tmp_path,
+        fresh=True,
+        cp_target="test_dram",
+    )
+    device = torch.device("cuda")
+    group_size = 4
+    m = torch.zeros(16, dtype=torch.float32, device=device)
+    v = torch.ones(16, dtype=torch.float32, device=device)
+    p = torch.arange(16, dtype=torch.float32, device=device) + 20.0
+    theta_cp = p.to(torch.bfloat16).clone()
+    selected_idx = torch.tensor([0, 5, 8], dtype=torch.long, device=device)
+    theta_cp[selected_idx] = (p[selected_idx] - 3.0).to(torch.bfloat16)
+    theta_before = theta_cp.clone()
+    h_lut_values = torch.ones(8, dtype=torch.float32, device=device)
+    h_lut_log_v_min = torch.zeros((), dtype=torch.float32, device=device)
+    h_lut_inv_log_v_width = torch.ones((), dtype=torch.float32, device=device)
+    total_th = torch.tensor(4.0, dtype=torch.float32, device=device)
+    hp = AdamHParams(lr_over_bc1=1.0, sqrt_bc2_inv=1.0, eps=1.0e-8)
+
+    lossy_state = LossyRecordWriteInputs(
+        bf16_groups_mvph=[(m, v, p, 0)],
+        name_list=["mlp.w"],
+        group_size=group_size,
+        theta_cp_groups=[theta_cp],
+        within_off_per_name=[0],
+        group_count_per_name=[4],
+        h_lut_values=h_lut_values,
+        h_lut_log_v_min=h_lut_log_v_min,
+        h_lut_inv_log_v_width=h_lut_inv_log_v_width,
+        total_th=total_th,
+        adam_hparams=hp,
+        direct_emission_enabled=True,
+        use_e_hat_proxy=False,
+        score_policy_id=1,
+    )
+    age = _attach_age2bit(lossy_state, 16, device)
+    lossy_state.step_device.fill_(10)
+    try:
+        state.write_for_iter(
+            step=10,
+            per_expert_updates={(0, 0): [("mlp.w", 0, 0, 16)]},
+            compute_event=None,
+            gpu_refs=[
+                m, v, p, theta_cp, h_lut_values, total_th,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
+            ],
+            lossy_state=lossy_state,
+        )
+        torch.cuda.synchronize()
+        assert state._direct_record_cursor_device is not None
+        assert state._direct_overflow_count_device is not None
+        assert int(state._direct_record_cursor_device[0].item()) == 3
+        assert int(state._direct_overflow_count_device[0].item()) == 0
+
+        selected_cpu = selected_idx.cpu()
+        theta_after = theta_cp.float().cpu()
+        p_bf16 = p.to(torch.bfloat16).float().cpu()
+        theta_before_cpu = theta_before.float().cpu()
+        rest_mask = torch.ones(16, dtype=torch.bool)
+        rest_mask[selected_cpu] = False
+        assert torch.equal(theta_after[selected_cpu], p_bf16[selected_cpu])
+        assert torch.equal(theta_after[rest_mask], theta_before_cpu[rest_mask])
+    finally:
+        state.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_direct_emission_resets_age_only_for_actual_written(tmp_path: Path):
     expert_map = {(0, 0): [("mlp.w", torch.Size([16]), 16)]}
     state = ExpertState(
@@ -494,6 +565,7 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
     m = torch.ones(16, dtype=torch.float32, device=device)
     v = torch.ones(16, dtype=torch.float32, device=device)
     p = torch.arange(16, dtype=torch.float32, device=device) + 40.0
+    theta_cp = torch.zeros(16, dtype=torch.bfloat16, device=device)
     h_lut_values = torch.ones(8, dtype=torch.float32, device=device)
     h_lut_log_v_min = torch.zeros((), dtype=torch.float32, device=device)
     h_lut_inv_log_v_width = torch.ones((), dtype=torch.float32, device=device)
@@ -505,6 +577,7 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
         bf16_groups_mvph=[(m, v, p, 0)],
         name_list=["mlp.w"],
         group_size=group_size,
+        theta_cp_groups=[theta_cp],
         within_off_per_name=[0],
         group_count_per_name=[4],
         h_lut_values=h_lut_values,
@@ -513,6 +586,8 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
         total_th=total_th,
         adam_hparams=hp,
         direct_emission_enabled=True,
+        use_e_hat_proxy=False,
+        score_policy_id=1,
         lfcl_fired_epoch=fired_epoch,
     )
     age = _attach_age2bit(lossy_state, 16, device)
@@ -524,7 +599,7 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
             per_expert_updates={(0, 0): [("mlp.w", 0, 0, 16)]},
             compute_event=None,
             gpu_refs=[
-                m, v, p, h_lut_values, total_th,
+                m, v, p, theta_cp, h_lut_values, total_th,
                 age.age_words, age.ehat_geom_lut, lossy_state.step_device,
                 fired_epoch,
             ],
@@ -534,6 +609,7 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
         assert state._direct_record_cursor_device is not None
         assert int(state._direct_record_cursor_device[0].item()) == 0
         assert int(age.age_words[0].item()) == 0
+        assert torch.equal(theta_cp.float().cpu(), p.to(torch.bfloat16).float().cpu())
     finally:
         state.shutdown()
 

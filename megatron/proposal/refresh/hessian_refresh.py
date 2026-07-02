@@ -354,9 +354,9 @@ def proposal_refresh_h_quantile(
 ) -> Optional[Dict[str, Any]]:
     """Refresh the H quantile mapping."""
 
-    if not _pipe()._config.get("expert_lossy_enabled", True):
+    if _pipe()._config.get("cp_mode") == "sequential":
         return {
-            "skipped": "expert_lossy_disabled",
+            "skipped": "sequential_cp",
             "iteration": int(iteration),
         }
     return _refresh_h_quantile_from_finite_diff(
@@ -381,11 +381,18 @@ def _refresh_h_quantile_from_finite_diff(
     _proposal_config = _ps._proposal_config
     _enabled = _ps._enabled
     _checkpoint_workers = _ps._checkpoint_workers
-    if not _enabled or _lossy_cp is None:
+    if not _enabled:
         return None
-    if getattr(_lossy_cp, "selection_mode", "hessian") == "v_hat":
-        _lossy_cp.update_h_anchor_quantiles(None, refresh_step=int(iteration))
-        _lossy_cp.update_v_mapping(global_step=int(iteration))
+    selection_mode = (
+        getattr(_lossy_cp, "selection_mode", None)
+        if _lossy_cp is not None else None
+    )
+    if selection_mode is None:
+        selection_mode = str(_config.get("selection_mode", "hessian"))
+    if selection_mode == "v_hat":
+        if _lossy_cp is not None:
+            _lossy_cp.update_h_anchor_quantiles(None, refresh_step=int(iteration))
+            _lossy_cp.update_v_mapping(global_step=int(iteration))
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return {
@@ -445,7 +452,16 @@ def _refresh_h_quantile_from_finite_diff(
     _proposal_diagnostics.vram_audit_step("pre_anchor", dump_breakdown=True, lossy_cp=_lossy_cp)
     # FD core accumulates hook-scaled per-element values into training grad storage.
     # K is fixed to one; robustness comes from the multi-batch anchor loop.
-    _group_size_for_fd = max(1, int(getattr(_lossy_cp, "group_size", 1)))
+    _group_size_for_fd = max(
+        1,
+        int(
+            getattr(
+                _lossy_cp,
+                "group_size",
+                getattr(_proposal_config, "group_size", 1),
+            )
+        ),
+    )
 
     import os as _os_off
 
@@ -567,8 +583,15 @@ def _refresh_h_quantile_from_finite_diff(
             raise RuntimeError(
                 "anchor needs Fp32StateMapper to locate training grad storage"
             )
-        _name_to_idx = getattr(_lossy_cp, "_tname_to_index", None)
-        if _name_to_idx is None and hasattr(_lossy_cp, "_tname_list"):
+        _name_to_idx = (
+            getattr(_lossy_cp, "_tname_to_index", None)
+            if _lossy_cp is not None else None
+        )
+        if (
+            _name_to_idx is None
+            and _lossy_cp is not None
+            and hasattr(_lossy_cp, "_tname_list")
+        ):
             _name_to_idx = {nm: idx for idx, nm
                             in enumerate(_lossy_cp._tname_list)}
             _lossy_cp._tname_to_index = _name_to_idx
@@ -672,7 +695,10 @@ def _refresh_h_quantile_from_finite_diff(
             # place, then build h_q from the per-expert grad accumulation views.
             if _grad_accum_views and _n_succ > 0:
                 _inv_succ = 1.0 / float(_n_succ)
-                _curvature_telemetry = getattr(_lossy_cp, "_curvature_progress_telemetry", None)
+                _curvature_telemetry = (
+                    getattr(_lossy_cp, "_curvature_progress_telemetry", None)
+                    if _lossy_cp is not None else None
+                )
                 if _curvature_telemetry is not None and getattr(_curvature_telemetry, "enabled", False):
                     for _view in _grad_accum_views:
                         _view.mul_(_inv_succ)
@@ -689,10 +715,11 @@ def _refresh_h_quantile_from_finite_diff(
                 else:
                     for _view in _grad_accum_views:
                         _view.mul_(_inv_succ).abs_()
-                _lossy_cp.update_h_anchor_quantiles(
-                    _grad_accum_views,
-                    refresh_step=int(iteration),
-                )
+                if _lossy_cp is not None:
+                    _lossy_cp.update_h_anchor_quantiles(
+                        _grad_accum_views,
+                        refresh_step=int(iteration),
+                    )
                 _fold_diag = _fold_h(_h_view_names, _grad_accum_views)
                 try:
                     import statistics as _st
@@ -831,6 +858,9 @@ def _refresh_h_quantile_from_finite_diff(
     ret = _finalize({"iter": iteration, "k_samples": k_samples,
                      "ms": elapsed_ms, "numel": n_elem,
                      "diag": diag_record})
+
+    if _lossy_cp is None:
+        return ret
 
     vq_t0 = _time.perf_counter()
     _lossy_cp.update_v_mapping(global_step=int(iteration))

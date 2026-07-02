@@ -156,9 +156,14 @@ class LossyCheckpointPipeline(
             getattr(proposal_config, "score_linear_source", "grad")
             if proposal_config is not None else "grad"
         )
+        self.e_hat_proxy = bool(
+            getattr(proposal_config, "e_hat_proxy", True)
+            if proposal_config is not None else True
+        )
         self._grad_score_lease = None
         self._score_linear_release_pending = False
         self._current_global_step_for_selection = -1
+        self._theta_cp_score_state = None
         # Production reads H through the quantile table. In hessian mode the
         # single hot-path score is the configured abs-H Taylor policy.  Probe
         # and direct emission must use the same helper/LUT snapshot; group-dg,
@@ -573,13 +578,16 @@ class LossyCheckpointPipeline(
         if age2bit_state is not None:
             add_owned_tensor("age2bit.age_words", getattr(age2bit_state, "age_words", None))
             add_owned_tensor("age2bit.ehat_geom_lut", getattr(age2bit_state, "ehat_geom_lut", None))
+        theta_cp_state = getattr(self, "_theta_cp_score_state", None)
+        if theta_cp_state is not None:
+            add_owned_tensor("theta_cp.values", getattr(theta_cp_state, "values", None))
         # Current dispatch carries no cross-iteration pending stash; current
         # lossy write inputs are local to ``step()``.
         # _v_mapping_v_flats and m/v/p group entries are flat views into
         # optimizer/proposal storage. Per-group descriptor and partial-count
         # scratch tensors own storage and are part of the proposal footprint.
         groups = getattr(self, "_groups", None) or []
-        skip_group_view_keys = {"m_flat", "v_flat", "p_flat"}
+        skip_group_view_keys = {"m_flat", "v_flat", "p_flat", "theta_cp_flat"}
         for group_idx, grp in enumerate(groups):
             if not isinstance(grp, dict):
                 continue
@@ -969,6 +977,25 @@ class LossyCheckpointPipeline(
                 f"views for every group; refusing fallback. {detail}"
             )
 
+        if not bool(getattr(self, "e_hat_proxy", True)):
+            from ..cutoff.theta_cp import allocate_theta_cp_score_state
+            self._theta_cp_score_state = allocate_theta_cp_score_state(
+                n_elements=int(total_elems),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            theta_values = self._theta_cp_score_state.values
+            for grp in self._groups:
+                start = int(grp["master_off"]) * int(g)
+                n_elem = int(grp["total"])
+                theta_view = theta_values.narrow(0, start, n_elem)
+                theta_view.copy_(grp["p_flat"], non_blocking=True)
+                grp["theta_cp_flat"] = theta_view
+        else:
+            self._theta_cp_score_state = None
+            for grp in self._groups:
+                grp["theta_cp_flat"] = None
+
         try:
             # Persistent memory accounting (only items truly retained
             # across iters).
@@ -987,8 +1014,12 @@ class LossyCheckpointPipeline(
             mem_score_lut = _tensor_mb(
                 age2bit_state.ehat_geom_lut if age2bit_state is not None else None
             )
+            theta_cp_state = getattr(self, "_theta_cp_score_state", None)
+            mem_theta_cp = _tensor_mb(
+                theta_cp_state.values if theta_cp_state is not None else None
+            )
             mem_hist = self._n_bins_cutoff * 8 / 1e6
-            mem_total = mem_age2bit + mem_score_lut + mem_hist
+            mem_total = mem_age2bit + mem_score_lut + mem_theta_cp + mem_hist
             print(f"[proposal] lossy CP state init: ZERO-COPY all groups, "
                   f"optimizer_groups={len(self._groups)}, "
                   f"total={total_elems} elements, groups={total_groups}, "
@@ -997,6 +1028,7 @@ class LossyCheckpointPipeline(
             print(f"[proposal] lossy CP mem persistent: "
                   f"age2bit={mem_age2bit:.1f}MB "
                   f"score_lut={mem_score_lut:.3f}MB "
+                  f"theta_cp={mem_theta_cp:.1f}MB "
                   f"hist_i64={mem_hist:.3f}MB -> "
                   f"total={mem_total:.1f}MB",
                   flush=True)
@@ -1121,6 +1153,7 @@ class LossyCheckpointPipeline(
             m_flat = grp.get("m_flat")
             v_flat = grp.get("v_flat")
             p_flat = grp.get("p_flat")
+            theta_cp_flat = grp.get("theta_cp_flat")
             score_linear_flat = grp.get("score_linear_flat")
             if m_flat is None or v_flat is None or p_flat is None:
                 raise RuntimeError(
@@ -1131,6 +1164,7 @@ class LossyCheckpointPipeline(
                 v_flat=v_flat,
                 p_flat=p_flat,
                 master_off_elem=int(grp["master_off"]) * int(self.group_size),
+                theta_cp_flat=theta_cp_flat,
                 score_linear_flat=score_linear_flat,
                 name_start=int(grp["start_name_in_grp"]),
                 name_end=int(grp["end_name_in_grp"]),
@@ -1181,6 +1215,7 @@ class LossyCheckpointPipeline(
             quantiles=quantiles,
             scratch=scratch,
             age2bit=getattr(self, "_age2bit_score_state", None),
+            theta_cp=getattr(self, "_theta_cp_score_state", None),
         )
 
     @torch.no_grad()

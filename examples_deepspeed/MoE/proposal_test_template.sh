@@ -71,7 +71,8 @@ case "$VARIANT" in
             --proposal-cp-target ${CP_TARGET:-disk} \
             --proposal-block-quant-g ${BLOCK_QUANT_G:-8} \
             --proposal-selection-mode ${SELECTION_MODE:-hessian} \
-            --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-100} \
+            --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-50} \
+            --proposal-hessian-refresh-warmup-every ${HESSIAN_REFRESH_WARMUP_EVERY:-20} \
             --proposal-topk-ratio ${PROPOSAL_TOPK:-0.04} \
             --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
             --proposal-async-queue ${ASYNC_QUEUE:-5} \

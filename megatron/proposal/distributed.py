@@ -47,25 +47,50 @@ class ProposalTopology:
 
     @property
     def writes_nonexpert(self) -> bool:
-        # Non-expert tensors are replicated across EP ranks within a PP stage.
-        # Disk mode shards the non-expert FC tensor set across EP replicas to
-        # avoid making EP0 copy/write the whole replicated payload.  DP replicas
-        # are still duplicates, so only the canonical DP rank participates.
-        return self.dp_rank == 0
+        # ZeRO-0 non-expert tensors are replicated, so every DP×EP replica can
+        # own one disjoint tensor-name shard.  ZeRO-1/2 uses the mapper's local
+        # partition fragments on the same per-rank writer path.
+        return True
 
     @property
     def namespace(self) -> str:
         return f"dp{self.dp_rank}/pp{self.pp_rank}/ep{self.ep_rank}"
 
     @property
+    def expert_namespace(self) -> str:
+        # Match DeepSpeed MoE checkpoint ownership: expert DP replicas are
+        # duplicate images, so every DP rank recovers from the canonical dp0
+        # expert namespace.
+        return f"dp0/pp{self.pp_rank}/ep{self.ep_rank}"
+
+    @property
     def nonexpert_namespace(self) -> str:
+        if self.dp_size > 1:
+            return f"pp{self.pp_rank}"
         return f"dp{self.dp_rank}/pp{self.pp_rank}"
 
     @property
     def selection_ranks(self) -> List[int]:
-        # Current implementation supports EP/PP with one DP replica.  Keeping
-        # this list explicit makes the future DP extension local to this file.
-        return list(range(self.world_size))
+        # Expert proposal selection must not count DP duplicate experts more
+        # than once.  The active selection domain is therefore every PP×EP
+        # shard at canonical DP rank 0.
+        if self.world_size <= 1:
+            return [0]
+        num_pp_groups = max(1, self.world_size // max(1, self.pp_size))
+        ranks: List[int] = []
+        for pp_rank in range(max(1, self.pp_size)):
+            pp_base = pp_rank * num_pp_groups
+            for ep_rank in range(max(1, self.ep_size)):
+                ranks.append(pp_base + ep_rank)
+        return ranks
+
+    @property
+    def nonexpert_shard_rank(self) -> int:
+        return int(self.dp_rank) * max(1, int(self.ep_size)) + int(self.ep_rank)
+
+    @property
+    def nonexpert_shard_count(self) -> int:
+        return max(1, int(self.dp_size) * max(1, int(self.ep_size)))
 
     def rank_root(self, cp_root: Path) -> Path:
         root = Path(cp_root)
@@ -74,7 +99,10 @@ class ProposalTopology:
         return root / self.namespace
 
     def expert_dir(self, cp_root: Path) -> Path:
-        return self.rank_root(cp_root) / "expert"
+        root = Path(cp_root)
+        if self.world_size <= 1:
+            return root / "expert"
+        return root / self.expert_namespace / "expert"
 
     def nonexpert_dir(self, cp_root: Path) -> Path:
         root = Path(cp_root)
@@ -103,12 +131,6 @@ def topology_from_args(args: Any) -> ProposalTopology:
             f"tp×pp×ep={tp_size}×{pp_size}×{ep_size}."
         )
     dp_size = world // denom
-    if dp_size != 1:
-        raise NotImplementedError(
-            "proposal: DP replicas need a dp0-only proposal process group and "
-            "cross-DP recovery policy; EP/PP support is enabled first."
-        )
-
     # Match Megatron's PP group layout:
     #   pipeline group i = range(i, world, world / pp_size)
     num_pp_groups = max(1, world // max(1, pp_size))

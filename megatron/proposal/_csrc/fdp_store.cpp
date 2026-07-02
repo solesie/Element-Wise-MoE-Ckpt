@@ -46,8 +46,20 @@ struct SharedMetadataControl {
     uint32_t flush_owner_rank = 0;
     uint32_t error_rank = 0xffffffffu;
     uint64_t metadata_flush_count = 0;
+    // reserved[0]: bitset of ranks that reported local writer completion for
+    // active_iter.  Keep it in reserved storage so the mmap control layout
+    // remains compatible with already-created objects.
     uint64_t reserved[16] = {};
 };
+
+uint32_t popcount_u64(uint64_t value) {
+    uint32_t count = 0;
+    while (value != 0) {
+        value &= (value - 1);
+        ++count;
+    }
+    return count;
+}
 
 const char* getenv_raw(const char* name) {
     const char* v = std::getenv(name);
@@ -752,13 +764,7 @@ void FdpStore::open_or_create_shared_metadata_mmap() {
             ctrl->layout_fingerprint == fingerprint &&
             ctrl->metadata_image_bytes == layout_.image_bytes &&
             ctrl->world_size == cfg_.world_size;
-        const bool force_reset_safe =
-            cfg_.force_format &&
-            (!valid ||
-             (ctrl->active_iter == 0 &&
-              ctrl->completed_processes == 0 &&
-              ctrl->flush_done != 0));
-        if (!valid || force_reset_safe) {
+        if (!valid || cfg_.force_format) {
             std::memset(shared_mmap_base_, 0,
                         static_cast<size_t>(shared_mmap_bytes_));
             pthread_mutexattr_t attr;
@@ -1326,6 +1332,7 @@ void FdpStore::begin_checkpoint_iter(uint64_t iter) {
             ctrl->flush_done = 0;
             ctrl->flush_owner_rank = 0xffffffffu;
             ctrl->error_rank = 0xffffffffu;
+            ctrl->reserved[0] = 0;
         }
         release_global_metadata_lock();
     } catch (...) {
@@ -1346,11 +1353,19 @@ bool FdpStore::mark_process_done_locked(uint64_t iter) {
             << ctrl->active_iter << " does not match " << iter;
         throw std::runtime_error(oss.str());
     }
-    if (ctrl->completed_processes >= ctrl->expected_processes) {
-        return false;
+    if (cfg_.rank < 64 && ctrl->expected_processes <= 64) {
+        const uint64_t rank_bit = (uint64_t{1} << cfg_.rank);
+        if ((ctrl->reserved[0] & rank_bit) != 0) {
+            return false;
+        }
+        ctrl->reserved[0] |= rank_bit;
+        ctrl->completed_processes = popcount_u64(ctrl->reserved[0]);
+    } else {
+        if (ctrl->completed_processes >= ctrl->expected_processes) {
+            return false;
+        }
+        ctrl->completed_processes += 1;
     }
-
-    ctrl->completed_processes += 1;
     if (ctrl->completed_processes != ctrl->expected_processes ||
         ctrl->flush_started != 0) {
         return false;
@@ -1378,6 +1393,9 @@ bool FdpStore::mark_writer_done(uint64_t iter,
     {
         std::lock_guard<std::mutex> local_lock(local_iter_mutex_);
         if (local_iter_ != iter) {
+            if (iter < local_iter_) {
+                return false;
+            }
             local_iter_ = iter;
             local_nonexpert_done_ = false;
             local_expert_done_ = false;
@@ -1394,8 +1412,7 @@ bool FdpStore::mark_writer_done(uint64_t iter,
             throw std::invalid_argument(
                 "mark_writer_done: writer_kind must be nonexpert, nefc, expert, or all");
         }
-        if (local_nonexpert_done_ && local_expert_done_ &&
-            !local_process_done_reported_) {
+        if (local_nonexpert_done_ && local_expert_done_) {
             local_process_done_reported_ = true;
             report_process_done = true;
         }
@@ -2288,7 +2305,6 @@ void FdpStore::prepare_io_plans(std::vector<FdpIoPlan>& plans) {
     for (const FdpIoPlan& plan : plans) {
         prepare_io_plan(plan);
     }
-    plans.clear();
 }
 
 std::string FdpStore::read_chunk_bytes(UcmdRing& ring,

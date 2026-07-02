@@ -15,7 +15,10 @@ except ImportError:
 
 
 if _HAS_TRITON:
-    from ..score_policy import _proposal_element_score_from_lut
+    from ..score_policy import (
+        _proposal_element_score_from_lut,
+        _proposal_element_score_from_theta_cp,
+    )
 
     @triton.jit
     def _stage_candidate_taus_kernel(
@@ -76,7 +79,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _generated_probe_entries_kernel(
-        m_ptr, linear_ptr, v_ptr,
+        m_ptr, linear_ptr, v_ptr, p_ptr, theta_cp_ptr,
         age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
@@ -108,6 +111,7 @@ if _HAS_TRITON:
         MAX_SAMPLES_PER_GROUP: tl.constexpr,
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
+        USE_E_HAT_PROXY: tl.constexpr,
         HAS_LFCL_FIRED_MASK: tl.constexpr,
         RUN_IF_DECISION_CODE: tl.constexpr,
     ):
@@ -185,21 +189,36 @@ if _HAS_TRITON:
         v_fp32 = v.to(tl.float32)
         global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
         age_code = _age2_load_code(age_words_ptr, global_elem_idx)
-        elem_score = _proposal_element_score_from_lut(
-            m,
-            linear,
-            v_fp32,
-            age_code,
-            h_lut_ptr,
-            log_v_min_ptr,
-            inv_log_v_width_ptr,
-            ehat_geom_lut_ptr,
-            lr_over_bc1,
-            sqrt_bc2_inv,
-            eps,
-            H_LUT_BINS,
-            SCORE_POLICY,
-        )
+        if USE_E_HAT_PROXY:
+            elem_score = _proposal_element_score_from_lut(
+                m,
+                linear,
+                v_fp32,
+                age_code,
+                h_lut_ptr,
+                log_v_min_ptr,
+                inv_log_v_width_ptr,
+                ehat_geom_lut_ptr,
+                lr_over_bc1,
+                sqrt_bc2_inv,
+                eps,
+                H_LUT_BINS,
+                SCORE_POLICY,
+            )
+        else:
+            p = tl.load(p_ptr + elem_off, mask=elem_mask, other=0.0)
+            theta_cp = tl.load(theta_cp_ptr + elem_off, mask=elem_mask, other=0.0)
+            elem_score = _proposal_element_score_from_theta_cp(
+                linear,
+                v_fp32,
+                p,
+                theta_cp,
+                h_lut_ptr,
+                log_v_min_ptr,
+                inv_log_v_width_ptr,
+                H_LUT_BINS,
+                SCORE_POLICY,
+            )
         force = (age_code == 3) & _age2_phase_hit(
             global_elem_idx, step_value, 128, 0x51ED270B,
         ) & selectable_mask
@@ -820,6 +839,8 @@ def launch_generated_block_probe_for_group(
     m_flat: torch.Tensor,
     score_linear_flat: Optional[torch.Tensor] = None,
     v_flat: torch.Tensor,
+    p_flat: torch.Tensor,
+    theta_cp_flat: Optional[torch.Tensor] = None,
     age2bit_words: torch.Tensor,
     ehat_geom_lut: torch.Tensor,
     h_lut_values: torch.Tensor,
@@ -848,6 +869,7 @@ def launch_generated_block_probe_for_group(
     eps: float,
     step: int,
     score_policy_id: int,
+    use_e_hat_proxy: bool = True,
     random_mode: bool = False,
     random_salt: int = 0,
     decision_code_guard: Optional[torch.Tensor] = None,
@@ -860,6 +882,11 @@ def launch_generated_block_probe_for_group(
     candidate_capacity = min(int(candidate_taus.numel()), int(sum_q.shape[1]))
     if n_entry_blocks <= 0 or n_cand <= 0:
         return
+    if not bool(use_e_hat_proxy):
+        if theta_cp_flat is None:
+            raise RuntimeError("theta_cp cutoff probe requires theta_cp_flat")
+        if theta_cp_flat.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError("theta_cp_flat must be a 2-byte floating tensor")
     gpb = _groups_per_program(group_size)
     max_samples = max(1, min(int(max_samples_per_group), int(n_entry_blocks)))
     guard = decision_code_guard if decision_code_guard is not None else sample_blocks_current
@@ -874,6 +901,8 @@ def launch_generated_block_probe_for_group(
         m_flat,
         score_linear_flat if score_linear_flat is not None else m_flat,
         v_flat,
+        p_flat,
+        theta_cp_flat if theta_cp_flat is not None else p_flat,
         age2bit_words,
         ehat_geom_lut,
         h_lut_values,
@@ -910,6 +939,7 @@ def launch_generated_block_probe_for_group(
         MAX_SAMPLES_PER_GROUP=max_samples,
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=(int(random_salt) & 0xFFFFFFFF) if bool(random_mode) else 0,
+        USE_E_HAT_PROXY=bool(use_e_hat_proxy),
         HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
         RUN_IF_DECISION_CODE=int(run_if_decision_code),
     )

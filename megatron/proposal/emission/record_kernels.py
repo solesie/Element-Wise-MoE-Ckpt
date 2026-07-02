@@ -62,6 +62,7 @@ class LossyRecordWriteInputs:
     name_list: List[str]
     group_size: int
     score_linear_groups: Optional[List[Optional[torch.Tensor]]] = None
+    theta_cp_groups: Optional[List[Optional[torch.Tensor]]] = None
     score_linear_release: Optional[Callable[[Optional["torch.cuda.Event"]], None]] = None
     within_off_per_name: List[int] = field(default_factory=list)
     group_count_per_name: List[int] = field(default_factory=list)
@@ -101,6 +102,7 @@ class LossyRecordWriteInputs:
     aos_layout_header_words: int = 0
     age2bit_words: Optional[torch.Tensor] = None
     ehat_geom_lut: Optional[torch.Tensor] = None
+    use_e_hat_proxy: bool = True
     score_policy_id: int = 0
     lfcl_fired_epoch: Optional[torch.Tensor] = None
 
@@ -129,7 +131,10 @@ def _triton_random_salt(random_mode: bool, random_salt: int) -> int:
 # ---------------------------------------------------------------------------
 
 if _HAS_TRITON:
-    from ..score_policy import _proposal_element_score_from_lut
+    from ..score_policy import (
+        _proposal_element_score_from_lut,
+        _proposal_element_score_from_theta_cp,
+    )
 
     @triton.jit
     def _age2_load_code(age_words_ptr, global_elem_idx):
@@ -228,7 +233,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _write_direct_records_segment_workqueue_kernel(
-        m_ptr, linear_ptr, v_ptr, p_ptr,
+        m_ptr, linear_ptr, v_ptr, p_ptr, theta_cp_ptr,
         age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
@@ -262,6 +267,7 @@ if _HAS_TRITON:
         RANDOM_MODE: tl.constexpr,
         RANDOM_SALT: tl.constexpr,
         USE_ADAM_SCALAR_PTR: tl.constexpr,
+        USE_E_HAT_PROXY: tl.constexpr,
         HAS_LFCL_FIRED_MASK: tl.constexpr,
         WORKER_COUNT: tl.constexpr,
     ):
@@ -342,21 +348,36 @@ if _HAS_TRITON:
                 elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
             )
             age_code = _age2_load_code(age_words_ptr, global_elem_idx_for_score)
-            elem_score = _proposal_element_score_from_lut(
-                m,
-                linear,
-                v_fp32,
-                age_code,
-                h_lut_ptr,
-                log_v_min_ptr,
-                inv_log_v_width_ptr,
-                ehat_geom_lut_ptr,
-                lr_scalar,
-                sqrt_bc2_scalar,
-                eps_scalar,
-                H_LUT_BINS,
-                SCORE_POLICY,
-            )
+            if USE_E_HAT_PROXY:
+                elem_score = _proposal_element_score_from_lut(
+                    m,
+                    linear,
+                    v_fp32,
+                    age_code,
+                    h_lut_ptr,
+                    log_v_min_ptr,
+                    inv_log_v_width_ptr,
+                    ehat_geom_lut_ptr,
+                    lr_scalar,
+                    sqrt_bc2_scalar,
+                    eps_scalar,
+                    H_LUT_BINS,
+                    SCORE_POLICY,
+                )
+            else:
+                p_score = tl.load(p_ptr + elem_off, mask=elem_mask, other=0.0)
+                theta_cp = tl.load(theta_cp_ptr + elem_off, mask=elem_mask, other=0.0)
+                elem_score = _proposal_element_score_from_theta_cp(
+                    linear,
+                    v_fp32,
+                    p_score,
+                    theta_cp,
+                    h_lut_ptr,
+                    log_v_min_ptr,
+                    inv_log_v_width_ptr,
+                    H_LUT_BINS,
+                    SCORE_POLICY,
+                )
             if RANDOM_MODE:
                 elem_score = _random_unit_from_index(
                     global_elem_idx_for_score, RANDOM_SALT,
@@ -403,6 +424,10 @@ if _HAS_TRITON:
             tl.store(record_out_i32_ptr + elem_word_off + 1, p.to(tl.int32, bitcast=True), mask=elem_write_mask)
             tl.store(record_out_i32_ptr + elem_word_off + 2, m.to(tl.int32, bitcast=True), mask=elem_write_mask)
             tl.store(record_out_i32_ptr + elem_word_off + 3, v.to(tl.int32, bitcast=True), mask=elem_write_mask)
+            if not USE_E_HAT_PROXY:
+                theta_update_mask = elem_write_mask | (elem_mask & expert_fired)
+                p_cp = tl.load(p_ptr + elem_off, mask=theta_update_mask, other=0.0)
+                tl.store(theta_cp_ptr + elem_off, p_cp, mask=theta_update_mask)
 
             promote0 = (age_code == 0) & _age2_phase_hit(
                 global_elem_idx_for_score, step_value, 6, 0xA511E9B3,
@@ -562,6 +587,8 @@ def launch_direct_records_for_segment_entry_workqueue(
     random_salt: int = 0,
     age2bit_words: Optional[torch.Tensor] = None,
     ehat_geom_lut: Optional[torch.Tensor] = None,
+    theta_cp_view: Optional[torch.Tensor] = None,
+    use_e_hat_proxy: bool = True,
     score_policy_id: int = 0,
     lfcl_fired_epoch: Optional[torch.Tensor] = None,
     step_device: Optional[torch.Tensor] = None,
@@ -580,6 +607,11 @@ def launch_direct_records_for_segment_entry_workqueue(
         raise RuntimeError("direct emission requires H LUT and total_th")
     if age2bit_words is None or ehat_geom_lut is None:
         raise RuntimeError("direct emission requires Age2Bit state")
+    if not bool(use_e_hat_proxy):
+        if theta_cp_view is None:
+            raise RuntimeError("theta_cp scoring requires theta_cp_view")
+        if theta_cp_view.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError("theta_cp_view must be a 2-byte floating tensor")
     if step_device is None:
         raise RuntimeError("direct emission requires step_device for Age2Bit aging")
     has_lfcl_mask = lfcl_fired_epoch is not None
@@ -601,6 +633,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         score_linear_view if score_linear_view is not None else m_view,
         v_view,
         p_view,
+        theta_cp_view if theta_cp_view is not None else p_view,
         age2bit_words,
         ehat_geom_lut,
         h_lut_values,
@@ -639,6 +672,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         RANDOM_MODE=bool(random_mode),
         RANDOM_SALT=_triton_random_salt(random_mode, random_salt),
         USE_ADAM_SCALAR_PTR=bool(use_adam_scalar_ptr),
+        USE_E_HAT_PROXY=bool(use_e_hat_proxy),
         HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
         WORKER_COUNT=int(workers),
     )
