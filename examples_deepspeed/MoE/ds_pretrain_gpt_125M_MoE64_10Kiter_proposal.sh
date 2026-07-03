@@ -48,13 +48,20 @@ export EVAL_ITERS=${EVAL_ITERS:-20}
 export LOG_INTERVAL=${LOG_INTERVAL:-10}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
 export NO_MEGATRON_CKPT=1
-export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${DIR}/output/ds_pretrain_gpt_125M_MoE64_10Kiter_proposal"}
+export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${REPO_ROOT}/results/ds_pretrain_gpt_125M_MoE64_10Kiter_proposal"}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
+PROPOSAL_ORACLE_ENABLE=${PROPOSAL_ORACLE_ENABLE:-1}
+case "${PROPOSAL_ORACLE_ENABLE}" in
+    1|true|TRUE|yes|YES|on|ON) PROPOSAL_ORACLE_ENABLE=1 ;;
+    *) PROPOSAL_ORACLE_ENABLE=0 ;;
+esac
 ORACLE_INTERVAL=${ORACLE_INTERVAL:-1000}
 ORACLE_ITERS=${ORACLE_ITERS:-}
-if [ -z "${ORACLE_ITERS}" ]; then
+if [ "${PROPOSAL_ORACLE_ENABLE}" != "1" ]; then
+    ORACLE_ITERS=""
+elif [ -z "${ORACLE_ITERS}" ] && [ "${ORACLE_INTERVAL}" -gt 0 ]; then
     for ((iter = ORACLE_INTERVAL; iter <= TRAIN_ITERS; iter += ORACLE_INTERVAL)); do
         if [ -z "${ORACLE_ITERS}" ]; then
             ORACLE_ITERS="${iter}"
@@ -62,6 +69,9 @@ if [ -z "${ORACLE_ITERS}" ]; then
             ORACLE_ITERS="${ORACLE_ITERS},${iter}"
         fi
     done
+fi
+if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ] && [ -z "${ORACLE_ITERS}" ]; then
+    PROPOSAL_ORACLE_ENABLE=0
 fi
 
 export PROPOSAL_INDEPENDENT_ORACLE_BOOTSTRAP=${PROPOSAL_INDEPENDENT_ORACLE_BOOTSTRAP:-0}
@@ -81,19 +91,23 @@ EXTRA_PROPOSAL_FLAGS=" \
     --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
     --proposal-lfcl-plan-policy ${LFCL_PLAN_POLICY:-lossy_log_size} \
     --proposal-hessian-refresh-warmup-every ${HESSIAN_REFRESH_WARMUP_EVERY:-20} \
-    --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-50} \
+    --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-50}"
+
+if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ]; then
+EXTRA_PROPOSAL_FLAGS="${EXTRA_PROPOSAL_FLAGS} \
     --proposal-independent-oracle-enable \
     --proposal-independent-oracle-iters ${ORACLE_ITERS} \
     --proposal-independent-oracle-log-dir ${ORACLE_LOG_DIR} \
     --proposal-independent-oracle-rank-sample ${ORACLE_RANK_SAMPLE:-262144} \
     --proposal-independent-oracle-actual-batches ${ORACLE_ACTUAL_BATCHES:-8} \
     --proposal-independent-oracle-hvp-batches ${ORACLE_HVP_BATCHES:-1}"
+fi
 
 export EXTRA_MEGATRON_FLAGS="${EXTRA_MEGATRON_FLAGS:-} ${EXTRA_PROPOSAL_FLAGS}"
 
 echo "[10K-proposal] dataset=${DATA_PATH}"
 echo "[10K-proposal] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_SIZE} experts=${EP_SIZE} gpus=${NUM_GPUS}"
 echo "[10K-proposal] train_iters=${TRAIN_ITERS} warmup_iters=${WARMUP_ITERS} warmup_tokens=${WARMUP_TOKENS} decay_tokens=${LR_DECAY_TOKENS}"
-echo "[10K-proposal] proposal=4% test_dram theta_cp=2byte W=1 LFCL=default_1pct oracle_iters=${ORACLE_ITERS}"
+echo "[10K-proposal] proposal=4% test_dram theta_cp=2byte W=1 LFCL=default_1pct oracle_enable=${PROPOSAL_ORACLE_ENABLE} oracle_iters=${ORACLE_ITERS}"
 
 exec bash "${BASE_SCRIPT}"

@@ -48,7 +48,7 @@ export EVAL_ITERS=${EVAL_ITERS:-20}
 export LOG_INTERVAL=${LOG_INTERVAL:-10}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
 export NO_MEGATRON_CKPT=1
-export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${DIR}/output/ds_pretrain_gpt_125M_MoE64_10Kiter_baseline"}
+export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${REPO_ROOT}/results/ds_pretrain_gpt_125M_MoE64_10Kiter_baseline"}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 

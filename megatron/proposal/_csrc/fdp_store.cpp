@@ -304,7 +304,9 @@ void FdpStore::load_config_from_env() {
     }
     cfg_.expert_slots = static_cast<uint32_t>(slots);
     const uint64_t nefc_shards =
-        static_cast<uint64_t>(cfg_.pp_size) * static_cast<uint64_t>(cfg_.ep_size);
+        static_cast<uint64_t>(cfg_.pp_size) *
+        static_cast<uint64_t>(cfg_.dp_size) *
+        static_cast<uint64_t>(cfg_.ep_size);
     if (nefc_shards == 0 || nefc_shards > kMaxExpertSlots) {
         throw std::runtime_error("FDP NEFC shard count is out of range");
     }
@@ -2449,7 +2451,11 @@ uint32_t FdpStore::global_expert_id(uint32_t expert_id) const {
 
 uint32_t FdpStore::current_nefc_shard() const {
     const uint64_t shard =
-        static_cast<uint64_t>(cfg_.pp_rank) * static_cast<uint64_t>(cfg_.ep_size) +
+        static_cast<uint64_t>(cfg_.pp_rank) *
+            static_cast<uint64_t>(cfg_.dp_size) *
+            static_cast<uint64_t>(cfg_.ep_size) +
+        static_cast<uint64_t>(cfg_.dp_rank) *
+            static_cast<uint64_t>(cfg_.ep_size) +
         static_cast<uint64_t>(cfg_.ep_rank);
     if (shard > std::numeric_limits<uint32_t>::max()) {
         throw std::out_of_range("current_nefc_shard: shard overflow");

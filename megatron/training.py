@@ -61,6 +61,7 @@ from megatron.proposal.hooks import (
     proposal_run_independent_oracle,
     proposal_shutdown,
     proposal_refresh_h_quantile, proposal_set_anchor_data_iter,
+    proposal_set_oracle_data_iter,
     proposal_vram_audit_iter_begin, proposal_vram_audit_iter_end,
 )
 
@@ -273,6 +274,14 @@ def pretrain(train_valid_test_dataset_provider,
                     train_valid_test_dataset_provider
                 )
                 proposal_set_anchor_data_iter(_hessian_valid_iter)
+            if (
+                getattr(args, 'proposal_enable', False)
+                and bool(getattr(args, 'proposal_independent_oracle_enable', False))
+            ):
+                _, _oracle_valid_iter, _ = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider
+                )
+                proposal_set_oracle_data_iter(_oracle_valid_iter)
 
             iteration = train(forward_step_func,
                             model, optimizer, opt_param_scheduler,

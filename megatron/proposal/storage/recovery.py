@@ -348,6 +348,7 @@ def _recover_from_fdp(
     if not nefc_shards:
         nefc_shards = [dict(entries.get("nefc", {}))]
     cur_pp = _env_int("PROPOSAL_FDP_PP_RANK", 0)
+    dp_size = _env_int("PROPOSAL_FDP_DP_SIZE", 1)
     ep_size = _env_int("PROPOSAL_FDP_EP_SIZE", 1)
     valid_nefc = [
         e for e in nefc_shards
@@ -361,9 +362,17 @@ def _recover_from_fdp(
     best_nefc = [
         e for e in valid_nefc if int(e.get("iter", -1)) == int(best_ne_iter)
     ]
-    if ep_size > 1:
-        shard_seen = {int(e.get("ep_rank", -1)) for e in best_nefc}
-        missing = [i for i in range(int(ep_size)) if i not in shard_seen]
+    if dp_size > 1 or ep_size > 1:
+        shard_seen = {
+            (int(e.get("dp_rank", -1)), int(e.get("ep_rank", -1)))
+            for e in best_nefc
+        }
+        missing = [
+            (dp, ep)
+            for dp in range(int(dp_size))
+            for ep in range(int(ep_size))
+            if (dp, ep) not in shard_seen
+        ]
         if missing:
             raise RuntimeError(
                 f"FDP recovery: missing NEFC shard(s) at iter "
@@ -372,7 +381,11 @@ def _recover_from_fdp(
     applied_steps: List[int] = []
     for shard in sorted(
         best_nefc,
-        key=lambda e: (int(e.get("ep_rank", 0)), int(e.get("shard_index", 0))),
+        key=lambda e: (
+            int(e.get("dp_rank", 0)),
+            int(e.get("ep_rank", 0)),
+            int(e.get("shard_index", 0)),
+        ),
     ):
         shard_index = int(shard.get("shard_index", 0))
         ne_blob = fdp_read_nefc_blob(

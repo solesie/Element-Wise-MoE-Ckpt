@@ -152,6 +152,9 @@ class ProposalController:
             return
         proposal_set_anchor_data_iter(it)
 
+    def set_oracle_data_iter(self, it: Any) -> None:
+        proposal_set_oracle_data_iter(it)
+
     def attach_expert_state(self, expert_state: Any) -> None:
         if self._lossy_cp is None:
             raise RuntimeError("proposal lossy checkpoint pipeline is not initialized")
@@ -880,9 +883,13 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
 
     try:
         from .telemetry.independent_oracle import run_independent_oracle
+        oracle_data_iterator = ctrl._config.get(
+            "_oracle_dedicated_valid_iter",
+            data_iterator,
+        )
         run_independent_oracle(
             model=model,
-            data_iterator=data_iterator,
+            data_iterator=oracle_data_iterator,
             iteration=int(iteration),
             lossy_cp=ctrl._lossy_cp,
             proposal_config=ctrl._proposal_config,
@@ -1465,6 +1472,10 @@ def proposal_simulate_fault(
 def proposal_set_anchor_data_iter(it: Any) -> None:
     from .refresh import hessian_refresh as h_refresh
     h_refresh.proposal_set_anchor_data_iter(it)
+
+
+def proposal_set_oracle_data_iter(it: Any) -> None:
+    get_controller()._config["_oracle_dedicated_valid_iter"] = it
 
 
 def proposal_refresh_h_quantile(

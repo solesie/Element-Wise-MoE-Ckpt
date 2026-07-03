@@ -56,6 +56,10 @@ def proposal_set_anchor_data_iter(it: Any) -> None:
     get_controller().set_anchor_data_iter(it)
 
 
+def proposal_set_oracle_data_iter(it: Any) -> None:
+    get_controller().set_oracle_data_iter(it)
+
+
 def proposal_simulate_fault(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
     return get_controller().simulate_fault(*args, **kwargs)
 
@@ -78,6 +82,7 @@ __all__ = [
     "proposal_vram_audit_iter_end",
     "proposal_refresh_h_quantile",
     "proposal_set_anchor_data_iter",
+    "proposal_set_oracle_data_iter",
     "proposal_simulate_fault",
     "proposal_recover",
     "proposal_shutdown",
