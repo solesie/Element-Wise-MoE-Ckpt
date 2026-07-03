@@ -36,13 +36,13 @@ def test_dp_topology_uses_dp0_expert_and_dp_ep_nonexpert_shards():
         tp_size=1,
     )
 
-    assert topo.writes_expert is False
+    assert topo.writes_expert is True
     assert topo.writes_nonexpert is True
-    assert topo.selection_ranks == [0, 1, 4, 5]
+    assert topo.selection_ranks == list(range(8))
     assert topo.nonexpert_shard_rank == 3
     assert topo.nonexpert_shard_count == 4
     assert topo.nonexpert_dir(Path("/cp")) == Path("/cp/pp1/non_expert")
-    assert topo.expert_dir(Path("/cp")) == Path("/cp/dp0/pp1/ep1/expert")
+    assert topo.expert_dir(Path("/cp")) == Path("/cp/dp1/pp1/ep1/expert")
 
 
 def test_recovery_scans_new_and_legacy_nonexpert_shard_names(tmp_path):

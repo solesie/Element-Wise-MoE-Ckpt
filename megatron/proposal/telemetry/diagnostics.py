@@ -95,6 +95,8 @@ def _record_vram_audit(label: str, extra: Optional[Dict[str, Any]] = None) -> No
         record = {
             "ts": time.time(),
             "iter": _CURRENT_ITER,
+            "rank": int(os.environ.get("RANK", "-1")),
+            "local_rank": int(os.environ.get("LOCAL_RANK", "-1")),
             "label": label,
             "alloc_mb": torch.cuda.memory_allocated() / 1e6,
             "peak_mb": torch.cuda.max_memory_allocated() / 1e6,

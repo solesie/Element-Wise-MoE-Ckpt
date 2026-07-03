@@ -21,6 +21,7 @@ from ..runtime import CheckpointWorkerPool, WriteRecord, get_d2h_stream
 from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
 from ..refresh.fp32_state import get_mapper
 from .expert_writer import ExpertState, HEADER_BLOCK_BYTES
+from .expert_partition import build_expert_partition_plan
 from .zero12_nonexpert import Zero12NonExpertCollector
 
 
@@ -123,7 +124,7 @@ def _launch_d2h_copies(
     dsts: List[torch.Tensor],
     srcs: List[torch.Tensor],
 ) -> None:
-    """Launch one GPU→pinned copy per contiguous FC tensor slice."""
+    """Launch bounded GPU→pinned copies for contiguous FC tensor slices."""
 
     if not dsts:
         return
@@ -138,11 +139,25 @@ def _launch_d2h_copies(
             )
 
     for dst, src in zip(dsts, srcs):
-        dst.copy_(src, non_blocking=True)
+        n = int(src.numel())
+        max_elem_bytes = max(int(dst.element_size()), int(src.element_size()), 1)
+        chunk_elems = max(1, int(binary_io.D2H_COPY_CHUNK_BYTES) // max_elem_bytes)
+        for off in range(0, n, chunk_elems):
+            count = min(chunk_elems, n - off)
+            dst.narrow(0, off, count).copy_(
+                src.narrow(0, off, count),
+                non_blocking=True,
+            )
 
 
 def _count_d2h_copies(srcs: List[torch.Tensor]) -> int:
-    return int(len(srcs))
+    total = 0
+    for src in srcs:
+        n = int(src.numel())
+        elem_bytes = max(int(src.element_size()), 1)
+        chunk_elems = max(1, int(binary_io.D2H_COPY_CHUNK_BYTES) // elem_bytes)
+        total += (n + chunk_elems - 1) // chunk_elems
+    return int(total)
 
 
 def _detect_expert_layout(named_params, num_experts: int) -> str:
@@ -321,6 +336,8 @@ class FCManager:
         self._lfcl_batch_capacity_bytes: int = 0
         self._lfcl_payload_numel_by_expert: Dict[ExpertId, int] = {}
         self._lfcl_field_cache_by_expert: Dict[ExpertId, List[Dict[str, Any]]] = {}
+        self._expert_partition_fragments_by_expert: Dict[ExpertId, List[Dict[str, Any]]] = {}
+        self._expert_partition_fragment_to_expert: Dict[str, ExpertId] = {}
         self._lfcl_adam_source_cache_warmed: bool = False
         self._last_lfcl_batch_cuda_event: Optional["torch.cuda.Event"] = None
         self._last_lfcl_batch_info: Optional[Dict[str, Any]] = None
@@ -377,13 +394,29 @@ class FCManager:
         if enable_expert_state:
             named_params = dict(self.model.named_parameters())
             self._named_params_cache = named_params
-            expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]] = {}
-            for eid, tnames in self._separated_tensors_by_slot.items():
-                entries: List[Tuple[str, torch.Size, int]] = []
-                for tname in tnames:
-                    p = named_params[tname]
-                    entries.append((tname, p.shape, int(p.numel())))
-                expert_tensor_map[eid] = entries
+            partition_plan = build_expert_partition_plan(
+                named_params,
+                self._separated_tensors_by_slot,
+            )
+            if partition_plan is None:
+                expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]] = {}
+                for eid, tnames in self._separated_tensors_by_slot.items():
+                    entries: List[Tuple[str, torch.Size, int]] = []
+                    for tname in tnames:
+                        p = named_params[tname]
+                        entries.append((tname, p.shape, int(p.numel())))
+                    expert_tensor_map[eid] = entries
+            else:
+                expert_tensor_map = partition_plan.expert_tensor_map
+                self._lfcl_field_cache_by_expert.update(
+                    partition_plan.field_cache_by_expert
+                )
+                self._expert_partition_fragments_by_expert = dict(
+                    partition_plan.fragments_by_expert
+                )
+                self._expert_partition_fragment_to_expert = dict(
+                    partition_plan.fragment_to_expert
+                )
             self._init_lfcl_batch_pinned(expert_tensor_map)
             pinned_aos_record_capacity: Optional[int] = None
             if pinned_aos_capacity_ratio is not None:
@@ -411,6 +444,9 @@ class FCManager:
                 pinned_aos_record_capacity=pinned_aos_record_capacity,
                 commit_lossy_records=commit_expert_lossy_records,
                 test_skip_d2h=bool(test_skip_expert_d2h),
+                partition_fragments_by_expert=(
+                    self._expert_partition_fragments_by_expert or None
+                ),
             )
         self._init_nonexpert_pinned_buffers()
 
@@ -578,7 +614,7 @@ class FCManager:
             )
             per_expert_slot_bytes[eid] = int(slot_bytes)
             named_params = self._named_params_cache
-            if named_params is not None:
+            if named_params is not None and eid not in self._lfcl_field_cache_by_expert:
                 self._lfcl_field_cache_by_expert[eid] = [
                     {
                         "name": tname,
@@ -634,11 +670,26 @@ class FCManager:
         field: Dict[str, Any],
         key: str,
     ) -> Optional[torch.Tensor]:
-        if getattr(get_mapper(), "mode", "") == "zero12":
-            return _fp32_opt_state_lfcl_source(self.optimizer, field["param"], key)
         src = field.get(key)
         if src is not None:
             return src
+        if "group_idx" in field and "local_offset" in field:
+            mapper = get_mapper()
+            if mapper is None:
+                return None
+            v = mapper.zero12_partition_view(
+                int(field["group_idx"]),
+                int(field["local_offset"]),
+                int(field["numel"]),
+                state_key=key,
+            )
+            if v is None:
+                return None
+            src = v.detach()
+            field[key] = src
+            return src
+        if getattr(get_mapper(), "mode", "") == "zero12":
+            return _fp32_opt_state_lfcl_source(self.optimizer, field["param"], key)
         v = _fp32_opt_state_live_view(self.optimizer, field["param"], key)
         if v is None:
             return None
@@ -1197,11 +1248,9 @@ class FCManager:
                 ]
             # === MERGED COPY PATH ====================================
             # Group consecutive entries whose source is contiguous in
-            # the SAME underlying storage. Each run becomes a SINGLE
-            # cudaMemcpyAsync (390 small launches → ~6 big launches in
-            # the typical MoE layout where non-expert params are packed
-            # into 1-2 DS group flat tensors). dst side is always
-            # contiguous by construction (plan offsets are sequential).
+            # the SAME underlying storage. Each run is still submitted in
+            # bounded D2H chunks so PP/compute can make progress between
+            # DMA commands. dst side is contiguous by construction.
             merged_dsts: List[torch.Tensor] = []
             merged_srcs: List[torch.Tensor] = []
             run_storage = None       # underlying storage data_ptr

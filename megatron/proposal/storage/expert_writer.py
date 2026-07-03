@@ -50,7 +50,7 @@ import struct
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -161,6 +161,7 @@ class _ExpertEntry:
     total_numel: int
     lossless_path: Path
     lossy_path: Path
+    partition_fragments: Optional[List[Dict[str, Any]]] = None
     # Open fd on lossy file (append mode), None until first lossy append.
     lossy_fd: Optional[int] = None
     lossy_start_step: int = -1
@@ -200,6 +201,9 @@ class ExpertState:
         pinned_aos_record_capacity: Optional[int] = None,
         commit_lossy_records: bool = True,
         test_skip_d2h: bool = False,
+        partition_fragments_by_expert: Optional[
+            Dict[ExpertId, List[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         """
         Args:
@@ -374,6 +378,10 @@ class ExpertState:
                 total_numel=cursor,
                 lossless_path=self._output_dir / _lossless_name(L, E),
                 lossy_path=self._output_dir / _lossy_name(L, E),
+                partition_fragments=(
+                    None if partition_fragments_by_expert is None
+                    else list(partition_fragments_by_expert.get(eid, []))
+                ),
             )
             if fresh:
                 from .proposal_io import unlink_path as _unlink
@@ -388,9 +396,6 @@ class ExpertState:
 
     def warmup_record_pipeline(self, device: torch.device) -> None:
         self._record_pipeline.warmup(device)
-
-    def aos_cuda_graph_ready(self) -> bool:
-        return bool(getattr(self._record_pipeline, "cuda_graph_ready", False))
 
     @property
     def pinned_aos_total_bytes(self) -> int:
@@ -747,14 +752,8 @@ class ExpertState:
             )
             return
         header_meta = {
-            "expert_id": [int(ent.expert_id[0]), int(ent.expert_id[1])],
+            **self._schema_header_meta(ent),
             "step": int(step),
-            "tensors": [
-                {"name": tn, "shape": list(shape), "numel": int(n)}
-                for (tn, shape, n) in ent.tensor_schema
-            ],
-            "global_offsets": dict(ent.global_offsets),
-            "total_numel": int(ent.total_numel),
             "layout": "param_m_v_concat_fp32",
             "source": "gpu_live_pmv",
         }
@@ -807,16 +806,25 @@ class ExpertState:
         finally:
             _os.close(dir_fd)
 
-    def _lfcl_header_for_entry(self, ent: "_ExpertEntry", step: int) -> bytes:
-        header_meta = {
+    def _schema_header_meta(self, ent: "_ExpertEntry") -> Dict[str, Any]:
+        meta = {
             "expert_id": [int(ent.expert_id[0]), int(ent.expert_id[1])],
-            "step": int(step),
             "tensors": [
                 {"name": tn, "shape": list(shape), "numel": int(n)}
                 for (tn, shape, n) in ent.tensor_schema
             ],
             "global_offsets": dict(ent.global_offsets),
             "total_numel": int(ent.total_numel),
+        }
+        if ent.partition_fragments:
+            meta["payload_kind"] = "zero12_expert_partition"
+            meta["fragments"] = list(ent.partition_fragments)
+        return meta
+
+    def _lfcl_header_for_entry(self, ent: "_ExpertEntry", step: int) -> bytes:
+        header_meta = {
+            **self._schema_header_meta(ent),
+            "step": int(step),
             "layout": "param_m_v_concat_fp32",
             "source": "gpu_live_pmv",
         }
@@ -1822,13 +1830,7 @@ class ExpertState:
         reset_counter: bool = True,
     ) -> None:
         header_meta = {
-            "expert_id": [int(ent.expert_id[0]), int(ent.expert_id[1])],
-            "tensors": [
-                {"name": tn, "shape": list(shape), "numel": int(n)}
-                for (tn, shape, n) in ent.tensor_schema
-            ],
-            "global_offsets": dict(ent.global_offsets),
-            "total_numel": int(ent.total_numel),
+            **self._schema_header_meta(ent),
             "start_step": int(step),
             "record_bytes": RECORD_BYTES,
         }
@@ -1934,6 +1936,24 @@ def read_expert_state_from_blobs(
             max_step = int(replay["max_step"])
 
     payload: Dict[str, Any] = {"_rolling_step": int(max_step)}
+    payload_kind = str(meta.get("payload_kind", ""))
+    if payload_kind == "zero12_expert_partition":
+        fragments = list(meta.get("fragments", []) or [])
+        payload["_payload_kind"] = payload_kind
+        payload["_fragments"] = fragments
+        cursor = 0
+        for entry_idx, entry in enumerate(tensors_meta):
+            frag_idx = (
+                int(fragments[entry_idx]["index"])
+                if entry_idx < len(fragments) else int(entry_idx)
+            )
+            numel = int(entry["numel"])
+            payload[f"frag{frag_idx}:param"] = p_flat.narrow(0, cursor, numel)
+            payload[f"frag{frag_idx}:exp_avg"] = m_flat.narrow(0, cursor, numel)
+            payload[f"frag{frag_idx}:exp_avg_sq"] = v_flat.narrow(0, cursor, numel)
+            cursor += numel
+        return payload
+
     cursor = 0
     for entry in tensors_meta:
         tname = entry["name"]

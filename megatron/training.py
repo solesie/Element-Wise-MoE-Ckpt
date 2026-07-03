@@ -49,7 +49,6 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
-from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.proposal.config import lr_warmup_iters_from_args
@@ -1363,7 +1362,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 cur_loss_value = None
         if getattr(args, 'proposal_enable', False):
             proposal_record_loss(step=iteration, loss=cur_loss_value)
-            proposal_run_independent_oracle(model, valid_data_iterator, iteration)
 
         # H cache refresh for selection_mode='hessian'. Uses valid data so
         # it does not consume/advance the training data iterator. The first
@@ -1382,6 +1380,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             proposal_refresh_h_quantile(
                 model, forward_step_func, valid_data_iterator, iteration,
             )
+        if getattr(args, 'proposal_enable', False):
+            proposal_run_independent_oracle(model, valid_data_iterator, iteration)
         if getattr(args, 'proposal_enable', False):
             proposal_vram_audit_iter_end(iteration)
 
@@ -1531,6 +1531,7 @@ def evaluate(forward_step_func,
     args = get_args()
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        from megatron.model.vision.knn_monitor import compute_feature_bank
         compute_feature_bank(model)
 
     # Turn on evaluation mode which disables dropout.

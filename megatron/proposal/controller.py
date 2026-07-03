@@ -128,19 +128,6 @@ class ProposalController:
     def vram_audit_iter_end(self, step: int) -> None:
         proposal_vram_audit_iter_end(step)
 
-    def aos_cuda_graph_ready(self) -> bool:
-        return bool(
-            self._lossy_cp is not None
-            and getattr(self._lossy_cp, "aos_cuda_graph_ready", lambda: False)()
-        )
-
-    def aos_cuda_graph_capture_required(self) -> bool:
-        if self._lossy_cp is None:
-            return False
-        if not bool(self._config.get("writes_expert", True)):
-            return False
-        return not bool(getattr(self._lossy_cp, "test_expert_selection_only", False))
-
     def refresh_h_quantile(self, *args: Any, **kwargs: Any) -> Any:
         if self._h_anchor is not None:
             return self._h_anchor.refresh(*args, **kwargs)
@@ -1198,23 +1185,39 @@ def _sync_post_iter_dispatch(iter_T: int) -> None:
     torch.distributed.barrier(group=cpu_pg)
 
 
+def _proposal_cpu_barrier(where: str) -> None:
+    """Synchronize proposal ranks without launching NCCL work on GPUs."""
+
+    del where
+    ctrl = get_controller()
+    world_size = int(getattr(ctrl, "_proposal_world_size", 1) or 1)
+    if world_size <= 1:
+        return
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return
+    cpu_pg = getattr(ctrl, "_proposal_cpu_pg", None)
+    if cpu_pg is None:
+        raise RuntimeError("proposal multi-rank sync requires CPU/Gloo group")
+    torch.distributed.barrier(group=cpu_pg)
+
+
+def _proposal_drain_cuda(where: str) -> None:
+    """Finish outstanding CUDA work before proposal mutates recovered state."""
+
+    del where
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _submit_post_step_checkpoint_task(task: PostStepCheckpointTask) -> None:
     """Submit a post-step checkpoint task to the proposal workers."""
 
     if get_controller()._checkpoint_workers is None:
         _execute_expert_post_iter(task)
         _execute_non_expert_post_iter(task)
-        return
-    if (
-        get_controller().aos_cuda_graph_capture_required()
-        and not get_controller().aos_cuda_graph_ready()
-    ):
-        get_controller()._checkpoint_workers.submit_expert(_execute_expert_post_iter, task)
-        get_controller()._checkpoint_workers.drain_expert()
-        get_controller()._checkpoint_workers.submit_non_expert(
-            _execute_non_expert_post_iter, task,
-        )
-        get_controller()._checkpoint_workers.drain_non_expert()
         return
     get_controller()._checkpoint_workers.submit_non_expert(_execute_non_expert_post_iter, task)
     get_controller()._checkpoint_workers.submit_expert(_execute_expert_post_iter, task)
@@ -1250,8 +1253,7 @@ def proposal_dispatch_post_iter(
             get_controller()._checkpoint_workers.drain_expert()
             get_controller()._checkpoint_workers.drain_expert_write()
         _proposal_io.fdp_mark_writer_done(_prev_iter_T, "all")
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        _proposal_cpu_barrier("fdp_mark_writer_done")
     _proposal_io.fdp_begin_checkpoint_iter(iter_T)
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
@@ -1301,6 +1303,8 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         _nonexpert_state_image = get_controller()._fc
     import time as _time
     _t_rec0 = _time.perf_counter()
+    _proposal_drain_cuda("proposal_recover_pre")
+    _proposal_cpu_barrier("proposal_recover_pre")
     diag = recover(
         model=inner_model,
         optimizer=inner_opt,
@@ -1312,6 +1316,8 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
         expert_dir=get_controller()._config.get("expert_cp_dir"),
     )
+    _proposal_drain_cuda("proposal_recover_post")
+    _proposal_cpu_barrier("proposal_recover")
     _t_rec1 = _time.perf_counter()
     # H_g is GPU-only; the next FD refresh will repopulate it. No disk
     # restore step.
@@ -1329,6 +1335,8 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         "recover_time_h_s": float(_t_rec2 - _t_rec1),
         "nonexpert_fc_iter": diag.nonexpert_fc_iter,
         "expert_fc_count": diag.expert_fc_count,
+        "expert_expected_count": getattr(diag, "expert_expected_count", 0),
+        "expert_missing_count": getattr(diag, "expert_missing_count", 0),
     }
 
 
@@ -1345,6 +1353,54 @@ def _flush_fault_record(rec: Dict[str, Any]) -> None:
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
+
+
+def _poison_live_state_before_synthetic_recover(
+    model: torch.nn.Module,
+    optimizer: Any,
+) -> Dict[str, int]:
+    """Erase local live state so synthetic fault recovery cannot reuse it.
+
+    A real crash restarts from checkpoint material only.  The in-process fault
+    injector must therefore wipe the current model/optimizer state before
+    calling recover(); otherwise missing expert payloads silently leave exact
+    live tensors in place and make the rollback loss meaningless.
+    """
+
+    from .refresh.fp32_state import get_mapper
+
+    mapper = get_mapper()
+    n_params = 0
+    n_master = 0
+    n_state = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            if not getattr(p, "requires_grad", False):
+                continue
+            n_params += 1
+            p.data.zero_()
+            if mapper is not None:
+                local = mapper.get_local_param_view(p)
+                if local is not None:
+                    local.zero_()
+                    n_master += 1
+                for key in ("exp_avg", "exp_avg_sq"):
+                    slot = mapper.get_local_state_view(p, key)
+                    if slot is not None:
+                        slot.zero_()
+                        n_state += 1
+            elif optimizer is not None:
+                state = optimizer.state.get(p, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    slot = state.get(key)
+                    if isinstance(slot, torch.Tensor):
+                        slot.zero_()
+                        n_state += 1
+    return {
+        "params": int(n_params),
+        "master": int(n_master),
+        "state": int(n_state),
+    }
 
 
 @torch.no_grad()
@@ -1397,13 +1453,27 @@ def _simulate_fault_impl(
             )
             flushed_paths = []
 
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    _proposal_drain_cuda("fault_pre_recover")
+    _proposal_cpu_barrier("fault_pre_recover")
 
     t0 = time.perf_counter()
     inner_model = get_controller()._config["_inner_model"]
     inner_opt = get_controller()._config["_inner_opt"]
     num_experts = get_controller()._config["num_experts"]
+    poison_stats = _poison_live_state_before_synthetic_recover(
+        inner_model,
+        inner_opt,
+    )
+    _proposal_drain_cuda("fault_poison_live_state")
+    _proposal_cpu_barrier("fault_poison_live_state")
+    if _should_write():
+        print(
+            "[proposal] synthetic_fault_poison: "
+            f"params={poison_stats['params']} "
+            f"master={poison_stats['master']} "
+            f"state={poison_stats['state']}",
+            flush=True,
+        )
     # Same test_dram short-circuit as proposal_recover() (above): only the
     # filesystem-off diagnostic path may pass in-memory images.
     _expert_state_image = None
@@ -1425,6 +1495,8 @@ def _simulate_fault_impl(
         nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
         expert_dir=get_controller()._config.get("expert_cp_dir"),
     )
+    _proposal_drain_cuda("fault_post_recover")
+    _proposal_cpu_barrier("fault_post_recover")
     # H_g is GPU-only; next FD refresh repopulates it.
     recover_s = time.perf_counter() - t0
 
@@ -1448,7 +1520,12 @@ def _simulate_fault_impl(
         "post_fault_loss": None,  # filled on next post_step by caller
         "nonexpert_fc_iter": int(diag.nonexpert_fc_iter),
         "expert_fc_count": int(diag.expert_fc_count),
+        "expert_expected_count": int(getattr(diag, "expert_expected_count", 0)),
+        "expert_missing_count": int(getattr(diag, "expert_missing_count", 0)),
         "B_max_lost_iter": B_max,
+        "poisoned_params": int(poison_stats["params"]),
+        "poisoned_master": int(poison_stats["master"]),
+        "poisoned_state": int(poison_stats["state"]),
     }
     # Store pending — post_fault_loss is filled on next train step.
     get_controller()._pending_fault_record = rec

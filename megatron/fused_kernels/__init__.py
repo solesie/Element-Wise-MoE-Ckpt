@@ -7,6 +7,11 @@ import subprocess
 import torch
 from torch.utils import cpp_extension
 
+_REQUESTED_CUDA_ARCH_LIST = (
+    os.environ.get("MEGATRON_FUSED_KERNEL_ARCH_LIST")
+    or os.environ.get("TORCH_CUDA_ARCH_LIST")
+)
+
 # Setting this param to a list has a problem of generating different
 # compilation commands (with diferent order of architectures) and
 # leading to recompilation of fused kernels. Set it to empty string
@@ -18,25 +23,27 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 def load(args):
 
     # Check if cuda 11 is installed for compute capability 8.0
-    cc_flag = []
+    cc_flag = _cuda_arch_flags_from_env(_REQUESTED_CUDA_ARCH_LIST)
+    use_requested_arch_list = bool(cc_flag)
     if torch.version.hip is None:
-        _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
-            cpp_extension.CUDA_HOME)
-        if int(bare_metal_major) >= 11:
-            cc_flag.append('-gencode')
-            cc_flag.append('arch=compute_80,code=sm_80')
-            if int(bare_metal_minor) >= 1:
+        if not use_requested_arch_list:
+            _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
+                cpp_extension.CUDA_HOME)
+            if int(bare_metal_major) >= 11:
                 cc_flag.append('-gencode')
-                cc_flag.append('arch=compute_86,code=sm_86')
-            if int(bare_metal_minor) >= 4:
+                cc_flag.append('arch=compute_80,code=sm_80')
+                if int(bare_metal_minor) >= 1:
+                    cc_flag.append('-gencode')
+                    cc_flag.append('arch=compute_86,code=sm_86')
+                if int(bare_metal_minor) >= 4:
+                    cc_flag.append('-gencode')
+                    cc_flag.append('arch=compute_87,code=sm_87')
+                if int(bare_metal_minor) >= 8:
+                    cc_flag.append('-gencode')
+                    cc_flag.append('arch=compute_89,code=sm_89')
+            if int(bare_metal_major) >= 12:
                 cc_flag.append('-gencode')
-                cc_flag.append('arch=compute_87,code=sm_87')
-            if int(bare_metal_minor) >= 8:
-                cc_flag.append('-gencode')
-                cc_flag.append('arch=compute_89,code=sm_89')
-        if int(bare_metal_major) >= 12:
-            cc_flag.append('-gencode')
-            cc_flag.append('arch=compute_90,code=sm_90')
+                cc_flag.append('arch=compute_90,code=sm_90')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
@@ -48,8 +55,11 @@ def load(args):
         if torch.version.hip is not None:
             extra_cuda_cflags=['-O3'] + extra_cuda_flags + cc_flag
         else:
+            base_cc_flag = [] if use_requested_arch_list else [
+                '-gencode', 'arch=compute_70,code=sm_70'
+            ]
             extra_cuda_cflags=['-O3',
-                               '-gencode', 'arch=compute_70,code=sm_70',
+                               *base_cc_flag,
                                '--use_fast_math'] + extra_cuda_flags + cc_flag
 
         return cpp_extension.load(
@@ -111,6 +121,25 @@ def _get_cuda_bare_metal_version(cuda_dir):
     bare_metal_minor = release[1][0]
 
     return raw_output, bare_metal_major, bare_metal_minor
+
+
+def _cuda_arch_flags_from_env(value):
+    if not value:
+        return []
+    flags = []
+    for raw in str(value).replace(";", " ").replace(",", " ").split():
+        token = raw.strip().lower()
+        if not token:
+            continue
+        token = token.removeprefix("sm_").removeprefix("compute_")
+        token = token.split("+", 1)[0]
+        if "." in token:
+            major, minor = token.split(".", 1)
+            token = f"{major}{minor}"
+        if not token.isdigit():
+            continue
+        flags.extend(["-gencode", f"arch=compute_{token},code=sm_{token}"])
+    return flags
 
 
 def _create_build_dir(buildpath):

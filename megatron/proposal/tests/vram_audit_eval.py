@@ -62,15 +62,39 @@ def _by_label_in_iter_range(records, label, lo, hi):
     ]
 
 
+def _split_by_rank(records: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    groups: Dict[int, List[Dict[str, Any]]] = {}
+    for rec in records:
+        rank = int(rec.get("rank", 0))
+        groups.setdefault(rank, []).append(rec)
+    return groups
+
+
 def _baseline_alloc(records: List[Dict[str, Any]]) -> float:
-    """Find alloc at pre-init (or earliest iter_begin); used as 'baseline' reference."""
+    """Estimate steady non-proposal alloc used as the R1 reference.
+
+    ``baseline_pre_init`` is recorded before proposal init, but some
+    Megatron/DeepSpeed builds allocate training-owned CUDA workspaces lazily at
+    first iter.  When audit records carry proposal ``tracked_total_mb``, infer
+    the steady non-proposal baseline from the earliest iter record and avoid
+    charging those training workspaces to proposal R1.
+    """
     pre = _by_label(records, "baseline_pre_init")
+    pre_alloc = float(pre[0].get("alloc_mb", 0.0)) if pre else 0.0
     if pre:
-        return float(pre[0].get("alloc_mb", 0.0))
+        steady = _by_label_in_iter_range(
+            records, "iter_end", STEADY_LO, STEADY_HI
+        )
+        for rec in steady + _by_label(records, "iter_end") + _by_label(records, "iter_begin"):
+            tracked = float(rec.get("tracked_total_mb", 0.0))
+            if tracked > 0:
+                return max(pre_alloc, float(rec.get("alloc_mb", 0.0)) - tracked)
+        return pre_alloc
     bs = _by_label(records, "iter_begin")
     if bs:
-        return float(bs[0].get("alloc_mb", 0.0))
-    return 0.0
+        tracked = float(bs[0].get("tracked_total_mb", 0.0))
+        return float(bs[0].get("alloc_mb", 0.0)) - max(0.0, tracked)
+    return pre_alloc
 
 
 def eval_r1(records: List[Dict[str, Any]]) -> Tuple[bool, str]:
@@ -220,17 +244,22 @@ def main(argv: List[str]) -> int:
         print(f"[vram_audit_eval] no records in {path}", file=sys.stderr)
         return 2
     print(f"=== VRAM AUDIT EVAL  ({len(records)} records from {path}) ===")
-    results = [
-        eval_r1(records),
-        eval_r2(records),
-        eval_r3(records),
-        eval_r4(records),
-    ]
     all_ok = True
-    for ok, msg in results:
-        print(msg)
-        if not ok:
-            all_ok = False
+    groups = _split_by_rank(records) if any("rank" in r for r in records) else {0: records}
+    for rank in sorted(groups):
+        rank_records = groups[rank]
+        header = f"--- rank {rank} ---" if len(groups) > 1 else "--- single stream ---"
+        print(header)
+        results = [
+            eval_r1(rank_records),
+            eval_r2(rank_records),
+            eval_r3(rank_records),
+            eval_r4(rank_records),
+        ]
+        for ok, msg in results:
+            print(msg)
+            if not ok:
+                all_ok = False
     print("=" * 30)
     print(f"OVERALL: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1

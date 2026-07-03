@@ -113,6 +113,14 @@ LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-300000000000}
 BATCH_SIZE=${BATCH_SIZE:-4}
 ZERO_STAGE=${ZERO_STAGE:-0}
 PRESCALE_GRAD=${PRESCALE_GRAD:-true}
+TRAIN_PRECISION=${TRAIN_PRECISION:-bf16}
+if [ "${TRAIN_PRECISION}" != "bf16" ]; then
+    echo "Unsupported TRAIN_PRECISION=${TRAIN_PRECISION}; this launcher is BF16-only" >&2
+    exit 2
+fi
+PRECISION_FLAG="--bf16"
+DS_FP16_ENABLED=false
+DS_BF16_ENABLED=true
 
 ## Model parallelism, 1 is no MP
 MP_SIZE=${MP_SIZE:-1}
@@ -199,16 +207,27 @@ if [ "${CL_ENABLED}" = "true" ]; then
 fi
 
 OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-$DIR/output}
-mkdir -p "${OUTPUT_BASEPATH}/tensorboard/"
-mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
 mkdir -p "${OUTPUT_BASEPATH}/log/"
-TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${host}_${current_time}"
-mkdir -p ${TENSORBOARD_DIR} 
+DATA_CACHE_PATH=${DATA_CACHE_PATH:-"${OUTPUT_BASEPATH}/data-cache"}
+mkdir -p "${DATA_CACHE_PATH}"
+TENSORBOARD_ARGS=""
+if [ "${NO_TENSORBOARD:-0}" != "1" ]; then
+    mkdir -p "${OUTPUT_BASEPATH}/tensorboard/"
+    TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${host}_${current_time}"
+    mkdir -p "${TENSORBOARD_DIR}"
+    TENSORBOARD_ARGS=" \
+        --tensorboard-queue-size 1 \
+        --log-timers-to-tensorboard \
+        --log-batch-size-to-tensorboard \
+        --log-validation-ppl-to-tensorboard \
+        --tensorboard-dir ${TENSORBOARD_DIR}"
+fi
 ## Note that for MoE model with billion-scale base model, the checkpoint can be
 ## as large as TB-scale which normal NFS cannot handle efficiently.
 CHECKPOINT_PATH="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
 CKPT_MEGATRON_OPTIONS=""
 if [ "${NO_MEGATRON_CKPT:-0}" != "1" ]; then
+    mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
     CKPT_MEGATRON_OPTIONS="--load ${CHECKPOINT_PATH} --save ${CHECKPOINT_PATH}"
 fi
 
@@ -263,6 +282,7 @@ data_options=" \
          --merge-file ${MERGE_PATH} \
          --data-path ${DATA_PATH} \
          ${VALID_DATA_PATH:+--valid-data-path ${VALID_DATA_PATH}} \
+         --data-cache-path ${DATA_CACHE_PATH} \
          --data-impl mmap"
         
 megatron_options=" \
@@ -301,13 +321,9 @@ megatron_options=" \
         --clip-grad 1.0 \
         --hysteresis 2 \
         --num-workers 0 \
-        --fp16 \
+        ${PRECISION_FLAG} \
         ${CKPT_MEGATRON_OPTIONS} \
-        --tensorboard-queue-size 1 \
-        --log-timers-to-tensorboard \
-        --log-batch-size-to-tensorboard \
-        --log-validation-ppl-to-tensorboard \
-        --tensorboard-dir ${TENSORBOARD_DIR} \
+        ${TENSORBOARD_ARGS} \
         ${EXTRA_MEGATRON_FLAGS:-}"
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
@@ -332,8 +348,8 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
     | sed "s/ZERO_STAGE/${ZERO_STAGE}/" \
     | sed "s/PRESCALE_GRAD/${PRESCALE_GRAD}/" \
-    | sed "s/CONFIG_FP16_ENABLED/true/" \
-    | sed "s/CONFIG_BF16_ENABLED/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/${DS_FP16_ENABLED}/" \
+    | sed "s/CONFIG_BF16_ENABLED/${DS_BF16_ENABLED}/" \
     | sed "s/CONFIG_CL_ENABLED/${CL_ENABLED}/" \
     | sed "s/CONFIG_CL_MIN/${CL_START_SEQLEN}/" \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \

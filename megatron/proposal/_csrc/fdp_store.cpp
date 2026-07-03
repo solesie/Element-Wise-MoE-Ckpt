@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -297,7 +298,9 @@ void FdpStore::load_config_from_env() {
             "PROPOSAL_FDP_NUM_MOE_LAYERS and "
             "PROPOSAL_FDP_EXPERTS_PER_LAYER must both be zero or both be set");
     }
-    const uint64_t slots = static_cast<uint64_t>(cfg_.num_moe_layers) *
+    const uint64_t slots = static_cast<uint64_t>(cfg_.dp_size) *
+                           static_cast<uint64_t>(cfg_.pp_size) *
+                           static_cast<uint64_t>(cfg_.num_moe_layers) *
                            static_cast<uint64_t>(cfg_.experts_per_layer);
     if (slots > kMaxExpertSlots) {
         throw std::runtime_error("FDP expert slot count exceeds kMaxExpertSlots");
@@ -528,31 +531,84 @@ void FdpStore::format_or_load() {
     if (!device_.is_open()) {
         throw std::runtime_error("format_or_load: device is not open");
     }
-    std::memset(superblock_buf_.data(), 0, superblock_buf_.bytes());
-    raw_read_metadata(superblock_buf_.data(), cfg_.metadata_start_lba,
-                      superblock_nlb_, "read_superblock");
-    const SuperBlock* sb = superblock_buf_.as<SuperBlock>();
-    if (sb->magic == kSuperMagic && !cfg_.force_format) {
-        validate_loaded_superblock(*sb);
-        load_existing_metadata(*sb);
-        return;
-    }
+    auto lock_global = [&]() {
+        if (global_lock_path_.empty()) {
+            return;
+        }
+        if (global_lock_fd_ < 0) {
+            global_lock_fd_ = ::open(
+                global_lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+            if (global_lock_fd_ < 0) {
+                throw std::runtime_error(
+                    std::string("open FDP format lock failed: ") +
+                    std::strerror(errno));
+            }
+        }
+        if (::flock(global_lock_fd_, LOCK_EX) != 0) {
+            throw std::runtime_error(
+                std::string("flock FDP format lock failed: ") +
+                std::strerror(errno));
+        }
+    };
+    auto unlock_global = [&]() {
+        if (global_lock_fd_ >= 0 &&
+            ::flock(global_lock_fd_, LOCK_UN) != 0) {
+            throw std::runtime_error(
+                std::string("unlock FDP format lock failed: ") +
+                std::strerror(errno));
+        }
+    };
 
-    if (!cfg_.allow_format && !cfg_.force_format) {
-        throw std::runtime_error(
-            "FDP superblock magic not found and PROPOSAL_FDP_ALLOW_FORMAT=1 "
-            "is not set");
+    const bool rank0 = cfg_.rank == 0;
+    for (uint32_t attempt = 0; attempt < 200; ++attempt) {
+        bool done = false;
+        lock_global();
+        try {
+            std::memset(superblock_buf_.data(), 0, superblock_buf_.bytes());
+            raw_read_metadata(superblock_buf_.data(), cfg_.metadata_start_lba,
+                              superblock_nlb_, "read_superblock");
+            const SuperBlock* sb = superblock_buf_.as<SuperBlock>();
+            const bool has_superblock = sb->magic == kSuperMagic;
+            const bool force_here = cfg_.force_format && rank0 && !open_;
+            if (has_superblock && !force_here) {
+                try {
+                    validate_loaded_superblock(*sb);
+                    load_existing_metadata(*sb);
+                    done = true;
+                } catch (...) {
+                    if (!(cfg_.force_format && !rank0)) {
+                        throw;
+                    }
+                }
+            } else if (force_here || (!has_superblock && cfg_.allow_format && rank0)) {
+                initialize_fresh_metadata();
+                seq_ = 1;
+                last_flush_iter_ = 0;
+                allocated_chunks_ = 0;
+                update_metadata_header(0, false);
+                write_superblock();
+                write_metadata_image();
+                if (cfg_.nvme_flush) {
+                    device_.flush(metadata_ring_, ns_.nsid);
+                }
+                done = true;
+            } else if (!has_superblock && !cfg_.allow_format && !cfg_.force_format) {
+                throw std::runtime_error(
+                    "FDP superblock magic not found and PROPOSAL_FDP_ALLOW_FORMAT=1 "
+                    "is not set");
+            }
+            unlock_global();
+        } catch (...) {
+            unlock_global();
+            throw;
+        }
+        if (done) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    initialize_fresh_metadata();
-    seq_ = 1;
-    last_flush_iter_ = 0;
-    allocated_chunks_ = 0;
-    update_metadata_header(0, false);
-    write_superblock();
-    write_metadata_image();
-    if (cfg_.nvme_flush) {
-        device_.flush(metadata_ring_, ns_.nsid);
-    }
+    throw std::runtime_error(
+        "FDP format_or_load: timed out waiting for rank0 to initialize metadata");
 }
 
 void FdpStore::initialize_fresh_metadata() {
@@ -766,7 +822,7 @@ void FdpStore::open_or_create_shared_metadata_mmap() {
             ctrl->layout_fingerprint == fingerprint &&
             ctrl->metadata_image_bytes == layout_.image_bytes &&
             ctrl->world_size == cfg_.world_size;
-        if (!valid || cfg_.force_format) {
+        if (!valid) {
             std::memset(shared_mmap_base_, 0,
                         static_cast<size_t>(shared_mmap_bytes_));
             pthread_mutexattr_t attr;
@@ -1589,6 +1645,9 @@ size_t FdpStore::write_lfcs(const std::string& object_name,
         lfcs->rank = cfg_.rank;
         lfcs->layer_id = layer_id;
         lfcs->expert_id = global_expert;
+        lfcs->dp_rank = cfg_.dp_rank;
+        lfcs->pp_rank = cfg_.pp_rank;
+        lfcs->ep_rank = cfg_.ep_rank;
         lfcs->generation = generation;
         lfcs->iter = iter;
         lfcs->logical_bytes = logical_bytes;
@@ -1681,6 +1740,9 @@ int64_t FdpStore::open_lfsy(const std::string& object_name,
         entry->rank = cfg_.rank;
         entry->layer_id = layer_id;
         entry->expert_id = global_expert;
+        entry->dp_rank = cfg_.dp_rank;
+        entry->pp_rank = cfg_.pp_rank;
+        entry->ep_rank = cfg_.ep_rank;
         entry->generation = generation;
         entry->start_iter = start_iter_u64;
         entry->logical_tail = kHeaderBlockBytes;
@@ -2429,8 +2491,14 @@ uint32_t FdpStore::expert_slot(uint32_t layer_id, uint32_t expert_id) const {
     if (global_expert >= cfg_.experts_per_layer) {
         throw std::out_of_range("expert_slot: expert_id out of range");
     }
-    const uint64_t slot = static_cast<uint64_t>(layer_id) *
-                          cfg_.experts_per_layer + global_expert;
+    const uint64_t rank_base =
+        (static_cast<uint64_t>(cfg_.dp_rank) * cfg_.pp_size + cfg_.pp_rank) *
+        static_cast<uint64_t>(cfg_.num_moe_layers) *
+        static_cast<uint64_t>(cfg_.experts_per_layer);
+    const uint64_t slot = rank_base +
+                          static_cast<uint64_t>(layer_id) *
+                              cfg_.experts_per_layer +
+                          global_expert;
     if (slot >= cfg_.expert_slots) {
         throw std::out_of_range("expert_slot: layer/expert out of range");
     }
@@ -2702,6 +2770,9 @@ std::vector<LfcsEntrySnapshot> FdpStore::read_lfcs_entries() {
         snap.rank = entry->rank;
         snap.layer_id = entry->layer_id;
         snap.expert_id = entry->expert_id;
+        snap.dp_rank = entry->dp_rank;
+        snap.pp_rank = entry->pp_rank;
+        snap.ep_rank = entry->ep_rank;
         snap.generation = entry->generation;
         snap.iter = entry->iter;
         snap.logical_bytes = entry->logical_bytes;
@@ -2731,6 +2802,9 @@ std::vector<LfsyEntrySnapshot> FdpStore::read_lfsy_entries() {
         snap.rank = entry->rank;
         snap.layer_id = entry->layer_id;
         snap.expert_id = entry->expert_id;
+        snap.dp_rank = entry->dp_rank;
+        snap.pp_rank = entry->pp_rank;
+        snap.ep_rank = entry->ep_rank;
         snap.generation = entry->generation;
         snap.start_iter = entry->start_iter;
         snap.logical_tail = entry->logical_tail;

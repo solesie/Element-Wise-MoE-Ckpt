@@ -21,6 +21,7 @@ class BF16OptGroupView:
     name_start: int = 0
     name_end: int = 0
     entry_elem_start: Optional[torch.Tensor] = None
+    entry_age_elem_start: Optional[torch.Tensor] = None
     entry_group_start: Optional[torch.Tensor] = None
     entry_group_count: Optional[torch.Tensor] = None
     entry_name_idx: Optional[torch.Tensor] = None

@@ -57,6 +57,8 @@ class RecoveryDiagnostics:
     nonexpert_fc_iter: int = -1
     nonexpert_fc_path: Optional[str] = None
     expert_fc_count: int = 0
+    expert_expected_count: int = 0
+    expert_missing_count: int = 0
     expert_fc_iters: Dict[ExpertId, int] = field(default_factory=dict)
     min_fc_iter: int = -1
     rolling_experts_loaded: int = 0
@@ -181,10 +183,21 @@ def _apply_payload_dict_to_model(
     data: Dict[str, Any],
     target_params: Dict[str, torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
+    *,
+    sync_lp: bool = True,
 ) -> int:
     """Scatter a pre-read CPU payload dict into model + optimizer state."""
     mapper = get_mapper()
     rolling_step = int(data.get("_rolling_step", 0)) if isinstance(data, dict) else 0
+    if str(data.get("_payload_kind", "")) == "zero12_expert_partition":
+        return _apply_zero12_partition_payload(
+            data,
+            {
+                "fragments": list(data.get("_fragments", []) or []),
+                "step": int(rolling_step),
+            },
+            sync_lp=sync_lp,
+        )
     for key, tensor in data.items():
         if not isinstance(key, str) or ":" not in key:
             continue
@@ -214,6 +227,8 @@ def _apply_payload_dict_to_model(
 def _apply_zero12_partition_payload(
     data: Dict[str, Any],
     scalars: Dict[str, Any],
+    *,
+    sync_lp: bool = True,
 ) -> int:
     owner = scalars.get("owner_global_rank", None)
     if owner is not None:
@@ -245,10 +260,11 @@ def _apply_zero12_partition_payload(
             mapper.copy_zero12_partition_fragment(
                 group_idx=group_idx,
                 local_offset=local_offset,
-                value=tensor.to(dtype=torch.float32),
+                value=tensor,
                 state_key=state_key,
             )
-    mapper.sync_zero12_fp32_to_lp()
+    if sync_lp:
+        mapper.sync_zero12_fp32_to_lp()
     return int(scalars.get("step", 0) or 0)
 
 
@@ -257,11 +273,21 @@ def _apply_fc_payload_to_model(
     scalars: Dict[str, Any],
     target_params: Dict[str, torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
+    *,
+    sync_lp: bool = True,
 ) -> int:
     if str(scalars.get("payload_kind", "")) == "zero12_nonexpert_partition":
-        return _apply_zero12_partition_payload(data, scalars)
-    rolling_step = _apply_payload_dict_to_model(data, target_params, optimizer)
+        return _apply_zero12_partition_payload(data, scalars, sync_lp=sync_lp)
+    rolling_step = _apply_payload_dict_to_model(
+        data, target_params, optimizer, sync_lp=sync_lp
+    )
     return int(scalars.get("step", rolling_step) or rolling_step)
+
+
+def _sync_recovered_zero12_lp() -> None:
+    mapper = get_mapper()
+    if mapper is not None:
+        mapper.sync_zero12_fp32_to_lp()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -282,11 +308,24 @@ def _fdp_global_expert_id(local_expert_id: int) -> int:
     return _env_int("PROPOSAL_FDP_EXPERT_ID_BASE", 0) + int(local_expert_id)
 
 
+def _fdp_entry_matches_current_topology(entry: Dict[str, Any]) -> bool:
+    dp = _env_int("PROPOSAL_FDP_DP_RANK", 0)
+    pp = _env_int("PROPOSAL_FDP_PP_RANK", 0)
+    ep = _env_int("PROPOSAL_FDP_EP_RANK", 0)
+    return (
+        int(entry.get("dp_rank", dp)) == dp
+        and int(entry.get("pp_rank", pp)) == pp
+        and int(entry.get("ep_rank", ep)) == ep
+    )
+
+
 def _load_fc_payload_into(
     payload_path: Path,
     target_params: Dict[str, torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
     expert_id: Optional[ExpertId] = None,
+    *,
+    sync_lp: bool = True,
 ) -> int:
     """Load FC payload into model + optimizer state.
 
@@ -307,8 +346,12 @@ def _load_fc_payload_into(
         from .proposal_io import load_binary
         tensor_dict, scalars = load_binary(payload_path)
         data = tensor_dict
-        return _apply_fc_payload_to_model(data, scalars, target_params, optimizer)
-    return _apply_payload_dict_to_model(data, target_params, optimizer)
+        return _apply_fc_payload_to_model(
+            data, scalars, target_params, optimizer, sync_lp=sync_lp
+        )
+    return _apply_payload_dict_to_model(
+        data, target_params, optimizer, sync_lp=sync_lp
+    )
 
 
 def _recover_from_fdp(
@@ -398,7 +441,8 @@ def _recover_from_fdp(
         )
         applied_steps.append(
             int(_apply_fc_payload_to_model(
-                ne_payload, ne_scalars, non_expert_params, optimizer
+                ne_payload, ne_scalars, non_expert_params, optimizer,
+                sync_lp=False,
             ))
         )
     diag.nonexpert_fc_iter = int(best_ne_iter)
@@ -418,6 +462,8 @@ def _recover_from_fdp(
             e = dict(raw)
             if not bool(e.get("valid", False)):
                 continue
+            if not _fdp_entry_matches_current_topology(e):
+                continue
             eid = (int(e.get("layer_id", -1)), int(e.get("expert_id", -1)))
             lfcs_by_eid[eid] = e
 
@@ -425,6 +471,8 @@ def _recover_from_fdp(
         for raw in entries.get("lfsy", []):
             e = dict(raw)
             if not bool(e.get("valid", False)):
+                continue
+            if not _fdp_entry_matches_current_topology(e):
                 continue
             eid = (int(e.get("layer_id", -1)), int(e.get("expert_id", -1)))
             lfsy_by_eid[eid] = e
@@ -475,7 +523,7 @@ def _recover_from_fdp(
         for eid in eids_with_fdp_state:
             data = new_pair_data[eid]
             log_step = _apply_payload_dict_to_model(
-                data, by_expert_params[eid], optimizer
+                data, by_expert_params[eid], optimizer, sync_lp=False
             )
             if log_step > int(t_fault):
                 raise RuntimeError(
@@ -494,6 +542,9 @@ def _recover_from_fdp(
     _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     diag.min_fc_iter = int(diag.nonexpert_fc_iter)
+    _t0 = _time.perf_counter()
+    _sync_recovered_zero12_lp()
+    _phase["lp_sync_ms"] = (_time.perf_counter() - _t0) * 1000.0
     _phase["total_ms"] = (_time.perf_counter() - t_all0) * 1000.0
     diag.summary.update(_phase)
     _print_recovery_phases(_phase, diag)
@@ -551,6 +602,7 @@ def recover(
         expert_dir=expert_dir,
     )
     non_expert_params, by_expert_params = _classify_params(model)
+    diag.expert_expected_count = len(by_expert_params)
     _phase["scan_classify_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     # 1. Non-expert FC
@@ -570,7 +622,10 @@ def recover(
                 f"test_dram non-expert state step {ne_step} is newer "
                 f"than requested fault step {int(t_fault)}"
             )
-        _apply_fc_payload_to_model(ne_payload, ne_scalars, non_expert_params, optimizer)
+        _apply_fc_payload_to_model(
+            ne_payload, ne_scalars, non_expert_params, optimizer,
+            sync_lp=False,
+        )
         diag.nonexpert_fc_iter = int(ne_step)
         diag.nonexpert_fc_path = "test_dram"
     else:
@@ -614,7 +669,9 @@ def recover(
                 f"{missing}"
             )
         for path in sorted(best_ne_paths):
-            _load_fc_payload_into(path, non_expert_params, optimizer)
+            _load_fc_payload_into(
+                path, non_expert_params, optimizer, sync_lp=False
+            )
         diag.nonexpert_fc_iter = int(best_ne_iter)
         diag.nonexpert_fc_path = ",".join(str(p) for p in sorted(best_ne_paths))
     _phase["nonexpert_fc_ms"] = (_time.perf_counter() - _t0) * 1000.0
@@ -632,11 +689,15 @@ def recover(
         # Recovery is just an O(num_experts × tensors_per_expert × full_size)
         # CPU→GPU copy. We bypass disk scan entirely for the expert path.
         _t_dram0 = _time.perf_counter()
+        missing: List[ExpertId] = []
         for (L, E), target in by_expert_params.items():
             payload = expert_state_image.read((L, E))
             if payload is None:
+                missing.append((L, E))
                 continue
-            log_step = _apply_payload_dict_to_model(payload, target, optimizer)
+            log_step = _apply_payload_dict_to_model(
+                payload, target, optimizer, sync_lp=False
+            )
             if log_step >= 0 and log_step <= t_fault:
                 log_loaded[(L, E)] = log_step
                 diag.expert_fc_iters[(L, E)] = log_step
@@ -645,6 +706,7 @@ def recover(
         ) * 1000.0
         diag.rolling_experts_loaded = len(log_loaded)
         diag.expert_fc_count = len(log_loaded)
+        diag.expert_missing_count = len(missing)
         if diag.expert_fc_count == 0:
             raise RuntimeError(
                 "test_dram expert state contained no recoverable experts; "
@@ -686,6 +748,10 @@ def recover(
                 for eid, data in pool.map(_read_one, eids_with_new_pair):
                     new_pair_data[eid] = data
         _phase["expert_read_ms"] = (_time.perf_counter() - _t_read0) * 1000.0
+        diag.expert_missing_count = max(
+            0,
+            len(by_expert_params) - len(eids_with_new_pair),
+        )
 
         # Phase B: apply CPU payloads serially.  This keeps recovery's GPU
         # transient lifetime predictable after the one-read CPU replay.
@@ -693,7 +759,9 @@ def recover(
         for eid in eids_with_new_pair:
             data = new_pair_data[eid]
             target = by_expert_params[eid]
-            log_step = _apply_payload_dict_to_model(data, target, optimizer)
+            log_step = _apply_payload_dict_to_model(
+                data, target, optimizer, sync_lp=False
+            )
             if log_step <= t_fault:
                 log_loaded[eid] = log_step
                 diag.expert_fc_iters[eid] = log_step
@@ -709,6 +777,9 @@ def recover(
     _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     diag.min_fc_iter = int(diag.nonexpert_fc_iter)
+    _t0 = _time.perf_counter()
+    _sync_recovered_zero12_lp()
+    _phase["lp_sync_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     _phase["total_ms"] = (_time.perf_counter() - _t_all0) * 1000.0
     diag.summary.update(_phase)
@@ -725,7 +796,9 @@ def _print_recovery_phases(phase: Dict[str, float], diag: RecoveryDiagnostics) -
         f"ne_fc={phase.get('nonexpert_fc_ms', 0.0):.1f} "
         f"expert_load={phase.get('expert_load_ms', 0.0):.1f}"
         f"(read={phase.get('expert_read_ms', 0.0):.1f}+apply={phase.get('expert_apply_ms', 0.0):.1f}) "
-        f"experts={diag.expert_fc_count}",
+        f"lp_sync={phase.get('lp_sync_ms', 0.0):.1f} "
+        f"experts={diag.expert_fc_count}/{diag.expert_expected_count} "
+        f"missing={diag.expert_missing_count}",
         flush=True,
     )
 

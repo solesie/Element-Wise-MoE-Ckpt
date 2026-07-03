@@ -190,13 +190,11 @@ class ProposalConfig:
         )
         skip_warmup_iters = lr_warmup_iters_from_args(args)
 
-        # Anchor processes half of one iteration's micro-batches (mb_per_iter/2):
-        # empirically ≥0.93 H coverage while under half the fwd+bwd budget.
-        _mb_per_iter = max(
-            1, int(getattr(args, "global_batch_size", 1))
-            // max(1, int(getattr(args, "micro_batch_size", 1)))
-        )
-        n_anchor_batches = max(1, _mb_per_iter // 2)
+        # Anchor default is one cached batch.  Finite difference runs +epsilon
+        # and -epsilon, so PipelineEngine executes two full train schedules by
+        # default.  Do not derive this from global_batch_size: PipelineEngine
+        # already expands one cached batch to its own micro-batch schedule.
+        n_anchor_batches = 1
 
         def _parse_int_tuple(raw) -> Tuple[int, ...]:
             if raw is None:

@@ -143,7 +143,22 @@ def test_bf16_partition_fragments_use_hp_mapping():
     )
 
 
-def test_mapper_accepts_deepspeed_fp16_optimizer_with_bf16_params():
+def test_partition_state_lookup_does_not_create_adam_state():
+    p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    p._hp_mapping = _PartitionHpMapping(hp_start=0, lp_start=0, numel=4)
+    torch_opt = torch.optim.SGD([p], lr=0.1)
+    bf16_candidate = _Bf16Candidate([p])
+    bf16_candidate.fp32_groups_flat_partition = [torch.arange(4, dtype=torch.float32)]
+    engine = _Engine(_EmptyFp16Candidate(bf16_candidate))
+
+    mapper = Fp32StateMapper(engine, torch_opt, torch.nn.Module())
+    flat = bf16_candidate.fp32_groups_flat_partition[0]
+
+    assert mapper.zero12_partition_view(0, 0, 4, state_key="exp_avg") is None
+    assert flat not in torch_opt.state
+
+
+def test_mapper_does_not_treat_bf16_params_as_fp16_zero0():
     p0 = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
     p1 = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
     torch_opt = torch.optim.SGD([p0, p1], lr=0.1)
@@ -152,7 +167,7 @@ def test_mapper_accepts_deepspeed_fp16_optimizer_with_bf16_params():
 
     mapper = Fp32StateMapper(engine, torch_opt, torch.nn.Module())
 
-    assert mapper.mode == "fp16_zero0"
+    assert mapper.mode == "bf16_zero0"
     view = mapper.get_grad_accum_view(p1)
     assert view.dtype == torch.bfloat16
     view.fill_(2.0)

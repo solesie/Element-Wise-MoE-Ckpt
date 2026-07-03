@@ -597,14 +597,19 @@ def _refresh_h_quantile_from_finite_diff(
             _lossy_cp._tname_to_index = _name_to_idx
         if _name_to_idx is None:
             _name_to_idx = {nm: idx for idx, nm in enumerate(_names_sorted)}
-        _missing = [_n for _n in _names_sorted if _n not in _name_to_idx]
-        if _missing:
-            raise RuntimeError(
-                f"{len(_missing)} expert names not in lossy checkpoint table; first: {_missing[:3]}")
-        _order = sorted(range(len(_expert_ps_sorted)),
-                        key=lambda i: _name_to_idx[_names_sorted[i]])
-        _expert_ps_sorted = [expert_ps[_i] for _i in _order]
-        _names_sorted = [_names_sorted[_i] for _i in _order]
+        _partition_layout = bool(
+            getattr(_lossy_cp, "_expert_partition_layout", False)
+            if _lossy_cp is not None else False
+        )
+        if not _partition_layout:
+            _missing = [_n for _n in _names_sorted if _n not in _name_to_idx]
+            if _missing:
+                raise RuntimeError(
+                    f"{len(_missing)} expert names not in lossy checkpoint table; first: {_missing[:3]}")
+            _order = sorted(range(len(_expert_ps_sorted)),
+                            key=lambda i: _name_to_idx[_names_sorted[i]])
+            _expert_ps_sorted = [expert_ps[_i] for _i in _order]
+            _names_sorted = [_names_sorted[_i] for _i in _order]
         _ne = [int(p.numel()) for p in _expert_ps_sorted]
         _grad_offsets = [0]
         for _n in _ne[:-1]:

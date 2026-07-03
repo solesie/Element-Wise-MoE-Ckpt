@@ -64,15 +64,16 @@ class EmissionOrchestrationMixin:
                 gpu_refs.append(theta_cp_g)
 
         element_within_off_host: List[int] = []
+        element_age_off_host: List[int] = []
         group_count_per_name_host: List[int] = []
         for grp_init_w in self._groups:
             sn_iw = int(grp_init_w["start_name_in_grp"])
             en_iw = int(grp_init_w["end_name_in_grp"])
-            moff_iw = int(grp_init_w["master_off"])
-            for name_iw in range(sn_iw, en_iw):
-                element_within_off_host.append(
-                    (int(offsets_cpu[name_iw]) - moff_iw) * group_size
-                )
+            phys_starts = list(grp_init_w.get("entry_elem_start_host", ()))
+            age_starts = list(grp_init_w.get("entry_age_elem_start_host", ()))
+            for entry_iw, name_iw in enumerate(range(sn_iw, en_iw)):
+                element_within_off_host.append(int(phys_starts[entry_iw]))
+                element_age_off_host.append(int(age_starts[entry_iw]))
                 group_count_per_name_host.append(
                     int(offsets_cpu[name_iw + 1]) - int(offsets_cpu[name_iw])
                 )
@@ -83,6 +84,7 @@ class EmissionOrchestrationMixin:
             "mvph": tuple(mvph),
             "theta_cp_groups": tuple(theta_cp_groups),
             "within_off_per_name": tuple(element_within_off_host),
+            "age_off_per_name": tuple(element_age_off_host),
             "group_count_per_name": tuple(group_count_per_name_host),
             "gpu_refs": tuple(gpu_refs),
             "total_records": int(total_records),
@@ -257,6 +259,7 @@ class EmissionOrchestrationMixin:
                     None,
                 ),
                 within_off_per_name=static_inputs["within_off_per_name"],
+                age_off_per_name=static_inputs["age_off_per_name"],
                 group_count_per_name=static_inputs["group_count_per_name"],
                 h_lut_values=pending.get("h_lut_values"),
                 h_lut_log_v_min=pending.get("h_lut_log_v_min"),

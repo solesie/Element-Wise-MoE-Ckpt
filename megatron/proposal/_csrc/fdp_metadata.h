@@ -22,7 +22,7 @@ constexpr uint64_t make_magic8(char a, char b, char c, char d,
 
 constexpr uint64_t kSuperMagic = make_magic8('F', 'D', 'P', 'C', 'P', 'S', 'B', '1');
 constexpr uint64_t kMetadataMagic = make_magic8('F', 'D', 'P', 'C', 'P', 'M', 'D', '1');
-constexpr uint32_t kFormatVersion = 2;
+constexpr uint32_t kFormatVersion = 3;
 constexpr uint64_t kDefaultChunkBytes = 64ull * 1024ull * 1024ull;
 constexpr uint32_t kMetadataHeaderBytes = 4096;
 
@@ -142,6 +142,10 @@ struct LfcsEntry {
     uint32_t rank;
     uint32_t layer_id;
     uint32_t expert_id;
+    uint32_t dp_rank;
+    uint32_t pp_rank;
+    uint32_t ep_rank;
+    uint32_t reserved_topology0;
     uint64_t generation;
     uint64_t iter;
     uint64_t logical_bytes;
@@ -156,6 +160,10 @@ struct LfsyEntry {
     uint32_t rank;
     uint32_t layer_id;
     uint32_t expert_id;
+    uint32_t dp_rank;
+    uint32_t pp_rank;
+    uint32_t ep_rank;
+    uint32_t reserved_topology0;
     uint64_t generation;
     uint64_t start_iter;
     uint64_t logical_tail;

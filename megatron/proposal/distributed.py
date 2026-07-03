@@ -41,9 +41,10 @@ class ProposalTopology:
 
     @property
     def writes_expert(self) -> bool:
-        # EP/PP shards are unique on each rank.  DP replicas are identical, so
-        # only the canonical DP rank persists them.
-        return self.dp_rank == 0
+        # Expert optimizer state follows DeepSpeed's local DP ownership.  With
+        # BF16 optimizer even ZeRO-0 exposes fp32 master/state as local DP
+        # partitions, so every DP rank owns its expert shard.
+        return True
 
     @property
     def writes_nonexpert(self) -> bool:
@@ -58,10 +59,7 @@ class ProposalTopology:
 
     @property
     def expert_namespace(self) -> str:
-        # Match DeepSpeed MoE checkpoint ownership: expert DP replicas are
-        # duplicate images, so every DP rank recovers from the canonical dp0
-        # expert namespace.
-        return f"dp0/pp{self.pp_rank}/ep{self.ep_rank}"
+        return f"dp{self.dp_rank}/pp{self.pp_rank}/ep{self.ep_rank}"
 
     @property
     def nonexpert_namespace(self) -> str:
@@ -71,18 +69,10 @@ class ProposalTopology:
 
     @property
     def selection_ranks(self) -> List[int]:
-        # Expert proposal selection must not count DP duplicate experts more
-        # than once.  The active selection domain is therefore every PP×EP
-        # shard at canonical DP rank 0.
-        if self.world_size <= 1:
-            return [0]
-        num_pp_groups = max(1, self.world_size // max(1, self.pp_size))
-        ranks: List[int] = []
-        for pp_rank in range(max(1, self.pp_size)):
-            pp_base = pp_rank * num_pp_groups
-            for ep_rank in range(max(1, self.ep_size)):
-                ranks.append(pp_base + ep_rank)
-        return ranks
+        # Proposal communication is a participation contract, not a write
+        # ownership contract.  Every rank joins the same reductions/barriers;
+        # local DP shard size decides each rank's value contribution.
+        return list(range(max(1, int(self.world_size))))
 
     @property
     def nonexpert_shard_rank(self) -> int:

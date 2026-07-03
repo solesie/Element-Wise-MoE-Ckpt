@@ -36,6 +36,7 @@ from .step_context import (
     fp32_v_t,
     ids_from_name,
 )
+from ..storage.expert_partition import build_expert_partition_plan
 
 _APPROX_PROBE_DEFAULT_SAMPLE_FRACTION = 0.01
 _APPROX_PROBE_MAX_SAMPLE_FRACTION = 0.05
@@ -351,13 +352,6 @@ class LossyCheckpointPipeline(
                     return
             device.copy_(host, non_blocking=True)
 
-    def aos_cuda_graph_ready(self) -> bool:
-        expert_state = getattr(self, "_expert_state", None)
-        return bool(
-            expert_state is not None
-            and getattr(expert_state, "aos_cuda_graph_ready", lambda: False)()
-        )
-
     def _build_approx_probe_metadata(self, *, device: torch.device) -> None:
         """Build static metadata for GPU-generated block-stratified probe.
 
@@ -610,7 +604,80 @@ class LossyCheckpointPipeline(
         # bucket we capture m, v, p refs, per-tensor sizes, and the original
         # tracked-name order.
         buckets: Dict[int, Dict[str, list]] = {}
+        separated: Dict[Tuple[int, int], List[str]] = {}
         for n in self._tracked_names:
+            eid = ids_from_name(n)
+            if eid is not None:
+                separated.setdefault(eid, []).append(n)
+        partition_plan = (
+            build_expert_partition_plan(self._name_to_param, separated)
+            if separated else None
+        )
+        self._expert_partition_layout = partition_plan is not None
+        if partition_plan is not None:
+            self._tname_to_eid.update(partition_plan.fragment_to_expert)
+            self._expert_partition_fragment_meta = {
+                str(frag["fragment_name"]): dict(frag)
+                for fragments in partition_plan.fragments_by_expert.values()
+                for frag in fragments
+            }
+            pending_adam_state = False
+            for eid in sorted(partition_plan.expert_tensor_map):
+                schema = partition_plan.expert_tensor_map[eid]
+                fragments = partition_plan.fragments_by_expert.get(eid, [])
+                for (frag_name, _shape, numel), frag in zip(schema, fragments):
+                    n_elem = int(numel)
+                    group_idx = int(frag["group_idx"])
+                    local_offset = int(frag["local_offset"])
+                    p_group = mapper.zero12_flat_group_view(
+                        group_idx, state_key=None,
+                    )
+                    m_group = mapper.zero12_flat_group_view(
+                        group_idx, state_key="exp_avg",
+                    )
+                    v_group = mapper.zero12_flat_group_view(
+                        group_idx, state_key="exp_avg_sq",
+                    )
+                    if p_group is None:
+                        raise RuntimeError(
+                            "expert partition fragment is missing local "
+                            f"fp32 source: {frag_name}"
+                        )
+                    if m_group is None or v_group is None:
+                        pending_adam_state = True
+                        break
+                    if local_offset < 0 or local_offset + n_elem > int(p_group.numel()):
+                        raise RuntimeError(
+                            "expert partition fragment exceeds local flat "
+                            f"group: {frag_name}"
+                        )
+                    b = buckets.setdefault(group_idx, {
+                        "names": [], "sizes": [],
+                        "m_refs": [m_group.detach().reshape(-1)],
+                        "v_refs": [v_group.detach().reshape(-1)],
+                        "p_refs": [p_group.detach().reshape(-1)],
+                        "opt_offsets": [0],
+                        "physical_offsets": [],
+                        "optimizer_group_idx": [group_idx],
+                        "flat_total": int(p_group.numel()),
+                    })
+                    b["names"].append(frag_name)
+                    b["sizes"].append(n_elem)
+                    b["physical_offsets"].append(local_offset)
+                if pending_adam_state:
+                    break
+            if pending_adam_state:
+                if not getattr(self, "_flat_layout_waiting_for_adam_state_logged", False):
+                    print(
+                        "[proposal] lossy CP layout deferred until DeepSpeed "
+                        "initializes BF16 Adam state",
+                        flush=True,
+                    )
+                    self._flat_layout_waiting_for_adam_state_logged = True
+                return
+
+        tracked_names_for_full = [] if partition_plan is not None else self._tracked_names
+        for n in tracked_names_for_full:
             p = self._name_to_param.get(n)
             if p is None:
                 continue
@@ -727,6 +794,8 @@ class LossyCheckpointPipeline(
                 f"divisible by group_size={g}; otherwise group ownership can "
                 f"cross tensor boundaries. Offenders: {sample}"
             )
+        self._flat_total = int(total_elems)
+        self.total_tracked = int(total_elems)
 
         from ..cutoff.age2bit import allocate_age2bit_score_state
         self._age2bit_score_state = allocate_age2bit_score_state(
@@ -808,8 +877,15 @@ class LossyCheckpointPipeline(
             v_refs = b["v_refs"]
             p_refs = b["p_refs"]
             opt_offsets = b.get("opt_offsets", [])
-            group_total = sum(sizes)
-            group_groups = group_total // g
+            physical_offsets = b.get("physical_offsets")
+            optimizer_group_indices = b.get("optimizer_group_idx", [g_idx])
+            optimizer_group_idx = (
+                int(optimizer_group_indices[0])
+                if optimizer_group_indices else int(g_idx)
+            )
+            tracked_total = sum(sizes)
+            group_total = int(b.get("flat_total", tracked_total))
+            group_groups = tracked_total // g
             master_off = cur_off  # start of this group's region in flat
             # h_g views removed — selection/write kernels do inline H lookup.
 
@@ -818,6 +894,7 @@ class LossyCheckpointPipeline(
 
             # Per-name views (in this master's region).
             entry_elem_start_host: List[int] = []
+            entry_age_elem_start_host: List[int] = []
             entry_group_start_host: List[int] = []
             entry_group_count_host: List[int] = []
             entry_name_idx_host: List[int] = []
@@ -829,14 +906,26 @@ class LossyCheckpointPipeline(
             while power < groups_per_program:
                 power *= 2
             groups_per_program = power
-            for n, sz in zip(names, sizes):
+            if physical_offsets is not None and len(physical_offsets) != len(sizes):
+                raise RuntimeError(
+                    "expert partition physical offset count does not match "
+                    "tracked fragment count"
+                )
+            for entry_i, (n, sz) in enumerate(zip(names, sizes)):
                 n_g = sz // g
                 if n_g == 0:
                     local_elem_off += int(sz)
                     continue
                 name_idx = len(self._tname_list)
-                entry_elem_start_host.append(int(local_elem_off))
-                entry_group_start_host.append(int(local_elem_off) // g)
+                entry_elem_start = (
+                    int(physical_offsets[entry_i])
+                    if physical_offsets is not None
+                    else int(local_elem_off)
+                )
+                entry_age_elem_start = int(cur_off) * int(g)
+                entry_elem_start_host.append(int(entry_elem_start))
+                entry_age_elem_start_host.append(int(entry_age_elem_start))
+                entry_group_start_host.append(int(entry_elem_start) // g)
                 entry_group_count_host.append(int(n_g))
                 entry_name_idx_host.append(int(name_idx))
                 local_entry_id = len(entry_name_idx_host) - 1
@@ -853,6 +942,7 @@ class LossyCheckpointPipeline(
             end_name_in_grp = len(self._tname_list)
             entry_descriptor_tokens = (
                 descriptor_arena.add(entry_elem_start_host, dtype=torch.int64),
+                descriptor_arena.add(entry_age_elem_start_host, dtype=torch.int64),
                 descriptor_arena.add(entry_group_start_host, dtype=torch.int64),
                 descriptor_arena.add(entry_group_count_host, dtype=torch.int32),
                 descriptor_arena.add(entry_name_idx_host, dtype=torch.int32),
@@ -868,9 +958,9 @@ class LossyCheckpointPipeline(
             p_flat, p_why = _try_flat_view(p_refs)
             zc = (m_flat is not None and v_flat is not None
                   and p_flat is not None
-                  and m_flat.numel() == group_total
-                  and v_flat.numel() == group_total
-                  and p_flat.numel() == group_total)
+                  and m_flat.numel() >= group_total
+                  and v_flat.numel() >= group_total
+                  and p_flat.numel() >= group_total)
             if not zc:
                 all_zero_copy = False
                 zc_reasons.append(
@@ -883,7 +973,8 @@ class LossyCheckpointPipeline(
                 _mflat_n = int(m_flat.numel()) if m_flat is not None else -1
                 _pflat_n = int(p_flat.numel()) if p_flat is not None else -1
                 print(f"[init_diag] g_idx={g_idx} master_off={master_off} "
-                      f"group_total_elem={group_total} group_groups={_group_total_g} "
+                      f"group_total_elem={group_total} tracked_elem={tracked_total} "
+                      f"group_groups={_group_total_g} "
                       f"sum_per_name_groups={_per_name_total} "
                       f"m_flat.numel={_mflat_n} p_flat.numel={_pflat_n} "
                       f"start_name={start_name_in_grp} end_name={end_name_in_grp} "
@@ -891,6 +982,7 @@ class LossyCheckpointPipeline(
                       flush=True)
             self._groups.append({
                 "g_idx": g_idx,
+                "optimizer_group_idx": optimizer_group_idx,
                 "names": names,
                 "sizes": sizes,
                 "m_refs": m_refs,
@@ -907,6 +999,7 @@ class LossyCheckpointPipeline(
                 "end_name_in_grp": end_name_in_grp,
                 "_entry_descriptor_tokens": entry_descriptor_tokens,
                 "entry_elem_start_host": list(entry_elem_start_host),
+                "entry_age_elem_start_host": list(entry_age_elem_start_host),
                 "entry_group_start_host": list(entry_group_start_host),
                 "entry_name_idx_host": list(entry_name_idx_host),
                 "entry_group_count_host": list(entry_group_count_host),
@@ -915,14 +1008,16 @@ class LossyCheckpointPipeline(
                     entry_block_local_group_start_host,
                 ),
                 "zero_copy": zc,
-                "total": group_total,
-                "total_aligned": (group_total // g) * g,
+                "total": tracked_total,
+                "flat_total": group_total,
+                "total_aligned": (tracked_total // g) * g,
             })
 
         descriptor_arena.materialize()
         for grp in self._groups:
             (
                 entry_elem_start_t,
+                entry_age_elem_start_t,
                 entry_group_start_t,
                 entry_group_count_t,
                 entry_name_idx_t,
@@ -933,6 +1028,7 @@ class LossyCheckpointPipeline(
                 for tok in grp.pop("_entry_descriptor_tokens")
             )
             grp["entry_elem_start"] = entry_elem_start_t
+            grp["entry_age_elem_start"] = entry_age_elem_start_t
             grp["entry_group_start"] = entry_group_start_t
             grp["entry_group_count"] = entry_group_count_t
             grp["entry_name_idx"] = entry_name_idx_t
@@ -986,11 +1082,20 @@ class LossyCheckpointPipeline(
             )
             theta_values = self._theta_cp_score_state.values
             for grp in self._groups:
-                start = int(grp["master_off"]) * int(g)
-                n_elem = int(grp["total"])
-                theta_view = theta_values.narrow(0, start, n_elem)
-                theta_view.copy_(grp["p_flat"], non_blocking=True)
-                grp["theta_cp_flat"] = theta_view
+                p_flat = grp["p_flat"]
+                for elem_start, age_start, group_count in zip(
+                    grp.get("entry_elem_start_host", ()),
+                    grp.get("entry_age_elem_start_host", ()),
+                    grp.get("entry_group_count_host", ()),
+                ):
+                    n_elem = int(group_count) * int(g)
+                    if n_elem <= 0:
+                        continue
+                    theta_values.narrow(0, int(age_start), n_elem).copy_(
+                        p_flat.narrow(0, int(elem_start), n_elem),
+                        non_blocking=True,
+                    )
+                grp["theta_cp_flat"] = theta_values
         else:
             self._theta_cp_score_state = None
             for grp in self._groups:
@@ -1075,7 +1180,7 @@ class LossyCheckpointPipeline(
             if view_for_group is None:
                 continue
             view = view_for_group(
-                int(grp.get("g_idx", -1)),
+                int(grp.get("optimizer_group_idx", grp.get("g_idx", -1))),
                 int(grp.get("optimizer_elem_offset", 0)),
                 int(m_flat.numel()),
             )
@@ -1169,6 +1274,7 @@ class LossyCheckpointPipeline(
                 name_start=int(grp["start_name_in_grp"]),
                 name_end=int(grp["end_name_in_grp"]),
                 entry_elem_start=grp.get("entry_elem_start"),
+                entry_age_elem_start=grp.get("entry_age_elem_start"),
                 entry_group_start=grp.get("entry_group_start"),
                 entry_group_count=grp.get("entry_group_count"),
                 entry_name_idx=grp.get("entry_name_idx"),

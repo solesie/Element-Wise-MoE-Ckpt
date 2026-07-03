@@ -146,6 +146,9 @@ struct LfcsEntrySnapshot {
     uint32_t rank = 0;
     uint32_t layer_id = 0;
     uint32_t expert_id = 0;
+    uint32_t dp_rank = 0;
+    uint32_t pp_rank = 0;
+    uint32_t ep_rank = 0;
     uint64_t generation = 0;
     uint64_t iter = 0;
     uint64_t logical_bytes = 0;
@@ -159,6 +162,9 @@ struct LfsyEntrySnapshot {
     uint32_t rank = 0;
     uint32_t layer_id = 0;
     uint32_t expert_id = 0;
+    uint32_t dp_rank = 0;
+    uint32_t pp_rank = 0;
+    uint32_t ep_rank = 0;
     uint64_t generation = 0;
     uint64_t start_iter = 0;
     uint64_t logical_tail = 0;

@@ -65,17 +65,6 @@ class SegmentD2H:
         # caller has set the final CUDA device.
         self._prod_done: List[Optional[torch.cuda.Event]] = [None] * num_buffers
         self._d2h_done: List[Optional[torch.cuda.Event]] = [None] * num_buffers
-        self._graph: Optional[torch.cuda.CUDAGraph] = None
-        self._graph_warmup_done = False
-        self._graph_signature: Optional[Tuple[Tuple[Tuple[int, int], ...], int, bool]] = None
-        self._graph_last_event: Optional[torch.cuda.Event] = None
-        self._graph_last_producer_event: Optional[torch.cuda.Event] = None
-        self._graph_external_d2h_done: Optional[torch.cuda.Event] = None
-        self._graph_external_producer_done: Optional[torch.cuda.Event] = None
-
-    @property
-    def cuda_graph_ready(self) -> bool:
-        return self._graph is not None
 
     @property
     def segment_bytes(self) -> int:
@@ -96,11 +85,8 @@ class SegmentD2H:
         segment_list = [(int(o), int(n)) for o, n in segments if int(n) > 0]
         if not segment_list:
             return None, None
-        return self._run_graph(
-            producer,
-            segment_list,
-            dst,
-            copy_to_host=bool(copy_to_host),
+        return self._enqueue_segment_commands(
+            producer, segment_list, dst, copy_to_host=bool(copy_to_host),
         )
 
     def _validate_run_inputs(
@@ -131,77 +117,6 @@ class SegmentD2H:
                 )
         return segment_list
 
-    def _graph_run_signature(
-        self,
-        segments: List[Tuple[int, int]],
-        dst: torch.Tensor,
-        *,
-        copy_to_host: bool,
-    ) -> Tuple[Tuple[Tuple[int, int], ...], int, bool]:
-        return tuple(segments), int(dst.data_ptr()), bool(copy_to_host)
-
-    def _run_graph(
-        self,
-        producer: Callable[[torch.Tensor, int, int], None],
-        segments: List[Tuple[int, int]],
-        dst: torch.Tensor,
-        *,
-        copy_to_host: bool,
-    ):
-        segment_list = self._validate_run_inputs(
-            segments, dst, copy_to_host=bool(copy_to_host),
-        )
-        signature = self._graph_run_signature(
-            segment_list, dst, copy_to_host=bool(copy_to_host),
-        )
-        if self._graph is not None:
-            if signature != self._graph_signature:
-                raise RuntimeError(
-                    "SegmentD2H CUDA graph signature changed; fixed graph "
-                    "topology/address contract was violated"
-                )
-            with torch.cuda.stream(self._compute_stream):
-                self._graph.replay()
-            return self._graph_last_event, self._graph_last_producer_event
-
-        if not self._graph_warmup_done:
-            self._graph_warmup_done = True
-            return self._enqueue_segment_commands(
-                producer,
-                segment_list,
-                dst,
-                copy_to_host=bool(copy_to_host),
-            )
-
-        self._prod_done = [None] * len(self._gpu_bufs)
-        self._d2h_done = [None] * len(self._gpu_bufs)
-        self._graph_external_d2h_done = torch.cuda.Event(external=True)
-        self._graph_external_producer_done = torch.cuda.Event(external=True)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            graph,
-            stream=self._compute_stream,
-            capture_error_mode="thread_local",
-        ):
-            last_event, last_producer_event = self._enqueue_segment_commands(
-                producer,
-                segment_list,
-                dst,
-                copy_to_host=bool(copy_to_host),
-                join_d2h_on_compute=True,
-                external_done_events=(
-                    self._graph_external_d2h_done,
-                    self._graph_external_producer_done,
-                ),
-            )
-        self._graph = graph
-        self._graph_signature = signature
-        self._graph_last_event = last_event
-        self._graph_last_producer_event = last_producer_event
-        with torch.cuda.stream(self._compute_stream):
-            self._graph.replay()
-        return self._graph_last_event, self._graph_last_producer_event
-
     def _enqueue_segment_commands(
         self,
         producer: Callable[[torch.Tensor, int, int], None],
@@ -209,9 +124,7 @@ class SegmentD2H:
         dst: torch.Tensor,
         *,
         copy_to_host: bool = True,
-        join_d2h_on_compute: bool = False,
-        external_done_events: Optional[Tuple["torch.cuda.Event", "torch.cuda.Event"]] = None,
-    ) -> Optional["torch.cuda.Event"]:
+    ) -> Tuple[Optional["torch.cuda.Event"], Optional["torch.cuda.Event"]]:
         """Stream caller-supplied segments from GPU through ``producer``
         into ``dst``.
 
@@ -262,11 +175,8 @@ class SegmentD2H:
         nb = len(self._gpu_bufs)
         buf = 0
         last_event: Optional[torch.cuda.Event] = None
-        last_join_event: Optional[torch.cuda.Event] = None
         last_producer_event: Optional[torch.cuda.Event] = None
         last_index = len(segment_list) - 1
-        external_d2h_done = external_done_events[0] if external_done_events else None
-        external_producer_done = external_done_events[1] if external_done_events else None
         for seg_index, (byte_off, n) in enumerate(segment_list):
             # Back-pressure: producer must not overwrite a staging buffer
             # whose previous d2h is still in flight.
@@ -286,15 +196,8 @@ class SegmentD2H:
             self._prod_done[buf].record(self._compute_stream)
             producer_event_for_wait = self._prod_done[buf]
             last_producer_event = producer_event_for_wait
-            if seg_index == last_index and external_producer_done is not None:
-                external_producer_done.record(self._compute_stream)
-                last_producer_event = external_producer_done
             if not copy_to_host:
                 last_event = producer_event_for_wait
-                last_join_event = producer_event_for_wait
-                if seg_index == last_index and external_d2h_done is not None:
-                    external_d2h_done.record(self._compute_stream)
-                    last_event = external_d2h_done
                 buf = (buf + 1) % nb
                 continue
             self._d2h_stream.wait_event(producer_event_for_wait)
@@ -312,18 +215,11 @@ class SegmentD2H:
                     chunk_off += chunk_n
                 if profile and time is not None:
                     d2h_enqueue_ms += (time.perf_counter() - t0) * 1000.0
-            if seg_index == last_index and external_d2h_done is not None:
-                external_d2h_done.record(self._d2h_stream)
-                last_event = external_d2h_done
             if self._d2h_done[buf] is None:
                 self._d2h_done[buf] = torch.cuda.Event()
             self._d2h_done[buf].record(self._d2h_stream)
-            if last_event is None:
-                last_event = self._d2h_done[buf]
-            last_join_event = self._d2h_done[buf]
+            last_event = self._d2h_done[buf]
             buf = (buf + 1) % nb
-        if bool(join_d2h_on_compute) and copy_to_host and last_join_event is not None:
-            self._compute_stream.wait_event(last_join_event)
         if profile and time is not None:
             total_ms = (time.perf_counter() - t_run0) * 1000.0
             total_bytes = sum(int(n) for _o, n in segment_list)

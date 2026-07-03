@@ -11,10 +11,15 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$DIR/../.." && pwd)
+if [ -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
+    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+fi
 export LD_LIBRARY_PATH=$(python3 -c 'import os,torch;print(os.path.join(os.path.dirname(torch.__file__),"lib"))' 2>/dev/null):${LD_LIBRARY_PATH:-}
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=${CUDA_HOME}/bin:${PATH}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
+export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
 
 SEQ_LEN=${SEQ_LEN:-2048}
 NUM_LAYERS=${NUM_LAYERS:-12}
@@ -29,6 +34,33 @@ EP_PARALLEL_SIZE=${EP_PARALLEL_SIZE:-1}
 NUM_EXPERTS=${NUM_EXPERTS:-48}
 MOE_TOPK=${MOE_TOPK:-1}
 ZERO_STAGE=${ZERO_STAGE:-0}
+USE_FLASH_ATTN_V2=${USE_FLASH_ATTN_V2:-true}
+FLASH_ATTN_FLAG=""
+case "${USE_FLASH_ATTN_V2}" in
+    1|true|TRUE|yes|YES|on|ON) FLASH_ATTN_FLAG="--use-flash-attn-v2" ;;
+esac
+TRAIN_PRECISION=${TRAIN_PRECISION:-bf16}
+case "${TRAIN_PRECISION}" in
+    fp16)
+        PRECISION_FLAG="--fp16"
+        DS_FP16_ENABLED=true
+        DS_BF16_ENABLED=false
+        ;;
+    bf16)
+        PRECISION_FLAG="--bf16"
+        DS_FP16_ENABLED=false
+        DS_BF16_ENABLED=true
+        ;;
+    none|off|false|FALSE|0)
+        PRECISION_FLAG=""
+        DS_FP16_ENABLED=false
+        DS_BF16_ENABLED=false
+        ;;
+    *)
+        echo "Unsupported TRAIN_PRECISION=${TRAIN_PRECISION}; expected fp16, bf16, or none" >&2
+        exit 2
+        ;;
+esac
 
 TRAIN_ITERS=${TRAIN_ITERS:-2000}
 SEED=${SEED:-2024}
@@ -89,7 +121,10 @@ esac
 
 VOCAB_PATH=${DIR}/../rebase/gpt2-vocab.json
 MERGE_PATH=${DIR}/../rebase/gpt2-merges.txt
-DEFAULT_DATA_ROOT="/home/elice/data/slimpajama_6b"
+DEFAULT_DATA_ROOT="/home/paul/data/slimpajama_6b"
+if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
+    DEFAULT_DATA_ROOT="/home/elice/data/slimpajama_6b"
+fi
 if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
     DEFAULT_DATA_ROOT="/home/asdf1234/data/slimpajama_6b"
 fi
@@ -121,7 +156,7 @@ megatron_options=" \
     --log-interval ${LOG_INTERVAL:-10} --eval-interval ${EVAL_INTERVAL:-100} --eval-iters ${EVAL_ITERS:-128} \
     --save-interval 100000 \
     --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 \
-    --num-workers 2 --bf16 --use-flash-attn-v2 --ds_fused_adam \
+    --num-workers 2 ${PRECISION_FLAG} ${FLASH_ATTN_FLAG} --ds_fused_adam \
     --seed ${SEED} \
     ${ACTIVATION_CHECKPOINT:+--checkpoint-activations --deepspeed-activation-checkpointing} \
     ${EXTRA_MEGATRON_FLAGS:-} \
@@ -135,8 +170,8 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" "${template_json}" \
     | sed "s/LOG_INTERVAL/10/" \
     | sed "s/ZERO_STAGE/${ZERO_STAGE}/" \
     | sed "s/PRESCALE_GRAD/$([ "${ZERO_STAGE}" -gt 0 ] && echo false || echo true)/" \
-    | sed "s/CONFIG_FP16_ENABLED/false/" \
-    | sed "s/CONFIG_BF16_ENABLED/true/" \
+    | sed "s/CONFIG_FP16_ENABLED/${DS_FP16_ENABLED}/" \
+    | sed "s/CONFIG_BF16_ENABLED/${DS_BF16_ENABLED}/" \
     | sed "s/CONFIG_CL_ENABLED/false/" \
     | sed "s/CONFIG_CL_MIN/80/" \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \

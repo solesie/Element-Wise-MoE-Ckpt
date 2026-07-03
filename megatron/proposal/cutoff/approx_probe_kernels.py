@@ -83,6 +83,7 @@ if _HAS_TRITON:
         age_words_ptr, ehat_geom_lut_ptr,
         h_lut_ptr, log_v_min_ptr, inv_log_v_width_ptr,
         entry_elem_start_ptr,
+        entry_age_elem_start_ptr,
         entry_group_start_ptr,
         entry_group_count_ptr,
         entry_stratum_idx_ptr,
@@ -164,6 +165,7 @@ if _HAS_TRITON:
             entry_block_local_group_start_ptr + entry_block_id,
         )
         entry_elem_start = tl.load(entry_elem_start_ptr + entry_id)
+        entry_age_elem_start = tl.load(entry_age_elem_start_ptr + entry_id)
         entry_group_start = tl.load(entry_group_start_ptr + entry_id)
         entry_group_count = tl.load(entry_group_count_ptr + entry_id)
 
@@ -179,6 +181,10 @@ if _HAS_TRITON:
             entry_elem_start + gid_local_2d * G + elem_lane_2d,
             (BLOCK_SIZE,),
         )
+        elem_age_off = tl.reshape(
+            entry_age_elem_start + gid_local_2d * G + elem_lane_2d,
+            (BLOCK_SIZE,),
+        )
         elem_mask = tl.reshape(gid_local_2d < entry_group_count, (BLOCK_SIZE,))
         selectable_mask = elem_mask & (~expert_fired)
         block_elem_count = tl.sum(elem_mask.to(tl.float32), axis=0)
@@ -187,7 +193,7 @@ if _HAS_TRITON:
         linear = tl.load(linear_ptr + elem_off, mask=elem_mask, other=0.0)
         v = tl.load(v_ptr + elem_off, mask=elem_mask, other=0.0)
         v_fp32 = v.to(tl.float32)
-        global_elem_idx = elem_off.to(tl.int64) + tl.cast(master_base_elem, tl.int64)
+        global_elem_idx = elem_age_off.to(tl.int64)
         age_code = _age2_load_code(age_words_ptr, global_elem_idx)
         if USE_E_HAT_PROXY:
             elem_score = _proposal_element_score_from_lut(
@@ -207,7 +213,7 @@ if _HAS_TRITON:
             )
         else:
             p = tl.load(p_ptr + elem_off, mask=elem_mask, other=0.0)
-            theta_cp = tl.load(theta_cp_ptr + elem_off, mask=elem_mask, other=0.0)
+            theta_cp = tl.load(theta_cp_ptr + elem_age_off, mask=elem_mask, other=0.0)
             elem_score = _proposal_element_score_from_theta_cp(
                 linear,
                 v_fp32,
@@ -847,6 +853,7 @@ def launch_generated_block_probe_for_group(
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
     entry_elem_start: torch.Tensor,
+    entry_age_elem_start: torch.Tensor,
     entry_group_start: torch.Tensor,
     entry_group_count: torch.Tensor,
     entry_stratum_idx: torch.Tensor,
@@ -909,6 +916,7 @@ def launch_generated_block_probe_for_group(
         h_lut_log_v_min,
         h_lut_inv_log_v_width,
         entry_elem_start,
+        entry_age_elem_start,
         entry_group_start,
         entry_group_count,
         entry_stratum_idx,

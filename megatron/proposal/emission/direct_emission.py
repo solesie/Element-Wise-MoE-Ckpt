@@ -26,6 +26,7 @@ class DirectEntryGroupPlan:
     bf16_group_idx: int
     max_group_count: int
     entry_elem_start: torch.Tensor
+    entry_age_elem_start: torch.Tensor
     entry_group_start: torch.Tensor
     entry_group_count: torch.Tensor
     entry_t_off: torch.Tensor
@@ -63,7 +64,7 @@ def build_direct_all_entries_emission_plan(
 
     _validate_direct_lossy_state(lossy_state)
     group_size = int(lossy_state.group_size)
-    entry_buckets: Dict[int, Dict[str, List[int]]] = {}
+    entry_buckets: Dict[Tuple[int, int], Dict[str, List[int]]] = {}
     for ent in entry_specs:
         expert_idx = int(getattr(ent, "expert_index", -1))
         if expert_idx < 0:
@@ -76,6 +77,7 @@ def build_direct_all_entries_emission_plan(
             raise RuntimeError(f"direct entry references missing BF16 group: {g_idx}")
         m_flat, _v_flat, _p_flat, _master_off_elem = mvph
         elem_start = int(getattr(ent, "entry_within_off", 0))
+        age_elem_start = int(getattr(ent, "entry_age_off", elem_start))
         group_count = int(getattr(ent, "name_group_count", 0))
         if group_count <= 0:
             continue
@@ -89,9 +91,10 @@ def build_direct_all_entries_emission_plan(
         if elem_start < 0 or elem_start + elem_n > int(m_flat.numel()):
             raise RuntimeError("direct entry exceeds BF16 group span")
         bucket = entry_buckets.setdefault(
-            g_idx,
+            (g_idx, _entry_size_bucket(group_count)),
             {
                 "elem_start": [],
+                "age_elem_start": [],
                 "group_start": [],
                 "group_count": [],
                 "t_off": [],
@@ -100,6 +103,7 @@ def build_direct_all_entries_emission_plan(
             },
         )
         bucket["elem_start"].append(elem_start)
+        bucket["age_elem_start"].append(age_elem_start)
         bucket["group_start"].append(group_start)
         bucket["group_count"].append(group_count)
         bucket["t_off"].append(int(getattr(ent, "t_off", 0)))
@@ -109,11 +113,12 @@ def build_direct_all_entries_emission_plan(
     arena = _DescriptorArena(device=device, stream=stream)
     group_plans: List[DirectEntryGroupPlan] = []
     pending_groups = []
-    for g_idx, bucket in entry_buckets.items():
+    for (g_idx, _size_bucket), bucket in sorted(entry_buckets.items()):
         pending_groups.append((
             int(g_idx),
             max(int(x) for x in bucket["group_count"]),
             arena.add(bucket["elem_start"], dtype=torch.int64),
+            arena.add(bucket["age_elem_start"], dtype=torch.int64),
             arena.add(bucket["group_start"], dtype=torch.int64),
             arena.add(bucket["group_count"], dtype=torch.int32),
             arena.add(bucket["t_off"], dtype=torch.int64),
@@ -122,8 +127,8 @@ def build_direct_all_entries_emission_plan(
         ))
     arena.materialize()
     for (
-        g_idx, max_group_count, elem_start, group_start, group_count, t_off,
-        expert_idx_group, record_byte,
+        g_idx, max_group_count, elem_start, age_elem_start, group_start,
+        group_count, t_off, expert_idx_group, record_byte,
     ) in pending_groups:
         table_capacity = int(group_count.length)
         segment_entry_indices = None
@@ -168,6 +173,7 @@ def build_direct_all_entries_emission_plan(
             bf16_group_idx=g_idx,
             max_group_count=max_group_count,
             entry_elem_start=arena.tensor(elem_start),
+            entry_age_elem_start=arena.tensor(age_elem_start),
             entry_group_start=arena.tensor(group_start),
             entry_group_count=arena.tensor(group_count),
             entry_t_off=arena.tensor(t_off),
@@ -187,6 +193,13 @@ def build_direct_all_entries_emission_plan(
         entries_by_group=tuple(group_plans),
         descriptor_host_refs=arena.host_refs,
     )
+
+
+def _entry_size_bucket(group_count: int) -> int:
+    """Bound rectangular workqueue waste without falling back to per-fragment launches."""
+
+    count = max(1, int(group_count))
+    return int(count - 1).bit_length()
 
 def with_segment_identity(
     plan: DirectSegmentEmissionPlan,
@@ -366,6 +379,7 @@ def emit_segment_direct_from_plan(
                 h_lut_log_v_min=lossy_state.h_lut_log_v_min,
                 h_lut_inv_log_v_width=lossy_state.h_lut_inv_log_v_width,
                 entry_elem_start=group_plan.entry_elem_start,
+                entry_age_elem_start=group_plan.entry_age_elem_start,
                 entry_group_start=group_plan.entry_group_start,
                 entry_group_count=group_plan.entry_group_count,
                 entry_t_off=group_plan.entry_t_off,

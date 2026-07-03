@@ -346,6 +346,48 @@ def _env_flag(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _param_ref_for_name(
+    lossy_cp: Any,
+    name: str,
+) -> Tuple[Optional[torch.nn.Parameter], int, int]:
+    param = lossy_cp._name_to_param.get(str(name))
+    if param is not None:
+        return param, 0, int(param.numel())
+    meta = getattr(lossy_cp, "_expert_partition_fragment_meta", {}) or {}
+    frag = meta.get(str(name))
+    if not isinstance(frag, dict):
+        return None, 0, 0
+    base = str(frag.get("name", ""))
+    param = lossy_cp._name_to_param.get(base)
+    if param is None:
+        return None, 0, 0
+    return param, int(frag.get("param_offset", 0) or 0), int(frag.get("numel", 0) or 0)
+
+
+def _copy_flat_to_param(
+    param: torch.nn.Parameter,
+    value: torch.Tensor,
+    *,
+    param_offset: int = 0,
+    n: Optional[int] = None,
+) -> None:
+    n_elem = int(value.numel() if n is None else n)
+    dst = param.data.detach().reshape(-1).narrow(0, int(param_offset), n_elem)
+    dst.copy_(
+        value.reshape(-1).narrow(0, 0, n_elem).to(
+            device=dst.device,
+            dtype=dst.dtype,
+        ),
+        non_blocking=True,
+    )
+
+
+def _grad_slice_for_spec(raw_grad: torch.Tensor, spec: Dict[str, Any]) -> torch.Tensor:
+    off = int(spec.get("param_offset", 0) or 0)
+    n = int(spec["n"])
+    return raw_grad.detach().reshape(-1).narrow(0, off, n)
+
+
 class _LiveParamSnapshot:
     """Immutable telemetry snapshot of the live low-precision model params.
 
@@ -369,7 +411,7 @@ class _LiveParamSnapshot:
         seen = set()
         for grp in getattr(lossy_cp, "_groups", ()) or ():
             for name in grp.get("names", ()):
-                param = lossy_cp._name_to_param.get(str(name))
+                param, _param_offset, _n = _param_ref_for_name(lossy_cp, str(name))
                 if param is None or id(param) in seen:
                     continue
                 seen.add(id(param))
@@ -633,7 +675,7 @@ def _set_params_to_checkpoint(lossy_cp: Any) -> None:
         local_off = 0
         for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
             n = int(size)
-            param = lossy_cp._name_to_param.get(str(name))
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
             if param is not None and n > 0:
                 src = _checkpoint_tensor_for_name(
                     lossy_cp, grp, str(name), local_off, n,
@@ -641,8 +683,12 @@ def _set_params_to_checkpoint(lossy_cp: Any) -> None:
                 if src is None:
                     local_off += n
                     continue
-                src = src.view(param.shape)
-                param.data.copy_(src.to(device=param.device, dtype=param.dtype), non_blocking=True)
+                _copy_flat_to_param(
+                    param,
+                    src,
+                    param_offset=param_offset,
+                    n=min(n, param_n),
+                )
             local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -661,10 +707,14 @@ def _restore_current_params(lossy_cp: Any) -> None:
         local_off = 0
         for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
             n = int(size)
-            param = lossy_cp._name_to_param.get(str(name))
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
             if param is not None and n > 0:
-                src = p_flat.narrow(0, local_off, n).view(param.shape)
-                param.data.copy_(src.to(device=param.device, dtype=param.dtype), non_blocking=True)
+                _copy_flat_to_param(
+                    param,
+                    p_flat.narrow(0, local_off, n),
+                    param_offset=param_offset,
+                    n=min(n, param_n),
+                )
             local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -679,7 +729,7 @@ def _set_params_perturbed(lossy_cp: Any, *, scale: float) -> None:
         local_off = 0
         for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
             n = int(size)
-            param = lossy_cp._name_to_param.get(str(name))
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
             if param is not None and n > 0:
                 p = p_flat.narrow(0, local_off, n)
                 c = _checkpoint_tensor_for_name(
@@ -690,7 +740,12 @@ def _set_params_perturbed(lossy_cp: Any, *, scale: float) -> None:
                     local_off += n
                     continue
                 value = p + float(scale) * (p - c)
-                param.data.copy_(value.view(param.shape).to(device=param.device, dtype=param.dtype), non_blocking=True)
+                _copy_flat_to_param(
+                    param,
+                    value,
+                    param_offset=param_offset,
+                    n=min(n, param_n),
+                )
             local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1422,8 +1477,8 @@ def _backward_grad_cpu_tensors(
     for idx, spec in enumerate(specs):
         param = spec["param"]
 
-        def _hook(raw_grad, *, _idx=idx):
-            grads[_idx] = raw_grad.detach().reshape(-1).float().cpu()
+        def _hook(raw_grad, *, _idx=idx, _spec=spec):
+            grads[_idx] = _grad_slice_for_spec(raw_grad, _spec).float().cpu()
             return torch.zeros_like(raw_grad)
 
         handles.append(param.register_hook(_hook))
@@ -1503,9 +1558,11 @@ def _set_params_plus_current_error(
             value = p.detach().float()
         else:
             value = p.detach().float() + float(scale) * (p.detach().float() - c.detach().float())
-        param.data.copy_(
-            value.view(param.shape).to(device=param.device, dtype=param.dtype),
-            non_blocking=True,
+        _copy_flat_to_param(
+            param,
+            value,
+            param_offset=int(spec.get("param_offset", 0) or 0),
+            n=n,
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1546,15 +1603,16 @@ def _tensor_specs(lossy_cp: Any) -> List[Dict[str, Any]]:
         local_off = 0
         for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
             n = int(size)
-            param = lossy_cp._name_to_param.get(str(name))
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
             if param is not None and n > 0:
                 specs.append({
                     "group_idx": int(group_idx),
                     "grp": grp,
                     "name": str(name),
                     "local_off": int(local_off),
-                    "n": int(n),
+                    "n": int(min(n, param_n)),
                     "param": param,
+                    "param_offset": int(param_offset),
                 })
             local_off += n
     return specs
@@ -1897,8 +1955,8 @@ def _backward_grad_tensors(
     for idx, spec in enumerate(specs):
         param = spec["param"]
 
-        def _hook(raw_grad, *, _idx=idx):
-            grads[_idx] = raw_grad.detach().reshape(-1).float().clone()
+        def _hook(raw_grad, *, _idx=idx, _spec=spec):
+            grads[_idx] = _grad_slice_for_spec(raw_grad, _spec).float().clone()
             return torch.zeros_like(raw_grad)
 
         handles.append(param.register_hook(_hook))
@@ -1938,9 +1996,11 @@ def _set_params_plus_direction_tensors(
         param = spec["param"]
         p = grp["p_flat"].narrow(0, off, n)
         value = p.detach().float() + float(scale) * e_t.detach().float()
-        param.data.copy_(
-            value.view(param.shape).to(device=param.device, dtype=param.dtype),
-            non_blocking=True,
+        _copy_flat_to_param(
+            param,
+            value,
+            param_offset=int(spec.get("param_offset", 0) or 0),
+            n=n,
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2093,9 +2153,11 @@ def _eval_gpu_policy_loss(
             if c is None:
                 continue
             value = torch.where(selected, p.detach(), c.detach())
-            param.data.copy_(
-                value.view(param.shape).to(device=param.device, dtype=param.dtype),
-                non_blocking=True,
+            _copy_flat_to_param(
+                param,
+                value,
+                param_offset=int(spec.get("param_offset", 0) or 0),
+                n=n,
             )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -2348,7 +2410,12 @@ def _set_params_plus_direction_parts(
         p = grp["p_flat"].narrow(0, off, n)
         e_t = torch.as_tensor(e_np, device=p.device, dtype=p.dtype)
         value = p + float(scale) * e_t
-        param.data.copy_(value.view(param.shape).to(device=param.device, dtype=param.dtype), non_blocking=True)
+        _copy_flat_to_param(
+            param,
+            value,
+            param_offset=int(spec.get("param_offset", 0) or 0),
+            n=n,
+        )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -2373,8 +2440,8 @@ def _backward_grad_parts(
     for idx, spec in enumerate(specs):
         param = spec["param"]
 
-        def _hook(raw_grad, *, _idx=idx):
-            grads[_idx] = raw_grad.detach().reshape(-1).float().cpu().numpy().astype(np.float32, copy=True)
+        def _hook(raw_grad, *, _idx=idx, _spec=spec):
+            grads[_idx] = _grad_slice_for_spec(raw_grad, _spec).float().cpu().numpy().astype(np.float32, copy=True)
             return torch.zeros_like(raw_grad)
 
         handles.append(param.register_hook(_hook))
@@ -2418,8 +2485,8 @@ def _backward_dot_direction(
         param = spec["param"]
         e_t = torch.as_tensor(e_np, device=param.device, dtype=torch.float32)
 
-        def _hook(raw_grad, *, _e=e_t):
-            flat = raw_grad.detach().reshape(-1).float()
+        def _hook(raw_grad, *, _e=e_t, _spec=spec):
+            flat = _grad_slice_for_spec(raw_grad, _spec).float()
             dot_tensors.append(torch.sum(flat * _e))
             return torch.zeros_like(raw_grad)
 
@@ -2733,7 +2800,12 @@ def _eval_selected_masks_loss(
                 continue
             mask = torch.as_tensor(mask_np, dtype=torch.bool, device=p.device)
             value = torch.where(mask, p, c)
-            param.data.copy_(value.view(param.shape).to(device=param.device, dtype=param.dtype), non_blocking=True)
+            _copy_flat_to_param(
+                param,
+                value,
+                param_offset=int(spec.get("param_offset", 0) or 0),
+                n=n,
+            )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return float(
@@ -2811,10 +2883,12 @@ def _backward_dot_and_sample(
             continue
         local_off = 0
         for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            param = lossy_cp._name_to_param.get(str(name))
+            group_n = int(size)
+            n = group_n
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+            n = min(n, int(param_n))
             if param is None or n <= 0:
-                local_off += n
+                local_off += group_n
                 continue
             p_slice = p_flat.narrow(0, local_off, n)
             c_slice = _checkpoint_tensor_for_name(
@@ -2827,8 +2901,8 @@ def _backward_dot_and_sample(
             e_slice = (p_slice - c_slice).detach()
             sample_info = sample_by_name.get(str(name))
 
-            def _hook(raw_grad, *, _e=e_slice, _sample=sample_info):
-                flat = raw_grad.detach().reshape(-1).float()
+            def _hook(raw_grad, *, _e=e_slice, _sample=sample_info, _param_offset=param_offset, _n=n):
+                flat = raw_grad.detach().reshape(-1).narrow(0, int(_param_offset), int(_n)).float()
                 dot_tensors.append(torch.sum(flat * _e.float()))
                 if _sample is not None:
                     vals = torch.index_select(flat, 0, _sample["offsets_t"]).detach().cpu().numpy()
@@ -2836,7 +2910,7 @@ def _backward_dot_and_sample(
                 return torch.zeros_like(raw_grad)
 
             handles.append(param.register_hook(_hook))
-            local_off += n
+            local_off += group_n
     try:
         _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():

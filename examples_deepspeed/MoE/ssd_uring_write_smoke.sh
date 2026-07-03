@@ -80,8 +80,8 @@ fi
 mkdir -p "${OUT}"
 
 if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ]; then
-    FDP_BLOCK_DEVICE="${PROPOSAL_FDP_BLOCK_DEVICE:-/dev/nvme0n1}"
-    FDP_DEVICE="${PROPOSAL_FDP_DEVICE:-/dev/ng0n1}"
+    FDP_BLOCK_DEVICE="${PROPOSAL_FDP_BLOCK_DEVICE:-/dev/nvme8n1}"
+    FDP_DEVICE="${PROPOSAL_FDP_DEVICE:-/dev/ng8n1}"
     FDP_BLOCK_NAME=$(basename "${FDP_BLOCK_DEVICE}")
     FDP_SYSFS="/sys/block/${FDP_BLOCK_NAME}"
     if [ ! -e "${FDP_SYSFS}/queue/logical_block_size" ] || [ ! -e "${FDP_SYSFS}/size" ]; then

@@ -202,16 +202,18 @@ class Fp32StateMapper:
             and hasattr(candidate, "fp16_groups")
         ):
             return False
-        if not self._groups_match_any_dtype(
-            candidate.fp16_groups, (torch.float16, torch.bfloat16)
-        ):
+        if self._groups_match_dtype(candidate.fp16_groups, torch.float16):
+            mode = "fp16_zero0"
+        elif self._groups_match_dtype(candidate.fp16_groups, torch.bfloat16):
+            mode = "bf16_zero0"
+        else:
             return False
         self._fp32_flat = candidate.fp32_groups_flat
         self._fp32_grad_flat = getattr(candidate, "fp32_groups_gradients_flat", None)
         self._coords = self._index_groups(candidate, "fp16_groups")
         if not self._coords:
             return False
-        self._mode = "fp16_zero0"
+        self._mode = mode
         return True
 
     def _try_bf16_zero0(self, candidate: object) -> bool:
@@ -447,14 +449,37 @@ class Fp32StateMapper:
             return None
         if state_key is None:
             return flat.narrow(0, local_offset, numel)
-        state = self._inner_opt.state.setdefault(flat, {})
+        state = self._inner_opt.state.get(flat, {})
         slot = state.get(state_key)
         if slot is None:
-            slot = torch.zeros_like(flat)
-            state[state_key] = slot
+            return None
         if local_offset + numel > int(slot.numel()):
             return None
         return slot.narrow(0, local_offset, numel)
+
+    def zero12_flat_group_view(
+        self,
+        group_idx: int,
+        *,
+        state_key: Optional[str] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return the local DeepSpeed flat group or its optimizer-state slot."""
+
+        if self._fp32_flat is None:
+            return None
+        group_idx = int(group_idx)
+        if group_idx < 0 or group_idx >= len(self._fp32_flat):
+            return None
+        flat = self._fp32_flat[group_idx]
+        if state_key is None:
+            return flat
+        state = self._inner_opt.state.get(flat, {})
+        slot = state.get(state_key)
+        if slot is None:
+            return None
+        if int(slot.numel()) < int(flat.numel()):
+            return None
+        return slot.reshape(-1)
 
     @torch.no_grad()
     def copy_zero12_partition_fragment(
@@ -476,7 +501,10 @@ class Fp32StateMapper:
                 "ZeRO partition payload does not match local optimizer layout: "
                 f"group={group_idx} offset={local_offset} n={value.numel()}"
             )
-        dst.copy_(value.reshape(-1).to(device=dst.device, dtype=dst.dtype))
+        src = value.reshape(-1)
+        if src.dtype != dst.dtype:
+            src = src.to(dtype=dst.dtype)
+        dst.copy_(src, non_blocking=False)
 
     def sync_zero12_fp32_to_lp(self) -> None:
         """Refresh low-precision model weights from local fp32 partitions."""

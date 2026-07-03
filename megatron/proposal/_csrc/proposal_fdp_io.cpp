@@ -115,6 +115,9 @@ py::dict lfcs_entry_to_dict(const proposal::fdp::LfcsEntrySnapshot& entry) {
     d["rank"] = entry.rank;
     d["layer_id"] = entry.layer_id;
     d["expert_id"] = entry.expert_id;
+    d["dp_rank"] = entry.dp_rank;
+    d["pp_rank"] = entry.pp_rank;
+    d["ep_rank"] = entry.ep_rank;
     d["generation"] = entry.generation;
     d["iter"] = entry.iter;
     d["logical_bytes"] = entry.logical_bytes;
@@ -130,6 +133,9 @@ py::dict lfsy_entry_to_dict(const proposal::fdp::LfsyEntrySnapshot& entry) {
     d["rank"] = entry.rank;
     d["layer_id"] = entry.layer_id;
     d["expert_id"] = entry.expert_id;
+    d["dp_rank"] = entry.dp_rank;
+    d["pp_rank"] = entry.pp_rank;
+    d["ep_rank"] = entry.ep_rank;
     d["generation"] = entry.generation;
     d["start_iter"] = entry.start_iter;
     d["logical_tail"] = entry.logical_tail;

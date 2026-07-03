@@ -27,7 +27,11 @@ SECTOR_BYTES = 4096
 
 
 def aos_layout_header_bytes(n_experts: int) -> int:
-    words = AOS_LAYOUT_HEADER_WORDS_FIXED + max(0, int(n_experts))
+    # Header payload: fixed fields, per-expert AOS offsets, per-expert record
+    # capacities.  The header is only the in-memory pinned slab contract between
+    # the GPU layout kernel and the CPU writer; per-expert disk blobs are
+    # unchanged.
+    words = AOS_LAYOUT_HEADER_WORDS_FIXED + 2 * max(0, int(n_experts))
     raw = words * 8
     return ((raw + SECTOR_BYTES - 1) // SECTOR_BYTES) * SECTOR_BYTES
 
@@ -102,14 +106,19 @@ class PinnedAosLayoutMirror:
             ent = item[0]
             expert_id = ent.expert_id
             off = int(view[AOS_LAYOUT_HEADER_WORDS_FIXED + i].item())
+            cap = int(view[AOS_LAYOUT_HEADER_WORDS_FIXED + n + i].item())
+            cap = min(
+                max(0, cap),
+                max(0, int(max_records_by_expert.get(expert_id, 0))),
+            )
             self.layer[i] = int(expert_id[0])
             self.expert[i] = int(expert_id[1])
             self.aos_byte_off[i] = off
-            self.blob_padded_bytes[i] = 0
-            self.record_capacity[i] = max(
-                0,
-                int(max_records_by_expert.get(expert_id, 0)),
+            raw = int(PREFIX_BYTES) + cap * int(RECORD_BYTES)
+            self.blob_padded_bytes[i] = (
+                0 if off < 0 else ((raw + SECTOR_BYTES - 1) // SECTOR_BYTES) * SECTOR_BYTES
             )
+            self.record_capacity[i] = cap
         self.active_count = n
 
     def rows(self) -> Iterable[AosLayoutRow]:
@@ -269,6 +278,7 @@ if _HAS_TRITON:
         for i in range(0, N_EXPERTS):
             tl.store(offset_ptr + i, -1)
             tl.store(header_ptr + 4 + i, -1)
+            tl.store(header_ptr + 4 + N_EXPERTS + i, 0)
 
         segment_ids = tl.arange(0, BLOCK_SEGMENTS)
         segment_mask = segment_ids < N_SEGMENTS
@@ -341,6 +351,7 @@ if _HAS_TRITON:
             tl.store(capacity_ptr + best_idx, cap)
             tl.store(offset_ptr + best_idx, device_layout_off)
             tl.store(header_ptr + 4 + best_idx, header_layout_off)
+            tl.store(header_ptr + 4 + N_EXPERTS + best_idx, cap)
             segment_used = tl.where(
                 segment_ids == chosen_seg,
                 tl.where(placed, segment_used + blob, segment_used),

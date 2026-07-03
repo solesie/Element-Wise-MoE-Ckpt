@@ -166,8 +166,20 @@ class FdpReadbackValidator:
         lfsy_header_count = 0
         lfsy_append_count = 0
 
+        latest_lfcs: Dict[Tuple[int, int], _ReadbackRecord] = {}
+        ordered: List[_ReadbackRecord] = []
         for rec in pending:
             if rec.kind == "lfcs":
+                key = (int(rec.layer), int(rec.expert))
+                if key not in latest_lfcs:
+                    ordered.append(rec)
+                latest_lfcs[key] = rec
+                continue
+            ordered.append(rec)
+
+        for rec in ordered:
+            if rec.kind == "lfcs":
+                rec = latest_lfcs[(int(rec.layer), int(rec.expert))]
                 total += self._validate_lfcs(rec)
                 lfcs_count += 1
             elif rec.kind == "lfsy_header":
@@ -309,6 +321,9 @@ class FdpReadbackValidator:
     def _lfsy_tail_by_local_expert(self) -> Dict[Tuple[int, int], int]:
         base = int(os.environ.get("PROPOSAL_FDP_EXPERT_ID_BASE", "0") or "0")
         ep_size = int(os.environ.get("PROPOSAL_FDP_EP_SIZE", "1") or "1")
+        dp_rank = int(os.environ.get("PROPOSAL_FDP_DP_RANK", "0") or "0")
+        pp_rank = int(os.environ.get("PROPOSAL_FDP_PP_RANK", "0") or "0")
+        ep_rank = int(os.environ.get("PROPOSAL_FDP_EP_RANK", "0") or "0")
         global_ids = os.environ.get("PROPOSAL_FDP_EXPERT_IDS_GLOBAL", "").lower() in (
             "1", "true", "yes",
         )
@@ -316,6 +331,12 @@ class FdpReadbackValidator:
         for raw in self._get_fdp().recovery_entries().get("lfsy", []):
             entry = dict(raw)
             if not bool(entry.get("valid", False)):
+                continue
+            if (
+                int(entry.get("dp_rank", dp_rank)) != dp_rank
+                or int(entry.get("pp_rank", pp_rank)) != pp_rank
+                or int(entry.get("ep_rank", ep_rank)) != ep_rank
+            ):
                 continue
             layer = int(entry.get("layer_id", -1))
             expert = int(entry.get("expert_id", -1))

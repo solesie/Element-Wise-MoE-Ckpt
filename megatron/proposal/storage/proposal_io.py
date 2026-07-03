@@ -82,6 +82,23 @@ def _fdp_global_expert_id_for_read(expert: int) -> int:
     return int(base) + int(expert)
 
 
+def _fdp_current_topology() -> Tuple[int, int, int]:
+    return (
+        int(os.environ.get("PROPOSAL_FDP_DP_RANK", "0") or "0"),
+        int(os.environ.get("PROPOSAL_FDP_PP_RANK", "0") or "0"),
+        int(os.environ.get("PROPOSAL_FDP_EP_RANK", "0") or "0"),
+    )
+
+
+def _fdp_entry_matches_current_topology(entry: Dict[str, Any]) -> bool:
+    dp, pp, ep = _fdp_current_topology()
+    return (
+        int(entry.get("dp_rank", dp)) == dp
+        and int(entry.get("pp_rank", pp)) == pp
+        and int(entry.get("ep_rank", ep)) == ep
+    )
+
+
 def _get_fdp():
     """Lazy-load and open the raw NVMe FDP backend session."""
     global _fdp_cext
@@ -109,6 +126,12 @@ SECTOR_BYTES: int = int(_cext.SECTOR_BYTES)
 # Pin-buffer chunk granularity.  Keep fixed so checkpoint sizing is
 # reproducible across runs.
 PIN_CHUNK_BYTES: int = 64 * 1024 * 1024
+
+# GPU->pinned DMA submission granularity for hot-path checkpoint copies.
+# This is intentionally smaller than the on-disk/pinned allocation chunk:
+# large DMA bursts can delay PP/compute progress even when the stream is
+# independent, while this bound keeps launch count modest.
+D2H_COPY_CHUNK_BYTES: int = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1085,7 @@ def fdp_read_lfcs_blob(
             (
                 e for e in entries
                 if bool(e.get("valid", False))
+                and _fdp_entry_matches_current_topology(e)
                 and int(e.get("layer_id", -1)) == int(layer)
                 and int(e.get("expert_id", -1)) == int(global_expert)
             ),
@@ -1097,6 +1121,7 @@ def fdp_read_lfsy_blob(
             (
                 e for e in entries
                 if bool(e.get("valid", False))
+                and _fdp_entry_matches_current_topology(e)
                 and int(e.get("layer_id", -1)) == int(layer)
                 and int(e.get("expert_id", -1)) == int(global_expert)
             ),

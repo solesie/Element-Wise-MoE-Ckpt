@@ -112,6 +112,9 @@ class EntrySpec:
     #   disk_idx = bf16_local - entry_within_off + t_off.
     # Default 0 means src_idx is already entry-local.
     entry_within_off: int = 0
+    # Entry's start position in proposal compact ELEMENT coords
+    # (age2bit/theta_cp address space).
+    entry_age_off: int = 0
 
 
 @dataclass
@@ -196,13 +199,6 @@ class AosEmitter:
 
         self._ensure_segment_d2h(device)
 
-    @property
-    def cuda_graph_ready(self) -> bool:
-        return (
-            self._segment_d2h is not None
-            and bool(getattr(self._segment_d2h, "cuda_graph_ready", False))
-        )
-
     def _build_direct_plan(
         self,
         *,
@@ -219,6 +215,15 @@ class AosEmitter:
 
         name_to_winoff = {
             nm: int(lossy_state.within_off_per_name[i])
+            for i, nm in enumerate(lossy_state.name_list)
+        }
+        age_offs = (
+            lossy_state.age_off_per_name
+            if len(lossy_state.age_off_per_name) == len(lossy_state.name_list)
+            else lossy_state.within_off_per_name
+        )
+        name_to_ageoff = {
+            nm: int(age_offs[i])
             for i, nm in enumerate(lossy_state.name_list)
         }
         name_to_idx = {nm: i for i, nm in enumerate(lossy_state.name_list)}
@@ -238,6 +243,7 @@ class AosEmitter:
             for (tname_f, _t_off, _bf16_g, _src_off, _n_recs) in filtered:
                 name_idx = int(name_to_idx.get(tname_f, -1))
                 within_off = int(name_to_winoff.get(tname_f, 0))
+                age_off = int(name_to_ageoff.get(tname_f, within_off))
                 if 0 <= name_idx < len(lossy_state.group_count_per_name):
                     group_count = int(lossy_state.group_count_per_name[name_idx])
                 else:
@@ -255,6 +261,7 @@ class AosEmitter:
                     expert_record_capacity=0,
                     expert_record_byte_off=0,
                     entry_within_off=within_off,
+                    entry_age_off=age_off,
                 ))
 
         device = _lossy_state_device(lossy_state)
