@@ -29,9 +29,10 @@ R2_LARGE_ALLOC_COUNT = 10     # if it happens > 10 times in trace window (= many
 R3_TOLERANCE_MB = 100.0
 R4_SLOPE_LIMIT_MB_PER_ITER = 1.0
 R4_WASTE_FACTOR = 1.5
-# Steady-state iter range for R2/R4 (short-iter mode: exit-interval=30,
-# warmup ~5 iters, anchor every 5).
-STEADY_LO = 10
+# Steady-state iter range for R2/R4.  Short H100/MoE runs can release
+# training-owned lazy workspaces around iter 10-11 on only some ranks, so start
+# after that cold-free edge when evaluating proposal-owned steady state.
+STEADY_LO = 12
 STEADY_HI = 25
 
 

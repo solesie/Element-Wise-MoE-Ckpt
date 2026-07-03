@@ -448,6 +448,28 @@ class FCManager:
                     self._expert_partition_fragments_by_expert or None
                 ),
             )
+            if commit_expert_lossy_records:
+                self._warm_lfcl_adam_source_cache_once()
+                if cp_target == "test_dram":
+                    seeded = self._expert_state.seed_test_dram_dense_image_from_live(
+                        self._lfcl_field_cache_by_expert,
+                        step=0,
+                    )
+                    print(
+                        f"[proposal] ExpertState test_dram initial dense seed: "
+                        f"{seeded}/{len(expert_tensor_map)} experts",
+                        flush=True,
+                    )
+                elif fresh_expert_state and not bool(test_skip_expert_d2h):
+                    bootstrapped = self._bootstrap_expert_lfcl_baselines(
+                        expert_tensor_map,
+                        step=0,
+                    )
+                    print(
+                        f"[proposal] ExpertState disk/FDP initial LFCL bootstrap: "
+                        f"{bootstrapped}/{len(expert_tensor_map)} experts",
+                        flush=True,
+                    )
         self._init_nonexpert_pinned_buffers()
 
     # ------------------------------------------------------------------
@@ -912,6 +934,39 @@ class FCManager:
         except Exception:
             batch_ready.set()
             raise
+
+    # ------------------------------------------------------------------
+    def _bootstrap_expert_lfcl_baselines(
+        self,
+        expert_tensor_map: Dict[ExpertId, List[Tuple[str, torch.Size, int]]],
+        *,
+        step: int = 0,
+    ) -> int:
+        state = self._expert_state
+        if state is None:
+            return 0
+        bootstrapped = 0
+        for expert_id in sorted(expert_tensor_map):
+            tnames = [
+                str(tname)
+                for tname, _shape, _numel in expert_tensor_map.get(expert_id, [])
+            ]
+            batch_info = self.collect_lfcl_batch_payload(
+                [(expert_id, tnames)],
+                ready_event=None,
+            )
+            if batch_info is None:
+                continue
+            state.compact_lossy_recovery_images_from_pinned_batch(
+                step=int(step),
+                batch_info=batch_info,
+                cuda_event=self._last_lfcl_batch_cuda_event,
+                commit_payload=True,
+            )
+            bootstrapped += 1
+        if self._checkpoint_workers is not None:
+            self._checkpoint_workers.drain_expert_write()
+        return int(bootstrapped)
 
     # ------------------------------------------------------------------
     def fire_nonexpert_fc_if_due(

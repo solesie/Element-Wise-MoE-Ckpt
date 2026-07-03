@@ -266,6 +266,107 @@ def test_pinned_aos_capacity_uses_local_worst_case(tmp_path: Path):
     state.shutdown()
 
 
+def test_test_dram_initial_seed_makes_all_experts_recoverable(tmp_path: Path):
+    expert_map = {
+        (0, 0): [("expert0.w", torch.Size([4]), 4)],
+        (0, 1): [("expert1.w", torch.Size([4]), 4)],
+    }
+    state = ExpertState(
+        expert_map,
+        output_dir=tmp_path,
+        fresh=True,
+        cp_target="test_dram",
+    )
+    try:
+        assert state.read((0, 0)) is None
+        fields = {
+            (0, 0): [{
+                "name": "expert0.w",
+                "numel": 4,
+                "param_src": torch.arange(4, dtype=torch.float32) + 1.0,
+                "exp_avg": torch.arange(4, dtype=torch.float32) + 10.0,
+                "exp_avg_sq": torch.arange(4, dtype=torch.float32) + 20.0,
+            }],
+            (0, 1): [{
+                "name": "expert1.w",
+                "numel": 4,
+                "param_src": torch.arange(4, dtype=torch.float32) + 101.0,
+                "exp_avg": None,
+                "exp_avg_sq": None,
+            }],
+        }
+        assert state.seed_test_dram_dense_image_from_live(fields, step=0) == 2
+        p0 = state.read((0, 0))
+        p1 = state.read((0, 1))
+        assert p0 is not None
+        assert p1 is not None
+        assert p0["expert0.w:param"].reshape(-1).tolist() == pytest.approx(
+            [1.0, 2.0, 3.0, 4.0],
+        )
+        assert p0["expert0.w:exp_avg"].reshape(-1).tolist() == pytest.approx(
+            [10.0, 11.0, 12.0, 13.0],
+        )
+        assert p1["expert1.w:param"].reshape(-1).tolist() == pytest.approx(
+            [101.0, 102.0, 103.0, 104.0],
+        )
+        assert p1["expert1.w:exp_avg"].reshape(-1).tolist() == pytest.approx(
+            [0.0, 0.0, 0.0, 0.0],
+        )
+    finally:
+        state.shutdown()
+
+
+def test_test_dram_partition_seed_reads_zero12_frag_payload(tmp_path: Path):
+    expert_map = {
+        (0, 0): [
+            ("frag0", torch.Size([2]), 2),
+            ("frag1", torch.Size([2]), 2),
+        ],
+    }
+    fragments = {
+        (0, 0): [
+            {"index": 0, "fragment_name": "frag0"},
+            {"index": 1, "fragment_name": "frag1"},
+        ],
+    }
+    state = ExpertState(
+        expert_map,
+        output_dir=tmp_path,
+        fresh=True,
+        cp_target="test_dram",
+        partition_fragments_by_expert=fragments,
+    )
+    try:
+        fields = {
+            (0, 0): [
+                {
+                    "name": "frag0",
+                    "numel": 2,
+                    "param_src": torch.tensor([1.0, 2.0]),
+                    "exp_avg": torch.tensor([3.0, 4.0]),
+                    "exp_avg_sq": torch.tensor([5.0, 6.0]),
+                },
+                {
+                    "name": "frag1",
+                    "numel": 2,
+                    "param_src": torch.tensor([7.0, 8.0]),
+                    "exp_avg": torch.tensor([9.0, 10.0]),
+                    "exp_avg_sq": torch.tensor([11.0, 12.0]),
+                },
+            ],
+        }
+        assert state.seed_test_dram_dense_image_from_live(fields, step=0) == 1
+        payload = state.read((0, 0))
+        assert payload is not None
+        assert payload["_payload_kind"] == "zero12_expert_partition"
+        assert payload["frag0:param"].tolist() == pytest.approx([1.0, 2.0])
+        assert payload["frag0:exp_avg"].tolist() == pytest.approx([3.0, 4.0])
+        assert payload["frag1:param"].tolist() == pytest.approx([7.0, 8.0])
+        assert payload["frag1:exp_avg_sq"].tolist() == pytest.approx([11.0, 12.0])
+    finally:
+        state.shutdown()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_direct_emission_cursor_cap_prevents_pinned_aos_overflow(tmp_path: Path):
     expert_map = {(0, 0): [("mlp.w", torch.Size([1024]), 1024)]}

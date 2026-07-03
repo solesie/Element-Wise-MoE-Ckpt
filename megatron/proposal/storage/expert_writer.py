@@ -611,6 +611,63 @@ class ExpertState:
             names = [x[2] for x in intervals]
             self._dense_interval_cache[eid] = (starts, ends, names)
 
+    @torch.no_grad()
+    def seed_test_dram_dense_image_from_live(
+        self,
+        fields_by_expert: Dict[ExpertId, List[Dict[str, Any]]],
+        *,
+        step: int = 0,
+    ) -> int:
+        """Seed test_dram dense recovery image from live local FP32 views.
+
+        test_dram recovery has no disk LFCL bootstrap.  Without this initial
+        image, experts that have not yet fired LFCL are invisible to recovery
+        and an in-process synthetic fault can leave exact live state behind.
+        """
+
+        if self.cp_target != "test_dram" or not self.commit_lossy_records:
+            return 0
+        seeded = 0
+        for eid, ent in self._entries.items():
+            buffers = self._dense_buffers.get(eid)
+            fields = fields_by_expert.get(eid)
+            if not buffers or not fields:
+                continue
+            for field in fields:
+                name = str(field.get("name", ""))
+                buf = buffers.get(name)
+                if buf is None:
+                    continue
+                n = int(buf["numel"])
+                sources = (
+                    ("p", field.get("param_src")),
+                    ("m", field.get("exp_avg")),
+                    ("v", field.get("exp_avg_sq")),
+                )
+                for dst_key, src in sources:
+                    dst = buf[dst_key]
+                    if src is None:
+                        dst.zero_()
+                        continue
+                    src_flat = src.detach().reshape(-1)
+                    if int(src_flat.numel()) != n:
+                        raise RuntimeError(
+                            "test_dram seed source length mismatch for "
+                            f"{eid} {name} {dst_key}: "
+                            f"src={src_flat.numel()} dst={n}"
+                        )
+                    if src_flat.dtype != torch.float32:
+                        raise RuntimeError(
+                            "test_dram seed requires existing FP32 live "
+                            f"source for {eid} {name} {dst_key}; got "
+                            f"{src_flat.dtype}"
+                        )
+                    dst.copy_(src_flat, non_blocking=False)
+            ent.step = int(step)
+            ent.lossless_step = max(int(ent.lossless_step), int(step))
+            seeded += 1
+        return int(seeded)
+
     # ------------------------------------------------------------------
     # I/O dispatch helper — route to expert_writer if present,
     # else execute synchronously (test / offline path).
@@ -1798,6 +1855,23 @@ class ExpertState:
         if tensor_buffers is None:
             return None
         out: Dict[str, torch.Tensor] = {}
+        if ent.partition_fragments:
+            out["_payload_kind"] = "zero12_expert_partition"
+            out["_fragments"] = list(ent.partition_fragments)
+            for frag in ent.partition_fragments:
+                frag_idx = int(frag["index"])
+                tname = str(frag["fragment_name"])
+                buf = tensor_buffers.get(tname)
+                if buf is None:
+                    continue
+                out[f"frag{frag_idx}:param"] = buf["p"].view(-1)
+                out[f"frag{frag_idx}:exp_avg"] = buf["m"].view(-1)
+                out[f"frag{frag_idx}:exp_avg_sq"] = buf["v"].view(-1)
+            out["_rolling_step"] = torch.tensor(
+                int(ent.step),
+                dtype=torch.long,
+            )
+            return out
         for tname, buf in tensor_buffers.items():
             shape = torch.Size(buf["shape"])
             out[f"{tname}:param"] = buf["p"].view(shape)
