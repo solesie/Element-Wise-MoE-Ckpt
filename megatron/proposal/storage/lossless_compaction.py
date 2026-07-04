@@ -87,6 +87,30 @@ class ExpertLosslessFC:
         self.last_phase_ms: Dict[str, float] = {}
         self.last_d2h_event: Optional[Any] = None
 
+    def _append_fire_log(self, step: int, fired: List[ExpertId]) -> None:
+        path_tmpl = os.environ.get("PROPOSAL_LFCL_FIRE_LOG", "")
+        if not path_tmpl or not fired:
+            return
+        rank = int(os.environ.get("RANK", "-1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = int(torch.distributed.get_rank())
+        path = path_tmpl.format(rank=rank, local_rank=local_rank)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        import json
+
+        record = {
+            "step": int(step),
+            "rank": rank,
+            "local_rank": local_rank,
+            "count": int(len(fired)),
+            "experts": [[int(layer), int(expert)] for layer, expert in fired],
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
     # ------------------------------------------------------------------
     @property
     def num_expert_slots(self) -> int:
@@ -281,6 +305,7 @@ class ExpertLosslessFC:
                 sub[k] = float(collect_sub.get(k, 0.0))
         sub["total_ms"] = (time.perf_counter() - _t0) * 1000.0
         self.last_phase_ms = sub
+        self._append_fire_log(int(step), fired)
         if os.environ.get("PROPOSAL_LFCL_PROFILE", "") in ("1", "true", "TRUE"):
             print(
                 f"[proposal] lfcl_profile @iter{int(step)}: "
