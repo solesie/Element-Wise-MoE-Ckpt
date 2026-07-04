@@ -1,0 +1,6 @@
+{"iter": 1, "estimator": "finite_diff", "expert_coverage": 1.0, "skip_ratio": 0.0, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 27.309989999821482}
+{"iter": 5, "estimator": "finite_diff", "expert_coverage": 0.5625, "skip_ratio": 0.4375, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 28.83579199988162}
+{"iter": 20, "estimator": "finite_diff", "expert_coverage": 0.6875, "skip_ratio": 0.3125, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 31.08351900004891}
+{"iter": 40, "estimator": "finite_diff", "expert_coverage": 0.9583333333333334, "skip_ratio": 0.041666666666666664, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 28.85861599997952}
+{"iter": 60, "estimator": "finite_diff", "expert_coverage": 0.9791666666666666, "skip_ratio": 0.020833333333333332, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 27.957433999972636}
+{"iter": 80, "estimator": "finite_diff", "expert_coverage": 1.0, "skip_ratio": 0.0, "eps": 0.001, "routing_freeze": true, "pipeline_fd_anchor": false, "vq_refresh_ms": 26.42375200002789}

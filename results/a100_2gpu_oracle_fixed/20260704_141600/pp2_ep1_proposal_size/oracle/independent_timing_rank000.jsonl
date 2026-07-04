@@ -1,0 +1,1 @@
+{"actual_batches": 2, "elapsed_ms": 3402.2582970001167, "hvp_batches": 1, "hvp_skip_reason": null, "mode": "independent_oracle_timing", "pipeline_engine": true, "rank": 0, "requested_hvp_batches": 1, "sample_elements": 32768, "step": 20}
