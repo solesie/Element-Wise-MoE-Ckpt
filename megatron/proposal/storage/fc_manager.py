@@ -5,7 +5,6 @@ name pattern ``...deepspeed_experts.{idx}...``.
 """
 from __future__ import annotations
 
-import re
 import os
 import threading
 import time
@@ -19,6 +18,7 @@ import math
 
 from ..runtime import CheckpointWorkerPool, WriteRecord, get_d2h_stream
 from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
+from ..expert_id import DS_EXPERT_IDX_RE, LAYER_RE, ids_from_name
 from ..refresh.fp32_state import get_mapper
 from .expert_writer import ExpertState, HEADER_BLOCK_BYTES
 from .expert_partition import build_expert_partition_plan
@@ -101,10 +101,6 @@ def _fp32_opt_state_lfcl_source(
             "refusing to materialize a full ZeRO state copy on the checkpoint path."
         )
     return optimizer.state.get(p, {}).get(key)
-
-
-LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
-DS_EXPERT_IDX_RE = re.compile(r"deepspeed_experts\.(\d+)\.")
 
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
@@ -480,12 +476,10 @@ class FCManager:
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            m_e = DS_EXPERT_IDX_RE.search(name)
-            if m_e is None:
+            ids = ids_from_name(name)
+            if ids is None:
                 continue
-            expert_idx = int(m_e.group(1))
-            m_l = LAYER_RE.search(name)
-            layer = int(m_l.group(1)) if m_l is not None else 0
+            layer, expert_idx = ids
             self._separated_tensors_by_slot.setdefault(
                 (layer, expert_idx), []
             ).append(name)

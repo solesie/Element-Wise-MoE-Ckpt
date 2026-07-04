@@ -2,11 +2,7 @@
 
 The active path ranks elements with one score:
 
-    default score(i) = max(0, -linear_i * e_hat_i + 0.5 * |H_i| * e_hat_i^2)
-
-where ``linear_i`` is selected by ``proposal_score_linear_source``.  The
-default source is the leased optimizer gradient, with momentum as an explicit
-fallback/legacy mode.
+    default score(i) = max(0, -m_i * e_hat_i + 0.5 * |H_i| * e_hat_i^2)
 
 ``LossyCpState`` holds the runtime views used by cutoff search and record
 write. ``LossyCheckpointPipeline`` owns one lossy checkpoint iteration.
@@ -153,16 +149,10 @@ class LossyCheckpointPipeline(
             if proposal_config is not None else DEFAULT_SCORE_POLICY
         )
         self.score_policy_id = int(score_policy_id(self.score_policy))
-        self.score_linear_source = str(
-            getattr(proposal_config, "score_linear_source", "grad")
-            if proposal_config is not None else "grad"
-        )
         self.e_hat_proxy = bool(
             getattr(proposal_config, "e_hat_proxy", True)
             if proposal_config is not None else True
         )
-        self._grad_score_lease = None
-        self._score_linear_release_pending = False
         self._current_global_step_for_selection = -1
         self._theta_cp_score_state = None
         # Production reads H through the quantile table. In hessian mode the
@@ -512,9 +502,6 @@ class LossyCheckpointPipeline(
 
     def tracked_names(self) -> List[str]:
         return list(self._tracked_names)
-
-    def set_grad_score_lease(self, lease: object) -> None:
-        self._grad_score_lease = lease
 
     def full_save_names(self) -> List[str]:
         return list(self._full_save_names)
@@ -1162,63 +1149,6 @@ class LossyCheckpointPipeline(
         self._flat_layout_done = True
 
     @torch.no_grad()
-    def _refresh_score_linear_views(self) -> None:
-        use_grad = str(getattr(self, "score_linear_source", "grad")) == "grad"
-        lease = getattr(self, "_grad_score_lease", None) if use_grad else None
-        self._score_linear_release_pending = bool(
-            lease is not None and getattr(lease, "has_leases", False)
-        )
-        cache_grad_for_oracle = bool(use_grad and self._independent_oracle_wants_grad_cache())
-        for grp in getattr(self, "_groups", ()) or ():
-            grp["score_linear_flat"] = None
-            if lease is None:
-                continue
-            m_flat = grp.get("m_flat")
-            if not isinstance(m_flat, torch.Tensor):
-                continue
-            view_for_group = getattr(lease, "view_for_group", None)
-            if view_for_group is None:
-                continue
-            view = view_for_group(
-                int(grp.get("optimizer_group_idx", grp.get("g_idx", -1))),
-                int(grp.get("optimizer_elem_offset", 0)),
-                int(m_flat.numel()),
-            )
-            if isinstance(view, torch.Tensor):
-                grp["score_linear_flat"] = view
-                if cache_grad_for_oracle:
-                    grp["g_score_flat"] = view.detach().clone()
-
-    def _independent_oracle_wants_grad_cache(self) -> bool:
-        cfg = getattr(self, "proposal_config", None)
-        if cfg is None or not bool(getattr(cfg, "independent_oracle_enable", False)):
-            return False
-        step = int(getattr(self, "_current_global_step_for_selection", -1))
-        if step < 0:
-            return False
-        iters = tuple(int(x) for x in getattr(cfg, "independent_oracle_iters", ()) or ())
-        return not iters or step in iters
-
-    def clear_independent_oracle_grad_cache(self) -> None:
-        for grp in getattr(self, "_groups", ()) or ():
-            grp.pop("g_score_flat", None)
-
-    def _release_score_linear_after_event(
-        self,
-        event: Optional["torch.cuda.Event"],
-    ) -> None:
-        lease = getattr(self, "_grad_score_lease", None)
-        if lease is None:
-            self._score_linear_release_pending = False
-            return
-        try:
-            lease.release_after(event)
-        finally:
-            self._score_linear_release_pending = False
-            for grp in getattr(self, "_groups", ()) or ():
-                grp["score_linear_flat"] = None
-
-    @torch.no_grad()
     def _refresh_lossy_cp_state_refs(self) -> None:
         """Refresh the V2 holder with the active tensor views.
 
@@ -1247,7 +1177,6 @@ class LossyCheckpointPipeline(
 
         device = self._selection_hist.device
         h_lut = self._ensure_h_lookup_lut(device=device)
-        self._refresh_score_linear_views()
 
         bf16_opt_groups: List[BF16OptGroupView] = []
         for grp in self._groups:
@@ -1259,7 +1188,6 @@ class LossyCheckpointPipeline(
             v_flat = grp.get("v_flat")
             p_flat = grp.get("p_flat")
             theta_cp_flat = grp.get("theta_cp_flat")
-            score_linear_flat = grp.get("score_linear_flat")
             if m_flat is None or v_flat is None or p_flat is None:
                 raise RuntimeError(
                     "LossyCpState requires m/v/p flat views for every group."
@@ -1270,7 +1198,6 @@ class LossyCheckpointPipeline(
                 p_flat=p_flat,
                 master_off_elem=int(grp["master_off"]) * int(self.group_size),
                 theta_cp_flat=theta_cp_flat,
-                score_linear_flat=score_linear_flat,
                 name_start=int(grp["start_name_in_grp"]),
                 name_end=int(grp["end_name_in_grp"]),
                 entry_elem_start=grp.get("entry_elem_start"),
@@ -1472,8 +1399,6 @@ class LossyCheckpointPipeline(
             selection_event=selection_event,
             d2h_event_callback=d2h_event_callback,
         )
-        if bool(getattr(self, "_score_linear_release_pending", False)):
-            self._release_score_linear_after_event(None)
         _t0_end = _time.perf_counter()
         phase_launch_ms = (_t0_end - _t0_dispatch_end) * 1000.0
         phase_setup_ms = (_t0_p1 - _t0_dispatch_end) * 1000.0

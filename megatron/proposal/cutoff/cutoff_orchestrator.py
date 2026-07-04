@@ -41,9 +41,6 @@ class CutoffOrchestrationMixin:
         step = getattr(self, "_last_vq_refresh_step", None)
         return -1 if step is None else int(step)
 
-    def _score_source_name(self) -> str:
-        return str(getattr(self, "score_linear_source", "grad"))
-
     def _set_selection_tau_meta(
         self,
         *,
@@ -213,7 +210,6 @@ class CutoffOrchestrationMixin:
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
                 p_flat=grp["p_flat"],
-                score_linear_flat=grp.get("score_linear_flat"),
                 theta_cp_flat=grp.get("theta_cp_flat"),
                 age2bit_words=age2bit_state.age_words,
                 ehat_geom_lut=age2bit_state.ehat_geom_lut,
@@ -275,7 +271,6 @@ class CutoffOrchestrationMixin:
                 m_flat=grp["m_flat"],
                 v_flat=grp["v_flat"],
                 p_flat=grp["p_flat"],
-                score_linear_flat=grp.get("score_linear_flat"),
                 theta_cp_flat=grp.get("theta_cp_flat"),
                 age2bit_words=age2bit_state.age_words,
                 ehat_geom_lut=age2bit_state.ehat_geom_lut,
@@ -586,7 +581,6 @@ class CutoffOrchestrationMixin:
             max_samples_for_group = max(1, min(max_samples_for_group, group_blocks))
             launch_generated_block_probe_for_group(
                 m_flat=grp["m_flat"],
-                score_linear_flat=grp.get("score_linear_flat"),
                 v_flat=grp["v_flat"],
                 p_flat=grp["p_flat"],
                 theta_cp_flat=grp.get("theta_cp_flat"),
@@ -841,7 +835,6 @@ class CutoffOrchestrationMixin:
                 max_samples_for_group = max(1, min(max_samples_for_group, group_blocks))
                 launch_generated_block_probe_for_group(
                     m_flat=grp["m_flat"],
-                    score_linear_flat=grp.get("score_linear_flat"),
                     v_flat=grp["v_flat"],
                     p_flat=grp["p_flat"],
                     theta_cp_flat=grp.get("theta_cp_flat"),

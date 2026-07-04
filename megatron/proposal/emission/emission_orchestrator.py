@@ -198,11 +198,6 @@ class EmissionOrchestrationMixin:
             ))
 
         if bool(getattr(self, "test_expert_selection_only", False)):
-            release_score_linear = getattr(
-                self, "_release_score_linear_after_event", None,
-            )
-            if callable(release_score_linear):
-                release_score_linear(selection_event)
             if d2h_event_callback is not None:
                 if torch.cuda.is_available():
                     event_no_aos = self._acquire_ring_event("compute")
@@ -249,15 +244,7 @@ class EmissionOrchestrationMixin:
                 bf16_groups_mvph=static_inputs["mvph"],
                 name_list=static_inputs["name_list"],
                 group_size=int(group_size),
-                score_linear_groups=tuple(
-                    grp.get("score_linear_flat") for grp in self._groups
-                ),
                 theta_cp_groups=static_inputs["theta_cp_groups"],
-                score_linear_release=getattr(
-                    self,
-                    "_release_score_linear_after_event",
-                    None,
-                ),
                 within_off_per_name=static_inputs["within_off_per_name"],
                 age_off_per_name=static_inputs["age_off_per_name"],
                 group_count_per_name=static_inputs["group_count_per_name"],
@@ -324,8 +311,4 @@ class EmissionOrchestrationMixin:
                 d2h_event_callback=d2h_event_callback,
             )
         else:
-            release_score_linear = getattr(
-                self, "_release_score_linear_after_event", None,
-            )
-            if callable(release_score_linear):
-                release_score_linear(selection_event)
+            return

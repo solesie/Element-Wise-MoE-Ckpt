@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from ..expert_id import DS_EXPERT_IDX_RE as _DS_EXPERT_IDX_RE
+from ..expert_id import ids_from_name as _ids_from_param_name
 from ..refresh.fp32_state import get_mapper
 
 
@@ -36,20 +38,7 @@ _NONEXPERT_FC_SHARD_RE = re.compile(
 _NONEXPERT_FC_LEGACY_EP_SHARD_RE = re.compile(
     r"^fc_nonexpert_ep(\d+)of(\d+)_iter(\d+)\.bin$"
 )
-_LAYER_IN_NAME = re.compile(r"\.layers\.(\d+)\.")
-_DS_EXPERT_IDX_RE = re.compile(r"deepspeed_experts\.(\d+)\.")
-
-
 ExpertId = Tuple[int, int]
-
-
-def _ids_from_param_name(name: str) -> Optional[ExpertId]:
-    m_e = _DS_EXPERT_IDX_RE.search(name)
-    if m_e is None:
-        return None
-    m_l = _LAYER_IN_NAME.search(name)
-    layer = int(m_l.group(1)) if m_l is not None else 0
-    return (layer, int(m_e.group(1)))
 
 
 @dataclass

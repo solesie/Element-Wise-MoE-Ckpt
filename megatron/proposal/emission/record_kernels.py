@@ -9,7 +9,7 @@ cutoff wrappers are not part of this module.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -61,9 +61,7 @@ class LossyRecordWriteInputs:
     bf16_groups_mvph: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
     name_list: List[str]
     group_size: int
-    score_linear_groups: Optional[List[Optional[torch.Tensor]]] = None
     theta_cp_groups: Optional[List[Optional[torch.Tensor]]] = None
-    score_linear_release: Optional[Callable[[Optional["torch.cuda.Event"]], None]] = None
     within_off_per_name: List[int] = field(default_factory=list)
     age_off_per_name: List[int] = field(default_factory=list)
     group_count_per_name: List[int] = field(default_factory=list)
@@ -564,7 +562,6 @@ def launch_direct_records_for_segment_entry_workqueue(
     m_view: torch.Tensor,
     v_view: torch.Tensor,
     p_view: torch.Tensor,
-    score_linear_view: Optional[torch.Tensor] = None,
     h_lut_values: torch.Tensor,
     h_lut_log_v_min: torch.Tensor,
     h_lut_inv_log_v_width: torch.Tensor,
@@ -640,7 +637,7 @@ def launch_direct_records_for_segment_entry_workqueue(
     workers = min(max_tasks, _direct_emit_worker_count(record_out_i32))
     _write_direct_records_segment_workqueue_kernel[(workers,)](
         m_view,
-        score_linear_view if score_linear_view is not None else m_view,
+        m_view,
         v_view,
         p_view,
         theta_cp_view if theta_cp_view is not None else p_view,

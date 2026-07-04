@@ -51,8 +51,6 @@ def collect_autograd_gold_sample(
     checkpoint_tensor_for_name: Callable[..., Optional[torch.Tensor]],
     restore_current_params: Callable[[Any], None],
     restore_rng_state: Callable[[Dict[str, Any]], None],
-    linear_key: str,
-    linear_name: str,
     iteration: int,
     rank: int,
 ) -> GoldSample:
@@ -222,7 +220,7 @@ def collect_autograd_gold_sample(
     e = np.asarray(sample_payload["e"], dtype=np.float32)
     v = np.asarray(sample_payload.get("v", np.zeros_like(e)), dtype=np.float32)
     h_lut = np.asarray(sample_payload["h_abs"], dtype=np.float32)
-    cached_linear = np.asarray(sample_payload["g" if linear_name == "g" else "m"], dtype=np.float32)
+    cached_linear = np.asarray(sample_payload["m"], dtype=np.float32)
     e_age = np.asarray(sample_payload["e_age"], dtype=np.float32)
     global_id = np.asarray(sample_payload.get("global_id", np.zeros_like(e, dtype=np.int64)), dtype=np.int64)
     sqrt_v = np.sqrt(np.maximum(v, np.float32(0.0)), dtype=np.float32)
@@ -310,7 +308,11 @@ def _sample_entries_by_spec(specs: Sequence[Dict[str, Any]], sample: Dict[str, A
             hi = int(np.searchsorted(local_offsets, end, side="left"))
             if hi <= lo:
                 continue
-            offsets_np = local_offsets[lo:hi] - np.int64(start)
+            offsets_np = (
+                local_offsets[lo:hi]
+                - np.int64(start)
+                + np.int64(int(spec.get("param_offset", 0) or 0))
+            )
             entries.append(_SampleEntry(
                 spec_index=int(spec_idx),
                 positions=positions[lo:hi].astype(np.int64, copy=True),
@@ -370,21 +372,29 @@ def _dot_grads_with_current_error(
             continue
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
-        p = grp["p_flat"].narrow(0, off, n)
+        logical_off = int(spec["local_off"])
+        elem_off = int(spec.get("elem_off", logical_off) or 0)
+        age_off = int(spec.get("age_off", logical_off) or 0)
+        p = grp["p_flat"].narrow(0, elem_off, n)
         c = checkpoint_tensor_for_name(
             lossy_cp,
             grp,
             str(spec["name"]),
-            off,
+            logical_off,
             n,
+            checkpoint_off=age_off,
             device=p.device,
             dtype=p.dtype,
         )
         if c is None:
             continue
         e = (p.detach().float() - c.detach().float()).reshape(-1)
-        term = torch.sum(grad.reshape(-1).float() * e)
+        grad_slice = grad.reshape(-1).narrow(
+            0,
+            int(spec.get("param_offset", 0) or 0),
+            n,
+        ).float()
+        term = torch.sum(grad_slice * e)
         total = term if total is None else total + term
     if total is None:
         device = specs[0]["param"].device if specs else torch.device("cpu")

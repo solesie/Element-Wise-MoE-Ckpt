@@ -58,7 +58,6 @@ class ProposalConfig:
     group_size: int
     selection_mode: str
     score_policy: str
-    score_linear_source: str
     e_hat_proxy: bool = True
 
     # Selection cutoff search.
@@ -136,12 +135,6 @@ class ProposalConfig:
             raise ValueError(
                 "proposal_score_policy must be one of "
                 f"{valid_score_policies}; got {score_policy!r}"
-            )
-        score_linear_source = getattr(args, "proposal_score_linear_source", "grad")
-        if score_linear_source not in ("grad", "momentum"):
-            raise ValueError(
-                "proposal_score_linear_source must be 'grad' or 'momentum'; "
-                f"got {score_linear_source!r}"
             )
         cp_mode = getattr(args, "proposal_cp_mode", "proposal")
         if cp_mode not in ("proposal", "sequential"):
@@ -221,7 +214,6 @@ class ProposalConfig:
             group_size=max(1, int(getattr(args, "proposal_block_quant_g", 8))),
             selection_mode=str(selection_mode),
             score_policy=str(score_policy),
-            score_linear_source=str(score_linear_source),
             e_hat_proxy=not bool(
                 getattr(args, "proposal_e_hat_proxy_off", False)
             ),

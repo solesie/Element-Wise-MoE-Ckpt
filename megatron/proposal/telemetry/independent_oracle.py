@@ -29,6 +29,9 @@ from .ideal_oracle import (
 )
 
 _SNAPSHOT_ATTR = "_independent_oracle_live_param_snapshot"
+_PRODUCTION_FIRST_ORDER_SOURCE = "momentum"
+_PRODUCTION_FIRST_ORDER_KEY = "m_flat"
+_PRODUCTION_FIRST_ORDER_NAME = "m_t"
 
 
 def independent_oracle_enabled(proposal_config: Any, iteration: int) -> bool:
@@ -68,9 +71,8 @@ def run_independent_oracle(
     m0 = model[0] if isinstance(model, (list, tuple)) else model
     pipeline_engine = bool(_is_pipeline_engine(m0))
     hvp_skip_reason = None
-    score_source = str(getattr(proposal_config, "score_linear_source", "grad"))
-    self_linear_key = "g_score_flat" if score_source == "grad" else "m_flat"
-    self_linear_name = "g" if score_source == "grad" else "m_t"
+    score_source = _PRODUCTION_FIRST_ORDER_SOURCE
+    first_order_name = _PRODUCTION_FIRST_ORDER_NAME
     batch_seed = int(getattr(proposal_config, "independent_oracle_batch_seed", 20240625) or 20240625)
     outer_rng = _capture_rng_state()
     prev_snapshot = getattr(lossy_cp, _SNAPSHOT_ATTR, None)
@@ -116,7 +118,7 @@ def run_independent_oracle(
         )
 
         e_stats = _full_e_stats(lossy_cp)
-        r1_self = _full_linear_dot(lossy_cp, linear_key=self_linear_key)
+        r1_self = _full_first_order_dot(lossy_cp)
         r2_full = None
         residual_self_full = None
         hvp_sample: Optional[np.ndarray] = None
@@ -141,8 +143,6 @@ def run_independent_oracle(
                     sample=sample,
                     loss_base=float(loss_base),
                     loss_base_batches=loss_base_batches,
-                    linear_key=self_linear_key,
-                    linear_name=self_linear_name,
                     proposal_config=proposal_config,
                     iteration=int(iteration),
                     rank=rank,
@@ -159,7 +159,7 @@ def run_independent_oracle(
                 )
             residual_self_full = float(actual_remaining) - (float(r1_self) + float(r2_full))
 
-        age_terms = _full_agebit_proxy_terms(lossy_cp, linear_key=self_linear_key)
+        age_terms = _full_agebit_proxy_terms(lossy_cp)
         r1_age_self = None
         r2_age_diag = None
         residual_self_agebit = None
@@ -174,8 +174,8 @@ def run_independent_oracle(
             "step": int(iteration),
             "rank": int(rank),
             "world": int(world),
-            "policy": f"{self_linear_name}+diag_abs_h+agebit",
-            "score_linear_source": score_source,
+            "policy": f"{first_order_name}+diag_abs_h+agebit",
+            "score_first_order_source": score_source,
             "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
             "batch_seed": int(batch_seed),
             "loss_base": float(loss_base),
@@ -198,7 +198,7 @@ def run_independent_oracle(
             "e_global_l2": float(e_stats["global_l2"]),
             "e_global_abs_mean": float(e_stats["global_abs_mean"]),
             "e_global_max": float(e_stats["global_max"]),
-            "R1_self_name": self_linear_name,
+            "R1_self_name": first_order_name,
             "R1_self_true_e": float(r1_self),
             "R2_full_hvp_true_e": float(r2_full) if r2_full is not None else None,
             "residual_actual_minus_self_true_e_hvp": (
@@ -217,7 +217,6 @@ def run_independent_oracle(
             "residual_actual_minus_self_agebit_diag_abs_h": (
                 float(residual_self_agebit) if residual_self_agebit is not None else None
             ),
-            "g_score_available": bool(_linear_key_available(lossy_cp, "g_score_flat")),
             "actual_batches": int(len(loss_bank)),
             "hvp_batches": int(min(hvp_batches, len(loss_bank))),
             "requested_hvp_batches": int(requested_hvp_batches),
@@ -235,6 +234,7 @@ def run_independent_oracle(
             iteration=int(iteration),
             rank=rank,
             world=world,
+            score_source=score_source,
         )
         for rank_row in rank_rows:
             _append_jsonl(log_dir / f"independent_rank_rank{rank:03d}.jsonl", rank_row)
@@ -246,7 +246,7 @@ def run_independent_oracle(
                     "step": int(iteration),
                     "rank": int(rank),
                     "world": int(world),
-                    "score_linear_source": score_source,
+                    "score_first_order_source": score_source,
                     "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
                     "enabled": True,
                     "status": "skip",
@@ -266,8 +266,6 @@ def run_independent_oracle(
                     checkpoint_tensor_for_name=_checkpoint_tensor_for_name,
                     restore_current_params=_restore_current_params,
                     restore_rng_state=_restore_rng_state,
-                    linear_key=self_linear_key,
-                    linear_name=self_linear_name,
                     iteration=int(iteration),
                     rank=rank,
                 )
@@ -276,7 +274,7 @@ def run_independent_oracle(
                     "step": int(iteration),
                     "rank": int(rank),
                     "world": int(world),
-                    "score_linear_source": score_source,
+                    "score_first_order_source": score_source,
                     "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
                     **gold.meta,
                 })
@@ -288,7 +286,7 @@ def run_independent_oracle(
                     rank=rank,
                     world=world,
                     score_source=score_source,
-                    linear_name=self_linear_name,
+                    first_order_name=first_order_name,
                 ):
                     _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", gold_row)
 
@@ -386,6 +384,114 @@ def _grad_slice_for_spec(raw_grad: torch.Tensor, spec: Dict[str, Any]) -> torch.
     off = int(spec.get("param_offset", 0) or 0)
     n = int(spec["n"])
     return raw_grad.detach().reshape(-1).narrow(0, off, n)
+
+
+def _group_entry_specs(
+    lossy_cp: Any,
+    group_idx: int,
+    grp: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return the same entry geometry used by production score/write kernels.
+
+    ``elem_off`` addresses live optimizer flat views (p/m/v/g), while
+    ``age_off`` addresses the compact theta/age space.  They are identical in
+    simple layouts, but diverge under expert partitioning / ZeRO flat groups.
+    ``logical_off`` is only the compact per-group coordinate used for sampling.
+    """
+
+    g = max(1, int(getattr(lossy_cp, "group_size", 1)))
+    master_base_elem = int(grp.get("master_off", 0)) * int(g)
+    tname_list = list(getattr(lossy_cp, "_tname_list", ()) or ())
+    elem_starts = list(grp.get("entry_elem_start_host", ()) or ())
+    age_starts = list(grp.get("entry_age_elem_start_host", ()) or ())
+    counts = list(grp.get("entry_group_count_host", ()) or ())
+    name_idxs = list(grp.get("entry_name_idx_host", ()) or ())
+    specs: List[Dict[str, Any]] = []
+
+    if (
+        elem_starts
+        and len(elem_starts) == len(age_starts) == len(counts) == len(name_idxs)
+    ):
+        group_names = list(grp.get("names", ()) or ())
+        for entry_idx, (elem_start, age_start, count, name_idx) in enumerate(
+            zip(elem_starts, age_starts, counts, name_idxs)
+        ):
+            n = int(count) * int(g)
+            if n <= 0:
+                continue
+            ni = int(name_idx)
+            if 0 <= ni < len(tname_list):
+                name = str(tname_list[ni])
+            elif entry_idx < len(group_names):
+                name = str(group_names[entry_idx])
+            else:
+                name = str(ni)
+            specs.append({
+                "group_idx": int(group_idx),
+                "grp": grp,
+                "name": name,
+                "entry_idx": int(entry_idx),
+                "name_idx": int(ni),
+                "logical_off": int(age_start) - int(master_base_elem),
+                "local_off": int(age_start) - int(master_base_elem),
+                "elem_off": int(elem_start),
+                "age_off": int(age_start),
+                "n": int(n),
+            })
+        return specs
+
+    logical_off = 0
+    flat_off = 0
+    for entry_idx, (name, size) in enumerate(zip(grp.get("names", ()), grp.get("sizes", ()))):
+        size_i = int(size)
+        n = (size_i // int(g)) * int(g)
+        if n > 0:
+            specs.append({
+                "group_idx": int(group_idx),
+                "grp": grp,
+                "name": str(name),
+                "entry_idx": int(entry_idx),
+                "name_idx": int(entry_idx),
+                "logical_off": int(logical_off),
+                "local_off": int(logical_off),
+                "elem_off": int(flat_off),
+                "age_off": int(master_base_elem) + int(logical_off),
+                "n": int(n),
+            })
+            logical_off += int(n)
+        flat_off += int(size_i)
+    return specs
+
+
+def _elem_off(spec: Dict[str, Any]) -> int:
+    return int(spec.get("elem_off", spec.get("local_off", 0)) or 0)
+
+
+def _age_off(spec: Dict[str, Any]) -> int:
+    return int(spec.get("age_off", spec.get("local_off", 0)) or 0)
+
+
+def _logical_off(spec: Dict[str, Any]) -> int:
+    return int(spec.get("logical_off", spec.get("local_off", 0)) or 0)
+
+
+def _checkpoint_tensor_for_spec(
+    lossy_cp: Any,
+    spec: Dict[str, Any],
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    return _checkpoint_tensor_for_name(
+        lossy_cp,
+        spec["grp"],
+        str(spec["name"]),
+        _logical_off(spec),
+        int(spec["n"]),
+        checkpoint_off=_age_off(spec),
+        device=device,
+        dtype=dtype,
+    )
 
 
 class _LiveParamSnapshot:
@@ -593,6 +699,7 @@ def _checkpoint_tensor_for_name(
     local_off: int,
     n: int,
     *,
+    checkpoint_off: Optional[int] = None,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> Optional[torch.Tensor]:
@@ -607,11 +714,12 @@ def _checkpoint_tensor_for_name(
     n = int(n)
     if n <= 0:
         return None
+    cp_off = int(local_off if checkpoint_off is None else checkpoint_off)
     c_flat = grp.get("theta_cp_flat")
     if isinstance(c_flat, torch.Tensor):
-        if int(local_off) < 0 or int(local_off) + n > int(c_flat.numel()):
+        if cp_off < 0 or cp_off + n > int(c_flat.numel()):
             return None
-        out = c_flat.detach().reshape(-1).narrow(0, int(local_off), n)
+        out = c_flat.detach().reshape(-1).narrow(0, cp_off, n)
     else:
         expert_state = getattr(lossy_cp, "_expert_state", None)
         dense_buffers = getattr(expert_state, "_dense_buffers", None)
@@ -638,24 +746,45 @@ def _checkpoint_values_for_offsets(
     lossy_cp: Any,
     grp: Dict[str, Any],
     local_offsets: np.ndarray,
+    *,
+    checkpoint_offsets: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     local_offsets = np.asarray(local_offsets, dtype=np.int64).reshape(-1)
+    cp_offsets = (
+        local_offsets
+        if checkpoint_offsets is None
+        else np.asarray(checkpoint_offsets, dtype=np.int64).reshape(-1)
+    )
     out = np.zeros(local_offsets.shape[0], dtype=np.float32)
     if local_offsets.size == 0:
         return out
+    if cp_offsets.shape[0] != local_offsets.shape[0]:
+        raise ValueError("checkpoint_offsets must have the same length as local_offsets")
     c_flat = grp.get("theta_cp_flat")
     if isinstance(c_flat, torch.Tensor):
-        idx = torch.as_tensor(local_offsets, dtype=torch.long, device=c_flat.device)
+        idx = torch.as_tensor(cp_offsets, dtype=torch.long, device=c_flat.device)
         return torch.index_select(c_flat.detach().reshape(-1), 0, idx).detach().float().cpu().numpy()
 
-    local_base = 0
-    for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-        n = int(size)
+    group_idx = -1
+    for i, cand in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
+        if cand is grp:
+            group_idx = int(i)
+            break
+    for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+        local_base = _logical_off(spec)
+        n = int(spec["n"])
         lo = int(np.searchsorted(local_offsets, local_base, side="left"))
         hi = int(np.searchsorted(local_offsets, local_base + n, side="left"))
         if hi > lo:
             offsets = local_offsets[lo:hi] - np.int64(local_base)
-            cp = _checkpoint_tensor_for_name(lossy_cp, grp, str(name), local_base, n)
+            cp = _checkpoint_tensor_for_name(
+                lossy_cp,
+                grp,
+                str(spec["name"]),
+                local_base,
+                n,
+                checkpoint_off=_age_off(spec),
+            )
             if cp is not None:
                 if cp.is_cuda:
                     idx = torch.as_tensor(offsets, dtype=torch.long, device=cp.device)
@@ -665,23 +794,18 @@ def _checkpoint_values_for_offsets(
                     out[lo:hi] = cp.detach().reshape(-1).cpu().numpy()[offsets].astype(
                         np.float32, copy=False,
                     )
-        local_base += n
     return out
 
 
 @torch.no_grad()
 def _set_params_to_checkpoint(lossy_cp: Any) -> None:
     for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(spec["name"]))
             if param is not None and n > 0:
-                src = _checkpoint_tensor_for_name(
-                    lossy_cp, grp, str(name), local_off, n,
-                )
+                src = _checkpoint_tensor_for_spec(lossy_cp, spec)
                 if src is None:
-                    local_off += n
                     continue
                 _copy_flat_to_param(
                     param,
@@ -689,7 +813,6 @@ def _set_params_to_checkpoint(lossy_cp: Any) -> None:
                     param_offset=param_offset,
                     n=min(n, param_n),
                 )
-            local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -700,44 +823,37 @@ def _restore_current_params(lossy_cp: Any) -> None:
     if snapshot is not None:
         snapshot.restore()
         return
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         p_flat = grp.get("p_flat")
         if p_flat is None:
             continue
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(spec["name"]))
             if param is not None and n > 0:
                 _copy_flat_to_param(
                     param,
-                    p_flat.narrow(0, local_off, n),
+                    p_flat.narrow(0, _elem_off(spec), n),
                     param_offset=param_offset,
                     n=min(n, param_n),
                 )
-            local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 @torch.no_grad()
 def _set_params_perturbed(lossy_cp: Any, *, scale: float) -> None:
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         p_flat = grp.get("p_flat")
         if p_flat is None:
             continue
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(spec["name"]))
             if param is not None and n > 0:
-                p = p_flat.narrow(0, local_off, n)
-                c = _checkpoint_tensor_for_name(
-                    lossy_cp, grp, str(name), local_off, n,
-                    device=p.device, dtype=p.dtype,
-                )
+                p = p_flat.narrow(0, _elem_off(spec), n)
+                c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
                 if c is None:
-                    local_off += n
                     continue
                 value = p + float(scale) * (p - c)
                 _copy_flat_to_param(
@@ -746,7 +862,6 @@ def _set_params_perturbed(lossy_cp: Any, *, scale: float) -> None:
                     param_offset=param_offset,
                     n=min(n, param_n),
                 )
-            local_off += n
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -756,28 +871,22 @@ def _full_e_stats(lossy_cp: Any) -> Dict[str, float]:
     local_abs = 0.0
     local_max = 0.0
     local_n = 0
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         p = grp.get("p_flat")
         if p is None:
             continue
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
             if n <= 0:
-                local_off += n
                 continue
-            p_slice = p.narrow(0, local_off, n)
-            c = _checkpoint_tensor_for_name(
-                lossy_cp, grp, str(name), local_off, n,
-                device=p_slice.device, dtype=p_slice.dtype,
-            )
+            p_slice = p.narrow(0, _elem_off(spec), n)
+            c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p_slice.device, dtype=p_slice.dtype)
             if c is not None:
                 e = (p_slice - c).detach().float()
                 local_sumsq += float(torch.dot(e, e).detach().item())
                 local_abs += float(torch.sum(torch.abs(e)).detach().item())
                 local_max = max(local_max, float(torch.max(torch.abs(e)).detach().item()))
                 local_n += int(e.numel())
-            local_off += n
     global_sumsq = _all_reduce_sum_float(local_sumsq, group=getattr(lossy_cp, "_proposal_cpu_pg", None))
     global_abs = _all_reduce_sum_float(local_abs, group=getattr(lossy_cp, "_proposal_cpu_pg", None))
     global_n = _all_reduce_sum_int(local_n, group=getattr(lossy_cp, "_proposal_cpu_pg", None))
@@ -790,41 +899,36 @@ def _full_e_stats(lossy_cp: Any) -> Dict[str, float]:
     }
 
 
-def _full_linear_dot(lossy_cp: Any, *, linear_key: str) -> float:
+def _full_first_order_dot(lossy_cp: Any) -> float:
     local = 0.0
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         p = grp.get("p_flat")
-        lin = grp.get(linear_key)
+        lin = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
         if p is None or lin is None:
             continue
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
             if n <= 0:
-                local_off += n
                 continue
-            p_slice = p.narrow(0, local_off, n)
-            c = _checkpoint_tensor_for_name(
-                lossy_cp, grp, str(name), local_off, n,
-                device=p_slice.device, dtype=p_slice.dtype,
-            )
+            off = _elem_off(spec)
+            p_slice = p.narrow(0, off, n)
+            c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p_slice.device, dtype=p_slice.dtype)
             if c is not None:
                 e = (p_slice - c).detach().float()
-                linear = lin.narrow(0, local_off, n).detach().float()
+                linear = lin.narrow(0, off, n).detach().float()
                 local += float(torch.dot(-linear, e).detach().item())
-            local_off += n
     return _all_reduce_sum_float(local, group=getattr(lossy_cp, "_proposal_cpu_pg", None))
 
 
-def _linear_key_available(lossy_cp: Any, linear_key: str) -> bool:
+def _first_order_available(lossy_cp: Any) -> bool:
     for grp in getattr(lossy_cp, "_groups", ()) or ():
-        if isinstance(grp.get(linear_key), torch.Tensor):
+        if isinstance(grp.get(_PRODUCTION_FIRST_ORDER_KEY), torch.Tensor):
             return True
     return False
 
 
 @torch.no_grad()
-def _full_agebit_proxy_terms(lossy_cp: Any, *, linear_key: str) -> Optional[Tuple[float, float]]:
+def _full_agebit_proxy_terms(lossy_cp: Any) -> Optional[Tuple[float, float]]:
     h_lut = getattr(lossy_cp, "_h_lookup_lut", None)
     h_values = getattr(h_lut, "values", None)
     log_v_min = getattr(h_lut, "log_v_min", None)
@@ -843,7 +947,7 @@ def _full_agebit_proxy_terms(lossy_cp: Any, *, linear_key: str) -> Optional[Tupl
     bins = int(h_values.numel())
     if bins <= 0:
         return None
-    if not _linear_key_available(lossy_cp, linear_key):
+    if not _first_order_available(lossy_cp):
         return None
 
     lr_over_bc1 = float(getattr(lossy_cp, "_adam_lr_over_bc1_for_selection", 1.0e-4))
@@ -853,7 +957,6 @@ def _full_agebit_proxy_terms(lossy_cp: Any, *, linear_key: str) -> Optional[Tupl
     inv_w = inv_width.detach().float()
     flat_geom = geom_lut.detach().float().reshape(-1)
     h_vals = h_values.detach().float()
-    group_size = int(getattr(lossy_cp, "group_size", 1))
     chunk = max(1024, int(os.environ.get(
         "PROPOSAL_INDEPENDENT_ORACLE_PROXY_CHUNK",
         "4194304",
@@ -861,47 +964,55 @@ def _full_agebit_proxy_terms(lossy_cp: Any, *, linear_key: str) -> Optional[Tupl
 
     local_r1 = 0.0
     local_r2 = 0.0
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         m_all = grp.get("m_flat")
         v_all = grp.get("v_flat")
-        lin_all = grp.get(linear_key)
+        lin_all = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
         if not (
             isinstance(m_all, torch.Tensor)
             and isinstance(v_all, torch.Tensor)
             and isinstance(lin_all, torch.Tensor)
         ):
             continue
-        n_total = int(min(m_all.numel(), v_all.numel(), lin_all.numel()))
-        global_base = int(grp.get("master_off", 0)) * group_size
         device = v_all.device
-        for start in range(0, n_total, chunk):
-            n = min(chunk, n_total - start)
-            idx = torch.arange(start, start + n, device=device, dtype=torch.long)
-            global_idx = idx + int(global_base)
-            word_idx = torch.div(global_idx, 16, rounding_mode="floor")
-            valid = word_idx < int(age_words.numel())
-            age_code = torch.zeros(n, dtype=torch.long, device=device)
-            if bool(valid.any().item()):
-                words = torch.index_select(age_words, 0, word_idx[valid]).to(torch.int64)
-                shift = ((global_idx[valid] & 15) << 1).to(torch.int64)
-                age_code[valid] = (words >> shift) & 3
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            elem = _elem_off(spec)
+            age = _age_off(spec)
+            total = int(spec["n"])
+            if total <= 0:
+                continue
+            for rel_start in range(0, total, chunk):
+                n = min(chunk, total - rel_start)
+                global_idx = torch.arange(
+                    int(age) + rel_start,
+                    int(age) + rel_start + n,
+                    device=device,
+                    dtype=torch.long,
+                )
+                word_idx = torch.div(global_idx, 16, rounding_mode="floor")
+                valid = word_idx < int(age_words.numel())
+                age_code = torch.zeros(n, dtype=torch.long, device=device)
+                if bool(valid.any().item()):
+                    words = torch.index_select(age_words, 0, word_idx[valid]).to(torch.int64)
+                    shift = ((global_idx[valid] & 15) << 1).to(torch.int64)
+                    age_code[valid] = (words >> shift) & 3
 
-            m = m_all.narrow(0, start, n).detach().float()
-            v = v_all.narrow(0, start, n).detach().float()
-            linear = lin_all.narrow(0, start, n).detach().float()
-            pos = (torch.log(torch.clamp(v, min=1.0e-30)) - log_min) * inv_w
-            pos = torch.clamp(pos, min=0.0, max=float(bins - 1))
-            lo = torch.floor(pos).to(torch.long)
-            hi = torch.clamp(lo + 1, max=bins - 1)
-            frac = pos - lo.float()
-            h_abs = h_vals[lo] + frac * (h_vals[hi] - h_vals[lo])
-            geom_idx_lo = torch.clamp(age_code * bins + lo, max=int(flat_geom.numel()) - 1)
-            geom_idx_hi = torch.clamp(age_code * bins + hi, max=int(flat_geom.numel()) - 1)
-            geom = flat_geom[geom_idx_lo] + frac * (flat_geom[geom_idx_hi] - flat_geom[geom_idx_lo])
-            denom = torch.sqrt(torch.clamp(v, min=0.0)) * float(sqrt_bc2_inv) + float(eps)
-            e_hat = (-float(lr_over_bc1) * m / denom) * geom
-            local_r1 += float(torch.sum(-linear * e_hat).detach().item())
-            local_r2 += float(torch.sum(0.5 * h_abs * e_hat * e_hat).detach().item())
+                m = m_all.narrow(0, elem + rel_start, n).detach().float()
+                v = v_all.narrow(0, elem + rel_start, n).detach().float()
+                linear = lin_all.narrow(0, elem + rel_start, n).detach().float()
+                pos = (torch.log(torch.clamp(v, min=1.0e-30)) - log_min) * inv_w
+                pos = torch.clamp(pos, min=0.0, max=float(bins - 1))
+                lo = torch.floor(pos).to(torch.long)
+                hi = torch.clamp(lo + 1, max=bins - 1)
+                frac = pos - lo.float()
+                h_abs = h_vals[lo] + frac * (h_vals[hi] - h_vals[lo])
+                geom_idx_lo = torch.clamp(age_code * bins + lo, max=int(flat_geom.numel()) - 1)
+                geom_idx_hi = torch.clamp(age_code * bins + hi, max=int(flat_geom.numel()) - 1)
+                geom = flat_geom[geom_idx_lo] + frac * (flat_geom[geom_idx_hi] - flat_geom[geom_idx_lo])
+                denom = torch.sqrt(torch.clamp(v, min=0.0)) * float(sqrt_bc2_inv) + float(eps)
+                e_hat = (-float(lr_over_bc1) * m / denom) * geom
+                local_r1 += float(torch.sum(-linear * e_hat).detach().item())
+                local_r2 += float(torch.sum(0.5 * h_abs * e_hat * e_hat).detach().item())
 
     group = getattr(lossy_cp, "_proposal_cpu_pg", None)
     return (
@@ -913,14 +1024,15 @@ def _full_agebit_proxy_terms(lossy_cp: Any, *, linear_key: str) -> Optional[Tupl
 def _build_sample(lossy_cp: Any, proposal_config: Any, *, rank: int) -> Dict[str, Any]:
     max_samples = int(getattr(proposal_config, "independent_oracle_rank_sample", 1048576) or 0)
     groups = list(getattr(lossy_cp, "_groups", ()) or ())
-    spans: List[Tuple[int, int, int]] = []
+    spans: List[Tuple[int, Dict[str, Any], int, int]] = []
     total = 0
     for group_idx, grp in enumerate(groups):
-        n = int(grp.get("total_aligned", grp.get("total", 0)) or 0)
-        if n <= 0:
-            continue
-        spans.append((group_idx, total, total + n))
-        total += n
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            if n <= 0:
+                continue
+            spans.append((group_idx, spec, total, total + n))
+            total += n
     n_sample = min(max_samples, total)
     if n_sample <= 0:
         return {"items": [], "n": 0}
@@ -928,17 +1040,28 @@ def _build_sample(lossy_cp: Any, proposal_config: Any, *, rank: int) -> Dict[str
     rng = np.random.default_rng(seed + int(rank) * 1000003)
     ids = np.sort(rng.choice(total, size=n_sample, replace=False).astype(np.int64))
     items = []
-    for group_idx, lo, hi in spans:
+    for group_idx, spec, lo, hi in spans:
         left = int(np.searchsorted(ids, lo, side="left"))
         right = int(np.searchsorted(ids, hi, side="left"))
         if right <= left:
             continue
-        local_offsets = ids[left:right] - np.int64(lo)
+        rel_offsets = ids[left:right] - np.int64(lo)
+        local_offsets = np.int64(_logical_off(spec)) + rel_offsets
+        elem_offsets = np.int64(_elem_off(spec)) + rel_offsets
+        age_offsets = np.int64(_age_off(spec)) + rel_offsets
+        device = groups[group_idx]["p_flat"].device
         items.append({
             "group_idx": int(group_idx),
+            "name": str(spec["name"]),
+            "entry_idx": int(spec.get("entry_idx", -1)),
             "positions": np.arange(left, right, dtype=np.int64),
+            "entry_offsets_np": rel_offsets.astype(np.int64, copy=False),
+            "entry_offsets_t": torch.as_tensor(rel_offsets, dtype=torch.long, device=device),
             "local_offsets_np": local_offsets.astype(np.int64, copy=False),
-            "local_offsets_t": torch.as_tensor(local_offsets, dtype=torch.long, device=groups[group_idx]["p_flat"].device),
+            "local_offsets_t": torch.as_tensor(local_offsets, dtype=torch.long, device=device),
+            "elem_offsets_np": elem_offsets.astype(np.int64, copy=False),
+            "elem_offsets_t": torch.as_tensor(elem_offsets, dtype=torch.long, device=device),
+            "age_offsets_np": age_offsets.astype(np.int64, copy=False),
         })
     return {"items": items, "n": int(n_sample)}
 
@@ -954,7 +1077,6 @@ def _gather_sample_payload(
     out = {
         "e": np.zeros(n, dtype=np.float32),
         "m": np.zeros(n, dtype=np.float32),
-        "g": np.zeros(n, dtype=np.float32),
         "v": np.zeros(n, dtype=np.float32),
         "h_abs": np.zeros(n, dtype=np.float32),
         "e_age": np.zeros(n, dtype=np.float32),
@@ -962,9 +1084,7 @@ def _gather_sample_payload(
         "global_id": np.zeros(n, dtype=np.int64),
         "force": np.zeros(n, dtype=bool),
         "score_m_diag": np.zeros(n, dtype=np.float32),
-        "score_g_diag": np.zeros(n, dtype=np.float32),
         "score_agebit": np.zeros(n, dtype=np.float32),
-        "score_g_agebit": np.zeros(n, dtype=np.float32),
     }
     h_lut = getattr(lossy_cp, "_h_lookup_lut", None)
     h_values = getattr(h_lut, "values", None)
@@ -987,23 +1107,21 @@ def _gather_sample_payload(
     for item in sample.get("items", ()):
         grp = lossy_cp._groups[int(item["group_idx"])]
         pos = item["positions"]
-        idx = item["local_offsets_t"]
+        idx = item.get("elem_offsets_t", item["local_offsets_t"])
         local_offsets_np = np.asarray(item["local_offsets_np"], dtype=np.int64)
+        age_offsets_np = np.asarray(item.get("age_offsets_np", local_offsets_np), dtype=np.int64)
         p = torch.index_select(grp["p_flat"], 0, idx).detach().float().cpu().numpy()
-        c = _checkpoint_values_for_offsets(lossy_cp, grp, local_offsets_np)
+        c = _checkpoint_values_for_offsets(
+            lossy_cp,
+            grp,
+            local_offsets_np,
+            checkpoint_offsets=age_offsets_np,
+        )
         m = torch.index_select(grp["m_flat"], 0, idx).detach().float().cpu().numpy()
-        g_flat = grp.get("g_score_flat")
-        if isinstance(g_flat, torch.Tensor):
-            g = torch.index_select(g_flat, 0, idx).detach().float().cpu().numpy()
-        else:
-            g = np.zeros_like(m, dtype=np.float32)
         v = torch.index_select(grp["v_flat"], 0, idx).detach().float().cpu().numpy()
         e = (p - c).astype(np.float32, copy=False)
         h_abs, lut_idx = _lookup_h_np(v, h_values_np, log_min_f, inv_w_f)
-        global_ids = (
-            local_offsets_np
-            + int(grp.get("master_off", 0)) * int(getattr(lossy_cp, "group_size", 1))
-        )
+        global_ids = age_offsets_np
         age_code = _unpack_age(age_words_np, global_ids)
         geom = _lookup_geom_np(geom_np, lut_idx, age_code, h_values_np.size)
         denom = np.sqrt(np.maximum(v, 0.0)).astype(np.float32) * np.float32(sqrt_bc2_inv) + np.float32(eps)
@@ -1016,7 +1134,6 @@ def _gather_sample_payload(
         )
         out["e"][pos] = e
         out["m"][pos] = m
-        out["g"][pos] = g
         out["v"][pos] = v
         out["h_abs"][pos] = h_abs
         out["e_age"][pos] = e_age
@@ -1024,9 +1141,7 @@ def _gather_sample_payload(
         out["global_id"][pos] = global_ids
         out["force"][pos] = force
         out["score_m_diag"][pos] = np.maximum(-m * e + 0.5 * h_abs * e * e, 0.0)
-        out["score_g_diag"][pos] = np.maximum(-g * e + 0.5 * h_abs * e * e, 0.0)
         out["score_agebit"][pos] = np.maximum(-m * e_age + 0.5 * h_abs * e_age * e_age, 0.0)
-        out["score_g_agebit"][pos] = np.maximum(-g * e_age + 0.5 * h_abs * e_age * e_age, 0.0)
     return out
 
 
@@ -1088,8 +1203,6 @@ def _run_oneshot_hvp_actual(
     sample: Dict[str, Any],
     loss_base: float,
     loss_base_batches: Sequence[float],
-    linear_key: str,
-    linear_name: str,
     proposal_config: Any,
     iteration: int,
     rank: int,
@@ -1109,8 +1222,6 @@ def _run_oneshot_hvp_actual(
             sample=sample,
             loss_base=loss_base,
             loss_base_batches=loss_base_batches,
-            linear_key=linear_key,
-            linear_name=linear_name,
             proposal_config=proposal_config,
             iteration=iteration,
             rank=rank,
@@ -1135,12 +1246,11 @@ def _run_oneshot_hvp_actual(
     )
     r2_full = _quadratic_from_parts(e_parts, h_e_parts, lossy_cp=lossy_cp)
     hvp_sample = _sample_parts_by_offsets(lossy_cp, specs, h_e_parts, sample)
-    linear_parts = _linear_parts(lossy_cp, specs, linear_key=linear_key)
+    linear_parts = _first_order_parts(lossy_cp, specs)
     h_abs_parts = _diag_abs_h_parts(lossy_cp, specs)
     age_score_parts = _agebit_score_parts(
         lossy_cp,
         specs,
-        linear_key=linear_key,
         iteration=int(iteration),
     )
 
@@ -1160,10 +1270,11 @@ def _run_oneshot_hvp_actual(
         "PROPOSAL_INDEPENDENT_ORACLE_ONESHOT_SAMPLE_CDF_THRESHOLD"
     )
 
+    first_order_name = _PRODUCTION_FIRST_ORDER_NAME
     for policy_name, score_parts in (
-        (f"{linear_name}+diag_abs_h+agebit", age_score_parts),
-        (f"{linear_name}+diag_abs_h+true_e", score_diag),
-        (f"{linear_name}+hvp_directional+true_e", score_hvp_directional),
+        (f"{first_order_name}+diag_abs_h+agebit", age_score_parts),
+        (f"{first_order_name}+diag_abs_h+true_e", score_diag),
+        (f"{first_order_name}+hvp_directional+true_e", score_hvp_directional),
     ):
         if use_sample_cdf_threshold:
             score_sample = _sample_parts_by_offsets(lossy_cp, specs, score_parts, sample)
@@ -1210,7 +1321,7 @@ def _run_oneshot_hvp_actual(
             "rank": int(rank),
             "world": int(world),
             "policy": policy_name,
-            "score_linear_source": str(linear_name),
+            "score_first_order_name": str(first_order_name),
             "topk_ratio": float(ratio),
             "selection_scope": str(info["selection_scope"]),
             "local_elements": int(total_n_local),
@@ -1266,8 +1377,6 @@ def _run_oneshot_hvp_actual_gpu(
     sample: Dict[str, Any],
     loss_base: float,
     loss_base_batches: Sequence[float],
-    linear_key: str,
-    linear_name: str,
     proposal_config: Any,
     iteration: int,
     rank: int,
@@ -1300,14 +1409,9 @@ def _run_oneshot_hvp_actual_gpu(
         iteration=int(iteration),
     )
 
-    if str(linear_name) == "g":
-        linear_sample = sample_payload["g"]
-        diag_true_sample = sample_payload["score_g_diag"]
-        agebit_sample = sample_payload["score_g_agebit"]
-    else:
-        linear_sample = sample_payload["m"]
-        diag_true_sample = sample_payload["score_m_diag"]
-        agebit_sample = sample_payload["score_agebit"]
+    linear_sample = sample_payload["m"]
+    diag_true_sample = sample_payload["score_m_diag"]
+    agebit_sample = sample_payload["score_agebit"]
 
     e_sample = sample_payload["e"]
     h_abs_sample = sample_payload["h_abs"]
@@ -1317,10 +1421,11 @@ def _run_oneshot_hvp_actual_gpu(
     ).astype(np.float32, copy=False)
     agebit_force_sample = _score_with_force(agebit_sample, sample_payload["force"])
 
+    first_order_name = _PRODUCTION_FIRST_ORDER_NAME
     threshold_policies: Tuple[Tuple[str, str, np.ndarray], ...] = (
-        (f"{linear_name}+diag_abs_h+agebit+force", "agebit_force", agebit_force_sample),
-        (f"{linear_name}+diag_abs_h+true_e", "diag_true_e", diag_true_sample),
-        (f"{linear_name}+hvp_directional+true_e", "hvp_directional", hvp_directional_sample),
+        (f"{first_order_name}+diag_abs_h+agebit+force", "agebit_force", agebit_force_sample),
+        (f"{first_order_name}+diag_abs_h+true_e", "diag_true_e", diag_true_sample),
+        (f"{first_order_name}+hvp_directional+true_e", "hvp_directional", hvp_directional_sample),
     )
     direct_policies: Tuple[Tuple[str, str], ...] = (
         ("random_hash", "random_hash"),
@@ -1342,7 +1447,6 @@ def _run_oneshot_hvp_actual_gpu(
             threshold=float(threshold_info["threshold"]),
             tie_prob=float(threshold_info["tie_prob"]),
             policy_kind=policy_kind,
-            linear_key=linear_key,
             iteration=int(iteration),
             ratio=float(ratio),
             loss_bank=loss_bank,
@@ -1352,7 +1456,7 @@ def _run_oneshot_hvp_actual_gpu(
             rank=rank,
             world=world,
             policy_name=policy_name,
-            linear_name=linear_name,
+            first_order_name=first_order_name,
             ratio=ratio,
             total_n_local=total_n_local,
             total_n=total_n,
@@ -1376,7 +1480,6 @@ def _run_oneshot_hvp_actual_gpu(
             threshold=float("nan"),
             tie_prob=0.0,
             policy_kind=policy_kind,
-            linear_key=linear_key,
             iteration=int(iteration),
             ratio=float(ratio),
             loss_bank=loss_bank,
@@ -1386,7 +1489,7 @@ def _run_oneshot_hvp_actual_gpu(
             rank=rank,
             world=world,
             policy_name=policy_name,
-            linear_name=linear_name,
+            first_order_name=first_order_name,
             ratio=ratio,
             total_n_local=total_n_local,
             total_n=total_n,
@@ -1513,17 +1616,9 @@ def _rms_for_current_error(
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         p = grp["p_flat"].narrow(0, off, n)
-        c = _checkpoint_tensor_for_name(
-            lossy_cp,
-            grp,
-            str(spec["name"]),
-            off,
-            n,
-            device=p.device,
-            dtype=p.dtype,
-        )
+        c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
         if c is None:
             continue
         e = p.detach().float() - c.detach().float()
@@ -1542,18 +1637,10 @@ def _set_params_plus_current_error(
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         param = spec["param"]
         p = grp["p_flat"].narrow(0, off, n)
-        c = _checkpoint_tensor_for_name(
-            lossy_cp,
-            grp,
-            str(spec["name"]),
-            off,
-            n,
-            device=p.device,
-            dtype=p.dtype,
-        )
+        c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
         if c is None:
             value = p.detach().float()
         else:
@@ -1578,17 +1665,9 @@ def _quadratic_current_error_with_hvp_parts(
     for spec, h_cpu in zip(specs, h_e_tensors):
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         p = grp["p_flat"].narrow(0, off, n)
-        c = _checkpoint_tensor_for_name(
-            lossy_cp,
-            grp,
-            str(spec["name"]),
-            off,
-            n,
-            device=p.device,
-            dtype=p.dtype,
-        )
+        c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
         if c is None:
             continue
         e = p.detach().float() - c.detach().float()
@@ -1600,21 +1679,16 @@ def _quadratic_current_error_with_hvp_parts(
 def _tensor_specs(lossy_cp: Any) -> List[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
     for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(spec["name"]))
+            n = int(min(n, param_n))
             if param is not None and n > 0:
-                specs.append({
-                    "group_idx": int(group_idx),
-                    "grp": grp,
-                    "name": str(name),
-                    "local_off": int(local_off),
-                    "n": int(min(n, param_n)),
-                    "param": param,
-                    "param_offset": int(param_offset),
-                })
-            local_off += n
+                enriched = dict(spec)
+                enriched["n"] = int(n)
+                enriched["param"] = param
+                enriched["param_offset"] = int(param_offset)
+                specs.append(enriched)
     return specs
 
 
@@ -1623,17 +1697,9 @@ def _direction_parts(lossy_cp: Any, specs: Sequence[Dict[str, Any]]) -> List[np.
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         p = grp["p_flat"].narrow(0, off, n)
-        c = _checkpoint_tensor_for_name(
-            lossy_cp,
-            grp,
-            str(spec["name"]),
-            off,
-            n,
-            device=p.device,
-            dtype=p.dtype,
-        )
+        c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
         if c is None:
             out.append(np.zeros(n, dtype=np.float32))
         else:
@@ -1641,13 +1707,13 @@ def _direction_parts(lossy_cp: Any, specs: Sequence[Dict[str, Any]]) -> List[np.
     return out
 
 
-def _linear_parts(lossy_cp: Any, specs: Sequence[Dict[str, Any]], *, linear_key: str) -> List[np.ndarray]:
+def _first_order_parts(lossy_cp: Any, specs: Sequence[Dict[str, Any]]) -> List[np.ndarray]:
     out: List[np.ndarray] = []
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
-        lin = grp.get(linear_key)
+        off = _elem_off(spec)
+        lin = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
         if isinstance(lin, torch.Tensor):
             out.append(lin.narrow(0, off, n).detach().float().cpu().numpy().astype(np.float32, copy=True))
         else:
@@ -1667,7 +1733,7 @@ def _diag_abs_h_parts(lossy_cp: Any, specs: Sequence[Dict[str, Any]]) -> List[np
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         v = grp["v_flat"].narrow(0, off, n).detach().float().cpu().numpy()
         h_abs, _ = _lookup_h_np(v, h_values_np, log_min_f, inv_w_f)
         out.append(h_abs.astype(np.float32, copy=True))
@@ -1678,7 +1744,6 @@ def _agebit_score_parts(
     lossy_cp: Any,
     specs: Sequence[Dict[str, Any]],
     *,
-    linear_key: str,
     iteration: int,
 ) -> List[np.ndarray]:
     h_lut = getattr(lossy_cp, "_h_lookup_lut", None)
@@ -1699,21 +1764,21 @@ def _agebit_score_parts(
     lr_over_bc1 = float(getattr(lossy_cp, "_adam_lr_over_bc1_for_selection", 1.0e-4))
     sqrt_bc2_inv = float(getattr(lossy_cp, "_adam_sqrt_bc2_inv_for_selection", 1.0))
     eps = float(getattr(lossy_cp, "_adam_eps_for_selection", 1.0e-8))
-    group_size = int(getattr(lossy_cp, "group_size", 1))
     out: List[np.ndarray] = []
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         m = grp["m_flat"].narrow(0, off, n).detach().float().cpu().numpy()
         v = grp["v_flat"].narrow(0, off, n).detach().float().cpu().numpy()
-        lin_t = grp.get(linear_key)
+        lin_t = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
         lin = (
             lin_t.narrow(0, off, n).detach().float().cpu().numpy()
             if isinstance(lin_t, torch.Tensor) else np.zeros(n, dtype=np.float32)
         )
         h_abs, lut_idx = _lookup_h_np(v, h_values_np, log_min_f, inv_w_f)
-        global_ids = np.arange(off, off + n, dtype=np.int64) + int(grp.get("master_off", 0)) * group_size
+        age = _age_off(spec)
+        global_ids = np.arange(age, age + n, dtype=np.int64)
         age_code = _unpack_age(age_words_np, global_ids)
         geom = _lookup_geom_np(geom_np, lut_idx, age_code, h_values_np.size)
         denom = np.sqrt(np.maximum(v, 0.0)).astype(np.float32) * np.float32(sqrt_bc2_inv) + np.float32(eps)
@@ -1804,7 +1869,7 @@ def _oneshot_actual_row(
     rank: int,
     world: int,
     policy_name: str,
-    linear_name: str,
+    first_order_name: str,
     ratio: float,
     total_n_local: int,
     total_n: int,
@@ -1832,7 +1897,7 @@ def _oneshot_actual_row(
         "rank": int(rank),
         "world": int(world),
         "policy": str(policy_name),
-        "score_linear_source": str(linear_name),
+        "score_first_order_name": str(first_order_name),
         "topk_ratio": float(ratio),
         "selection_scope": str(threshold_info.get("selection_scope", "gpu")),
         "local_elements": int(total_n_local),
@@ -1877,17 +1942,9 @@ def _direction_tensors(lossy_cp: Any, specs: Sequence[Dict[str, Any]]) -> List[t
     for spec in specs:
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         p = grp["p_flat"].narrow(0, off, n)
-        c = _checkpoint_tensor_for_name(
-            lossy_cp,
-            grp,
-            str(spec["name"]),
-            off,
-            n,
-            device=p.device,
-            dtype=p.dtype,
-        )
+        c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
         if c is None:
             out.append(torch.zeros(n, dtype=torch.float32, device=p.device))
         else:
@@ -1992,7 +2049,7 @@ def _set_params_plus_direction_tensors(
     for spec, e_t in zip(specs, e_tensors):
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         param = spec["param"]
         p = grp["p_flat"].narrow(0, off, n)
         value = p.detach().float() + float(scale) * e_t.detach().float()
@@ -2047,7 +2104,7 @@ def _sample_tensors_by_offsets(
     by_group: Dict[int, List[Tuple[int, int, torch.Tensor]]] = {}
     for spec, tensor in zip(specs, tensors):
         by_group.setdefault(int(spec["group_idx"]), []).append(
-            (int(spec["local_off"]), int(spec["n"]), tensor)
+            (_logical_off(spec), int(spec["n"]), tensor)
         )
     for item in sample.get("items", ()):
         group_idx = int(item["group_idx"])
@@ -2116,7 +2173,6 @@ def _eval_gpu_policy_loss(
     threshold: float,
     tie_prob: float,
     policy_kind: str,
-    linear_key: str,
     iteration: int,
     ratio: float,
     loss_bank: Sequence[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]],
@@ -2131,25 +2187,16 @@ def _eval_gpu_policy_loss(
                 threshold=float(threshold),
                 tie_prob=float(tie_prob),
                 policy_kind=str(policy_kind),
-                linear_key=linear_key,
                 iteration=int(iteration),
                 ratio=float(ratio),
             )
             local_selected += int(selected.sum().detach().item())
             grp = spec["grp"]
             n = int(spec["n"])
-            off = int(spec["local_off"])
+            off = _elem_off(spec)
             param = spec["param"]
             p = grp["p_flat"].narrow(0, off, n)
-            c = _checkpoint_tensor_for_name(
-                lossy_cp,
-                grp,
-                str(spec["name"]),
-                off,
-                n,
-                device=p.device,
-                dtype=p.dtype,
-            )
+            c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
             if c is None:
                 continue
             value = torch.where(selected, p.detach(), c.detach())
@@ -2183,7 +2230,6 @@ def _gpu_policy_selected_mask(
     threshold: float,
     tie_prob: float,
     policy_kind: str,
-    linear_key: str,
     iteration: int,
     ratio: float,
 ) -> torch.Tensor:
@@ -2199,19 +2245,11 @@ def _gpu_policy_selected_mask(
         return torch.remainder(global_ids + int(iteration), int(period)) == 0
 
     grp = spec["grp"]
-    off = int(spec["local_off"])
+    off = _elem_off(spec)
     p = grp["p_flat"].narrow(0, off, n)
-    c = _checkpoint_tensor_for_name(
-        lossy_cp,
-        grp,
-        str(spec["name"]),
-        off,
-        n,
-        device=p.device,
-        dtype=p.dtype,
-    )
+    c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
     e = torch.zeros(n, dtype=torch.float32, device=p.device) if c is None else (p.detach().float() - c.detach().float())
-    lin_t = grp.get(linear_key)
+    lin_t = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
     linear = (
         lin_t.narrow(0, off, n).detach().float()
         if isinstance(lin_t, torch.Tensor) else torch.zeros(n, dtype=torch.float32, device=p.device)
@@ -2233,7 +2271,6 @@ def _gpu_policy_selected_mask(
         score, force = _agebit_score_tensor(
             lossy_cp=lossy_cp,
             spec=spec,
-            linear_key=linear_key,
             iteration=int(iteration),
         )
     else:
@@ -2257,7 +2294,7 @@ def _gpu_policy_selected_mask(
 def _diag_abs_h_tensor(lossy_cp: Any, spec: Dict[str, Any]) -> torch.Tensor:
     grp = spec["grp"]
     n = int(spec["n"])
-    off = int(spec["local_off"])
+    off = _elem_off(spec)
     v = grp["v_flat"].narrow(0, off, n).detach().float()
     h_lut = getattr(lossy_cp, "_h_lookup_lut", None)
     h_values = getattr(h_lut, "values", None)
@@ -2284,16 +2321,15 @@ def _agebit_score_tensor(
     *,
     lossy_cp: Any,
     spec: Dict[str, Any],
-    linear_key: str,
     iteration: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     grp = spec["grp"]
     n = int(spec["n"])
-    off = int(spec["local_off"])
+    off = _elem_off(spec)
     device = grp["p_flat"].device
     m = grp["m_flat"].narrow(0, off, n).detach().float()
     v = grp["v_flat"].narrow(0, off, n).detach().float()
-    lin_t = grp.get(linear_key)
+    lin_t = grp.get(_PRODUCTION_FIRST_ORDER_KEY)
     linear = (
         lin_t.narrow(0, off, n).detach().float()
         if isinstance(lin_t, torch.Tensor) else torch.zeros(n, dtype=torch.float32, device=device)
@@ -2320,7 +2356,7 @@ def _agebit_score_tensor(
 def _geom_tensor(lossy_cp: Any, spec: Dict[str, Any], *, age_code: torch.Tensor) -> torch.Tensor:
     grp = spec["grp"]
     n = int(spec["n"])
-    off = int(spec["local_off"])
+    off = _elem_off(spec)
     v = grp["v_flat"].narrow(0, off, n).detach().float()
     h_lut = getattr(lossy_cp, "_h_lookup_lut", None)
     h_values = getattr(h_lut, "values", None)
@@ -2365,10 +2401,9 @@ def _age_code_tensor(lossy_cp: Any, spec: Dict[str, Any]) -> torch.Tensor:
 def _global_ids_for_spec(lossy_cp: Any, spec: Dict[str, Any]) -> torch.Tensor:
     grp = spec["grp"]
     n = int(spec["n"])
-    off = int(spec["local_off"])
+    off = _age_off(spec)
     device = grp["p_flat"].device
-    base = int(grp.get("master_off", 0)) * int(getattr(lossy_cp, "group_size", 1))
-    return torch.arange(off, off + n, dtype=torch.long, device=device) + int(base)
+    return torch.arange(off, off + n, dtype=torch.long, device=device)
 
 
 def _hash_uniform_tensor(global_ids: torch.Tensor, *, seed: int) -> torch.Tensor:
@@ -2405,7 +2440,7 @@ def _set_params_plus_direction_parts(
     for spec, e_np in zip(specs, e_parts):
         grp = spec["grp"]
         n = int(spec["n"])
-        off = int(spec["local_off"])
+        off = _elem_off(spec)
         param = spec["param"]
         p = grp["p_flat"].narrow(0, off, n)
         e_t = torch.as_tensor(e_np, device=p.device, dtype=p.dtype)
@@ -2516,7 +2551,7 @@ def _sample_parts_by_offsets(
     by_group: Dict[int, List[Tuple[int, int, np.ndarray]]] = {}
     for spec, part in zip(specs, parts):
         group_idx = int(spec["group_idx"])
-        by_group.setdefault(group_idx, []).append((int(spec["local_off"]), int(spec["n"]), part))
+        by_group.setdefault(group_idx, []).append((_logical_off(spec), int(spec["n"]), part))
     for item in sample.get("items", ()):
         group_idx = int(item["group_idx"])
         local_offsets = np.asarray(item["local_offsets_np"], dtype=np.int64)
@@ -2784,18 +2819,10 @@ def _eval_selected_masks_loss(
         for spec, mask_np in zip(specs, selected_masks):
             grp = spec["grp"]
             n = int(spec["n"])
-            off = int(spec["local_off"])
+            off = _elem_off(spec)
             param = spec["param"]
             p = grp["p_flat"].narrow(0, off, n)
-            c = _checkpoint_tensor_for_name(
-                lossy_cp,
-                grp,
-                str(spec["name"]),
-                off,
-                n,
-                device=p.device,
-                dtype=p.dtype,
-            )
+            c = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p.device, dtype=p.dtype)
             if c is None:
                 continue
             mask = torch.as_tensor(mask_np, dtype=torch.bool, device=p.device)
@@ -2877,29 +2904,23 @@ def _backward_dot_and_sample(
     dot_tensors: List[torch.Tensor] = []
     sample_out = np.zeros(int(sample.get("n", 0)), dtype=np.float32)
     handles = []
-    for grp in getattr(lossy_cp, "_groups", ()) or ():
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
         p_flat = grp.get("p_flat")
         if p_flat is None:
             continue
-        local_off = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            group_n = int(size)
-            n = group_n
-            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(name))
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            param, param_offset, param_n = _param_ref_for_name(lossy_cp, str(spec["name"]))
             n = min(n, int(param_n))
             if param is None or n <= 0:
-                local_off += group_n
                 continue
-            p_slice = p_flat.narrow(0, local_off, n)
-            c_slice = _checkpoint_tensor_for_name(
-                lossy_cp, grp, str(name), local_off, n,
-                device=p_slice.device, dtype=p_slice.dtype,
-            )
+            off = _elem_off(spec)
+            p_slice = p_flat.narrow(0, off, n)
+            c_slice = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p_slice.device, dtype=p_slice.dtype)
             if c_slice is None:
-                local_off += n
                 continue
             e_slice = (p_slice - c_slice).detach()
-            sample_info = sample_by_name.get(str(name))
+            sample_info = sample_by_name.get(str(spec["name"]))
 
             def _hook(raw_grad, *, _e=e_slice, _sample=sample_info, _param_offset=param_offset, _n=n):
                 flat = raw_grad.detach().reshape(-1).narrow(0, int(_param_offset), int(_n)).float()
@@ -2910,7 +2931,6 @@ def _backward_dot_and_sample(
                 return torch.zeros_like(raw_grad)
 
             handles.append(param.register_hook(_hook))
-            local_off += group_n
     try:
         _backward_from_forward_loss(model=model, forward_loss=forward_loss)
         if torch.cuda.is_available():
@@ -2931,24 +2951,26 @@ def _sample_by_name(lossy_cp: Any, sample: Dict[str, Any]) -> Dict[str, Dict[str
     out: Dict[str, Dict[str, Any]] = {}
     for item in sample.get("items", ()):
         grp = lossy_cp._groups[int(item["group_idx"])]
-        local_offsets = np.asarray(item["local_offsets_np"], dtype=np.int64)
+        name = str(item.get("name", ""))
         positions = np.asarray(item["positions"], dtype=np.int64)
-        local_base = 0
-        for name, size in zip(grp.get("names", ()), grp.get("sizes", ())):
-            n = int(size)
-            lo = int(np.searchsorted(local_offsets, local_base, side="left"))
-            hi = int(np.searchsorted(local_offsets, local_base + n, side="left"))
-            if hi > lo:
-                offs = local_offsets[lo:hi] - np.int64(local_base)
-                out[str(name)] = {
-                    "positions": positions[lo:hi],
-                    "offsets_t": torch.as_tensor(
-                        offs,
-                        dtype=torch.long,
-                        device=grp["p_flat"].device,
-                    ),
-                }
-            local_base += n
+        if not name:
+            continue
+        offsets_np = np.asarray(item.get("entry_offsets_np", ()), dtype=np.int64)
+        if offsets_np.size <= 0:
+            continue
+        offsets_t = torch.as_tensor(offsets_np, dtype=torch.long, device=grp["p_flat"].device)
+        if name not in out:
+            out[name] = {
+                "positions": positions,
+                "offsets_t": offsets_t,
+            }
+        else:
+            prev = out[name]
+            prev["positions"] = np.concatenate([
+                np.asarray(prev["positions"], dtype=np.int64),
+                positions,
+            ])
+            prev["offsets_t"] = torch.cat([prev["offsets_t"], offsets_t], dim=0)
     return out
 
 
@@ -2960,32 +2982,23 @@ def _rank_metric_rows(
     iteration: int,
     rank: int,
     world: int,
+    score_source: str,
 ) -> List[Dict[str, Any]]:
     e = sample_payload["e"]
     m = sample_payload["m"]
-    g = sample_payload["g"]
     e_age = sample_payload["e_age"]
-    age_code = sample_payload["age_code"]
     force = sample_payload["force"]
+    age_code = sample_payload["age_code"]
     score_agebit = sample_payload["score_agebit"]
-    score_g_agebit = sample_payload["score_g_agebit"]
     score_m_diag = sample_payload["score_m_diag"]
-    score_g_diag = sample_payload["score_g_diag"]
     if hvp_sample is None:
         return []
-    score_source = str(getattr(proposal_config, "score_linear_source", "grad"))
-    if score_source == "grad":
-        prefix = "g"
-        score_age = score_g_agebit
-        score_true = score_g_diag
-        target_directional_name = "g_hvp_directional"
-        linear = g
-    else:
-        prefix = "m_t"
-        score_age = score_agebit
-        score_true = score_m_diag
-        target_directional_name = "m_t_hvp_directional"
-        linear = m
+    score_source = str(score_source)
+    prefix = "m_t"
+    score_age = score_agebit
+    score_true = score_m_diag
+    target_directional_name = "m_t_hvp_directional"
+    linear = m
     target_directional = np.maximum(
         -linear * e + 0.5 * e * hvp_sample,
         0.0,
@@ -3008,7 +3021,7 @@ def _rank_metric_rows(
             "rank": int(rank),
             "world": int(world),
             "policy": policy_name,
-            "score_linear_source": score_source,
+            "score_first_order_source": score_source,
             "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
             "score": score_name,
             "target": target_label,
@@ -3108,7 +3121,7 @@ def _autograd_gold_rank_rows(
     rank: int,
     world: int,
     score_source: str,
-    linear_name: str,
+    first_order_name: str,
 ) -> List[Dict[str, Any]]:
     if not gold_arrays:
         return []
@@ -3235,9 +3248,9 @@ def _autograd_gold_rank_rows(
             "score": str(score_name),
             "target": str(target_name),
             "question": str(question),
-            "score_linear_source": str(score_source),
-            "gold_linear_name": "autograd_validation_g",
-            "production_linear_name": str(linear_name),
+            "score_first_order_source": str(score_source),
+            "gold_first_order_name": "autograd_validation_g",
+            "production_first_order_name": str(first_order_name),
             "topk_ratio": float(ratio),
             "sample_elements": int(score.size),
             "spearman": _spearman(score, target),
@@ -3255,17 +3268,17 @@ def _autograd_gold_rank_rows(
         "step": int(iteration),
         "rank": int(rank),
         "world": int(world),
-        "score_linear_source": str(score_source),
+        "score_first_order_source": str(score_source),
         "topk_ratio": float(ratio),
         "sample_elements": int(np.asarray(gold_arrays["g_autograd"]).size),
-        "cached_linear_name": str(linear_name),
+        "cached_first_order_name": str(first_order_name),
         "g_autograd_vs_cached_spearman": _spearman(
             np.asarray(gold_arrays["g_autograd"], dtype=np.float32),
-            np.asarray(sample_payload["g" if linear_name == "g" else "m"], dtype=np.float32),
+            np.asarray(sample_payload["m"], dtype=np.float32),
         ),
         "g_autograd_vs_cached_pearson": _pearson(
             np.asarray(gold_arrays["g_autograd"], dtype=np.float32),
-            np.asarray(sample_payload["g" if linear_name == "g" else "m"], dtype=np.float32),
+            np.asarray(sample_payload["m"], dtype=np.float32),
         ),
     })
     return rows
@@ -3342,9 +3355,9 @@ def _ehat_diagnostic_row(
         "step": int(iteration),
         "rank": int(rank),
         "world": int(world),
-        "policy": f"{'g' if score_source == 'grad' else 'm_t'}+diag_abs_h+agebit",
+        "policy": "m_t+diag_abs_h+agebit",
         "target": str(target_name),
-        "score_linear_source": score_source,
+            "score_first_order_source": score_source,
         "topk_ratio": float(ratio),
         "sample_elements": int(e.size),
         "ehat_abs_mean": float(np.mean(abs_e_age)) if e_age.size else 0.0,

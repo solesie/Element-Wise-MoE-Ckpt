@@ -303,7 +303,6 @@ def launch_reduce_score_minmax_for_group(
     m_flat: torch.Tensor,
     v_flat: torch.Tensor,
     p_flat: torch.Tensor,
-    score_linear_flat: Optional[torch.Tensor] = None,
     theta_cp_flat: Optional[torch.Tensor] = None,
     age2bit_words: torch.Tensor,
     ehat_geom_lut: torch.Tensor,
@@ -352,7 +351,7 @@ def launch_reduce_score_minmax_for_group(
     lfcl_fired_epoch_t = lfcl_fired_epoch if lfcl_fired_epoch is not None else entry_block_entry_idx
     _reduce_score_minmax_entries_kernel[(n_entry_blocks,)](
         m_flat,
-        score_linear_flat if score_linear_flat is not None else m_flat,
+        m_flat,
         v_flat,
         p_flat,
         theta_cp_flat if theta_cp_flat is not None else p_flat,
@@ -394,7 +393,6 @@ def launch_build_score_log_hist_for_group(
     m_flat: torch.Tensor,
     v_flat: torch.Tensor,
     p_flat: torch.Tensor,
-    score_linear_flat: Optional[torch.Tensor] = None,
     theta_cp_flat: Optional[torch.Tensor] = None,
     age2bit_words: torch.Tensor,
     ehat_geom_lut: torch.Tensor,
@@ -444,7 +442,7 @@ def launch_build_score_log_hist_for_group(
     lfcl_fired_epoch_t = lfcl_fired_epoch if lfcl_fired_epoch is not None else entry_block_entry_idx
     _build_score_log_hist_entries_kernel[(n_entry_blocks,)](
         m_flat,
-        score_linear_flat if score_linear_flat is not None else m_flat,
+        m_flat,
         v_flat,
         p_flat,
         theta_cp_flat if theta_cp_flat is not None else p_flat,

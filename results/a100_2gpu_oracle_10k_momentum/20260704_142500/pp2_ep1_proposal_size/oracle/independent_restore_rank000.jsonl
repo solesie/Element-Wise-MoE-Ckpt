@@ -1,0 +1,3 @@
+{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 0, "status": "ok", "step": 50, "world": 2}
+{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 0, "status": "ok", "step": 500, "world": 2}
+{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 0, "status": "ok", "step": 1000, "world": 2}

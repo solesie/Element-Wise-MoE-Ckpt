@@ -843,7 +843,6 @@ def launch_stage_candidate_taus(
 def launch_generated_block_probe_for_group(
     *,
     m_flat: torch.Tensor,
-    score_linear_flat: Optional[torch.Tensor] = None,
     v_flat: torch.Tensor,
     p_flat: torch.Tensor,
     theta_cp_flat: Optional[torch.Tensor] = None,
@@ -906,7 +905,7 @@ def launch_generated_block_probe_for_group(
     )
     _generated_probe_entries_kernel[(max_samples,)](
         m_flat,
-        score_linear_flat if score_linear_flat is not None else m_flat,
+        m_flat,
         v_flat,
         p_flat,
         theta_cp_flat if theta_cp_flat is not None else p_flat,

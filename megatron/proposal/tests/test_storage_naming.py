@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from megatron.proposal.expert_id import ids_from_name
 from megatron.proposal.distributed import ProposalTopology
 from megatron.proposal.storage.recovery import _scan_cp_dir
 
@@ -64,3 +65,16 @@ def test_recovery_scans_new_and_legacy_nonexpert_shard_names(tmp_path):
         (9, ne_dir / "fc_nonexpert_ep01of04_iter00000009.bin"),
     ]
     assert expert_pairs == {}
+
+
+def test_pipeline_module_expert_names_keep_leading_layer_id():
+    assert ids_from_name(
+        "9.mlp.deepspeed_moe.experts.deepspeed_experts.14.wi.weight"
+    ) == (9, 14)
+    assert ids_from_name(
+        "module.11.mlp.deepspeed_moe.experts.deepspeed_experts.3.wo.weight"
+    ) == (11, 3)
+    assert ids_from_name(
+        "language_model.encoder.layers.5.mlp.deepspeed_moe.experts."
+        "deepspeed_experts.7.wi.weight"
+    ) == (5, 7)

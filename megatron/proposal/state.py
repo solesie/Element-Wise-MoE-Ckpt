@@ -17,7 +17,6 @@ class BF16OptGroupView:
     p_flat: torch.Tensor
     master_off_elem: int
     theta_cp_flat: Optional[torch.Tensor] = None
-    score_linear_flat: Optional[torch.Tensor] = None
     name_start: int = 0
     name_end: int = 0
     entry_elem_start: Optional[torch.Tensor] = None

@@ -2,26 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
+from ..expert_id import ids_from_name
 from ..refresh.fp32_state import get_mapper
-
-
-_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
-_DS_EXPERT_IDX_RE = re.compile(r"deepspeed_experts\.(\d+)\.")
-
-
-def ids_from_name(name: str) -> Optional[Tuple[int, int]]:
-    m_e = _DS_EXPERT_IDX_RE.search(name)
-    if m_e is None:
-        return None
-    m_l = _LAYER_RE.search(name)
-    layer = int(m_l.group(1)) if m_l is not None else 0
-    return (layer, int(m_e.group(1)))
 
 
 @torch.no_grad()

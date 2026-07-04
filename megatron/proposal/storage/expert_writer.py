@@ -1502,6 +1502,12 @@ class ExpertState:
             "selected_by_expert": cursor_list,
             "overflow_by_expert": overflow_list,
         }
+        direct_feedback_log = os.environ.get("PROPOSAL_DIRECT_FEEDBACK_LOG", "")
+        if direct_feedback_log:
+            feedback["expert_ids"] = [
+                [int(eid[0]), int(eid[1])]
+                for eid in self._direct_feedback_expert_ids[:n]
+            ]
         if (
             self._direct_layout_feedback_enabled
             and self._direct_capacity_pinned is not None
@@ -1521,8 +1527,41 @@ class ExpertState:
                     for eid in self._direct_feedback_expert_ids[:n]
                 ],
             })
+        if direct_feedback_log:
+            self._append_direct_feedback_log(direct_feedback_log, feedback)
         self._latest_direct_feedback = feedback
         return feedback
+
+    def _append_direct_feedback_log(
+        self,
+        path_spec: str,
+        feedback: Dict[str, Any],
+    ) -> None:
+        import json
+
+        try:
+            rank = int(os.environ.get("RANK", "0") or "0")
+        except ValueError:
+            rank = 0
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+        except ValueError:
+            local_rank = 0
+        path_s = str(path_spec)
+        if "{rank}" in path_s or "{local_rank}" in path_s:
+            path_s = path_s.format(rank=rank, local_rank=local_rank)
+        else:
+            base, ext = os.path.splitext(path_s)
+            path_s = f"{base}_rank{rank:03d}{ext or '.jsonl'}"
+        path = Path(path_s)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "rank": int(rank),
+            "local_rank": int(local_rank),
+            **feedback,
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _persist_lossy_aos_from_pinned(
         self,

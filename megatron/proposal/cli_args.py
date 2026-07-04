@@ -42,14 +42,6 @@ def add_proposal_args(parser):
                             "uses the configured first-order source plus "
                             "0.5*|H|*e_hat^2; the second-order ablation uses "
                             "|H|*e_hat^2.")
-    group.add_argument("--proposal-score-linear-source", type=str,
-                       default="grad",
-                       choices=["grad", "momentum"],
-                       help="First-order Taylor source for hessian scoring. "
-                            "'grad' leases DeepSpeed ZeRO-1/2 optimizer "
-                            "gradients when available and falls back to "
-                            "momentum otherwise. 'momentum' preserves the "
-                            "legacy -m*e_hat term.")
     group.add_argument("--proposal-e-hat-proxy-off",
                        "--proposal-ehat-proxy-off",
                        dest="proposal_e_hat_proxy_off",
