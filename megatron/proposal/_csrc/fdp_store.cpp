@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -316,7 +315,7 @@ void FdpStore::load_config_from_env() {
     cfg_.nefc_shard_count = static_cast<uint32_t>(nefc_shards);
     cfg_.nefc_shard_index = current_nefc_shard();
 
-    cfg_.nefc_qd = checked_u32(env_u64_default("PROPOSAL_FDP_NEFC_QD", 32),
+    cfg_.nefc_qd = checked_u32(env_u64_default("PROPOSAL_FDP_NEFC_QD", 64),
                                "PROPOSAL_FDP_NEFC_QD");
     cfg_.expert_qd = checked_u32(
         env_u64_default("PROPOSAL_FDP_EXPERT_QD", 64),
@@ -344,7 +343,8 @@ void FdpStore::open_from_env() {
 
     try {
         device_.open_device(cfg_.device_path);
-        metadata_ring_.init(cfg_.metadata_qd, "metadata_ring");
+        metadata_ring_.init(cfg_.metadata_qd, "metadata_ring", device_.fd(),
+                            false);
         ns_ = device_.identify(metadata_ring_, cfg_.nsid);
 
         if (!cfg_.metadata_nlb_explicit) {
@@ -401,8 +401,10 @@ void FdpStore::open_from_env() {
 
         validate_namespace_layout();
 
-        nefc_data_ring_.init(cfg_.nefc_qd, "nefc_data_ring");
-        expert_data_ring_.init(cfg_.expert_qd, "expert_data_ring");
+        nefc_data_ring_.init(cfg_.nefc_qd, "nefc_data_ring", device_.fd(),
+                             true);
+        expert_data_ring_.init(cfg_.expert_qd, "expert_data_ring", device_.fd(),
+                               true);
 
         allocate_metadata_image();
         format_or_load();
@@ -822,7 +824,8 @@ void FdpStore::open_or_create_shared_metadata_mmap() {
             ctrl->layout_fingerprint == fingerprint &&
             ctrl->metadata_image_bytes == layout_.image_bytes &&
             ctrl->world_size == cfg_.world_size;
-        if (!valid) {
+        const bool reset_for_format = cfg_.force_format && cfg_.rank == 0;
+        if (!valid || reset_for_format) {
             std::memset(shared_mmap_base_, 0,
                         static_cast<size_t>(shared_mmap_bytes_));
             pthread_mutexattr_t attr;
@@ -2292,7 +2295,6 @@ void FdpStore::write_chunk_list(UcmdRing& ring, int64_t pinned_addr,
         throw std::invalid_argument(std::string(where) +
                                     ": chunk list too small");
     }
-
     const uint8_t* base = reinterpret_cast<const uint8_t*>(pinned_addr);
     uint64_t remaining = total_padded_bytes;
     for (size_t i = 0; i < chunks.size() && remaining > 0; ++i) {

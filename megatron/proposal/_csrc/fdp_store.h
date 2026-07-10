@@ -41,7 +41,7 @@ struct FdpEnvConfig {
     uint32_t expert_id_base = 0;
     bool expert_ids_global = false;
 
-    uint32_t nefc_qd = 32;
+    uint32_t nefc_qd = 64;
     uint32_t expert_qd = 64;
     uint32_t metadata_qd = 8;
     uint32_t max_io_kb = 256;

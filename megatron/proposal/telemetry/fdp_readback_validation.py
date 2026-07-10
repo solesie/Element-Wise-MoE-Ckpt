@@ -203,6 +203,41 @@ class FdpReadbackValidator:
         self.validate_nefc()
         self.validate_expert()
 
+    def validate_ring_stats(self, kind: str, stats: Dict[str, Any]) -> None:
+        """Validate the production SQ/CQ contract at the readback fence."""
+
+        if not self.enabled():
+            return
+        submitted = int(stats.get("submitted", 0) or 0)
+        completed = int(stats.get("commands", 0) or 0)
+        qd = int(stats.get("queue_depth", 0) or 0)
+        submit_calls = int(stats.get("submit_calls", 0) or 0)
+        registered_file_submits = int(
+            stats.get("registered_file_submits", 0) or 0
+        )
+        if stats.get("submission_policy") != "sq_space":
+            raise RuntimeError(f"{kind}: FDP submission policy is not sq_space")
+        if not bool(stats.get("sqpoll")) or not bool(
+            stats.get("completion_thread")
+        ):
+            raise RuntimeError(f"{kind}: SQPOLL/CQ thread contract is disabled")
+        if qd != 64:
+            raise RuntimeError(f"{kind}: expected QD64, got {qd}")
+        if submitted != completed:
+            raise RuntimeError(
+                f"{kind}: submitted/completed mismatch {submitted}/{completed}"
+            )
+        if submit_calls < submitted:
+            raise RuntimeError(
+                f"{kind}: expected at least one submit call per command, "
+                f"got calls={submit_calls} commands={submitted}"
+            )
+        if registered_file_submits != submitted:
+            raise RuntimeError(
+                f"{kind}: registered-file submits {registered_file_submits} "
+                f"!= commands {submitted}"
+            )
+
     def _queue(self, target: List[_ReadbackRecord],
                rec: _ReadbackRecord) -> None:
         with self._lock:

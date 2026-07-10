@@ -468,27 +468,13 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
         raise RuntimeError(f"invalid FDP max_io_bytes={max_io_bytes}")
     expected_cmds = {"nefc": 0, "expert": 0}
 
-    def empty_batch_stats() -> Dict[str, float]:
-        return {
-            "commands": -1,
-            "submitted": 0,
-            "first_submit_ns": 0,
-            "last_cqe_ns": 0,
-            "submit_lifetime_ns": 0,
-            "submit_lifetime_ms": 0.0,
-        }
+    def empty_batch_stats() -> Dict[str, int]:
+        return {"commands": -1}
 
-    def normalize_batch_stats(stats_dict) -> Dict[str, float]:
+    def normalize_batch_stats(stats_dict) -> Dict[str, int]:
         if not stats_dict:
             return empty_batch_stats()
-        return {
-            "commands": int(stats_dict.get("commands", -1)),
-            "submitted": int(stats_dict.get("submitted", 0)),
-            "first_submit_ns": int(stats_dict.get("first_submit_ns", 0)),
-            "last_cqe_ns": int(stats_dict.get("last_cqe_ns", 0)),
-            "submit_lifetime_ns": int(stats_dict.get("submit_lifetime_ns", 0)),
-            "submit_lifetime_ms": float(stats_dict.get("submit_lifetime_ms", 0.0)),
-        }
+        return {"commands": int(stats_dict.get("commands", -1))}
 
     def data_write_cmds(nbytes: int) -> int:
         return _round_up(int(nbytes), max_io_bytes) // max_io_bytes
@@ -598,12 +584,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
         expert_fdp_write_ms = 0.0
         nefc_end_batch_ms = 0.0
         expert_end_batch_ms = 0.0
-        nefc_submit_lifetime_ms = 0.0
-        expert_submit_lifetime_ms = 0.0
-        nefc_first_submit_ns = 0
-        nefc_last_cqe_ns = 0
-        expert_first_submit_ns = 0
-        expert_last_cqe_ns = 0
         global_batch_submit_ms = 0.0
         nefc_written = 0
         lfcs_written_total = 0
@@ -939,16 +919,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
             expert_fdp_write_ms = float(results["expert"]["fdp_write_ms"])
             nefc_end_batch_ms = float(results["nefc"]["end_batch_ms"])
             expert_end_batch_ms = float(results["expert"]["end_batch_ms"])
-            nefc_stats = normalize_batch_stats(results["nefc"].get("batch_stats"))
-            expert_stats = normalize_batch_stats(
-                results["expert"].get("batch_stats")
-            )
-            nefc_submit_lifetime_ms = float(nefc_stats["submit_lifetime_ms"])
-            expert_submit_lifetime_ms = float(expert_stats["submit_lifetime_ms"])
-            nefc_first_submit_ns = int(nefc_stats["first_submit_ns"])
-            nefc_last_cqe_ns = int(nefc_stats["last_cqe_ns"])
-            expert_first_submit_ns = int(expert_stats["first_submit_ns"])
-            expert_last_cqe_ns = int(expert_stats["last_cqe_ns"])
             lfsy_written_total = int(results["expert"]["lfsy_written_total"])
             batch_counts["nefc_commands"] = int(results["nefc"]["commands"])
             batch_counts["expert_commands"] = int(results["expert"]["commands"])
@@ -984,18 +954,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
                 global_batch_submit_ms = (
                     time.perf_counter() - global_batch_submit_start
                 ) * 1000.0
-                nefc_stats = normalize_batch_stats(batch_stats.get("nefc"))
-                expert_stats = normalize_batch_stats(batch_stats.get("expert"))
-                nefc_submit_lifetime_ms = float(
-                    nefc_stats["submit_lifetime_ms"]
-                )
-                expert_submit_lifetime_ms = float(
-                    expert_stats["submit_lifetime_ms"]
-                )
-                nefc_first_submit_ns = int(nefc_stats["first_submit_ns"])
-                nefc_last_cqe_ns = int(nefc_stats["last_cqe_ns"])
-                expert_first_submit_ns = int(expert_stats["first_submit_ns"])
-                expert_last_cqe_ns = int(expert_stats["last_cqe_ns"])
                 batch_counts = {
                     "nefc_commands": int(batch_stats["nefc_commands"]),
                     "expert_commands": int(batch_stats["expert_commands"]),
@@ -1036,7 +994,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
         data_written_total = int(nefc_written) + int(lfcs_written_total) + int(
             lfsy_written_total
         )
-        expert_written_total = int(lfcs_written_total) + int(lfsy_written_total)
         fdp_write_mib_s = 0.0
         if fdp_write_wall_ms > 0:
             fdp_write_mib_s = (
@@ -1047,33 +1004,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
             io_wall_mib_s = (
                 float(data_written_total) / (1024.0 * 1024.0)
             ) / (data_total_ms / 1000.0)
-        nefc_submit_mib_s = 0.0
-        if nefc_submit_lifetime_ms > 0:
-            nefc_submit_mib_s = (
-                float(nefc_written) / (1024.0 * 1024.0)
-            ) / (nefc_submit_lifetime_ms / 1000.0)
-        expert_submit_mib_s = 0.0
-        if expert_submit_lifetime_ms > 0:
-            expert_submit_mib_s = (
-                float(expert_written_total) / (1024.0 * 1024.0)
-            ) / (expert_submit_lifetime_ms / 1000.0)
-        submit_lifetime_ms = 0.0
-        submit_mib_s = 0.0
-        first_submit_times = [
-            t for t in (nefc_first_submit_ns, expert_first_submit_ns) if t > 0
-        ]
-        last_cqe_times = [
-            t for t in (nefc_last_cqe_ns, expert_last_cqe_ns) if t > 0
-        ]
-        if first_submit_times and last_cqe_times:
-            submit_lifetime_ms = (
-                max(last_cqe_times) - min(first_submit_times)
-            ) / 1000000.0
-            if submit_lifetime_ms > 0:
-                submit_mib_s = (
-                    float(data_written_total) / (1024.0 * 1024.0)
-                ) / (submit_lifetime_ms / 1000.0)
-
         print(
             f"[fdp-smoke] iter={step:03d} "
             f"LFCS={','.join(selected_labels)} "
@@ -1088,12 +1018,6 @@ def _run_train_like_smoke(args: argparse.Namespace, proposal_io,
             f"expert_fdp_write_ms={expert_fdp_write_ms:.3f} "
             f"nefc_end_batch_ms={nefc_end_batch_ms:.3f} "
             f"expert_end_batch_ms={expert_end_batch_ms:.3f} "
-            f"nefc_submit_lifetime_ms={nefc_submit_lifetime_ms:.3f} "
-            f"expert_submit_lifetime_ms={expert_submit_lifetime_ms:.3f} "
-            f"submit_lifetime_ms={submit_lifetime_ms:.3f} "
-            f"nefc_submit_mib_s={nefc_submit_mib_s:.1f} "
-            f"expert_submit_mib_s={expert_submit_mib_s:.1f} "
-            f"submit_mib_s={submit_mib_s:.1f} "
             f"fdp_write_ms={fdp_write_wall_ms:.3f} "
             f"fdp_write_sum_ms={fdp_write_sum_ms:.3f} "
             f"fdp_write_mib_s={fdp_write_mib_s:.1f} "

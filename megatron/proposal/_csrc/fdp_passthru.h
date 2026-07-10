@@ -19,9 +19,9 @@ struct NamespaceInfo {
 struct UcmdRingBatchStats {
     uint32_t commands = 0;
     uint32_t submitted = 0;
-    uint64_t first_submit_ns = 0;
-    uint64_t last_cqe_ns = 0;
-    uint64_t submit_lifetime_ns = 0;
+    uint32_t queue_depth = 0;
+    uint32_t submit_calls = 0;
+    uint32_t registered_file_submits = 0;
 };
 
 class UcmdRing {
@@ -32,26 +32,29 @@ public:
     UcmdRing(const UcmdRing&) = delete;
     UcmdRing& operator=(const UcmdRing&) = delete;
 
-    void init(uint32_t queue_depth, const std::string& name);
+    void init(uint32_t queue_depth, const std::string& name,
+              int registered_fd, bool completion_thread);
     void close();
     bool is_open() const;
+    bool is_batching() const;
+    bool has_completion_thread() const;
     uint32_t queue_depth() const { return queue_depth_; }
     const std::string& name() const { return name_; }
 
     void begin_batch();
     uint32_t end_batch();
     UcmdRingBatchStats last_batch_stats() const;
-    bool is_batching() const;
 
     void submit_nvme(int fd, uint32_t cmd_op, const nvme_uring_cmd& cmd,
                      const char* where);
 
 private:
-    uint32_t drain_batch_fragment();
-    uint32_t submit_ready_sqes(const char* where);
-    uint32_t reap_available_cqes();
-    uint32_t wait_one_cqe();
-    void wait_for_batch_room();
+    void submit_async(int fd, uint32_t cmd_op, const nvme_uring_cmd& cmd,
+                      const char* where);
+    void submit_sync(int fd, uint32_t cmd_op, const nvme_uring_cmd& cmd,
+                     const char* where);
+    void wait_for_sq_space();
+    void completion_loop();
 
     struct Impl;
     Impl* impl_;

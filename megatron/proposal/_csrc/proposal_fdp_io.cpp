@@ -86,11 +86,12 @@ py::dict batch_stats_to_dict(const proposal::fdp::UcmdRingBatchStats& s) {
     py::dict d;
     d["commands"] = s.commands;
     d["submitted"] = s.submitted;
-    d["first_submit_ns"] = s.first_submit_ns;
-    d["last_cqe_ns"] = s.last_cqe_ns;
-    d["submit_lifetime_ns"] = s.submit_lifetime_ns;
-    d["submit_lifetime_ms"] =
-        static_cast<double>(s.submit_lifetime_ns) / 1000000.0;
+    d["queue_depth"] = s.queue_depth;
+    d["submit_calls"] = s.submit_calls;
+    d["registered_file_submits"] = s.registered_file_submits;
+    d["submission_policy"] = "sq_space";
+    d["completion_thread"] = true;
+    d["sqpoll"] = true;
     return d;
 }
 

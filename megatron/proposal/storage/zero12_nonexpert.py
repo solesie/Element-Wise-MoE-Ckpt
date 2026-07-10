@@ -155,23 +155,14 @@ class Zero12NonExpertCollector:
         self.checkpoint_workers = checkpoint_workers
         self._named_params_cache: Optional[Dict[str, torch.nn.Parameter]] = None
         self._pinned_cpu: Optional[torch.Tensor] = None
-        self._pinned_ring: List[Optional[torch.Tensor]] = [None, None]
-        self._pinned_ready: List[threading.Event] = [
-            threading.Event() for _ in self._pinned_ring
-        ]
-        for ev in self._pinned_ready:
-            ev.set()
-        self._pinned_cursor = 0
+        self._pinned_ready = threading.Event()
+        self._pinned_ready.set()
         if torch.cuda.is_available():
             self._main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
-            self._ring_d2h_events: List[Optional["torch.cuda.Event"]] = [
-                torch.cuda.Event() for _ in self._pinned_ring
-            ]
         else:
             self._main_event = None
             self._d2h_event = None
-            self._ring_d2h_events = [None for _ in self._pinned_ring]
 
     def preallocate(self) -> None:
         """Allocate pinned capacity once before the training hot path."""
@@ -195,12 +186,6 @@ class Zero12NonExpertCollector:
         if padded_bytes & 3:
             padded_bytes = (padded_bytes + 3) & ~3
         pinned_numel = max(1, padded_bytes // 4)
-        use_ring = self.cp_target == "disk" and self.checkpoint_workers is not None
-        if use_ring:
-            for i, pinned in enumerate(self._pinned_ring):
-                if pinned is None or int(pinned.numel()) < int(pinned_numel):
-                    self._pinned_ring[i] = _alloc_sector_aligned_pinned_fp32(pinned_numel)
-            return
         if self._pinned_cpu is None or int(self._pinned_cpu.numel()) < int(pinned_numel):
             self._pinned_cpu = _alloc_sector_aligned_pinned_fp32(pinned_numel)
 
@@ -260,25 +245,27 @@ class Zero12NonExpertCollector:
             padded_bytes = (padded_bytes + 3) & ~3
         pinned_numel = padded_bytes // 4
 
-        use_ring = self.cp_target == "disk" and self.checkpoint_workers is not None
+        use_writer_lease = (
+            self.cp_target == "disk" and self.checkpoint_workers is not None
+        )
         ready_event_for_writer: Optional[threading.Event] = None
-        ring_d2h_event: Optional["torch.cuda.Event"] = None
+        slab_d2h_event: Optional["torch.cuda.Event"] = None
         wait_ms = 0.0
-        if use_ring:
-            slot = int(self._pinned_cursor) % len(self._pinned_ring)
-            ready_event_for_writer = self._pinned_ready[slot]
+        if use_writer_lease:
+            ready_event_for_writer = self._pinned_ready
             tw = time.perf_counter()
             ready_event_for_writer.wait()
             wait_ms = (time.perf_counter() - tw) * 1000.0
             ready_event_for_writer.clear()
-            ring_d2h_event = self._ring_d2h_events[slot]
-            pinned = self._pinned_ring[slot]
-            if pinned is None or int(pinned.numel()) < int(pinned_numel):
-                pinned = _alloc_sector_aligned_pinned_fp32(
-                    int(max(pinned_numel, pinned_numel * 1.5))
+            slab_d2h_event = self._d2h_event
+            pinned = self._pinned_cpu
+            if pinned is None:
+                raise RuntimeError("ZeRO12 non-expert slab was not preallocated")
+            if int(pinned.numel()) < int(pinned_numel):
+                raise RuntimeError(
+                    f"zero12 non-expert pinned capacity {pinned.numel()} "
+                    f"< required {pinned_numel}"
                 )
-                self._pinned_ring[slot] = pinned
-            self._pinned_cursor += 1
         else:
             pinned = self._pinned_cpu
             if pinned is None:
@@ -312,7 +299,11 @@ class Zero12NonExpertCollector:
         read_event: Optional["torch.cuda.Event"] = None
         if torch.cuda.is_available():
             d2h_stream = get_d2h_stream()
-            d2h_event = ring_d2h_event if ring_d2h_event is not None else self._d2h_event
+            d2h_event = (
+                slab_d2h_event
+                if slab_d2h_event is not None
+                else self._d2h_event
+            )
             if d2h_event is None or self._main_event is None:
                 raise RuntimeError("ZeRO12 non-expert collect events are not initialized")
             if ready_event is None:

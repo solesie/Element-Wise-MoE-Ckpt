@@ -311,21 +311,12 @@ class FCManager:
         self.last_tick_phase_ms: Dict[str, float] = {}
 
         # Cached pinned CPU buffers for fast GPU→CPU transfers. Non-expert
-        # FC has one owner and reuses a single slab/ring. Expert LFCL uses
+        # FC has one owner and reuses a single slab. Expert LFCL uses
         # one per-iteration contiguous slab and one writer lease, matching
         # the AOS ownership model.
         self._collect_pinned_cpu: Optional[torch.Tensor] = None
-        _ne_ring_slots = 4
-        self._collect_nonexpert_pinned_ring: List[Optional[torch.Tensor]] = [
-            None for _ in range(_ne_ring_slots)
-        ]
-        self._collect_nonexpert_pinned_ready: List[threading.Event] = [
-            threading.Event() for _ in self._collect_nonexpert_pinned_ring
-        ]
-        for _ev in self._collect_nonexpert_pinned_ready:
-            _ev.set()
-        self._collect_nonexpert_d2h_events: List[Optional["torch.cuda.Event"]] = []
-        self._collect_nonexpert_pinned_cursor: int = 0
+        self._collect_nonexpert_ready = threading.Event()
+        self._collect_nonexpert_ready.set()
         self._lfcl_batch_pinned: Optional[torch.Tensor] = None
         self._lfcl_batch_ready = threading.Event()
         self._lfcl_batch_ready.set()
@@ -345,17 +336,15 @@ class FCManager:
         if torch.cuda.is_available():
             self._collect_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._collect_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
-            self._collect_nonexpert_d2h_events = [
-                torch.cuda.Event() for _ in self._collect_nonexpert_pinned_ring
-            ]
+            self._collect_nonexpert_d2h_event: Optional["torch.cuda.Event"] = (
+                torch.cuda.Event()
+            )
             self._lfcl_batch_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._lfcl_batch_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
         else:
             self._collect_main_event = None
             self._collect_d2h_event = None
-            self._collect_nonexpert_d2h_events = [
-                None for _ in self._collect_nonexpert_pinned_ring
-            ]
+            self._collect_nonexpert_d2h_event = None
             self._lfcl_batch_main_event = None
             self._lfcl_batch_d2h_event = None
 
@@ -577,17 +566,6 @@ class FCManager:
             int(binary_io.PIN_CHUNK_BYTES),
         )
         pinned_numel = padded_bytes // 4
-        if (
-            self.cp_target == "disk"
-            and self._checkpoint_workers is not None
-            and len(self._collect_nonexpert_pinned_ring) > 1
-        ):
-            for i in range(len(self._collect_nonexpert_pinned_ring)):
-                if self._collect_nonexpert_pinned_ring[i] is None:
-                    self._collect_nonexpert_pinned_ring[i] = (
-                        _alloc_sector_aligned_pinned_fp32(pinned_numel)
-                    )
-            return
         if self._collect_pinned_cpu is None:
             self._collect_pinned_cpu = _alloc_sector_aligned_pinned_fp32(
                 pinned_numel,
@@ -1203,32 +1181,26 @@ class FCManager:
             padded_bytes = (padded_bytes + 3) & ~3
         pinned_numel = padded_bytes // 4
 
-        use_nonexpert_ring = (
+        use_writer_lease = (
             self.cp_target == "disk"
             and self._checkpoint_workers is not None
-            and len(self._collect_nonexpert_pinned_ring) > 1
         )
         producer_ready_event = ready_event
         ready_event_for_writer: Optional[threading.Event] = None
-        ring_d2h_event: Optional["torch.cuda.Event"] = None
-        if use_nonexpert_ring:
-            ring = self._collect_nonexpert_pinned_ring
-            slot = int(self._collect_nonexpert_pinned_cursor) % len(ring)
-            ready_event_for_writer = self._collect_nonexpert_pinned_ready[slot]
+        slab_d2h_event: Optional["torch.cuda.Event"] = None
+        if use_writer_lease:
+            ready_event_for_writer = self._collect_nonexpert_ready
             ready_event_for_writer.wait()
             ready_event_for_writer.clear()
-            if slot < len(self._collect_nonexpert_d2h_events):
-                ring_d2h_event = self._collect_nonexpert_d2h_events[slot]
-            pinned = ring[slot]
+            slab_d2h_event = self._collect_nonexpert_d2h_event
+            pinned = self._collect_pinned_cpu
             if pinned is None:
-                init_numel = int(max(pinned_numel, pinned_numel * 1.5))
-                pinned = _alloc_sector_aligned_pinned_fp32(init_numel)
-                ring[slot] = pinned
-            elif pinned.numel() < pinned_numel:
-                init_numel = int(max(pinned_numel, pinned_numel * 1.5))
-                pinned = _alloc_sector_aligned_pinned_fp32(init_numel)
-                ring[slot] = pinned
-            self._collect_nonexpert_pinned_cursor += 1
+                raise RuntimeError("non-expert pinned slab was not preallocated")
+            if pinned.numel() < pinned_numel:
+                raise RuntimeError(
+                    f"non-expert pinned capacity {pinned.numel()} "
+                    f"< required {pinned_numel}"
+                )
         else:
             # Phase 5: NE-FC pinned is allocated ONCE on first call with
             # 1.5× headroom over that first iter's footprint. Subsequent
@@ -1371,7 +1343,11 @@ class FCManager:
         d2h_copy_cmds = _count_d2h_copies(merged_srcs)
         if torch.cuda.is_available():
             d2h_stream = get_d2h_stream()
-            d2h_event = ring_d2h_event if ring_d2h_event is not None else self._collect_d2h_event
+            d2h_event = (
+                slab_d2h_event
+                if slab_d2h_event is not None
+                else self._collect_d2h_event
+            )
             if d2h_event is None:
                 raise RuntimeError("FCManager collect events were not initialized")
             main_event = self._collect_main_event

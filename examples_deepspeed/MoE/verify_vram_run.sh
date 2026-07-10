@@ -23,7 +23,7 @@ env NUM_LAYERS=12 HIDDEN_SIZE=768 NUM_ATTN_HEADS=12 \
     PROPOSAL_VRAM_AUDIT=1 PROPOSAL_VRAM_AUDIT_LOG="$AUDIT_LOG" \
     PROPOSAL_PER_ITER_ALLOC_TRACE=1 \
     PROPOSAL_ROUTING_FREEZE_ENABLE=1 \
-    EXTRA_MEGATRON_FLAGS="--exit-interval 20 --eval-interval 999999 --eval-iters 0 --log-interval 5 --proposal-test-skip-expert-commit --proposal-test-skip-nonexpert-commit" \
+    EXTRA_MEGATRON_FLAGS="--exit-interval 26 --eval-interval 999999 --eval-iters 0 --log-interval 5 --proposal-test-skip-expert-commit --proposal-test-skip-nonexpert-commit" \
     OUTPUT_BASEPATH=$OUT SEED=2024 \
     VARIANT=verify_vram \
     bash "$DIR/proposal_test_template.sh" > "$OUT/run.log" 2>&1 || true

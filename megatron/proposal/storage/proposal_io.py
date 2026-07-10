@@ -906,6 +906,8 @@ def fdp_end_data_batch_stats() -> Dict[str, Any]:
             "fdp_end_data_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
     stats = dict(_get_fdp().end_data_batch_stats())
+    _fdp_readback_validator.validate_ring_stats("nefc", dict(stats["nefc"]))
+    _fdp_readback_validator.validate_ring_stats("expert", dict(stats["expert"]))
     _fdp_readback_validator.validate_all()
     return stats
 
@@ -930,6 +932,7 @@ def fdp_end_nefc_batch_stats() -> Dict[str, Any]:
             "fdp_end_nefc_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
     stats = dict(_get_fdp().end_nefc_batch_stats())
+    _fdp_readback_validator.validate_ring_stats("nefc", stats)
     _fdp_readback_validator.validate_nefc()
     return stats
 
@@ -956,6 +959,7 @@ def fdp_end_expert_batch_stats() -> Dict[str, Any]:
             "fdp_end_expert_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
         )
     stats = dict(_get_fdp().end_expert_batch_stats())
+    _fdp_readback_validator.validate_ring_stats("expert", stats)
     _fdp_readback_validator.validate_expert()
     return stats
 
