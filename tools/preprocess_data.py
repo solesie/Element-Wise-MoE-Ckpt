@@ -96,6 +96,10 @@ class Encoder(object):
                     sentence_lens.append(len(sentence_ids))
             if len(doc_ids) > 0 and self.args.append_eod:
                 doc_ids.append(Encoder.tokenizer.eod)
+                # The mmap index stores one size per encoded sentence/document.
+                # Account for the appended EOD in that size so every following
+                # document pointer stays aligned with the binary token stream.
+                sentence_lens[-1] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
         return ids, lens, len(json_line)
@@ -384,4 +388,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

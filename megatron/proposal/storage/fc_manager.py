@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 
@@ -393,6 +393,11 @@ class FCManager:
                     expert_tensor_map[eid] = entries
             else:
                 expert_tensor_map = partition_plan.expert_tensor_map
+                # ZeRO-1/2 owns only the expert fragments present in this
+                # rank's optimizer partition.  LFCL planning, slot counts and
+                # recovery diagnostics must use that local ownership set, not
+                # the unpartitioned model enumeration above.
+                self._install_active_expert_ids(expert_tensor_map.keys())
                 self._lfcl_field_cache_by_expert.update(
                     partition_plan.field_cache_by_expert
                 )
@@ -456,6 +461,34 @@ class FCManager:
                         flush=True,
                     )
         self._init_nonexpert_pinned_buffers()
+
+    def _install_active_expert_ids(self, expert_ids: Iterable[ExpertId]) -> None:
+        """Replace expert-slot metadata with the rank-owned active IDs."""
+
+        active = sorted({
+            (int(expert_id[0]), int(expert_id[1]))
+            for expert_id in expert_ids
+        })
+        self._all_expert_ids = active
+        self._slot_index = {
+            expert_id: slot for slot, expert_id in enumerate(active)
+        }
+        self._sorted_layers = sorted({layer for layer, _expert in active})
+        self._num_layers = len(self._sorted_layers)
+        self._num_experts_by_layer = {
+            layer: sum(1 for eid in active if eid[0] == layer)
+            for layer in self._sorted_layers
+        }
+        self.num_experts = (
+            max(self._num_experts_by_layer.values())
+            if self._num_experts_by_layer else 0
+        )
+        self._num_expert_slots = len(active)
+        fraction = float(getattr(self, "lfcl_fraction_pct", 0.0))
+        self._experts_per_lfcl_event = (
+            max(1, math.ceil(len(active) * fraction / 100.0))
+            if active and fraction > 0.0 else 0
+        )
 
     # ------------------------------------------------------------------
     def _enumerate_params(self) -> None:

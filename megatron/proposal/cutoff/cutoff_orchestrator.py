@@ -29,6 +29,22 @@ _APPROX_PROBE_COUNT_MISMATCH_GROW_AFTER = 3
 
 
 class CutoffOrchestrationMixin:
+    def _invalidate_global_selection_element_count_cache(self) -> None:
+        """Drop a selection-domain count computed for an older flat layout.
+
+        DeepSpeed ZeRO-1/2 installs the rank-local optimizer partition after
+        the pipeline object has enumerated the unpartitioned model.  The
+        controller may therefore have populated these fields from the full
+        local expert tensors before ``_init_lossy_flat_layout`` replaces them
+        with DP-owned fragments.  Counts are cheap to rebuild once, but a
+        stale value doubles (for DP=2) both the global K target and direct
+        feedback denominator.
+        """
+
+        self._global_selection_element_count_host = None
+        self._local_selection_element_count_host = None
+        self._selection_domain_count_logged = False
+
     def _valid_positive_threshold(self, tau: float) -> bool:
         return valid_positive_threshold(float(tau))
 
@@ -343,7 +359,20 @@ class CutoffOrchestrationMixin:
             process_group=process_group,
             world_size=int(world_size),
         )
+        self._local_selection_element_count_host = int(local_n_elements)
         self._global_selection_element_count_host = int(count)
+        topology = getattr(self, "_topology", None)
+        if (
+            topology is not None
+            and bool(getattr(topology, "is_global_rank0", False))
+            and not bool(getattr(self, "_selection_domain_count_logged", False))
+        ):
+            print(
+                "[proposal] finalized partitioned selection domain "
+                f"rank0_local={int(local_n_elements)} global={int(count)}",
+                flush=True,
+            )
+            self._selection_domain_count_logged = True
         return int(count)
 
     def _apply_direct_emission_feedback(

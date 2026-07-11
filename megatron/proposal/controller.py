@@ -51,6 +51,11 @@ class PostStepCheckpointTask:
     expert_started_at: float = 0.0
     non_expert_ready_at: float = 0.0
     expert_ready_at: float = 0.0
+    defer_stage0_expert_emission: bool = False
+    expert_emission_release: threading.Event = field(
+        default_factory=threading.Event,
+    )
+    expert_emission_cuda_event: Optional["torch.cuda.Event"] = None
 
 
 class ProposalController:
@@ -71,6 +76,10 @@ class ProposalController:
         self._config = {}
         self._pending_fault_record = None
         self._dispatch_ready_event = None
+        # Re-recorded once per normal PP-stage-0 iteration.  The object itself
+        # is allocated once at proposal init so the steady path creates no
+        # CUDA events.
+        self._stage0_emission_cuda_event = None
         self._proposal_cpu_pg = None
         self._proposal_world_size = 1
 
@@ -83,11 +92,13 @@ class ProposalController:
         iter_T: int,
         *,
         sync_processes: bool = True,
+        defer_stage0_emission: bool = False,
     ) -> None:
         proposal_dispatch_post_iter(
             model,
             iter_T,
             sync_processes=bool(sync_processes),
+            defer_stage0_emission=bool(defer_stage0_emission),
         )
 
     def step(
@@ -96,6 +107,8 @@ class ProposalController:
         global_step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
+        emission_release_event: Optional[threading.Event] = None,
+        emission_cuda_event: Optional["torch.cuda.Event"] = None,
     ) -> Any:
         if self._lossy_cp is None:
             return None
@@ -104,6 +117,8 @@ class ProposalController:
             global_step=global_step,
             ready_event=ready_event,
             d2h_event_callback=d2h_event_callback,
+            emission_release_event=emission_release_event,
+            emission_cuda_event=emission_cuda_event,
         )
 
     def wait_d2h_before_optimizer(self) -> None:
@@ -196,8 +211,47 @@ def _should_write() -> bool:
     return torch.distributed.get_rank() == 0
 
 
+def _stage0_bubble_deferral_enabled(
+    topology: ProposalTopology,
+    *,
+    enable_zbh1_pipeline: bool,
+) -> bool:
+    """Whether this rank has the standard 1F1B stage-0 backward bubble."""
+
+    return bool(
+        int(topology.pp_size) > 1
+        and int(topology.pp_rank) == 0
+        and not bool(enable_zbh1_pipeline)
+    )
+
+
+def _release_stage0_expert_emission(*, record_cuda_event: bool = True) -> None:
+    """Release one deferred stage-0 expert scan at its gradient-wait boundary.
+
+    The host event wakes the expert worker.  A reusable CUDA event orders that
+    worker's compute stream after the main-stream forward work preceding the
+    first ``RecvGrad``.  The normal PipelineEngine hook records that event,
+    posts the complete receive through the original instruction, and only then
+    calls this helper with ``record_cuda_event=False``.  That host ordering is
+    essential: proposal scan must never race ahead of posting the NCCL receive.
+    Repeated calls are harmless and provide an optimizer-step fallback for
+    custom PipelineEngine schedules that omit the standard receive hook.
+    """
+
+    ctrl = get_controller()
+    task = getattr(ctrl, "_latest_post_step_checkpoint_task", None)
+    if task is None or not bool(task.defer_stage0_expert_emission):
+        return
+    if task.expert_emission_release.is_set():
+        return
+    event = task.expert_emission_cuda_event
+    if record_cuda_event and event is not None and torch.cuda.is_available():
+        event.record(torch.cuda.current_stream())
+    task.expert_emission_release.set()
+
+
 def _install_pipeline_optimizer_fence(model: Any) -> None:
-    """Wire the proposal fence into DeepSpeed PipelineEngine's optimizer step.
+    """Wire proposal bubble release/fence into DeepSpeed PipelineEngine.
 
     PipelineEngine executes forward/backward and optimizer.step inside
     ``train_batch()``, so the normal Megatron optimizer-fence call site is not
@@ -213,26 +267,64 @@ def _install_pipeline_optimizer_fence(model: Any) -> None:
         return
 
     opt_key = None
-    original = None
+    original_opt = None
+    recv_grad_key = None
+    original_recv_grad = None
     for key, fn in instr_map.items():
         if getattr(key, "__name__", "") == "OptimizerStep":
             opt_key = key
-            original = fn
-            break
-    if opt_key is None or original is None:
+            original_opt = fn
+        elif getattr(key, "__name__", "") == "RecvGrad":
+            recv_grad_key = key
+            original_recv_grad = fn
+    if opt_key is None or original_opt is None:
         return
 
     def _proposal_optimizer_step(self, *args: Any, **kwargs: Any) -> Any:
+        # Correctness fallback for a custom schedule without the standard
+        # late-backward cooldown hook.
+        # Release first, then wait for the resulting read/D2H completion.
+        _release_stage0_expert_emission(record_cuda_event=True)
         proposal_wait_d2h_before_optimizer()
-        return original(self, *args, **kwargs)
+        return original_opt(self, *args, **kwargs)
+
+    def _proposal_recv_grad(self, *args: Any, **kwargs: Any) -> Any:
+        task = get_controller()._latest_post_step_checkpoint_task
+        first_deferred_recv = bool(
+            task is not None
+            and task.defer_stage0_expert_emission
+            and not task.expert_emission_release.is_set()
+        )
+        try:
+            if first_deferred_recv:
+                # Seal only the preceding F1/.../F(P-1) work.  This event must
+                # be recorded before the original receive, because c10d makes
+                # the main stream wait for that receive before subsequent
+                # backward.
+                event = task.expert_emission_cuda_event
+                if event is not None and torch.cuda.is_available():
+                    event.record(torch.cuda.current_stream())
+            # DeepSpeed posts every gradient tensor receive here.  Its CPU
+            # call returns after enqueue while the NCCL kernel remains active.
+            return original_recv_grad(self, *args, **kwargs)
+        finally:
+            if first_deferred_recv:
+                # Wake the worker only after NCCL receive submission.  The
+                # worker waits the pre-receive event above, not an event placed
+                # behind the main-stream receive dependency.  On a CUDA/P2P
+                # exception this release is only a teardown-liveness measure;
+                # the optimizer is not allowed to continue that failed step.
+                _release_stage0_expert_emission(record_cuda_event=False)
 
     local_map = dict(instr_map)
     local_map[opt_key] = _proposal_optimizer_step
+    if recv_grad_key is not None and original_recv_grad is not None:
+        local_map[recv_grad_key] = _proposal_recv_grad
     engine._INSTRUCTION_MAP = local_map
     engine._proposal_pipeline_fence_installed = True
     if _should_write():
         print(
-            "[proposal] PipelineEngine optimizer fence installed",
+            "[proposal] PipelineEngine optimizer fence/stage0 bubble hook installed",
             flush=True,
         )
 
@@ -284,6 +376,18 @@ def init_proposal(
 
     topology = topology_from_args(args)
     get_controller()._topology = topology
+    _defer_stage0_expert_emission = _stage0_bubble_deferral_enabled(
+        topology,
+        enable_zbh1_pipeline=bool(
+            getattr(args, "enable_zbh1_pipeline", False)
+        ),
+    )
+    if (
+        _defer_stage0_expert_emission
+        and torch.cuda.is_available()
+        and get_controller()._stage0_emission_cuda_event is None
+    ):
+        get_controller()._stage0_emission_cuda_event = torch.cuda.Event()
     if os.environ.get("PROPOSAL_IO_BACKEND", "").lower() == "fdp":
         os.environ.setdefault("PROPOSAL_FDP_RANK", str(int(topology.global_rank)))
         os.environ.setdefault("PROPOSAL_FDP_WORLD_SIZE", str(int(topology.world_size)))
@@ -416,6 +520,9 @@ def init_proposal(
         "rank_namespace": topology.namespace,
         "writes_expert": topology.writes_expert,
         "writes_nonexpert": topology.writes_nonexpert,
+        "defer_stage0_expert_emission": bool(
+            _defer_stage0_expert_emission
+        ),
     }
     _test_skip_expert_commit = bool(
         getattr(args, "proposal_test_skip_expert_commit", False)
@@ -549,49 +656,6 @@ def init_proposal(
     pinned_aos_capacity_tolerance = float(
         get_controller()._proposal_config.pinned_aos_capacity_tolerance,
     )
-    if get_controller()._lossy_cp is not None:
-        local_selection_elems = max(
-            0,
-            int(getattr(get_controller()._lossy_cp, "total_tracked", 0)),
-        )
-        global_selection_elems = int(local_selection_elems)
-        if _proposal_world_size > 1 and local_selection_elems > 0:
-            try:
-                count_t = torch.tensor(
-                    [local_selection_elems],
-                    dtype=torch.int64,
-                    device="cpu",
-                )
-                torch.distributed.all_reduce(
-                    count_t,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=_proposal_cpu_pg,
-                )
-                global_selection_elems = int(count_t.item())
-            except Exception as _cap_exc:
-                raise RuntimeError(
-                    "proposal: failed to compute global selection element "
-                    "count for multi-rank strict tau/capacity sizing."
-                ) from _cap_exc
-        setattr(
-            get_controller()._lossy_cp,
-            "_local_selection_element_count_host",
-            int(local_selection_elems),
-        )
-        setattr(
-            get_controller()._lossy_cp,
-            "_global_selection_element_count_host",
-            int(global_selection_elems),
-        )
-        if _proposal_world_size > 1 and local_selection_elems > 0:
-            if _should_write():
-                print(
-                    "[proposal] multi-rank selection domain "
-                    f"local={local_selection_elems} global={global_selection_elems} "
-                    f"aos_capacity_ratio={pinned_aos_capacity_ratio:.6f} "
-                    f"tolerance={pinned_aos_capacity_tolerance:.6f}",
-                    flush=True,
-                )
 
     # CP layout: split non-expert + expert into separate subdirectories.
     # DP>1 stores non-expert shards in a PP-common directory, while expert
@@ -813,23 +877,18 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
     if ctrl._checkpoint_workers is not None:
         ctrl._checkpoint_workers.drain()
 
-    try:
-        from .telemetry.independent_oracle import run_independent_oracle
-        oracle_data_iterator = ctrl._config.get(
-            "_oracle_dedicated_valid_iter",
-            data_iterator,
-        )
-        run_independent_oracle(
-            model=model,
-            data_iterator=oracle_data_iterator,
-            iteration=int(iteration),
-            lossy_cp=ctrl._lossy_cp,
-            proposal_config=ctrl._proposal_config,
-        )
-    finally:
-        clear = getattr(ctrl._lossy_cp, "clear_independent_oracle_grad_cache", None)
-        if callable(clear):
-            clear()
+    from .telemetry.independent_oracle import run_independent_oracle
+    oracle_data_iterator = ctrl._config.get(
+        "_oracle_dedicated_valid_iter",
+        data_iterator,
+    )
+    run_independent_oracle(
+        model=model,
+        data_iterator=oracle_data_iterator,
+        iteration=int(iteration),
+        lossy_cp=ctrl._lossy_cp,
+        proposal_config=ctrl._proposal_config,
+    )
 
 
 def _proposal_tracked_gpu_memory_breakdown() -> Tuple[float, List[Tuple[str, float]]]:
@@ -1022,6 +1081,14 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
                     global_step=task.iter_T,
                     ready_event=task.cuda_event,
                     d2h_event_callback=_mark_expert_d2h_event,
+                    emission_release_event=(
+                        task.expert_emission_release
+                        if task.defer_stage0_expert_emission else None
+                    ),
+                    emission_cuda_event=(
+                        task.expert_emission_cuda_event
+                        if task.defer_stage0_expert_emission else None
+                    ),
                 )
         if ctrl._expert_lossless_fc is not None:
             fired_experts = ctrl._expert_lossless_fc.fire_planned(
@@ -1173,6 +1240,7 @@ def proposal_dispatch_post_iter(
     iter_T: int,
     *,
     sync_processes: bool = True,
+    defer_stage0_emission: bool = False,
 ) -> None:
     """Submit iter ``T`` checkpoint work before next forward.
 
@@ -1203,11 +1271,22 @@ def proposal_dispatch_post_iter(
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
         event.record()
+    ctrl = get_controller()
+    defer_expert = bool(
+        defer_stage0_emission
+        and ctrl._config.get("defer_stage0_expert_emission", False)
+    )
     task = PostStepCheckpointTask(
         cuda_event=event,
         iter_T=iter_T,
         sync_processes=bool(sync_processes),
+        defer_stage0_expert_emission=defer_expert,
+        expert_emission_cuda_event=(
+            ctrl._stage0_emission_cuda_event if defer_expert else None
+        ),
     )
+    if not defer_expert:
+        task.expert_emission_release.set()
     if not bool(sync_processes):
         task.dispatch_release_ready.set()
     get_controller()._latest_post_step_checkpoint_task = task
@@ -1260,6 +1339,14 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
         nonexpert_state_image=_nonexpert_state_image,
         nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
         expert_dir=get_controller()._config.get("expert_cp_dir"),
+        expected_expert_ids=(
+            get_controller()._fc.expert_state.expert_ids()
+            if (
+                get_controller()._fc is not None
+                and get_controller()._fc.expert_state is not None
+            )
+            else None
+        ),
     )
     _proposal_drain_cuda("proposal_recover_post")
     _proposal_cpu_barrier("proposal_recover")
@@ -1439,6 +1526,14 @@ def _simulate_fault_impl(
         nonexpert_state_image=_nonexpert_state_image,
         nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
         expert_dir=get_controller()._config.get("expert_cp_dir"),
+        expected_expert_ids=(
+            get_controller()._fc.expert_state.expert_ids()
+            if (
+                get_controller()._fc is not None
+                and get_controller()._fc.expert_state is not None
+            )
+            else None
+        ),
     )
     _proposal_drain_cuda("fault_post_recover")
     _proposal_cpu_barrier("fault_post_recover")

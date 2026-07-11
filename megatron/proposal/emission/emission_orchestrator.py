@@ -42,6 +42,15 @@ class EmissionOrchestrationMixin:
             eid: per_expert_batch[eid]
             for eid in sorted(per_expert_batch)
         }
+        write_expert_ids = tuple(per_expert_batch)
+        hint_expert_ids = tuple(getattr(self, "_local_expert_ids", ()))
+        if hint_expert_ids != write_expert_ids:
+            raise RuntimeError(
+                "capacity-demand hint expert order does not match the "
+                "rank-local direct-emission layout: "
+                f"hint={hint_expert_ids[:8]} ({len(hint_expert_ids)} slots), "
+                f"write={write_expert_ids[:8]} ({len(write_expert_ids)} slots)"
+            )
 
         mvph: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
         theta_cp_groups: List[Optional[torch.Tensor]] = []
@@ -81,6 +90,7 @@ class EmissionOrchestrationMixin:
         cached = {
             "name_list": name_list,
             "per_expert_batch": per_expert_batch,
+            "capacity_hint_expert_ids": hint_expert_ids,
             "mvph": tuple(mvph),
             "theta_cp_groups": tuple(theta_cp_groups),
             "within_off_per_name": tuple(element_within_off_host),
@@ -274,6 +284,9 @@ class EmissionOrchestrationMixin:
                     self._approx_probe_expected_selected_count
                 ),
                 capacity_demand_hint=self._approx_probe_capacity_demand_hint,
+                capacity_demand_hint_expert_ids=static_inputs[
+                    "capacity_hint_expert_ids"
+                ],
                 total_elems_global=int(total_elems_for_actual_k),
                 allowed_probe_count_delta=max(1, int(allowed_probe_count_delta)),
                 sample_blocks_min=int(self._approx_probe_sample_blocks_min),

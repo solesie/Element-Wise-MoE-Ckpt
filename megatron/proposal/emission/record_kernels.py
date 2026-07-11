@@ -89,6 +89,9 @@ class LossyRecordWriteInputs:
     probe_diagnostics: Optional[torch.Tensor] = None
     probe_expected_selected_count: Optional[torch.Tensor] = None
     capacity_demand_hint: Optional[torch.Tensor] = None
+    capacity_demand_hint_expert_ids: Tuple[Tuple[int, int], ...] = field(
+        default_factory=tuple,
+    )
     total_elems_global: int = 0
     allowed_probe_count_delta: int = 0
     sample_blocks_min: int = 1

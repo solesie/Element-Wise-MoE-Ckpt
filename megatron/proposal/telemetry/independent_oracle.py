@@ -16,6 +16,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from ..refresh.fp32_state import (
+    discard_zero12_grad_state,
+    get_engine_optimizer,
+)
 from .ideal_oracle import (
     _all_reduce_mean_float,
     _all_reduce_sum_float,
@@ -32,6 +36,8 @@ _SNAPSHOT_ATTR = "_independent_oracle_live_param_snapshot"
 _PRODUCTION_FIRST_ORDER_SOURCE = "momentum"
 _PRODUCTION_FIRST_ORDER_KEY = "m_flat"
 _PRODUCTION_FIRST_ORDER_NAME = "m_t"
+_ORACLE_SEED = 20240625
+_HVP_BATCHES = 1
 
 
 def independent_oracle_enabled(proposal_config: Any, iteration: int) -> bool:
@@ -65,15 +71,11 @@ def run_independent_oracle(
     t0 = time.perf_counter()
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    actual_batches = max(1, int(getattr(proposal_config, "independent_oracle_actual_batches", 4) or 4))
-    hvp_batches = max(0, int(getattr(proposal_config, "independent_oracle_hvp_batches", 1) or 0))
-    requested_hvp_batches = int(hvp_batches)
+    hvp_batches = _HVP_BATCHES
+    requested_hvp_batches = _HVP_BATCHES
     m0 = model[0] if isinstance(model, (list, tuple)) else model
     pipeline_engine = bool(_is_pipeline_engine(m0))
-    hvp_skip_reason = None
-    score_source = _PRODUCTION_FIRST_ORDER_SOURCE
-    first_order_name = _PRODUCTION_FIRST_ORDER_NAME
-    batch_seed = int(getattr(proposal_config, "independent_oracle_batch_seed", 20240625) or 20240625)
+    batch_seed = _ORACLE_SEED
     outer_rng = _capture_rng_state()
     prev_snapshot = getattr(lossy_cp, _SNAPSHOT_ATTR, None)
     live_snapshot = None
@@ -84,7 +86,7 @@ def run_independent_oracle(
         loss_bank = _build_forward_loss_bank(
             model=model,
             data_iterator=data_iterator,
-            n_batches=actual_batches,
+            n_batches=hvp_batches,
         )
         if not loss_bank:
             _append_jsonl(log_dir / f"independent_skip_rank{rank:03d}.jsonl", {
@@ -93,218 +95,32 @@ def run_independent_oracle(
                 "rank": int(rank),
                 "world": int(world),
                 "reason": "empty_loss_bank",
-                "requested_actual_batches": int(actual_batches),
+                "requested_hvp_batches": int(requested_hvp_batches),
             })
             return
 
         live_snapshot = _LiveParamSnapshot.capture(lossy_cp)
         setattr(lossy_cp, _SNAPSHOT_ATTR, live_snapshot)
-        proposal_group = getattr(lossy_cp, "_proposal_cpu_pg", None)
-        loss_base, loss_base_batches = _eval_loss_bank_values(
-            loss_bank,
-            group=proposal_group,
-        )
-        loss_policy, loss_policy_batches = _eval_checkpoint_loss_values(
-            lossy_cp=lossy_cp,
+        _run_independent_rank_only(
             model=model,
             loss_bank=loss_bank,
-            group=proposal_group,
-        )
-        actual_remaining = float(loss_policy) - float(loss_base)
-        actual_delta_stats = _paired_delta_stats(
-            base=loss_base_batches,
-            policy=loss_policy_batches,
-            seed=int(batch_seed) + int(iteration),
-        )
-
-        e_stats = _full_e_stats(lossy_cp)
-        r1_self = _full_first_order_dot(lossy_cp)
-        r2_full = None
-        residual_self_full = None
-        hvp_sample: Optional[np.ndarray] = None
-        oneshot_rows: List[Dict[str, Any]] = []
-
-        sample = _build_sample(lossy_cp, proposal_config, rank=rank)
-        sample_payload = _gather_sample_payload(
-            lossy_cp,
-            sample,
             iteration=int(iteration),
-        )
-
-        if hvp_batches > 0 and e_stats["global_rms"] > 0.0:
-            fd_eps = float(getattr(proposal_config, "ideal_oracle_fd_eps", None) or getattr(proposal_config, "finite_diff_eps", 1.0e-3) or 1.0e-3)
-            if _env_flag("PROPOSAL_INDEPENDENT_ORACLE_ONESHOT_HVP_ACTUAL"):
-                r2_full, hvp_sample, oneshot_rows = _run_oneshot_hvp_actual(
-                    lossy_cp=lossy_cp,
-                    model=model,
-                    loss_bank=loss_bank,
-                    hvp_loss_bank=loss_bank[:hvp_batches],
-                    fd_eps=fd_eps,
-                    sample=sample,
-                    loss_base=float(loss_base),
-                    loss_base_batches=loss_base_batches,
-                    proposal_config=proposal_config,
-                    iteration=int(iteration),
-                    rank=rank,
-                    world=world,
-                )
-            else:
-                r2_full, hvp_sample = _hvp_for_current_error(
-                    lossy_cp=lossy_cp,
-                    model=model,
-                    loss_bank=loss_bank[:hvp_batches],
-                    fd_eps=fd_eps,
-                    rms_e=float(e_stats["global_rms"]),
-                    sample=sample,
-                )
-            residual_self_full = float(actual_remaining) - (float(r1_self) + float(r2_full))
-
-        age_terms = _full_agebit_proxy_terms(lossy_cp)
-        r1_age_self = None
-        r2_age_diag = None
-        residual_self_agebit = None
-        if age_terms is not None:
-            r1_age_self, r2_age_diag = age_terms
-            residual_self_agebit = (
-                float(actual_remaining) - (float(r1_age_self) + float(r2_age_diag))
-            )
-
-        row = {
-            "mode": "independent_oracle_loss",
-            "step": int(iteration),
-            "rank": int(rank),
-            "world": int(world),
-            "policy": f"{first_order_name}+diag_abs_h+agebit",
-            "score_first_order_source": score_source,
-            "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
-            "batch_seed": int(batch_seed),
-            "loss_base": float(loss_base),
-            "loss_policy_checkpoint": float(loss_policy),
-            "fault_val_loss_delta": float(actual_remaining),
-            "actual_loss_remaining": float(actual_remaining),
-            "actual_delta_mean": float(actual_delta_stats["mean"]),
-            "actual_delta_median": float(actual_delta_stats["median"]),
-            "actual_delta_std": float(actual_delta_stats["std"]),
-            "actual_delta_ci95_low": float(actual_delta_stats["ci95_low"]),
-            "actual_delta_ci95_high": float(actual_delta_stats["ci95_high"]),
-            "actual_delta_positive_ratio": float(actual_delta_stats["positive_ratio"]),
-            "actual_delta_min": float(actual_delta_stats["min"]),
-            "actual_delta_max": float(actual_delta_stats["max"]),
-            "actual_delta_n": int(actual_delta_stats["n"]),
-            "loss_base_batches": actual_delta_stats.get("base_batches"),
-            "loss_policy_checkpoint_batches": actual_delta_stats.get("policy_batches"),
-            "actual_delta_batches": actual_delta_stats.get("delta_batches"),
-            "e_global_rms": float(e_stats["global_rms"]),
-            "e_global_l2": float(e_stats["global_l2"]),
-            "e_global_abs_mean": float(e_stats["global_abs_mean"]),
-            "e_global_max": float(e_stats["global_max"]),
-            "R1_self_name": first_order_name,
-            "R1_self_true_e": float(r1_self),
-            "R2_full_hvp_true_e": float(r2_full) if r2_full is not None else None,
-            "residual_actual_minus_self_true_e_hvp": (
-                float(residual_self_full) if residual_self_full is not None else None
-            ),
-            "R1_self_agebit_e_hat": (
-                float(r1_age_self) if r1_age_self is not None else None
-            ),
-            "R2_diag_abs_h_agebit": (
-                float(r2_age_diag) if r2_age_diag is not None else None
-            ),
-            "first_plus_diag_abs_h_agebit_proxy": (
-                float(r1_age_self + r2_age_diag)
-                if r1_age_self is not None and r2_age_diag is not None else None
-            ),
-            "residual_actual_minus_self_agebit_diag_abs_h": (
-                float(residual_self_agebit) if residual_self_agebit is not None else None
-            ),
-            "actual_batches": int(len(loss_bank)),
-            "hvp_batches": int(min(hvp_batches, len(loss_bank))),
-            "requested_hvp_batches": int(requested_hvp_batches),
-            "hvp_skip_reason": hvp_skip_reason,
-            "pipeline_engine": bool(pipeline_engine),
-        }
-        _append_jsonl(log_dir / f"independent_loss_rank{rank:03d}.jsonl", row)
-        for oneshot_row in oneshot_rows:
-            _append_jsonl(log_dir / f"independent_oneshot_rank{rank:03d}.jsonl", oneshot_row)
-
-        rank_rows = _rank_metric_rows(
-            sample_payload=sample_payload,
-            hvp_sample=hvp_sample,
+            lossy_cp=lossy_cp,
             proposal_config=proposal_config,
-            iteration=int(iteration),
             rank=rank,
             world=world,
-            score_source=score_source,
+            log_dir=log_dir,
+            started_at=t0,
+            requested_hvp_batches=requested_hvp_batches,
+            pipeline_engine=pipeline_engine,
         )
-        for rank_row in rank_rows:
-            _append_jsonl(log_dir / f"independent_rank_rank{rank:03d}.jsonl", rank_row)
-
-        if _env_flag("PROPOSAL_INDEPENDENT_ORACLE_AUTOGRAD_GOLD"):
-            if pipeline_engine:
-                _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", {
-                    "mode": "independent_autograd_gold_status",
-                    "step": int(iteration),
-                    "rank": int(rank),
-                    "world": int(world),
-                    "score_first_order_source": score_source,
-                    "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
-                    "enabled": True,
-                    "status": "skip",
-                    "reason": "pipeline_engine_not_supported",
-                })
-            else:
-                from .autograd_gold import collect_autograd_gold_sample
-
-                specs = _tensor_specs(lossy_cp)
-                gold = collect_autograd_gold_sample(
-                    lossy_cp=lossy_cp,
-                    model=model,
-                    specs=specs,
-                    sample=sample,
-                    sample_payload=sample_payload,
-                    loss_bank=loss_bank,
-                    checkpoint_tensor_for_name=_checkpoint_tensor_for_name,
-                    restore_current_params=_restore_current_params,
-                    restore_rng_state=_restore_rng_state,
-                    iteration=int(iteration),
-                    rank=rank,
-                )
-                _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", {
-                    "mode": "independent_autograd_gold_status",
-                    "step": int(iteration),
-                    "rank": int(rank),
-                    "world": int(world),
-                    "score_first_order_source": score_source,
-                    "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
-                    **gold.meta,
-                })
-                for gold_row in _autograd_gold_rank_rows(
-                    gold_arrays=gold.arrays,
-                    sample_payload=sample_payload,
-                    proposal_config=proposal_config,
-                    iteration=int(iteration),
-                    rank=rank,
-                    world=world,
-                    score_source=score_source,
-                    first_order_name=first_order_name,
-                ):
-                    _append_jsonl(log_dir / f"independent_autograd_gold_rank{rank:03d}.jsonl", gold_row)
-
-        timing = {
-            "mode": "independent_oracle_timing",
-            "step": int(iteration),
-            "rank": int(rank),
-            "elapsed_ms": float((time.perf_counter() - t0) * 1000.0),
-            "actual_batches": int(len(loss_bank)),
-            "hvp_batches": int(min(hvp_batches, len(loss_bank))),
-            "requested_hvp_batches": int(requested_hvp_batches),
-            "hvp_skip_reason": hvp_skip_reason,
-            "pipeline_engine": bool(pipeline_engine),
-            "sample_elements": int(sample_payload["e"].size),
-        }
-        _append_jsonl(log_dir / f"independent_timing_rank{rank:03d}.jsonl", timing)
+        return
     finally:
         _restore_current_params(lossy_cp)
+        # Pipeline HVP runs ReduceGrads but intentionally skips OptimizerStep.
+        # Drop that ZeRO scratch table just as Hessian refresh does; otherwise
+        # the first oracle leaves one local gradient partition resident.
+        discard_zero12_grad_state(get_engine_optimizer(model))
         if live_snapshot is not None:
             max_diff = live_snapshot.max_abs_diff()
             if max_diff > float(os.environ.get(
@@ -338,6 +154,79 @@ def run_independent_oracle(
         else:
             setattr(lossy_cp, _SNAPSHOT_ATTR, prev_snapshot)
         _restore_rng_state(outer_rng)
+
+
+def _run_independent_rank_only(
+    *,
+    model: Any,
+    loss_bank: Sequence[Tuple[Callable[[], Tuple[torch.Tensor, Dict[str, Any]]], Dict[str, Any]]],
+    iteration: int,
+    lossy_cp: Any,
+    proposal_config: Any,
+    rank: int,
+    world: int,
+    log_dir: Path,
+    started_at: float,
+    requested_hvp_batches: int,
+    pipeline_engine: bool,
+) -> None:
+    """Measure ranking quality without running unrelated loss/proxy telemetry."""
+
+    error_rms = _global_error_rms(lossy_cp)
+    sample = _build_sample(lossy_cp, proposal_config, rank=rank)
+    sample_payload = _gather_sample_payload(
+        lossy_cp,
+        sample,
+        iteration=int(iteration),
+    )
+    fd_eps = float(
+        getattr(proposal_config, "ideal_oracle_fd_eps", None)
+        or getattr(proposal_config, "finite_diff_eps", 1.0e-3)
+        or 1.0e-3
+    )
+    hvp_sample: Optional[np.ndarray] = None
+    hvp_batches = min(int(requested_hvp_batches), len(loss_bank))
+    if hvp_batches > 0 and error_rms > 0.0:
+        _r2_unused, hvp_sample = _hvp_for_current_error(
+            lossy_cp=lossy_cp,
+            model=model,
+            loss_bank=loss_bank[:hvp_batches],
+            fd_eps=fd_eps,
+            rms_e=float(error_rms),
+            sample=sample,
+            compute_full_quadratic=False,
+        )
+
+    rank_rows = _rank_metric_rows(
+        sample_payload=sample_payload,
+        hvp_sample=hvp_sample,
+        proposal_config=proposal_config,
+        iteration=int(iteration),
+        rank=rank,
+        world=world,
+        score_source=_PRODUCTION_FIRST_ORDER_SOURCE,
+    )
+    rank_rows = [
+        row for row in rank_rows
+        if row.get("mode") == "independent_oracle_rank"
+    ]
+    for row in rank_rows:
+        _append_jsonl(log_dir / f"independent_rank_rank{rank:03d}.jsonl", row)
+
+    _append_jsonl(log_dir / f"independent_timing_rank{rank:03d}.jsonl", {
+        "mode": "independent_oracle_timing",
+        "step": int(iteration),
+        "rank": int(rank),
+        "elapsed_ms": float((time.perf_counter() - started_at) * 1000.0),
+        "actual_batches": 0,
+        "hvp_batches": int(hvp_batches),
+        "requested_hvp_batches": int(requested_hvp_batches),
+        "hvp_skip_reason": None if hvp_sample is not None else "zero_checkpoint_error",
+        "pipeline_engine": bool(pipeline_engine),
+        "rank_only": True,
+        "sample_elements": int(sample_payload["e"].size),
+        "rank_rows": int(len(rank_rows)),
+    })
 
 
 def _env_flag(name: str) -> bool:
@@ -899,6 +788,37 @@ def _full_e_stats(lossy_cp: Any) -> Dict[str, float]:
     }
 
 
+def _global_error_rms(lossy_cp: Any) -> float:
+    """Return only the checkpoint-error RMS needed to scale sampled HVP."""
+
+    local_sumsq = 0.0
+    local_n = 0
+    for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
+        p = grp.get("p_flat")
+        if p is None:
+            continue
+        for spec in _group_entry_specs(lossy_cp, group_idx, grp):
+            n = int(spec["n"])
+            if n <= 0:
+                continue
+            p_slice = p.narrow(0, _elem_off(spec), n)
+            checkpoint = _checkpoint_tensor_for_spec(
+                lossy_cp,
+                spec,
+                device=p_slice.device,
+                dtype=p_slice.dtype,
+            )
+            if checkpoint is None:
+                continue
+            error = (p_slice - checkpoint).detach().float()
+            local_sumsq += float(torch.dot(error, error).detach().item())
+            local_n += int(error.numel())
+    group = getattr(lossy_cp, "_proposal_cpu_pg", None)
+    global_sumsq = _all_reduce_sum_float(local_sumsq, group=group)
+    global_n = _all_reduce_sum_int(local_n, group=group)
+    return math.sqrt(max(0.0, global_sumsq) / float(max(1, global_n)))
+
+
 def _full_first_order_dot(lossy_cp: Any) -> float:
     local = 0.0
     for group_idx, grp in enumerate(getattr(lossy_cp, "_groups", ()) or ()):
@@ -1036,7 +956,7 @@ def _build_sample(lossy_cp: Any, proposal_config: Any, *, rank: int) -> Dict[str
     n_sample = min(max_samples, total)
     if n_sample <= 0:
         return {"items": [], "n": 0}
-    seed = int(getattr(proposal_config, "independent_oracle_rank_sample_seed", 20240625) or 20240625)
+    seed = _ORACLE_SEED
     rng = np.random.default_rng(seed + int(rank) * 1000003)
     ids = np.sort(rng.choice(total, size=n_sample, replace=False).astype(np.int64))
     items = []
@@ -1153,6 +1073,7 @@ def _hvp_for_current_error(
     fd_eps: float,
     rms_e: float,
     sample: Dict[str, Any],
+    compute_full_quadratic: bool = True,
 ) -> Tuple[float, np.ndarray]:
     if not loss_bank:
         return 0.0, np.zeros(int(sample.get("n", 0)), dtype=np.float32)
@@ -1169,6 +1090,7 @@ def _hvp_for_current_error(
                 forward_loss=forward_loss,
                 rng_state=rng_state,
                 sample=sample,
+                compute_full_dot=compute_full_quadratic,
             )
             _restore_current_params(lossy_cp)
             _set_params_perturbed(lossy_cp, scale=-float(fd_eps) * inv_rms)
@@ -1178,10 +1100,19 @@ def _hvp_for_current_error(
                 forward_loss=forward_loss,
                 rng_state=rng_state,
                 sample=sample,
+                compute_full_dot=compute_full_quadratic,
             )
-            local_ehe = float(rms_e) * (float(dot_plus) - float(dot_minus)) / (2.0 * float(fd_eps))
-            global_ehe = _all_reduce_sum_float(local_ehe, group=getattr(lossy_cp, "_proposal_cpu_pg", None))
-            r2_acc += 0.5 * float(global_ehe)
+            if compute_full_quadratic:
+                local_ehe = (
+                    float(rms_e)
+                    * (float(dot_plus) - float(dot_minus))
+                    / (2.0 * float(fd_eps))
+                )
+                global_ehe = _all_reduce_sum_float(
+                    local_ehe,
+                    group=getattr(lossy_cp, "_proposal_cpu_pg", None),
+                )
+                r2_acc += 0.5 * float(global_ehe)
             sample_acc += (
                 float(rms_e)
                 * (grad_plus.astype(np.float32, copy=False) - grad_minus.astype(np.float32, copy=False))
@@ -2891,6 +2822,7 @@ def _backward_dot_and_sample(
     forward_loss: Callable[[], Tuple[torch.Tensor, Dict[str, Any]]],
     rng_state: Optional[Dict[str, Any]],
     sample: Dict[str, Any],
+    compute_full_dot: bool = True,
 ) -> Tuple[float, np.ndarray]:
     if rng_state is not None:
         _restore_rng_state(rng_state)
@@ -2915,17 +2847,33 @@ def _backward_dot_and_sample(
             if param is None or n <= 0:
                 continue
             off = _elem_off(spec)
-            p_slice = p_flat.narrow(0, off, n)
-            c_slice = _checkpoint_tensor_for_spec(lossy_cp, spec, device=p_slice.device, dtype=p_slice.dtype)
-            if c_slice is None:
-                continue
-            e_slice = (p_slice - c_slice).detach()
+            e_slice = None
+            if compute_full_dot:
+                p_slice = p_flat.narrow(0, off, n)
+                c_slice = _checkpoint_tensor_for_spec(
+                    lossy_cp,
+                    spec,
+                    device=p_slice.device,
+                    dtype=p_slice.dtype,
+                )
+                if c_slice is None:
+                    continue
+                e_slice = (p_slice - c_slice).detach()
             sample_info = sample_by_name.get(str(spec["name"]))
 
             def _hook(raw_grad, *, _e=e_slice, _sample=sample_info, _param_offset=param_offset, _n=n):
-                flat = raw_grad.detach().reshape(-1).narrow(0, int(_param_offset), int(_n)).float()
-                dot_tensors.append(torch.sum(flat * _e.float()))
+                flat = None
+                if _e is not None or _sample is not None:
+                    flat = (
+                        raw_grad.detach()
+                        .reshape(-1)
+                        .narrow(0, int(_param_offset), int(_n))
+                        .float()
+                    )
+                if _e is not None and flat is not None:
+                    dot_tensors.append(torch.sum(flat * _e.float()))
                 if _sample is not None:
+                    assert flat is not None
                     vals = torch.index_select(flat, 0, _sample["offsets_t"]).detach().cpu().numpy()
                     sample_out[_sample["positions"]] = vals.astype(np.float32, copy=False)
                 return torch.zeros_like(raw_grad)
@@ -2986,9 +2934,7 @@ def _rank_metric_rows(
 ) -> List[Dict[str, Any]]:
     e = sample_payload["e"]
     m = sample_payload["m"]
-    e_age = sample_payload["e_age"]
     force = sample_payload["force"]
-    age_code = sample_payload["age_code"]
     score_agebit = sample_payload["score_agebit"]
     score_m_diag = sample_payload["score_m_diag"]
     if hvp_sample is None:
@@ -3043,21 +2989,43 @@ def _rank_metric_rows(
                 row[f"{mkey}{key}"] = val
         rows.append(row)
 
-    rows.append(_ehat_diagnostic_row(
+    return rows
+
+
+def _ehat_diagnostic_from_rank_inputs(
+    *,
+    sample_payload: Dict[str, np.ndarray],
+    hvp_sample: Optional[np.ndarray],
+    proposal_config: Any,
+    iteration: int,
+    rank: int,
+    world: int,
+    score_source: str,
+) -> Optional[Dict[str, Any]]:
+    """Build the non-ranking e-hat diagnostic for the full oracle only."""
+
+    if hvp_sample is None:
+        return None
+    e = sample_payload["e"]
+    target_name = "m_t_hvp_directional"
+    target = np.maximum(
+        -sample_payload["m"] * e + 0.5 * e * hvp_sample,
+        0.0,
+    ).astype(np.float32, copy=False)
+    return _ehat_diagnostic_row(
         e=e,
-        e_age=e_age,
-        age_code=age_code,
-        force=force,
-        score=score_age,
-        target=target_directional,
-        target_name=target_directional_name,
+        e_age=sample_payload["e_age"],
+        age_code=sample_payload["age_code"],
+        force=sample_payload["force"],
+        score=sample_payload["score_agebit"],
+        target=target,
+        target_name=target_name,
         proposal_config=proposal_config,
         iteration=int(iteration),
         rank=rank,
         world=world,
         score_source=score_source,
-    ))
-    return rows
+    )
 
 
 def _top_heavy_metrics(

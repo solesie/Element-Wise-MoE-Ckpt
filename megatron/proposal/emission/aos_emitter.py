@@ -213,6 +213,26 @@ class AosEmitter:
             with_segment_identity,
         )
 
+        prepared_expert_ids = tuple(
+            (int(ent.expert_id[0]), int(ent.expert_id[1]))
+            for ent, _total_n, _filtered in prepared
+        )
+        hint_expert_ids = tuple(
+            (int(eid[0]), int(eid[1]))
+            for eid in lossy_state.capacity_demand_hint_expert_ids
+        )
+        if (
+            lossy_state.capacity_demand_hint is not None
+            and hint_expert_ids != prepared_expert_ids
+        ):
+            raise RuntimeError(
+                "capacity-demand hint expert order changed between probe and "
+                "AOS emission: "
+                f"hint={hint_expert_ids[:8]} ({len(hint_expert_ids)} slots), "
+                f"prepared={prepared_expert_ids[:8]} "
+                f"({len(prepared_expert_ids)} slots)"
+            )
+
         name_to_winoff = {
             nm: int(lossy_state.within_off_per_name[i])
             for i, nm in enumerate(lossy_state.name_list)

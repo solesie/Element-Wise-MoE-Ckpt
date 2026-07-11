@@ -18,7 +18,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -166,6 +166,31 @@ def _classify_params(
         else:
             by_expert.setdefault(ids, {})[name] = p
     return non_expert, by_expert
+
+
+def _partition_owned_expert_params(
+    by_expert: Dict[ExpertId, Dict[str, torch.nn.Parameter]],
+    expected_expert_ids: Optional[Iterable[ExpertId]],
+) -> Dict[ExpertId, Dict[str, torch.nn.Parameter]]:
+    """Restrict recovery accounting to this rank's optimizer ownership.
+
+    The low-precision model still enumerates every logical expert under
+    ZeRO-1/2, while LFCL/LFSY stores only the FP32 master/Adam fragments owned
+    by the current DP rank.  Treating the model enumeration as the recovery
+    denominator therefore reports valid, unowned experts as missing.
+    """
+
+    if expected_expert_ids is None:
+        return dict(by_expert)
+    owned = {
+        (int(expert_id[0]), int(expert_id[1]))
+        for expert_id in expected_expert_ids
+    }
+    return {
+        expert_id: params
+        for expert_id, params in by_expert.items()
+        if expert_id in owned
+    }
 
 
 def _apply_payload_dict_to_model(
@@ -349,6 +374,7 @@ def _recover_from_fdp(
     *,
     t_fault: int,
     load_expert_fcs: bool,
+    expected_expert_ids: Optional[Iterable[ExpertId]],
     diag: RecoveryDiagnostics,
     t_all0: float,
 ) -> RecoveryDiagnostics:
@@ -364,6 +390,11 @@ def _recover_from_fdp(
 
     _t0 = _time.perf_counter()
     non_expert_params, by_expert_params = _classify_params(model)
+    owned_expert_params = _partition_owned_expert_params(
+        by_expert_params,
+        expected_expert_ids,
+    )
+    diag.expert_expected_count = len(owned_expert_params)
     from .proposal_io import (
         fdp_read_lfcs_blob,
         fdp_read_lfsy_blob,
@@ -467,7 +498,7 @@ def _recover_from_fdp(
             lfsy_by_eid[eid] = e
 
         eids_with_fdp_state = [
-            eid for eid in by_expert_params
+            eid for eid in owned_expert_params
             if (
                 (eid[0], _fdp_global_expert_id(eid[1])) in lfcs_by_eid
                 or (eid[0], _fdp_global_expert_id(eid[1])) in lfsy_by_eid
@@ -512,7 +543,7 @@ def _recover_from_fdp(
         for eid in eids_with_fdp_state:
             data = new_pair_data[eid]
             log_step = _apply_payload_dict_to_model(
-                data, by_expert_params[eid], optimizer, sync_lp=False
+                data, owned_expert_params[eid], optimizer, sync_lp=False
             )
             if log_step > int(t_fault):
                 raise RuntimeError(
@@ -526,6 +557,10 @@ def _recover_from_fdp(
 
         diag.rolling_experts_loaded = len(log_loaded)
         diag.expert_fc_count = len(log_loaded)
+        diag.expert_missing_count = max(
+            0,
+            diag.expert_expected_count - diag.expert_fc_count,
+        )
         if diag.expert_fc_count == 0:
             raise RuntimeError("FDP recovery: no expert LFCS/LFSY state found")
     _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
@@ -551,6 +586,7 @@ def recover(
     nonexpert_state_image: Optional[Any] = None,
     nonexpert_dir: Optional[Path] = None,
     expert_dir: Optional[Path] = None,
+    expected_expert_ids: Optional[Iterable[ExpertId]] = None,
 ) -> RecoveryDiagnostics:
     """Rebuild state from CP files at ``t_fault``.
 
@@ -563,6 +599,8 @@ def recover(
 
     ``expert_state_image`` / ``nonexpert_state_image``: optional filesystem-off
     diagnostic inputs for cp_target=test_dram. Production recovery scans disk.
+    ``expected_expert_ids`` is the current rank's partition-owned expert set;
+    when omitted, the unpartitioned model enumeration is used.
     """
     import time as _time
     _phase: Dict[str, float] = {}
@@ -579,6 +617,7 @@ def recover(
                 optimizer,
                 t_fault=int(t_fault),
                 load_expert_fcs=bool(load_expert_fcs),
+                expected_expert_ids=expected_expert_ids,
                 diag=diag,
                 t_all0=_t_all0,
             )
@@ -591,7 +630,11 @@ def recover(
         expert_dir=expert_dir,
     )
     non_expert_params, by_expert_params = _classify_params(model)
-    diag.expert_expected_count = len(by_expert_params)
+    owned_expert_params = _partition_owned_expert_params(
+        by_expert_params,
+        expected_expert_ids,
+    )
+    diag.expert_expected_count = len(owned_expert_params)
     _phase["scan_classify_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     # 1. Non-expert FC
@@ -679,7 +722,7 @@ def recover(
         # CPU→GPU copy. We bypass disk scan entirely for the expert path.
         _t_dram0 = _time.perf_counter()
         missing: List[ExpertId] = []
-        for (L, E), target in by_expert_params.items():
+        for (L, E), target in owned_expert_params.items():
             payload = expert_state_image.read((L, E))
             if payload is None:
                 missing.append((L, E))
@@ -712,7 +755,7 @@ def recover(
         from .expert_writer import read_expert_state
 
         eids_with_new_pair: List[ExpertId] = []
-        for (L, E), _target in by_expert_params.items():
+        for (L, E), _target in owned_expert_params.items():
             pair = expert_pairs.get((L, E))
             if pair is not None and (pair[0].exists() or pair[1].exists()):
                 eids_with_new_pair.append((L, E))
@@ -739,7 +782,7 @@ def recover(
         _phase["expert_read_ms"] = (_time.perf_counter() - _t_read0) * 1000.0
         diag.expert_missing_count = max(
             0,
-            len(by_expert_params) - len(eids_with_new_pair),
+            len(owned_expert_params) - len(eids_with_new_pair),
         )
 
         # Phase B: apply CPU payloads serially.  This keeps recovery's GPU
@@ -747,7 +790,7 @@ def recover(
         _t_apply0 = _time.perf_counter()
         for eid in eids_with_new_pair:
             data = new_pair_data[eid]
-            target = by_expert_params[eid]
+            target = owned_expert_params[eid]
             log_step = _apply_payload_dict_to_model(
                 data, target, optimizer, sync_lp=False
             )

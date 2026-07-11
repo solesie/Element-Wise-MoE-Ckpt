@@ -18,6 +18,38 @@ def get_engine_optimizer(model: Any) -> Any:
     return getattr(module, "optimizer", None)
 
 
+def discard_zero12_grad_state(optimizer: Any) -> None:
+    """Release ZeRO-1/2 gradient tables without touching optimizer state.
+
+    Training-halt workloads such as Hessian refresh and the independent HVP
+    oracle run backward without an optimizer step. DeepSpeed therefore does
+    not perform its usual post-step cleanup of ``averaged_gradients``. Those
+    tensors are scratch results, not Adam state, and must be dropped before
+    training resumes.
+    """
+
+    if optimizer is None:
+        return
+    try:
+        for name in ("averaged_gradients", "all_grad_tensors"):
+            table = getattr(optimizer, name, None)
+            if isinstance(table, dict):
+                for key in list(table):
+                    table[key] = None
+            elif isinstance(table, list):
+                for index in range(len(table)):
+                    table[index] = None
+        for group in getattr(optimizer, "bit16_groups", ()):
+            for param in group:
+                param.grad = None
+                if hasattr(param, "grad_accum"):
+                    param.grad_accum = None
+    except Exception:
+        # DeepSpeed optimizer layouts vary across releases. Callers also clear
+        # model parameter grads, so an unknown layout remains safe.
+        pass
+
+
 try:
     from deepspeed.utils import (
         safe_get_full_fp32_param,

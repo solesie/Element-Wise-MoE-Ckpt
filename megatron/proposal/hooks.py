@@ -20,11 +20,13 @@ def proposal_dispatch_post_iter(
     iter_T: int,
     *,
     sync_processes: bool = True,
+    defer_stage0_emission: bool = False,
 ) -> None:
     get_controller().dispatch_post_step_task(
         model,
         iter_T,
         sync_processes=bool(sync_processes),
+        defer_stage0_emission=bool(defer_stage0_emission),
     )
 
 

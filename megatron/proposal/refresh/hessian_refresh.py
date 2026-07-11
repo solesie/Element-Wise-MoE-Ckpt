@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from .fp32_state import (
+    discard_zero12_grad_state,
     get_engine_optimizer,
     get_mapper,
     pinned_snapshot,
@@ -37,44 +38,6 @@ def _should_write() -> bool:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
     return torch.distributed.get_rank() == 0
-
-
-def _zero12_clear_param_grad_refs(ds_opt: Any) -> None:
-    if ds_opt is None:
-        return
-    try:
-        for group in getattr(ds_opt, "bit16_groups", ()):
-            for p in group:
-                p.grad = None
-                if hasattr(p, "grad_accum"):
-                    p.grad_accum = None
-    except Exception:
-        pass
-
-
-def _zero12_discard_anchor_grad_state(ds_opt: Any) -> None:
-    """Discard FD-H anchor gradients from ZeRO1/2's normal grad stores.
-
-    The anchor intentionally writes H estimates into DeepSpeed's ordinary
-    gradient-accumulation path.  After h_q is built, those values must not reach
-    optimizer.step().  Keep this cleanup narrow: do not reset ZeRO reducer
-    bookkeeping that the normal forward/backward lifecycle owns.
-    """
-
-    if ds_opt is None:
-        return
-    try:
-        for name in ("averaged_gradients", "all_grad_tensors"):
-            table = getattr(ds_opt, name, None)
-            if isinstance(table, dict):
-                for key in list(table.keys()):
-                    table[key] = None
-            elif isinstance(table, list):
-                for idx in range(len(table)):
-                    table[idx] = None
-        _zero12_clear_param_grad_refs(ds_opt)
-    except Exception:
-        pass
 
 
 def _zero12_expert_h_views_from_table(
@@ -618,7 +581,7 @@ def _refresh_h_quantile_from_finite_diff(
         if _zero12_mode:
             _h_view_names = []
             _grad_accum_views = []
-            _zero12_discard_anchor_grad_state(_ds_engine_opt)
+            discard_zero12_grad_state(_ds_engine_opt)
             for _p in _expert_ps_sorted:
                 _p.grad = None
                 if hasattr(_p, "grad_accum"):
@@ -739,7 +702,7 @@ def _refresh_h_quantile_from_finite_diff(
                 fd_ret = []
         finally:
             if _zero12_mode:
-                _zero12_discard_anchor_grad_state(_ds_engine_opt)
+                discard_zero12_grad_state(_ds_engine_opt)
                 try:
                     _final_views = None
                 except Exception:
@@ -780,7 +743,7 @@ def _refresh_h_quantile_from_finite_diff(
                 except Exception:
                     pass
         restore_training_state(_config.get("_inner_opt"), _train_state_snap)
-        _zero12_discard_anchor_grad_state(_ds_engine_opt)
+        discard_zero12_grad_state(_ds_engine_opt)
         # Final belt-and-suspenders: force-clear any residual lp.grad.
         # model may be a list/tuple (Megatron DDP wrapper) — unwrap first.
         _m_clear = model[0] if isinstance(model, (list, tuple)) else model
@@ -1096,6 +1059,7 @@ def _pipeline_exec_batch(
     cached_microbatches: List[Any],
     *,
     backward: bool,
+    reduce_grads: bool = True,
 ) -> None:
     """Run PipelineEngine schedule on cached microbatches.
 
@@ -1108,13 +1072,18 @@ def _pipeline_exec_batch(
 
     class _TrainNoStepSchedule(_ds_schedule.TrainSchedule):
         def steps(self):  # type: ignore[override]
-            skip = (
-                _ds_schedule.ReduceTiedGrads,
-                _ds_schedule.ReduceGrads,
-                _ds_schedule.OptimizerStep,
-            )
+            # Intermediate +/- FD passes must retain their transformed grads
+            # in PipelineEngine's normal accumulation storage.  Only the last
+            # pass reduces them into ZeRO-1/2 ``averaged_gradients``; every
+            # pass continues to skip the optimizer step.
+            skip = [_ds_schedule.OptimizerStep]
+            if not reduce_grads:
+                skip.extend(
+                    (_ds_schedule.ReduceTiedGrads, _ds_schedule.ReduceGrads)
+                )
+            skip_types = tuple(skip)
             for cmds in super().steps():
-                kept = [cmd for cmd in cmds if not isinstance(cmd, skip)]
+                kept = [cmd for cmd in cmds if not isinstance(cmd, skip_types)]
                 yield kept
 
     sched_cls = _TrainNoStepSchedule if backward else _ds_schedule.InferenceSchedule
@@ -1419,8 +1388,14 @@ def _compute_fd_fast_flat(
                                         pipeline_engine,
                                         pipeline_microbatches,
                                         backward=True,
+                                        reduce_grads=is_last_backward,
                                     )
-                                    _clear_pipeline_grads()
+                                    # Keep transformed grads resident across
+                                    # all non-final +/- passes.  The final
+                                    # ReduceGrads command has already copied
+                                    # them into ZeRO's averaged-grad table.
+                                    if is_last_backward:
+                                        _clear_pipeline_grads()
                                 elif schedule_backward_fn is not None:
                                     _ok = schedule_backward_fn()
                                     if not _ok:

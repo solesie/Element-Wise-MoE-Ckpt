@@ -107,10 +107,6 @@ class ProposalConfig:
     independent_oracle_iters: Tuple[int, ...] = ()
     independent_oracle_log_dir: Optional[Path] = None
     independent_oracle_rank_sample: int = 1048576
-    independent_oracle_rank_sample_seed: int = 20240625
-    independent_oracle_actual_batches: int = 4
-    independent_oracle_hvp_batches: int = 4
-    independent_oracle_batch_seed: int = 20240625
 
     @classmethod
     def from_args(cls, args, cp_root: str) -> "ProposalConfig":
@@ -304,39 +300,5 @@ class ProposalConfig:
                         1048576,
                     ) or 0
                 ),
-            ),
-            independent_oracle_rank_sample_seed=int(
-                getattr(
-                    args,
-                    "proposal_independent_oracle_rank_sample_seed",
-                    20240625,
-                ) or 20240625
-            ),
-            independent_oracle_actual_batches=max(
-                1,
-                int(
-                    getattr(
-                        args,
-                        "proposal_independent_oracle_actual_batches",
-                        4,
-                    ) or 4
-                ),
-            ),
-            independent_oracle_hvp_batches=max(
-                0,
-                int(
-                    getattr(
-                        args,
-                        "proposal_independent_oracle_hvp_batches",
-                        4,
-                    ) or 0
-                ),
-            ),
-            independent_oracle_batch_seed=int(
-                getattr(
-                    args,
-                    "proposal_independent_oracle_batch_seed",
-                    20240625,
-                ) or 20240625
             ),
         )

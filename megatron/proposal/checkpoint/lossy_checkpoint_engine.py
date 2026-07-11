@@ -342,6 +342,22 @@ class LossyCheckpointPipeline(
                     return
             device.copy_(host, non_blocking=True)
 
+    def _active_expert_ids_for_current_layout(self) -> Tuple[Tuple[int, int], ...]:
+        """Return expert slots represented by the active rank-local layout.
+
+        Original parameter names remain in ``_tname_to_eid`` after a ZeRO
+        partition plan is installed.  Restricting the lookup to
+        ``_tname_list`` excludes experts for which this DP rank owns no flat
+        fragment and makes the order identical to the sorted direct-write
+        batch.
+        """
+
+        return tuple(sorted({
+            self._tname_to_eid[name]
+            for name in self._tname_list
+            if name in self._tname_to_eid
+        }))
+
     def _build_approx_probe_metadata(self, *, device: torch.device) -> None:
         """Build static metadata for GPU-generated block-stratified probe.
 
@@ -350,7 +366,12 @@ class LossyCheckpointPipeline(
         contiguous entry-block population of each optimizer flat group.
         """
 
-        local_expert_ids = sorted(set(self._tname_to_eid.values()))
+        # ``_tname_to_eid`` intentionally retains the original model names so
+        # recovery can resolve them.  Under ZeRO-1/2, however, some of those
+        # experts have no fragment on this DP rank.  Capacity hints must use
+        # the exact same expert slots as direct emission, which are represented
+        # by the active, partitioned ``_tname_list`` only.
+        local_expert_ids = self._active_expert_ids_for_current_layout()
         self._local_expert_ids = tuple(local_expert_ids)
         self._local_expert_to_idx = {
             eid: idx for idx, eid in enumerate(local_expert_ids)
@@ -1146,6 +1167,12 @@ class LossyCheckpointPipeline(
         except Exception:
             pass
 
+        # Controller setup can cache the unpartitioned model-domain count
+        # before DeepSpeed creates its rank-local ZeRO flat.  Every rank
+        # reaches this one-time layout boundary, so invalidate collectively
+        # here and let the first real selection rebuild the global count from
+        # ``LossyCpState.index.n_total_elements``.
+        self._invalidate_global_selection_element_count_cache()
         self._flat_layout_done = True
 
     @torch.no_grad()
@@ -1258,6 +1285,8 @@ class LossyCheckpointPipeline(
         global_step: int,
         ready_event: Optional["torch.cuda.Event"] = None,
         d2h_event_callback: Optional[Any] = None,
+        emission_release_event: Optional[Any] = None,
+        emission_cuda_event: Optional["torch.cuda.Event"] = None,
     ) -> Tuple[
         LossyStepStats,
         Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -1273,6 +1302,14 @@ class LossyCheckpointPipeline(
                 on it.
             d2h_event_callback: called with the expert AOS final-D2H event
                 used by the optimizer fence and pinned-slab writer lease.
+            emission_release_event: optional host event used only by PP stage
+                0. Stage 1 cutoff is launched normally, then the expert worker
+                waits here before the full direct-emission scan and D2H.
+            emission_cuda_event: reusable event recorded immediately before
+                stage 0 posts its first RecvGrad. The host release occurs only
+                after the original RecvGrad instruction has posted all NCCL
+                receives; the proposal compute stream then waits on this
+                pre-receive event.
         """
         import time as _time
         _t0_entry = _time.perf_counter()
@@ -1392,6 +1429,19 @@ class LossyCheckpointPipeline(
             "random_salt": int(getattr(self, "_selection_random_salt", 0)),
         }
         lossy_write_inputs.update(dict(getattr(self, "_selection_tau_meta", {}) or {}))
+
+        if emission_release_event is not None:
+            # This blocks only the expert worker thread. The pipeline training
+            # thread records ``emission_cuda_event`` before stage 0's first
+            # RecvGrad, posts that receive, and only then sets the host event.
+            # The worker therefore cannot submit scan ahead of NCCL, while its
+            # compute stream is ordered after the preceding forward kernels.
+            if not emission_release_event.wait(timeout=300.0):
+                raise RuntimeError(
+                    "timed out waiting for PP stage0 backward-bubble release"
+                )
+            if stream is not None and emission_cuda_event is not None:
+                stream.wait_event(emission_cuda_event)
 
         self._lossy_record_writer.write_for_iter(
             optimizer,

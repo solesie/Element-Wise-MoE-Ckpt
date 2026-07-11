@@ -202,9 +202,7 @@ EXTRA_PROPOSAL_FLAGS="${EXTRA_PROPOSAL_FLAGS} \
     --proposal-independent-oracle-enable \
     --proposal-independent-oracle-iters ${ORACLE_ITERS} \
     --proposal-independent-oracle-log-dir ${ORACLE_LOG_DIR} \
-    --proposal-independent-oracle-rank-sample ${ORACLE_RANK_SAMPLE:-262144} \
-    --proposal-independent-oracle-actual-batches ${ORACLE_ACTUAL_BATCHES:-8} \
-    --proposal-independent-oracle-hvp-batches ${ORACLE_HVP_BATCHES:-1}"
+    --proposal-independent-oracle-rank-sample ${ORACLE_RANK_SAMPLE:-262144}"
 fi
 
 export EXTRA_MEGATRON_FLAGS="${EXTRA_MEGATRON_FLAGS:-} ${EXTRA_PROPOSAL_FLAGS}"

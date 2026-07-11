@@ -1342,7 +1342,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
         if getattr(args, 'proposal_enable', False) and iteration > 0:
-            proposal_dispatch_post_iter(model, iter_T=iteration)
+            proposal_dispatch_post_iter(
+                model,
+                iter_T=iteration,
+                # Only the normal next-iteration dispatch has a following
+                # pipeline fwd0/bwd bubble. Refresh/oracle/fault dispatches
+                # below remain immediate to avoid drain deadlocks.
+                defer_stage0_emission=True,
+            )
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,

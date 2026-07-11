@@ -8,19 +8,19 @@ if [ -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
 fi
 BASE_SCRIPT="${DIR}/ds_pretrain_gpt_350M_MoE128.sh"
 
-DEFAULT_DATA_ROOT="/home/paul/data/slimpajama_6b"
-if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
-    DEFAULT_DATA_ROOT="/home/elice/data/slimpajama_6b"
-fi
-if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
-    DEFAULT_DATA_ROOT="/home/asdf1234/data/slimpajama_6b"
-fi
-
+DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-/home/paul/data/slimpajama_6b}
+DEFAULT_TRAIN_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document"
+DEFAULT_VALID_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_valid_text_document"
 export VOCAB_PATH=${VOCAB_PATH:-"${DIR}/../rebase/gpt2-vocab.json"}
 export MERGE_PATH=${MERGE_PATH:-"${DIR}/../rebase/gpt2-merges.txt"}
-export DATA_PATH=${DATA_PATH:-"${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document"}
-export VALID_DATA_PATH=${VALID_DATA_PATH:-"${DEFAULT_DATA_ROOT}/slimpajama_6b_valid_text_document"}
+export DATA_PATH=${DATA_PATH:-"${DEFAULT_TRAIN_PREFIX}"}
+export VALID_DATA_PATH=${VALID_DATA_PATH:-"${DEFAULT_VALID_PREFIX}"}
 export DATA_CACHE_PATH=${DATA_CACHE_PATH:-"${REPO_ROOT}/results/data-cache"}
+if [ ! -e "${DATA_PATH}.idx" ] || [ ! -e "${DATA_PATH}.bin" ] || \
+   [ ! -e "${VALID_DATA_PATH}.idx" ] || [ ! -e "${VALID_DATA_PATH}.bin" ]; then
+    echo "SlimPajama 6B mmap dataset is not ready; run dataset/download_slimpajama_6b.sh." >&2
+    exit 2
+fi
 
 export TRAIN_ITERS=${TRAIN_ITERS:-10000}
 export SEQ_LEN=${SEQ_LEN:-2048}
@@ -35,9 +35,9 @@ export NUM_GPUS_PERNODE=${NUM_GPUS_PERNODE:-8}
 export MP_SIZE=${MP_SIZE:-1}
 export PP_SIZE=${PP_SIZE:-2}
 export EP_SIZE=${EP_SIZE:-128}
-export MOE_EXPERT_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE:-2}
+export MOE_EXPERT_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE:-4}
 export ZERO_STAGE=${ZERO_STAGE:-1}
-export BATCH_SIZE=${BATCH_SIZE:-4}
+export BATCH_SIZE=${BATCH_SIZE:-8}
 export ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-false}
 export TRAIN_PRECISION=${TRAIN_PRECISION:-bf16}
 export LR=${LR:-2.0e-4}
@@ -49,8 +49,8 @@ if [ "${DENOM}" -le 0 ] || [ $((NUM_GPUS % DENOM)) -ne 0 ]; then
     exit 2
 fi
 DP_SIZE=$((NUM_GPUS / DENOM))
-if [ "${DP_SIZE}" -ne 2 ]; then
-    echo "Expected DP=2, got DP=${DP_SIZE}" >&2
+if [ "${DP_SIZE}" -ne 1 ]; then
+    echo "Expected DP=1, got DP=${DP_SIZE}" >&2
     exit 2
 fi
 
@@ -66,7 +66,7 @@ export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
 export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
-export EXTRA_MEGATRON_FLAGS=${BASELINE_EXTRA_MEGATRON_FLAGS:-}
+export EXTRA_MEGATRON_FLAGS="--use-flash-attn-v2 ${BASELINE_EXTRA_MEGATRON_FLAGS:-}"
 
 echo "[350M-10K-baseline] dataset=${DATA_PATH}"
 echo "[350M-10K-baseline] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_SIZE} experts=${EP_SIZE} gpus=${NUM_GPUS}"
