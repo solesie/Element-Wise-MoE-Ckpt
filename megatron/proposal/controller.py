@@ -24,7 +24,8 @@ from .refresh.fp32_state import (
     set_mapper,
 )
 from .refresh.hessian_refresh import HQuantileAnchor
-from .config import ProposalConfig
+from .config import ProposalConfig, lr_warmup_iters_from_args
+from .expert_id import build_expert_id_map
 from .storage.fc_manager import FCManager, _detect_expert_layout, DS_EXPERT_IDX_RE
 from .checkpoint.lossy_checkpoint_engine import LossyCheckpointPipeline
 from .storage.recovery import recover
@@ -51,11 +52,11 @@ class PostStepCheckpointTask:
     expert_started_at: float = 0.0
     non_expert_ready_at: float = 0.0
     expert_ready_at: float = 0.0
-    defer_stage0_expert_emission: bool = False
-    expert_emission_release: threading.Event = field(
+    defer_stage0_emission: bool = False
+    stage0_emission_release: threading.Event = field(
         default_factory=threading.Event,
     )
-    expert_emission_cuda_event: Optional["torch.cuda.Event"] = None
+    stage0_emission_cuda_event: Optional["torch.cuda.Event"] = None
 
 
 class ProposalController:
@@ -82,6 +83,8 @@ class ProposalController:
         self._stage0_emission_cuda_event = None
         self._proposal_cpu_pg = None
         self._proposal_world_size = 1
+        self._warmup_end_iter = 0
+        self._active = False
 
     def init(self, model: Any, optimizer: Any, args: Any, cp_root: str) -> None:
         init_proposal(model, optimizer, args, cp_root)
@@ -100,6 +103,15 @@ class ProposalController:
             sync_processes=bool(sync_processes),
             defer_stage0_emission=bool(defer_stage0_emission),
         )
+
+    def finalize_post_step(self, model: Any, iteration: int) -> None:
+        proposal_finalize_post_iter(model, iteration)
+
+    def activate_after_warmup(self, model: Any, iteration: int) -> bool:
+        return proposal_activate_after_warmup(model, iteration)
+
+    def prepare_after_optimizer(self) -> None:
+        proposal_prepare_after_optimizer()
 
     def step(
         self,
@@ -140,6 +152,9 @@ class ProposalController:
 
     def vram_audit_iter_end(self, step: int) -> None:
         proposal_vram_audit_iter_end(step)
+
+    def vram_audit_dispatch_post_iter(self, model: Any, iter_T: int) -> bool:
+        return proposal_vram_audit_dispatch_post_iter(model, iter_T)
 
     def refresh_h_quantile(self, *args: Any, **kwargs: Any) -> Any:
         if self._h_anchor is not None:
@@ -225,29 +240,50 @@ def _stage0_bubble_deferral_enabled(
     )
 
 
-def _release_stage0_expert_emission(*, record_cuda_event: bool = True) -> None:
-    """Release one deferred stage-0 expert scan at its gradient-wait boundary.
+def _release_stage0_emission(*, record_cuda_event: bool = True) -> None:
+    """Release deferred stage-0 checkpoint reads at the gradient-wait boundary.
 
-    The host event wakes the expert worker.  A reusable CUDA event orders that
-    worker's compute stream after the main-stream forward work preceding the
-    first ``RecvGrad``.  The normal PipelineEngine hook records that event,
-    posts the complete receive through the original instruction, and only then
-    calls this helper with ``record_cuda_event=False``.  That host ordering is
-    essential: proposal scan must never race ahead of posting the NCCL receive.
-    Repeated calls are harmless and provide an optimizer-step fallback for
-    custom PipelineEngine schedules that omit the standard receive hook.
+    The host event wakes both checkpoint workers.  A reusable CUDA event orders
+    expert emission and non-expert D2H after the main-stream forward work
+    preceding the first ``RecvGrad``.  The normal PipelineEngine hook records
+    that event, posts the complete receive through the original instruction,
+    and only then calls this helper with ``record_cuda_event=False``.  That host
+    ordering is essential: checkpoint traffic must never race ahead of posting
+    the NCCL receive.  Repeated calls are harmless and provide an optimizer-step
+    fallback for custom PipelineEngine schedules that omit the standard hook.
     """
 
     ctrl = get_controller()
     task = getattr(ctrl, "_latest_post_step_checkpoint_task", None)
-    if task is None or not bool(task.defer_stage0_expert_emission):
+    if task is None or not bool(task.defer_stage0_emission):
         return
-    if task.expert_emission_release.is_set():
+    if task.stage0_emission_release.is_set():
         return
-    event = task.expert_emission_cuda_event
-    if record_cuda_event and event is not None and torch.cuda.is_available():
-        event.record(torch.cuda.current_stream())
-    task.expert_emission_release.set()
+    event = task.stage0_emission_cuda_event
+    try:
+        if record_cuda_event and event is not None and torch.cuda.is_available():
+            event.record(torch.cuda.current_stream())
+    finally:
+        # Never strand either worker if CUDA/P2P fails while entering the
+        # bubble.  The failed training step will still propagate its error;
+        # this release is only for worker/teardown liveness.
+        task.stage0_emission_release.set()
+
+
+def _wait_stage0_emission_boundary(
+    task: PostStepCheckpointTask,
+) -> Optional["torch.cuda.Event"]:
+    """Wait on the worker thread and return the bubble boundary event."""
+
+    ready_event = task.cuda_event
+    if not task.defer_stage0_emission:
+        return ready_event
+    if not task.stage0_emission_release.wait(timeout=300.0):
+        raise RuntimeError(
+            "timed out waiting for PP stage0 backward-bubble release"
+        )
+    boundary_event = task.stage0_emission_cuda_event
+    return boundary_event if boundary_event is not None else ready_event
 
 
 def _install_pipeline_optimizer_fence(model: Any) -> None:
@@ -284,7 +320,7 @@ def _install_pipeline_optimizer_fence(model: Any) -> None:
         # Correctness fallback for a custom schedule without the standard
         # late-backward cooldown hook.
         # Release first, then wait for the resulting read/D2H completion.
-        _release_stage0_expert_emission(record_cuda_event=True)
+        _release_stage0_emission(record_cuda_event=True)
         proposal_wait_d2h_before_optimizer()
         return original_opt(self, *args, **kwargs)
 
@@ -292,8 +328,8 @@ def _install_pipeline_optimizer_fence(model: Any) -> None:
         task = get_controller()._latest_post_step_checkpoint_task
         first_deferred_recv = bool(
             task is not None
-            and task.defer_stage0_expert_emission
-            and not task.expert_emission_release.is_set()
+            and task.defer_stage0_emission
+            and not task.stage0_emission_release.is_set()
         )
         try:
             if first_deferred_recv:
@@ -301,7 +337,7 @@ def _install_pipeline_optimizer_fence(model: Any) -> None:
                 # be recorded before the original receive, because c10d makes
                 # the main stream wait for that receive before subsequent
                 # backward.
-                event = task.expert_emission_cuda_event
+                event = task.stage0_emission_cuda_event
                 if event is not None and torch.cuda.is_available():
                     event.record(torch.cuda.current_stream())
             # DeepSpeed posts every gradient tensor receive here.  Its CPU
@@ -314,7 +350,7 @@ def _install_pipeline_optimizer_fence(model: Any) -> None:
                 # behind the main-stream receive dependency.  On a CUDA/P2P
                 # exception this release is only a teardown-liveness measure;
                 # the optimizer is not allowed to continue that failed step.
-                _release_stage0_expert_emission(record_cuda_event=False)
+                _release_stage0_emission(record_cuda_event=False)
 
     local_map = dict(instr_map)
     local_map[opt_key] = _proposal_optimizer_step
@@ -351,6 +387,10 @@ def init_proposal(
     if not get_controller()._enabled:
         return
     get_controller()._proposal_config = ProposalConfig.from_args(args, cp_root)
+    get_controller()._warmup_end_iter = max(
+        0, int(lr_warmup_iters_from_args(args)),
+    )
+    get_controller()._active = get_controller()._warmup_end_iter == 0
     get_controller()._h_anchor = HQuantileAnchor(
         finite_diff_eps=get_controller()._proposal_config.finite_diff_eps,
         n_anchor_batches=max(
@@ -376,48 +416,58 @@ def init_proposal(
 
     topology = topology_from_args(args)
     get_controller()._topology = topology
-    _defer_stage0_expert_emission = _stage0_bubble_deferral_enabled(
+    _defer_stage0_emission = _stage0_bubble_deferral_enabled(
         topology,
         enable_zbh1_pipeline=bool(
             getattr(args, "enable_zbh1_pipeline", False)
         ),
     )
     if (
-        _defer_stage0_expert_emission
+        _defer_stage0_emission
         and torch.cuda.is_available()
         and get_controller()._stage0_emission_cuda_event is None
     ):
         get_controller()._stage0_emission_cuda_event = torch.cuda.Event()
-    if os.environ.get("PROPOSAL_IO_BACKEND", "").lower() == "fdp":
-        os.environ.setdefault("PROPOSAL_FDP_RANK", str(int(topology.global_rank)))
-        os.environ.setdefault("PROPOSAL_FDP_WORLD_SIZE", str(int(topology.world_size)))
-        os.environ.setdefault("PROPOSAL_FDP_DP_RANK", str(int(topology.dp_rank)))
-        os.environ.setdefault("PROPOSAL_FDP_DP_SIZE", str(int(topology.dp_size)))
-        os.environ.setdefault("PROPOSAL_FDP_PP_RANK", str(int(topology.pp_rank)))
-        os.environ.setdefault("PROPOSAL_FDP_PP_SIZE", str(int(topology.pp_size)))
-        os.environ.setdefault("PROPOSAL_FDP_EP_RANK", str(int(topology.ep_rank)))
-        os.environ.setdefault("PROPOSAL_FDP_EP_SIZE", str(int(topology.ep_size)))
-        _fdp_num_layers = int(getattr(args, "num_layers", 0) or 0)
-        if _fdp_num_layers > 0:
-            os.environ.setdefault(
-                "PROPOSAL_FDP_NUM_MOE_LAYERS",
-                str(_fdp_num_layers),
+    # These topology keys also identify objects in the rank-local I/O backlog,
+    # so publish them for test_dram/file runs as well as the FDP backend.
+    os.environ.setdefault("PROPOSAL_FDP_RANK", str(int(topology.global_rank)))
+    os.environ.setdefault("PROPOSAL_FDP_WORLD_SIZE", str(int(topology.world_size)))
+    os.environ.setdefault("PROPOSAL_FDP_DP_RANK", str(int(topology.dp_rank)))
+    os.environ.setdefault("PROPOSAL_FDP_DP_SIZE", str(int(topology.dp_size)))
+    os.environ.setdefault("PROPOSAL_FDP_PP_RANK", str(int(topology.pp_rank)))
+    os.environ.setdefault("PROPOSAL_FDP_PP_SIZE", str(int(topology.pp_size)))
+    os.environ.setdefault("PROPOSAL_FDP_EP_RANK", str(int(topology.ep_rank)))
+    os.environ.setdefault("PROPOSAL_FDP_EP_SIZE", str(int(topology.ep_size)))
+    num_layers = int(getattr(args, "num_layers", 0) or 0)
+    if num_layers > 0:
+        configured_layers = os.environ.get("PROPOSAL_FDP_NUM_MOE_LAYERS")
+        if (
+            configured_layers is not None
+            and int(configured_layers) != int(num_layers)
+        ):
+            raise ValueError(
+                "PROPOSAL_FDP_NUM_MOE_LAYERS must equal the model layer "
+                f"count ({num_layers}), got {configured_layers}"
             )
-        os.environ.setdefault(
-            "PROPOSAL_FDP_EXPERTS_PER_LAYER",
-            str(int(num_experts_scalar)),
-        )
-        if int(topology.ep_size) > 1 and int(num_experts_scalar) > 0:
-            if int(num_experts_scalar) % int(topology.ep_size) != 0:
-                raise RuntimeError(
-                    "FDP global expert-slot mapping requires num_experts to be "
-                    "divisible by ep_size unless PROPOSAL_FDP_EXPERT_ID_BASE "
-                    "is set explicitly."
-                )
+        os.environ["PROPOSAL_FDP_NUM_MOE_LAYERS"] = str(num_layers)
+    os.environ.setdefault(
+        "PROPOSAL_FDP_EXPERTS_PER_LAYER", str(int(num_experts_scalar)),
+    )
+    if int(topology.ep_size) > 1 and int(num_experts_scalar) > 0:
+        if int(num_experts_scalar) % int(topology.ep_size) == 0:
             local_experts = int(num_experts_scalar) // int(topology.ep_size)
             os.environ.setdefault(
                 "PROPOSAL_FDP_EXPERT_ID_BASE",
                 str(int(topology.ep_rank) * int(local_experts)),
+            )
+        elif (
+            os.environ.get("PROPOSAL_IO_BACKEND", "").lower() == "fdp"
+            and "PROPOSAL_FDP_EXPERT_ID_BASE" not in os.environ
+        ):
+            raise RuntimeError(
+                "FDP global expert-slot mapping requires num_experts to be "
+                "divisible by ep_size unless PROPOSAL_FDP_EXPERT_ID_BASE "
+                "is set explicitly."
             )
 
     # B3: guard unsupported configs.
@@ -480,6 +530,22 @@ def init_proposal(
             "Is this an MoE model?"
         )
 
+    # DeepSpeed PipelineModule prefixes names with an execution-list position,
+    # not a model-layer number.  Resolve each expert name through the actual
+    # layer object's ``layer_number`` once, then use that canonical map in all
+    # storage and recovery paths.
+    expert_id_map = build_expert_id_map(
+        inner_model,
+        num_layers=num_layers,
+    )
+    if set(expert_id_map) != set(expert_param_names):
+        missing = sorted(set(expert_param_names) - set(expert_id_map))
+        extra = sorted(set(expert_id_map) - set(expert_param_names))
+        raise RuntimeError(
+            "canonical expert-id map does not match rank-local expert "
+            f"parameters: missing={missing} extra={extra}"
+        )
+
     if topology.is_global_rank0:
         print(
             f"[proposal] Fp32StateMapper mode={mapper.mode}  "
@@ -518,11 +584,10 @@ def init_proposal(
         "proposal_config": get_controller()._proposal_config,
         "topology": topology,
         "rank_namespace": topology.namespace,
+        "expert_id_map": expert_id_map,
         "writes_expert": topology.writes_expert,
         "writes_nonexpert": topology.writes_nonexpert,
-        "defer_stage0_expert_emission": bool(
-            _defer_stage0_expert_emission
-        ),
+        "defer_stage0_emission": bool(_defer_stage0_emission),
     }
     _test_skip_expert_commit = bool(
         getattr(args, "proposal_test_skip_expert_commit", False)
@@ -559,6 +624,9 @@ def init_proposal(
         and bool(topology.writes_expert)
     )
     cp_target = str(get_controller()._proposal_config.cp_target)
+    # The backlog tracer is environment-gated but must report the effective
+    # CLI/config target, including callers that did not export this variable.
+    os.environ["PROPOSAL_CP_TARGET"] = cp_target
     get_controller()._config["expert_lossy_commit_enabled"] = (
         (not _test_skip_expert_commit) and topology.writes_expert
     )
@@ -584,13 +652,14 @@ def init_proposal(
             checkpoint_workers=get_controller()._checkpoint_workers,
             group_size=get_controller()._proposal_config.group_size,
             proposal_config=get_controller()._proposal_config,
+            expert_id_map=expert_id_map,
         )
         get_controller()._lossy_cp.test_expert_selection_only = bool(
             _test_expert_selection_only,
         )
         # Eager-allocate the per-BF16-group flat buffers and selection scratch.
-        # Required so iter-1 H refresh has valid metadata before the first
-        # lossy checkpoint step runs on expert_launcher.
+        # Required so the warmup-boundary H refresh has valid metadata before
+        # the first lossy checkpoint step runs on expert_launcher.
         get_controller()._lossy_cp._init_lossy_flat_layout(inner_opt)
     else:
         get_controller()._lossy_cp = None
@@ -701,6 +770,10 @@ def init_proposal(
             or (not topology.writes_nonexpert and cp_target != "test_dram")
         ),
         lfcl_capacity_world_size=int(_proposal_world_size),
+        expert_id_map=expert_id_map,
+        defer_initial_expert_bootstrap=(
+            int(get_controller()._warmup_end_iter) > 0
+        ),
         nonexpert_shard_rank=(
             int(topology.nonexpert_shard_rank) if cp_target != "test_dram" else 0
         ),
@@ -810,7 +883,7 @@ def init_proposal(
         if _should_write():
             print(
                 f"[proposal] POST-INIT VRAM: alloc={_post_init_alloc/1e6:.1f} MB "
-                f"(Δ from baseline = {delta:+.1f} MB; lazy buffers add at iter 1)",
+                f"(Δ from baseline = {delta:+.1f} MB; lazy buffers add at first active step)",
                 flush=True,
             )
     # Audit: post_init record (R1 baseline). dump_breakdown captures
@@ -821,10 +894,76 @@ def init_proposal(
     )
 
 
+def proposal_activate_after_warmup(model, iteration: int) -> bool:
+    """Create the first learned recovery baseline at the LR-warmup boundary."""
+
+    del model
+    ctrl = get_controller()
+    iteration = int(iteration)
+    if not ctrl._enabled:
+        return False
+    if ctrl._active:
+        return False
+    warmup_end = int(ctrl._warmup_end_iter)
+    if iteration < warmup_end:
+        return False
+    if iteration != warmup_end:
+        raise RuntimeError(
+            "proposal activation missed the LR-warmup boundary: "
+            f"iteration={iteration} warmup_end={warmup_end}"
+        )
+    workers = ctrl._checkpoint_workers
+    if workers is not None:
+        workers.drain()
+    if ctrl._lossy_cp is not None:
+        ctrl._lossy_cp._init_lossy_flat_layout(ctrl._config["_inner_opt"])
+        if not getattr(ctrl._lossy_cp, "_flat_layout_done", False):
+            raise RuntimeError(
+                "proposal activation requires initialized Adam/layout state"
+            )
+    ready_event = ctrl.acquire_dispatch_ready_event()
+    if ready_event is not None:
+        ready_event.record(torch.cuda.current_stream())
+    fc = ctrl._fc
+    if fc is None:
+        raise RuntimeError("proposal activation requires FCManager")
+    expert_count = fc.bootstrap_expert_recovery_baseline(step=iteration)
+    nonexpert_saved = fc.bootstrap_nonexpert_recovery_baseline(
+        step=iteration,
+        ready_event=ready_event,
+    )
+    if workers is not None:
+        workers.drain()
+    if ctrl._lossy_cp is not None:
+        ctrl._lossy_cp.reset_checkpoint_score_state_from_live(
+            next_global_step=iteration + 1,
+        )
+    ctrl._active = True
+    if _should_write():
+        print(
+            f"[proposal] activated after LR warmup @iter{iteration}: "
+            f"expert_baselines={int(expert_count)} "
+            f"nonexpert_baseline={int(bool(nonexpert_saved))}",
+            flush=True,
+        )
+    return True
+
+
+def proposal_prepare_after_optimizer() -> None:
+    """Finish init-once layout allocation after Adam state first exists."""
+
+    ctrl = get_controller()
+    lossy_cp = ctrl._lossy_cp
+    if not ctrl._enabled or ctrl._active or lossy_cp is None:
+        return
+    if not getattr(lossy_cp, "_flat_layout_done", False):
+        lossy_cp._init_lossy_flat_layout(ctrl._config["_inner_opt"])
+
+
 def proposal_record_loss(step: int, loss: Optional[float]) -> None:
     """Record the latest training loss and proposal diagnostics."""
     del step
-    if not get_controller()._enabled:
+    if not get_controller()._enabled or not get_controller()._active:
         return
     if get_controller()._pending_fault_record is not None and loss is not None:
         get_controller()._pending_fault_record["post_fault_loss"] = float(loss)
@@ -836,7 +975,12 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
     """Run telemetry-only rollback oracle for the current checkpoint image."""
 
     ctrl = get_controller()
-    if not ctrl._enabled or ctrl._lossy_cp is None or ctrl._proposal_config is None:
+    if (
+        not ctrl._enabled
+        or not ctrl._active
+        or ctrl._lossy_cp is None
+        or ctrl._proposal_config is None
+    ):
         if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
             print(
                 "[proposal] independent_oracle skip: "
@@ -960,6 +1104,7 @@ def _proposal_tracked_gpu_memory_breakdown() -> Tuple[float, List[Tuple[str, flo
 def _proposal_vram_audit_extra() -> Dict[str, Any]:
     total_mb, items = _proposal_tracked_gpu_memory_breakdown()
     return {
+        "proposal_enabled": bool(get_controller()._enabled),
         "tracked_total_mb": float(total_mb),
         "tracked_items": [
             (name, float(size_mb)) for name, size_mb in items if size_mb > 0.01
@@ -972,6 +1117,10 @@ def proposal_vram_audit_iter_begin(step: int) -> None:
 
     if not _proposal_diagnostics.is_vram_audit_enabled():
         return
+    # install_alloc_trace is intentionally called here as well as proposal
+    # init: a proposal-off baseline never enters init_proposal(), but still
+    # needs the same audit metadata and long-running allocator counters.
+    _proposal_diagnostics.install_alloc_trace()
     _proposal_diagnostics.set_iter(int(step))
     _proposal_diagnostics.vram_audit_step(
         "iter_begin",
@@ -997,6 +1146,55 @@ def proposal_vram_audit_iter_end(step: int) -> None:
     )
 
 
+def proposal_vram_audit_dispatch_post_iter(model: Any, iter_T: int) -> bool:
+    """Run one selected checkpoint dispatch inside exact allocator history.
+
+    A full training step creates hundreds of thousands of unrelated autograd
+    allocation events.  The exact R2 audit therefore traces only the proposal
+    dispatch/read/D2H region, synchronously and with pipeline deferral disabled.
+    Returning ``False`` tells the caller to use the normal asynchronous
+    dispatch path.  This audit-only path never changes optimizer state.
+    """
+
+    from .telemetry import diagnostics as _proposal_diagnostics
+
+    if not get_controller()._enabled or not get_controller()._active:
+        return False
+    iter_T = int(iter_T)
+    if not _proposal_diagnostics.begin_steady_allocator_history(iter_T):
+        return False
+    # The training-loop prologue is iteration T+1, while this dispatch and the
+    # trace both describe checkpoint state produced by optimizer step T.
+    _proposal_diagnostics.set_iter(iter_T)
+    try:
+        if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
+            raise RuntimeError(
+                "selected allocator-trace iteration was already dispatched; "
+                "choose a non-anchor/non-oracle steady iteration "
+                f"(iter_T={iter_T})"
+            )
+        proposal_dispatch_post_iter(
+            model,
+            iter_T=iter_T,
+            sync_processes=True,
+            defer_stage0_emission=False,
+        )
+        if get_controller()._latest_post_step_checkpoint_task is None:
+            raise RuntimeError(
+                f"selected allocator-trace dispatch created no task (iter_T={iter_T})"
+            )
+        # Wait for the worker-owned scan and both D2H domains to enqueue on
+        # the main stream.  end_allocator_history() then synchronizes once so
+        # all frees/segment changes belong to this exact region.
+        proposal_wait_d2h_before_optimizer()
+    finally:
+        try:
+            _proposal_diagnostics.end_steady_allocator_history(iter_T)
+        finally:
+            _proposal_diagnostics.set_iter(iter_T + 1)
+    return True
+
+
 def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
     """Body of the host_writer_non_expert worker task.
 
@@ -1014,10 +1212,14 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
     try:
         task.non_expert_started_at = time.perf_counter()
         task.dispatch_release_ready.wait()
+        # On PP stage 0 this is the first-RecvGrad boundary event, which is
+        # later than the post-optimizer dispatch event.  FCManager wires it
+        # into the D2H stream without blocking the training thread.
+        ready_event = _wait_stage0_emission_boundary(task)
         if get_controller()._fc is not None:
             get_controller()._fc.fire_nonexpert_fc_if_due(
                 step=task.iter_T,
-                ready_event=task.cuda_event,
+                ready_event=ready_event,
                 d2h_event_callback=_mark_non_expert_read_ready,
             )
         from .storage import proposal_io as _proposal_io
@@ -1082,19 +1284,23 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
                     ready_event=task.cuda_event,
                     d2h_event_callback=_mark_expert_d2h_event,
                     emission_release_event=(
-                        task.expert_emission_release
-                        if task.defer_stage0_expert_emission else None
+                        task.stage0_emission_release
+                        if task.defer_stage0_emission else None
                     ),
                     emission_cuda_event=(
-                        task.expert_emission_cuda_event
-                        if task.defer_stage0_expert_emission else None
+                        task.stage0_emission_cuda_event
+                        if task.defer_stage0_emission else None
                     ),
                 )
         if ctrl._expert_lossless_fc is not None:
+            # The lossy path above already gates direct scan/AOS D2H after
+            # cutoff.  Select the same boundary explicitly for LFCL D2H as
+            # well, including sequential/LFCL-only configurations.
+            lfcl_ready_event = _wait_stage0_emission_boundary(task)
             fired_experts = ctrl._expert_lossless_fc.fire_planned(
                 task.iter_T,
                 fired_experts,
-                ready_event=task.cuda_event,
+                ready_event=lfcl_ready_event,
             )
             lfcl_d2h_event = getattr(
                 ctrl._expert_lossless_fc,
@@ -1224,10 +1430,32 @@ def _proposal_drain_cuda(where: str) -> None:
         torch.cuda.synchronize()
 
 
+def _acquire_gpu_replay_lanes():
+    """Lease fixed expert replay lanes; topology stays elsewhere."""
+
+    from contextlib import nullcontext
+
+    ctrl = get_controller()
+    fc = getattr(ctrl, "_fc", None)
+    expert_state = getattr(fc, "expert_state", None) if fc is not None else None
+    if (
+        expert_state is None
+        or not torch.cuda.is_available()
+        or getattr(fc, "cp_target", "disk") == "test_dram"
+    ):
+        return nullcontext(None)
+    return expert_state.acquire_recovery_lanes()
+
+
 def _submit_post_step_checkpoint_task(task: PostStepCheckpointTask) -> None:
     """Submit a post-step checkpoint task to the proposal workers."""
 
     if get_controller()._checkpoint_workers is None:
+        # A deferred task requires the training thread to advance to
+        # RecvGrad, which is impossible while running this fallback inline.
+        task.defer_stage0_emission = False
+        task.stage0_emission_cuda_event = None
+        task.stage0_emission_release.set()
         _execute_expert_post_iter(task)
         _execute_non_expert_post_iter(task)
         return
@@ -1249,9 +1477,11 @@ def proposal_dispatch_post_iter(
     immediately; no forward hook or arm/release stash is used.
     """
 
-    if not get_controller()._enabled:
+    if not get_controller()._enabled or not get_controller()._active:
         return
     iter_T = int(iter_T)
+    if iter_T <= int(get_controller()._warmup_end_iter):
+        return
     if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
         return
     from .storage import proposal_io as _proposal_io
@@ -1272,21 +1502,21 @@ def proposal_dispatch_post_iter(
     if event is not None:
         event.record()
     ctrl = get_controller()
-    defer_expert = bool(
+    defer_stage0 = bool(
         defer_stage0_emission
-        and ctrl._config.get("defer_stage0_expert_emission", False)
+        and ctrl._config.get("defer_stage0_emission", False)
     )
     task = PostStepCheckpointTask(
         cuda_event=event,
         iter_T=iter_T,
         sync_processes=bool(sync_processes),
-        defer_stage0_expert_emission=defer_expert,
-        expert_emission_cuda_event=(
-            ctrl._stage0_emission_cuda_event if defer_expert else None
+        defer_stage0_emission=defer_stage0,
+        stage0_emission_cuda_event=(
+            ctrl._stage0_emission_cuda_event if defer_stage0 else None
         ),
     )
-    if not defer_expert:
-        task.expert_emission_release.set()
+    if not defer_stage0:
+        task.stage0_emission_release.set()
     if not bool(sync_processes):
         task.dispatch_release_ready.set()
     get_controller()._latest_post_step_checkpoint_task = task
@@ -1295,11 +1525,105 @@ def proposal_dispatch_post_iter(
     from .telemetry import diagnostics as _d
     _d._proposal_post_iter_diagnostics(model, int(iter_T))
 
+
+def proposal_finalize_post_iter(model, iteration: int) -> None:
+    """Commit the final optimizer result when no next iteration exists.
+
+    Normal training dispatches iteration ``T`` immediately before iteration
+    ``T+1``.  At training termination there is no next-loop prologue, so this
+    terminal-only hook performs the same dispatch without pipeline deferral,
+    then drains every checkpoint domain before model save/evaluation starts.
+    The dispatch's existing iteration guard makes this idempotent when a final
+    H refresh, oracle, or fault path already made the state visible.
+    """
+
+    ctrl = get_controller()
+    iteration = int(iteration)
+    if not ctrl._enabled or not ctrl._active or iteration <= 0:
+        return
+
+    proposal_dispatch_post_iter(
+        model,
+        iter_T=iteration,
+        sync_processes=True,
+        defer_stage0_emission=False,
+    )
+    workers = ctrl._checkpoint_workers
+    local_failure: Optional[str] = None
+    try:
+        if workers is not None:
+            workers.drain()
+    except BaseException as exc:
+        local_failure = f"worker drain: {type(exc).__name__}: {exc}"
+
+    task = ctrl._latest_post_step_checkpoint_task
+    if task is not None and local_failure is None:
+        if task.non_expert_error is not None:
+            exc = task.non_expert_error
+            local_failure = (
+                f"non-expert task at iter {task.iter_T}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        elif task.expert_error is not None:
+            exc = task.expert_error
+            local_failure = (
+                f"expert task at iter {task.iter_T}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            # Terminal-only host synchronization is outside the steady
+            # training path and guarantees pinned payloads are complete before
+            # save/eval.
+            try:
+                for event in (
+                    task.non_expert_d2h_event,
+                    task.expert_d2h_event,
+                ):
+                    if event is not None:
+                        event.synchronize()
+            except BaseException as exc:
+                local_failure = (
+                    f"D2H completion at iter {task.iter_T}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+    ctrl._latest_post_step_checkpoint_task = None
+
+    # Every rank must make the same success/failure decision before the next
+    # collective BF16 save.  Raising a rank-local worker error before this
+    # Gloo collective would strand the healthy ranks in model save.
+    world_size = int(getattr(ctrl, "_proposal_world_size", 1) or 1)
+    failures: List[Optional[str]] = [local_failure]
+    if world_size > 1:
+        cpu_pg = getattr(ctrl, "_proposal_cpu_pg", None)
+        if (
+            cpu_pg is None
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            raise RuntimeError(
+                "proposal terminal finalize requires the proposal CPU/Gloo "
+                "process group"
+            )
+        failures = [None] * world_size
+        torch.distributed.all_gather_object(
+            failures,
+            local_failure,
+            group=cpu_pg,
+        )
+    for rank, failure in enumerate(failures):
+        if failure:
+            raise RuntimeError(
+                f"proposal terminal checkpoint failed on rank {rank}: "
+                f"{failure}"
+            )
+
+
 def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]:
     if not get_controller()._enabled or get_controller()._cp_dir is None:
         return None
     if get_controller()._checkpoint_workers is not None:
         get_controller()._checkpoint_workers.drain()
+
     # Flush the log-structured expert state so end-of-training replay sees
     # the same on-disk snapshot that fault injection would see.
     if get_controller()._fc is not None and get_controller()._fc.expert_state is not None:
@@ -1329,26 +1653,31 @@ def proposal_recover(model, optimizer, t_fault: int) -> Optional[Dict[str, Any]]
     _t_rec0 = _time.perf_counter()
     _proposal_drain_cuda("proposal_recover_pre")
     _proposal_cpu_barrier("proposal_recover_pre")
-    diag = recover(
-        model=inner_model,
-        optimizer=inner_opt,
-        cp_dir=get_controller()._cp_dir,
-        t_fault=t_fault,
-        num_experts=num_experts,
-        expert_state_image=_expert_state_image,
-        nonexpert_state_image=_nonexpert_state_image,
-        nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
-        expert_dir=get_controller()._config.get("expert_cp_dir"),
-        expected_expert_ids=(
-            get_controller()._fc.expert_state.expert_ids()
-            if (
-                get_controller()._fc is not None
-                and get_controller()._fc.expert_state is not None
+    with _acquire_gpu_replay_lanes() as gpu_replay_lanes:
+        try:
+            diag = recover(
+                model=inner_model,
+                optimizer=inner_opt,
+                cp_dir=get_controller()._cp_dir,
+                t_fault=t_fault,
+                num_experts=num_experts,
+                expert_state_image=_expert_state_image,
+                nonexpert_state_image=_nonexpert_state_image,
+                nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
+                expert_dir=get_controller()._config.get("expert_cp_dir"),
+                expected_expert_ids=(
+                    get_controller()._fc.expert_state.expert_ids()
+                    if (
+                        get_controller()._fc is not None
+                        and get_controller()._fc.expert_state is not None
+                    )
+                    else None
+                ),
+                expert_id_map=get_controller()._config.get("expert_id_map"),
+                gpu_replay_lanes=gpu_replay_lanes,
             )
-            else None
-        ),
-    )
-    _proposal_drain_cuda("proposal_recover_post")
+        finally:
+            _proposal_drain_cuda("proposal_recover_post")
     _proposal_cpu_barrier("proposal_recover")
     _t_rec1 = _time.perf_counter()
     # H_g is GPU-only; the next FD refresh will repopulate it. No disk
@@ -1516,26 +1845,31 @@ def _simulate_fault_impl(
     ):
         _expert_state_image = get_controller()._fc.expert_state
         _nonexpert_state_image = get_controller()._fc
-    diag = recover(
-        model=inner_model,
-        optimizer=inner_opt,
-        cp_dir=get_controller()._cp_dir,
-        t_fault=int(step),
-        num_experts=num_experts,
-        expert_state_image=_expert_state_image,
-        nonexpert_state_image=_nonexpert_state_image,
-        nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
-        expert_dir=get_controller()._config.get("expert_cp_dir"),
-        expected_expert_ids=(
-            get_controller()._fc.expert_state.expert_ids()
-            if (
-                get_controller()._fc is not None
-                and get_controller()._fc.expert_state is not None
+    with _acquire_gpu_replay_lanes() as gpu_replay_lanes:
+        try:
+            diag = recover(
+                model=inner_model,
+                optimizer=inner_opt,
+                cp_dir=get_controller()._cp_dir,
+                t_fault=int(step),
+                num_experts=num_experts,
+                expert_state_image=_expert_state_image,
+                nonexpert_state_image=_nonexpert_state_image,
+                nonexpert_dir=get_controller()._config.get("nonexpert_cp_dir"),
+                expert_dir=get_controller()._config.get("expert_cp_dir"),
+                expected_expert_ids=(
+                    get_controller()._fc.expert_state.expert_ids()
+                    if (
+                        get_controller()._fc is not None
+                        and get_controller()._fc.expert_state is not None
+                    )
+                    else None
+                ),
+                expert_id_map=get_controller()._config.get("expert_id_map"),
+                gpu_replay_lanes=gpu_replay_lanes,
             )
-            else None
-        ),
-    )
-    _proposal_drain_cuda("fault_post_recover")
+        finally:
+            _proposal_drain_cuda("fault_post_recover")
     _proposal_cpu_barrier("fault_post_recover")
     # H_g is GPU-only; next FD refresh repopulates it.
     recover_s = time.perf_counter() - t0
@@ -1607,6 +1941,20 @@ def proposal_shutdown() -> Dict[str, Any]:
     """Drain writers, dump write logs and diagnostic summaries, then cleanup."""
     if not get_controller()._enabled:
         return {}
+    # An exception may reach shutdown before stage 0 posts its first RecvGrad.
+    # Release a pending task before FCManager/worker drains to avoid a teardown
+    # deadlock.  Normal completed tasks make this a no-op.
+    try:
+        _release_stage0_emission(record_cuda_event=True)
+    except Exception:
+        # _release_stage0_emission sets the host gate in ``finally``.  CUDA is
+        # already failing, so continue draining CPU workers and metadata.
+        pass
+    # Drain launcher domains before ExpertState closes files or releases slab
+    # leases.  This is also required on exception teardown, where a task may
+    # have been submitted but not yet reached expert_writer.
+    if get_controller()._checkpoint_workers is not None:
+        get_controller()._checkpoint_workers.drain()
     import json
     summary: Dict[str, Any] = {}
     dump_dir: Optional[Path] = None
@@ -1646,6 +1994,11 @@ def proposal_shutdown() -> Dict[str, Any]:
         ws = get_controller()._checkpoint_workers.summary()
         summary["async_total_write_ms"] = ws.get("total_write_ms", 0.0)
         get_controller()._checkpoint_workers.shutdown()
+    try:
+        from .telemetry.io_backlog import close_io_backlog_trace
+        close_io_backlog_trace()
+    except Exception:
+        pass
     # Audit: dump per-iter alloc trace summary to audit log (R2 evidence).
     try:
         from .telemetry import diagnostics as _proposal_diagnostics

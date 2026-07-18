@@ -163,7 +163,7 @@ class AosEmitter:
                  target_record_capacity: Optional[int] = None,
                  segment_bytes: int = DEFAULT_SEGMENT_BYTES,
                  num_segment_buffers: int = 2) -> None:
-        if not pinned_aos.is_pinned():
+        if torch.cuda.is_available() and not pinned_aos.is_pinned():
             raise ValueError("AosEmitter: pinned_aos must be pinned")
         if pinned_aos.dtype != torch.uint8:
             raise ValueError("AosEmitter: pinned_aos must be uint8")
@@ -198,6 +198,14 @@ class AosEmitter:
         """Allocate all GPU/event resources before the first checkpoint iter."""
 
         self._ensure_segment_d2h(device)
+        self._segment_d2h.warmup()
+
+    def recovery_lanes(self):
+        """Borrow both warm fixed lanes for quiesced fault recovery."""
+
+        if self._segment_d2h is None:
+            return None
+        return self._segment_d2h.recovery_lanes()
 
     def _build_direct_plan(
         self,
@@ -374,10 +382,7 @@ class AosEmitter:
         capacity_signature = (
             tuple(int(total_n) for _ent, total_n, _filtered in prepared)
         )
-        if (
-            self._direct_plan is None
-            or capacity_signature != self._direct_plan_capacity_signature
-        ):
+        if self._direct_plan is None:
             self._direct_plan = self._build_direct_plan(
                 step=int(step),
                 prepared=prepared,
@@ -386,6 +391,11 @@ class AosEmitter:
                 stream=self._segment_d2h._compute_stream,
             )
             self._direct_plan_capacity_signature = capacity_signature
+        elif capacity_signature != self._direct_plan_capacity_signature:
+            raise RuntimeError(
+                "direct AOS schema/capacity changed after cold-start plan "
+                "initialization; refusing a steady-path CUDA reallocation"
+            )
         direct_plan = self._direct_plan
         lossy_state.aos_layout_offsets = direct_plan.layout_state.offset_device
         lossy_state.aos_layout_capacities = direct_plan.layout_state.capacity_device

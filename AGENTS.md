@@ -102,7 +102,12 @@ forward 중 `.item()` / `.cpu()` / pageable H2D, 또는 legacy default-stream se
 
 **V2 iteration sequence**:
 ```
-iter T (T ≥ 1):
+LR warmup W > 0:
+  iter 1..W     ─── baseline training only; proposal I/O/H-refresh/selection 없음
+  post-step W   ─── exact non-expert + all-expert LFCL/test_dram bootstrap
+                    theta_cp/age reset → initial H refresh
+
+active iter T (T > W):
   proposal_dispatch  ──► Event.record(main_stream)
                          ne_writer.submit(task(T-1's opt 산출, event_grad_ready))
                          expert_launcher.submit(task(T-1's opt 산출, event_grad_ready))
@@ -114,10 +119,15 @@ iter T (T ≥ 1):
                           (workers 의 AOS D2H 까지 optimizer.step 전 완료 보장)
   optimizer.step()
 
-iter 0 (특수 케이스):
+iter 0..W (특수 구간):
   forward → backward → optimizer.step()
-  ↑ proposal / wait 모두 skip — 이전 iter 의 opt 산출이 없음
+  ↑ proposal / wait 모두 skip
 ```
+
+첫 lossy/non-expert per-iter dispatch 는 post-step `W+1` 상태이며 다음 loop
+prologue 에 실행한다. H refresh 는 bootstrap step `W` 에 한 번 실행하고, 이후에는 기존
+absolute cadence (`iteration % refresh_every == 0`) 를 유지한다. 예: `W=80`,
+`refresh_every=100` 이면 `80, 100, 200, ...`.
 
 **Race / correctness 분석**:
 - iter T 의 proposal 은 iter T-1 의 optimizer.step 산출 (p, m, v) 을 D2H — workers 가
@@ -713,23 +723,20 @@ LFCL baseline + LFSY 만 유효. LFCL baseline 은 plan 이 고른 expert/chunk 
 
 아래 §14.1–14.3 은 **disk mode 의 recovery** 만 다룬다.
 
-### 14.1 per-expert 병렬 read + backward early termination — ✅ 완료
+### 14.1 bounded read + rank-local GPU LFSY replay — ✅ 완료
 
-`ThreadPoolExecutor(n_workers = min(32, num_local_experts))` 로 expert 단위 GIL-free
-병렬. 각 thread 가 자기 expert 의 LFSY 를 **뒤에서부터** 읽어 dedup:
+FDP recovery 는 rank 가 소유한 expert 를 두 개씩 bounded read batch 로 가져온다. LFCL dense
+baseline decode 는 기존 CPU 경로를 유지하고, fresh LFSY 는 pinned read buffer 에 받은 뒤
+이미 존재하는 segment GPU staging 을 빌려 physical append 순서(old → new)로 resident
+FP32 `p/m/v` view 에 scatter 한다. 같은 expert 의 block 은 한 stream 에 순서대로 제출하므로
+마지막 write 가 최종값이 된다. 한 block 안의 idx uniqueness 는 production direct-emission
+format marker로 고정하며, marker가 없는 legacy LFSY는 기존 CPU reverse/seen replay로
+fallback 한다.
 
-핵심 — dense LFCL baseline 을 먼저 읽고, 해당 baseline 이후의 LFSY 를 **뒤에서부터**
-읽어 latest-wins 로 dedup 한다. expert 단위 baseline 에서는
-`target = n_elements_in_expert` 이고, chunk 단위 baseline 에서는
-`target = n_elements_in_chunk` 이다.
-
-종료 조건이 트리거되지 않는 경우 (일부 element 가 LFCL 이후 한 번도 선택 안 됐을 때):
-- 그 element 는 LFCL compaction baseline 값으로 남는다. 이는 최신 실제값이라는 뜻이
-  아니라, V2 lossy recovery image 의 baseline 이다.
-- read 가 LFSY 끝까지 도달 → fall back. schema / corruption 측면의 문제는 없지만,
-  unselected element 의 residual lossy gap 은 설계상 남는다.
-
-전형적 학습 시나리오 (topk_ratio × LFCL_period ≫ 1) 에선 대부분 early termination 트리거.
+각 bounded batch의 H2D/scatter가 끝나면 host payload를 즉시 해제한다. 따라서 전체 expert의
+dense baseline과 LFSY를 동시에 붙잡지 않는다. PP/EP는 각 rank의 기존 layer/expert 소유권,
+ZeRO-1은 LFCL/LFSY header의 `group_idx/local_offset/numel` fragment만 적용한다. replay
+모듈은 topology 결정이나 collective를 수행하지 않는다.
 
 대규모 모델에서 replay 비용을 bounded 로 유지하려면 full expert 단위만으로는 부족할 수
 있다. 권장 확장 방향은 fixed-size chunk LFCL 이다:
@@ -745,14 +752,16 @@ LFCL baseline + LFSY 만 유효. LFCL baseline 은 plan 이 고른 expert/chunk 
 element 별 "최신 log 위치" 를 steady-state 에서 정확히 유지하는 것은 기본 금지한다. 이는
 `n_elements × offset` 크기의 dense index 와 selected-record 당 random update 를 요구하므로,
 CPU dense scatter 를 dense index scatter 로 되살리거나 VRAM 에서 R1 을 위반할 위험이 크다.
-대신 recovery 시점에 chunk-local dedup flags 을 임시로 만들고 backward scan 으로 latest-wins 를
+legacy/file fallback에서만 recovery 시점의 backward scan + seen bitmap으로 latest-wins를
 구성한다. steady-state 에 유지하는 것은 chunk/block 수준 metadata 와 byte counter 까지로
 제한한다.
 
 ### 14.2 GPU apply 단계 — ✅ 완료
 
-per-expert recovered dense buffer → GPU H2D. **per-expert CUDA stream pool** (~8-way) 으로 동시
-적용해 PCIe / NVLink bandwidth saturate. V1 의 sequential apply 대비 단순 변경.
+LFCL baseline 적용 뒤 LFSY를 rank-local resident FP32 state에 직접 replay한다. 추가
+model-sized GPU allocation이나 per-expert stream/event를 만들지 않고, checkpoint worker가
+drain된 동안 기존 fixed staging 하나를 lease한다. 모든 expert가 끝난 뒤 DeepSpeed의 기존
+FP32→BF16 sync를 한 번만 호출한다.
 
 ## 17. 모듈 책임 분리 상태
 

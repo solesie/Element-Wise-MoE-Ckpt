@@ -88,9 +88,8 @@ def add_proposal_args(parser):
                             "|H_diag| every N iters and overwrite the cached H. "
                             "Default 50 after LR warmup. Set 0 to disable.")
     group.add_argument("--proposal-hessian-refresh-warmup-every", type=int, default=20,
-                       help="During LR warmup, refresh |H_diag| every N iters. "
-                            "Default 20. Ignored when "
-                            "--proposal-hessian-refresh-every=0.")
+                       help="Deprecated compatibility option. Proposal I/O and "
+                            "H refresh now start only after LR warmup.")
     group.add_argument("--proposal-test-skip-expert-commit", action="store_true",
                        help="Test/profiling only: run expert selection, AOS "
                             "materialization, and D2H, then skip CPU dense "

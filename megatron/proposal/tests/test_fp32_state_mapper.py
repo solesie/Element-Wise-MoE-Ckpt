@@ -1,5 +1,6 @@
 import torch
 
+from megatron.proposal.refresh import fp32_state
 from megatron.proposal.refresh.fp32_state import Fp32StateMapper, set_mapper
 from megatron.proposal.storage.recovery import _apply_zero12_partition_payload
 
@@ -235,3 +236,50 @@ def test_zero12_partition_payload_recovery_updates_local_master_and_state():
         torch.arange(30, 35, dtype=torch.float32),
     )
     assert getattr(candidate, "update_lp_called", False)
+
+
+def test_rng_tracker_snapshot_is_not_mutated_when_installed():
+    saved = {"model-parallel-rng": torch.tensor([1, 2, 3], dtype=torch.uint8)}
+    installed = fp32_state.clone_rng_tracker_states(saved)
+
+    # CudaRNGStatesTracker.set_states keeps this exact dict, and fork() later
+    # replaces values in it.  The reusable saved state must remain unchanged.
+    installed["model-parallel-rng"] = torch.tensor([9, 9, 9], dtype=torch.uint8)
+
+    torch.testing.assert_close(
+        saved["model-parallel-rng"],
+        torch.tensor([1, 2, 3], dtype=torch.uint8),
+    )
+
+
+def test_hessian_phase_rng_restore_replays_same_tracker_state(monkeypatch):
+    from megatron.core import tensor_parallel
+    from megatron.proposal.refresh import hessian_refresh
+
+    class _Tracker:
+        states = None
+
+        def set_states(self, states):
+            self.states = states
+
+    tracker = _Tracker()
+    monkeypatch.setattr(
+        tensor_parallel,
+        "get_cuda_rng_tracker",
+        lambda: tracker,
+    )
+    state = {
+        "torch": torch.get_rng_state(),
+        "cuda": None,
+        "mpu": {"model-parallel-rng": torch.tensor([1, 2, 3], dtype=torch.uint8)},
+    }
+
+    hessian_refresh._restore_anchor_rng_state(state)
+    tracker.states["model-parallel-rng"] = torch.tensor([9, 9, 9], dtype=torch.uint8)
+    hessian_refresh._restore_anchor_rng_state(state)
+
+    torch.testing.assert_close(
+        tracker.states["model-parallel-rng"],
+        torch.tensor([1, 2, 3], dtype=torch.uint8),
+    )
+    assert tracker.states is not state["mpu"]

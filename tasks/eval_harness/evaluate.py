@@ -1,27 +1,22 @@
 # This code is originally from https://github.com/bigscience-workshop/Megatron-DeepSpeed
 # under the license https://huggingface.co/spaces/bigscience/license
 
-from functools import reduce
-from logging import logMultiprocessing
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir,os.path.pardir)))
 
-from lm_eval.models.gpt2 import GPT2LM
-from lm_eval import evaluator, tasks, utils
-from lm_eval.base import CacheHook
+from lm_eval import evaluator, utils
+from lm_eval.base import CacheHook, LM
 from tqdm import tqdm
 import torch.nn.functional as F
 
-from lm_eval.tasks import ALL_TASKS
 from pretrain_gpt import model_provider
 import numpy as np
 import time
 
 import torch
 from megatron import get_args
-from megatron import print_rank_0
 from megatron import get_tokenizer
 from megatron.core.enums import ModelType
 from megatron.core import mpu
@@ -30,22 +25,25 @@ from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_para
 
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
-import pickle
 import json
+
+from tasks.eval_harness.paper_tasks import (
+    TASK_NAMES,
+    get_paper_task_dict,
+    protocol_metadata,
+)
 
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron.model.distributed import DistributedDataParallel as LocalDDP
 from megatron.model.module import Float16Module
-from deepspeed.runtime.pipe import schedule
 from deepspeed.accelerator import get_accelerator
 
-class EvalHarnessAdaptor(GPT2LM):
+class EvalHarnessAdaptor(LM):
     def __init__(self, model, tokenizer):
         args = get_args()
         self.args = args
         self.model = model
         self.tokenizer = tokenizer
-        self.VOCAB_SIZE = tokenizer.vocab_size
         self.EOT_TOKEN_ID = tokenizer.eod
 
         self._max_length = args.seq_length
@@ -56,12 +54,11 @@ class EvalHarnessAdaptor(GPT2LM):
 
         self.cache_hook = CacheHook(None)
         self.is_main = args.rank == 0
-        self.is_local_main = args.local_rank == 0
         self._device = get_accelerator().current_device_name()
-        self.is_model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         self.is_pipe_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
         self.is_data_parallel = mpu.get_data_parallel_world_size() > 1
         self.adaptive_seq_len = args.adaptive_seq_len
+        self.max_gen_toks = args.generation_max_tokens
         if self.is_data_parallel and args.moe_expert_parallel_size == 1: # For MoE model, allow a "fake data parallel" in order to partition model into multiple gpus
             raise NotImplementedError("Data parallelism is currently not supported for evaluation")
 
@@ -125,7 +122,6 @@ class EvalHarnessAdaptor(GPT2LM):
     def _loglikelihood_tokens(self, requests, disable_tqdm=False):
         disable_tqdm = disable_tqdm if self.is_main else True
         res = []
-        res_len = 0  # storing the result length for later
         self.model.eval()
         with torch.no_grad():
             def _collate(x):
@@ -160,7 +156,6 @@ class EvalHarnessAdaptor(GPT2LM):
                     inplens.append(inplen)
 
                 logits = self._model_call(torch.cat(inps, dim=0))
-                res_len += len(chunk)
                 if logits is not None:
                     multi_logits = F.log_softmax(logits, dim=-1).cpu()  # [batch, seq, vocab]
 
@@ -242,11 +237,16 @@ class EvalHarnessAdaptor(GPT2LM):
                 # dummy data iterator for pipelining.
                 data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
                 self.model.micro_batches = len(data_iterator)
+                if args.adaptive_seq_len:
+                    # Each evaluation chunk may have a different sequence
+                    # width, so discard DeepSpeed's cached receive buffers
+                    # before the next activation metadata exchange.
+                    self.model.reset_activation_shape()
                 output = self.model.eval_batch(iter(data_iterator), compute_loss = False, reduce_output = None)
 
 
                 if output is not None:
-                    output = torch.cat(output, 0)[:len(inps)]
+                    output = concat_pipeline_logits(output, len(inps))
                 else:
                     output = None
 
@@ -285,12 +285,106 @@ class EvalHarnessAdaptor(GPT2LM):
         else:
             return self.tokenizer.tokenizer.encode(text, add_special_tokens=False)
 
+    def tokenizer_decode(self, tokens):
+        return self.tokenizer.tokenizer.decode(tokens)
+
+    def greedy_until(self, requests):
+        """Greedy generation for explicitly requested generation tasks.
+
+        Every pipeline rank advances the same token sequence.  The last stage
+        chooses the token and broadcasts it within its pipeline group before
+        the next model call.
+        """
+        results = []
+        self.model.eval()
+        with torch.no_grad():
+            for chunk in utils.chunks(requests, self.batch_size):
+                contexts = []
+                stops = []
+                for context, until in chunk:
+                    encoded = self.tokenizer_encode(context)
+                    contexts.append(encoded[-self.max_length :])
+                    stops.append([until] if isinstance(until, str) else list(until))
+
+                generated = [[] for _ in chunk]
+                active = [True] * len(chunk)
+                for _ in range(self.max_gen_toks):
+                    model_tokens = [
+                        (context + continuation)[-self.max_length :]
+                        for context, continuation in zip(contexts, generated)
+                    ]
+                    lengths = [len(tokens) for tokens in model_tokens]
+                    width = max(lengths)
+                    inputs = torch.full(
+                        (len(chunk), width),
+                        self.EOT_TOKEN_ID,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    for row, tokens in enumerate(model_tokens):
+                        inputs[row, : len(tokens)] = torch.tensor(
+                            tokens, dtype=torch.long, device=self.device
+                        )
+
+                    logits = self._model_call(inputs)
+                    next_tokens = torch.zeros(
+                        len(chunk), dtype=torch.long, device=self.device
+                    )
+                    if self.is_last_stage:
+                        rows = torch.arange(len(chunk), device=self.device)
+                        positions = torch.tensor(lengths, device=self.device) - 1
+                        next_tokens.copy_(logits[rows, positions].argmax(dim=-1))
+                    if self.is_pipe_parallel:
+                        torch.distributed.broadcast(
+                            next_tokens,
+                            src=mpu.get_pipeline_model_parallel_last_rank(),
+                            group=mpu.get_pipeline_model_parallel_group(),
+                        )
+
+                    token_list = next_tokens.tolist()
+                    for row, token in enumerate(token_list):
+                        if not active[row]:
+                            continue
+                        if token == self.EOT_TOKEN_ID:
+                            active[row] = False
+                            continue
+                        generated[row].append(token)
+                        decoded = self.tokenizer_decode(generated[row])
+                        if any(stop and stop in decoded for stop in stops[row]):
+                            active[row] = False
+                    if not any(active):
+                        break
+
+                for continuation, until in zip(generated, stops):
+                    decoded = self.tokenizer_decode(continuation)
+                    stop_positions = [decoded.find(stop) for stop in until if stop]
+                    stop_positions = [position for position in stop_positions if position >= 0]
+                    if stop_positions:
+                        decoded = decoded[: min(stop_positions)]
+                    results.append(decoded)
+        return results
+
 
 from megatron.initialize import initialize_megatron
 import megatron
 
 from tools.convert_checkpoint.deepspeed_checkpoint import DeepSpeedCheckpoint
-from tools.convert_checkpoint.deepspeed_to_megatron import _create_rank_checkpoint
+try:
+    from .checkpoint_utils import (
+        concat_pipeline_logits,
+        deepspeed_model_only_eval_config,
+        load_deepspeed_checkpoint_args,
+        prepare_bf16_eval_module,
+        resolve_deepspeed_checkpoint_dir,
+    )
+except ImportError:  # evaluate.py is normally launched as a script.
+    from checkpoint_utils import (
+        concat_pipeline_logits,
+        deepspeed_model_only_eval_config,
+        load_deepspeed_checkpoint_args,
+        prepare_bf16_eval_module,
+        resolve_deepspeed_checkpoint_dir,
+    )
 
 def override_args(args, override_args, skip_keys, skip_if_specified_keys):
     for k, v in vars(override_args).items():
@@ -322,13 +416,50 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     megatron.arguments._print_args = lambda *_args, **kwarg: None
     args = parse_args(extra_args_provider=extra_args_provider)
 
-    ds_checkpoint = DeepSpeedCheckpoint(args.load,
-                                        tp_degree=args.tensor_model_parallel_size,
-                                        pp_degree=args.pipeline_model_parallel_size,
-                                        no_pp=args.no_pipeline_parallel)
-
-
-    cp_args = ds_checkpoint.get_args()
+    if args.deepspeed:
+        world = int(args.world_size)
+        tp = int(args.tensor_model_parallel_size)
+        pp = int(args.pipeline_model_parallel_size)
+        ep = int(args.moe_expert_parallel_size)
+        parallel_product = tp * pp * ep
+        if parallel_product <= 0 or world % parallel_product:
+            raise RuntimeError(
+                f"invalid evaluator topology world={world}, tp={tp}, pp={pp}, ep={ep}"
+            )
+        cp_path = resolve_deepspeed_checkpoint_dir(
+            args.load,
+            require_model_only=True,
+            expected_topology={
+                "world_size": world,
+                "tensor_parallel_size": tp,
+                "pipeline_parallel_size": pp,
+                "expert_parallel_size": ep,
+                "data_parallel_size": world // parallel_product,
+            },
+        )
+        cp_args = load_deepspeed_checkpoint_args(cp_path)
+        bundled_vocab = os.path.join(cp_path, 'tokenizer', 'gpt2-vocab.json')
+        bundled_merges = os.path.join(cp_path, 'tokenizer', 'gpt2-merges.txt')
+        bundled_ds_config = os.path.join(cp_path, 'deepspeed_config.json')
+        if os.path.isfile(bundled_vocab):
+            cp_args.vocab_file = bundled_vocab
+        if os.path.isfile(bundled_merges):
+            cp_args.merge_file = bundled_merges
+        if not args.masked_softmax_fusion:
+            cp_args.masked_softmax_fusion = False
+        if not isinstance(getattr(cp_args, 'deepspeed_config_dict', None), dict):
+            if not os.path.isfile(bundled_ds_config):
+                raise RuntimeError('checkpoint has no embedded DeepSpeed config')
+            with open(bundled_ds_config, 'r', encoding='utf-8') as config_file:
+                cp_args.deepspeed_config_dict = json.load(config_file)
+        ds_checkpoint = None
+    else:
+        cp_path = args.load
+        ds_checkpoint = DeepSpeedCheckpoint(args.load,
+                                            tp_degree=args.tensor_model_parallel_size,
+                                            pp_degree=args.pipeline_model_parallel_size,
+                                            no_pp=args.no_pipeline_parallel)
+        cp_args = ds_checkpoint.get_args()
     # Merge the current args with the checkpoint args.
     skip_keys = ['world_size', 'rank', 'local_rank','device_count', 'micro_batch_size','global_batch_size', 'batch_size', 'tensorboard_dir', 'deepspeed', 'deepspeed_config',
                      'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'rampup_batch_size', 'iteration', 'inference', 'random_ltd']
@@ -343,6 +474,10 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     cp_args.tokenizer_type = 'GPT2BPETokenizer'
 
     override_args(args, cp_args, skip_keys, skip_if_specified)
+    # setup_model_and_optimizer passes the embedded dict to DeepSpeed. Recent
+    # DeepSpeed versions reject receiving both this dict and a config path.
+    if args.deepspeed:
+        args.deepspeed_config = None
 
     # stop megatron from reparsing the arguments.
     megatron.arguments.parse_args = lambda *_args, **kwarg: args
@@ -355,6 +490,17 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
 
     # Initializing megatron will update eg. tokenizer size. Override again.
     override_args(args, cp_args, skip_keys, skip_if_specified)
+    if args.deepspeed:
+        # Keep Megatron's BF16 parameter construction from the checkpoint,
+        # but do not instantiate the training ZeRO/BF16 optimizer wrappers in
+        # a model-only evaluator.  Also collapse the training GAS to one eval
+        # batch so PipelineEngine does not replay the 10K training schedule.
+        args.deepspeed_config_dict = deepspeed_model_only_eval_config(
+            args.deepspeed_config_dict,
+            micro_batch_size=args.micro_batch_size,
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+        )
+        args.zero_stage = 0
 
     # print final arguments.
     _print_args("eval_harness arguments", args)
@@ -371,15 +517,34 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
         deepspeed.runtime.state_dict_factory.MegatronSDLoader.sanity_check = lambda self, ckpt_file_name: None
 
 
-        cp_path = args.load
         args.load = None
         model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
         model = model[0]
+        if not args.eval_fp32:
+            # Disabling DeepSpeed's BF16 optimizer wrapper also disables its
+            # automatic module cast.  Apply that cast explicitly so plain
+            # torch modules such as positional embeddings cannot remain FP32.
+            prepare_bf16_eval_module(model.module)
         zero_enabled = model._config.zero_enabled
         model._config.zero_enabled = False
-        _, _ = model.load_checkpoint(cp_path, tag = '.', load_optimizer_states=False, load_lr_scheduler_states=False, load_module_only=True)
-        model._config.zero_enabled = zero_enabled
+        try:
+            load_path, _ = model.load_checkpoint(
+                cp_path,
+                tag='.',
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_only=True,
+            )
+        finally:
+            model._config.zero_enabled = zero_enabled
+        if load_path is None:
+            raise RuntimeError(f'DeepSpeed failed to load model-only checkpoint: {cp_path}')
     else:
+        # This converter has a script-style import and is not needed by the
+        # normal DeepSpeed path.  Keep it lazy so DeepSpeed evaluation does not
+        # depend on tools/convert_checkpoint being on sys.path.
+        from tools.convert_checkpoint.deepspeed_to_megatron import _create_rank_checkpoint
+
         model = get_model(model_provider)[0]
         # Initialize megatron model using the parsed state dict.
         sd = _create_rank_checkpoint(ds_checkpoint, None, mpu.get_tensor_model_parallel_rank(), mpu.get_pipeline_model_parallel_rank(), True)
@@ -395,12 +560,20 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
 def tasks_args(parser):
     """Provide extra arguments required for tasks."""
     group = parser.add_argument_group(title='Evaluation options')
-    group.add_argument('--task_list', type=str, default = "all", help='Either "all" or comma separated list of tasks.')
+    group.add_argument('--task_list', type=str, default=','.join(TASK_NAMES),
+                       help='Comma-separated subset of the fixed paper tasks.')
     group.add_argument('--results_path', type=str, default = "./results.json", help='Path to where the results will be stored.')
+    group.add_argument('--paper-data-dir', type=str,
+                       default='/home/paul/data/lm_eval_paper_6tasks',
+                       help='Prepared paper-task data root containing manifest.json.')
     group.add_argument('--adaptive_seq_len',  default = False, action='store_true',
                        help='Should the sequence length be adapted to the batch during evaluation, if in fp16 the results will be slightly different due to numerical errors but greatly speed up evaluation.')
     group.add_argument('--num_fewshot', type=int, default = 0, help='Number of few-shot prompts.')
     group.add_argument('--eval_fp32',  default = False, action='store_true', help='Should the evaluation run in fp32')
+    group.add_argument('--limit', type=int, default=None,
+                       help='Evaluation-example limit for plumbing smoke tests only.')
+    group.add_argument('--generation-max-tokens', type=int, default=64,
+                       help='Maximum greedy continuation length for generation tasks.')
     return parser
 
 from megatron.arguments import parse_args
@@ -410,29 +583,50 @@ def main():
     model = load_ds_checkpoint_and_setup_megatron(extra_args_provider=tasks_args)
 
     args = get_args()
+    if args.num_fewshot != 0:
+        raise ValueError('the paper protocol is fixed to zero-shot (--num_fewshot 0)')
+    os.environ['LM_EVAL_PAPER_DATA'] = args.paper_data_dir
     if args.deepspeed and args.adaptive_seq_len:
         # adaptive_seq_len hack #1:
         # CL automatically enables reset_activation_shape() which allows us to change input shapes
         # and it also reshapes the attenion scores in attention_mask_func
         args.curriculum_learning_legacy = 1
 
-    task_list = ALL_TASKS if args.task_list == 'all' else args.task_list.split(',')
-    task_dict = tasks.get_task_dict(task_list)
+    task_list = list(TASK_NAMES) if args.task_list == 'all' else args.task_list.split(',')
+    task_dict = get_paper_task_dict(task_list)
 
     model.module.activation_checkpoint_interval = 0
     model._compute_loss = False
+    # Standalone scoring consumes logits only. DeepSpeed 0.19 still polls
+    # auxiliary losses with compute_loss=False, before GPTModelPipe has values.
+    model.module.get_additional_losses = lambda: None
     model.fwd_outputs = []
 
     tokenizer = get_tokenizer()
     adaptor = EvalHarnessAdaptor(model, tokenizer)
-    results = evaluator.evaluate(adaptor, task_dict, False, args.num_fewshot, None)
+    results = evaluator.evaluate(
+        adaptor,
+        task_dict,
+        False,
+        args.num_fewshot,
+        args.limit,
+    )
+    results['paper_protocol'] = protocol_metadata()
 
-    if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+    candidate = args.rank if (
+        mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0
+    ) else args.world_size
+    writer = torch.tensor(candidate, dtype=torch.int64, device=adaptor.device)
+    torch.distributed.all_reduce(writer, op=torch.distributed.ReduceOp.MIN)
+    writer_rank = int(writer.item())
+    if args.rank == writer_rank:
         print(json.dumps(results, indent=2))
+        os.makedirs(os.path.dirname(os.path.abspath(args.results_path)), exist_ok=True)
         with open(args.results_path, 'w') as outfile:
             json.dump(results, outfile, indent = 4)
     end = time.time()
-    print("evaluation of {} ends in {:.2f} sec, or {:.2f} min, or {:.2f} hr".format(args.task_list, end-start, (end-start)/60.0, (end-start)/3600.0))
+    if args.rank == writer_rank:
+        print("evaluation of {} ends in {:.2f} sec, or {:.2f} min, or {:.2f} hr".format(args.task_list, end-start, (end-start)/60.0, (end-start)/3600.0))
 
 if __name__ == '__main__':
     main()

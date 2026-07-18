@@ -198,6 +198,10 @@ class RefreshOrchestrationMixin:
         launch_fill_quantiles_from_log_hist(
             hist, self._h_quantile_values, min_bound=h_lo_t, max_bound=h_hi_t,
         )
+        self._last_h_quantile_summary = (
+            float(self._h_quantile_values.mean().item()),
+            float(self._h_quantile_values.max().item()),
+        )
         self._h_anchor_initialised = True
         self._ensure_h_lookup_lut()
         launch_rebuild_h_lookup_lut(

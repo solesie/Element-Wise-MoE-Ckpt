@@ -1068,6 +1068,11 @@ def _add_checkpointing_args(parser):
 
     group.add_argument('--save', type=str, default=None,
                        help='Output directory to save checkpoints to.')
+    group.add_argument('--save-bf16-model', type=str, default=None,
+                       help='After training, save the final live BF16 model in '
+                            'DeepSpeed model-only shard format. This excludes '
+                            'FP32 master weights, optimizer, and RNG state and '
+                            'cannot be used to resume training.')
     group.add_argument('--save-interval', type=int, default=None,
                        help='Number of iterations between checkpoint saves.')
     group.add_argument('--no-save-optim', action='store_true', default=None,

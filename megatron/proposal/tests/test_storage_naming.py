@@ -1,8 +1,11 @@
 from pathlib import Path
 
-from megatron.proposal.expert_id import ids_from_name
+import pytest
+import torch
+
+from megatron.proposal.expert_id import build_expert_id_map, ids_from_name
 from megatron.proposal.distributed import ProposalTopology
-from megatron.proposal.storage.recovery import _scan_cp_dir
+from megatron.proposal.storage.recovery import _classify_params, _scan_cp_dir
 
 
 def test_nonexpert_dir_is_pp_scoped_not_ep_scoped():
@@ -67,13 +70,78 @@ def test_recovery_scans_new_and_legacy_nonexpert_shard_names(tmp_path):
     assert expert_pairs == {}
 
 
-def test_pipeline_module_expert_names_keep_leading_layer_id():
+class _FakeExpertLayer(torch.nn.Module):
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = int(layer_number)
+        self.deepspeed_experts = torch.nn.ModuleList([
+            torch.nn.Linear(1, 1, bias=False),
+        ])
+
+
+def _fake_pipe(*, wrapped=False, bad_layer=None):
+    pipe = torch.nn.Module()
+    pipe.add_module("2", _FakeExpertLayer(0))
+    pipe.add_module("5", _FakeExpertLayer(3 if bad_layer is None else bad_layer))
+    if not wrapped:
+        return pipe
+    wrapper = torch.nn.Module()
+    wrapper.add_module("module", pipe)
+    return wrapper
+
+
+def test_pipeline_module_expert_names_use_model_layer_number():
+    model = _fake_pipe()
+    expert_ids = build_expert_id_map(model, num_layers=4)
+
+    assert expert_ids["2.deepspeed_experts.0.weight"] == (0, 0)
+    assert expert_ids["5.deepspeed_experts.0.weight"] == (3, 0)
     assert ids_from_name(
-        "9.mlp.deepspeed_moe.experts.deepspeed_experts.14.wi.weight"
-    ) == (9, 14)
-    assert ids_from_name(
-        "module.11.mlp.deepspeed_moe.experts.deepspeed_experts.3.wo.weight"
-    ) == (11, 3)
+        "5.deepspeed_experts.0.weight", expert_ids,
+    ) == (3, 0)
+
+
+def test_pipeline_module_expert_map_supports_module_wrapper():
+    model = _fake_pipe(wrapped=True)
+    expert_ids = build_expert_id_map(model, num_layers=4)
+
+    assert expert_ids["module.2.deepspeed_experts.0.weight"] == (0, 0)
+    assert expert_ids["module.5.deepspeed_experts.0.weight"] == (3, 0)
+
+
+def test_recovery_classification_uses_same_canonical_layer_map():
+    model = _fake_pipe()
+    expert_ids = build_expert_id_map(model, num_layers=4)
+
+    non_expert, by_expert = _classify_params(model, expert_ids)
+
+    assert non_expert == {}
+    assert set(by_expert) == {(0, 0), (3, 0)}
+
+
+def test_pipeline_module_name_without_canonical_map_fails_closed():
+    with pytest.raises(ValueError, match="canonical expert-id map"):
+        ids_from_name("9.deepspeed_experts.14.weight")
+
+
+def test_pipeline_module_layer_outside_model_range_fails_closed():
+    with pytest.raises(RuntimeError, match=r"outside \[0, 4\)"):
+        build_expert_id_map(_fake_pipe(bad_layer=4), num_layers=4)
+
+
+def test_pipeline_module_without_layer_number_fails_closed():
+    model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.add_module("deepspeed_experts", torch.nn.ModuleList([
+        torch.nn.Linear(1, 1, bias=False),
+    ]))
+    model.add_module("2", layer)
+
+    with pytest.raises(RuntimeError, match="has no layer_number"):
+        build_expert_id_map(model, num_layers=1)
+
+
+def test_nonpipeline_expert_name_keeps_model_layer_id():
     assert ids_from_name(
         "language_model.encoder.layers.5.mlp.deepspeed_moe.experts."
         "deepspeed_experts.7.wi.weight"

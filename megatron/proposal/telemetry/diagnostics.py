@@ -119,9 +119,23 @@ def vram_audit_step(
     dump_breakdown: bool = False,
     lossy_cp: Optional[Any] = None,
     extra: Optional[Dict[str, Any]] = None,
+    synchronize: bool = True,
 ) -> None:
+    """Record one VRAM sample when the audit is explicitly enabled.
+
+    ``synchronize`` is part of the caller contract used at anchor boundaries.
+    The current recorder has always synchronized before sampling; rejecting
+    the keyword made every H-refresh fail even when auditing was disabled.
+    Keep the disabled production path as an immediate no-op and reject the
+    only unsupported mode (an unsynchronized sample) explicitly instead of
+    silently changing its meaning.
+    """
     if not is_vram_audit_enabled():
         return
+    if not synchronize:
+        raise RuntimeError(
+            "unsynchronized proposal VRAM samples are not supported"
+        )
     audit_extra: Dict[str, Any] = dict(extra) if extra else {}
     if dump_breakdown and lossy_cp is not None:
         try:
@@ -134,6 +148,91 @@ def vram_audit_step(
         except Exception:
             pass
     _record_vram_audit(label, audit_extra)
+
+
+def _allocator_history_requested() -> bool:
+    return os.environ.get("PROPOSAL_PER_ITER_ALLOC_TRACE", "") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+def _configured_steady_allocator_history_iters() -> set[int]:
+    raw = os.environ.get("PROPOSAL_ALLOC_TRACE_ITERS", "").strip()
+    if not raw:
+        return set()
+    try:
+        return {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except ValueError as exc:
+        raise RuntimeError(
+            "PROPOSAL_ALLOC_TRACE_ITERS must be a comma-separated list of integers"
+        ) from exc
+
+
+def _raise_allocator_history_unavailable(region: str, step: int) -> None:
+    raise RuntimeError(
+        "exact CUDA allocator-history audit was requested for "
+        f"{region}@{int(step)}, but no allocator-history backend is installed; "
+        "refusing to emit a misleading R2/R4 PASS"
+    )
+
+
+def begin_allocator_history(
+    region: str,
+    step: int,
+    *,
+    force: bool = False,
+) -> bool:
+    """Enter an exact allocator-history region, if one was requested.
+
+    ``force`` means that an enabled backend should include this region even
+    when it is outside the steady-iteration selection.  It deliberately does
+    not override the environment gate: normal training must remain a no-op.
+    This tree currently has no exact allocator-history backend, so an explicit
+    request fails closed rather than falling back to the incomplete Python
+    tensor-factory tracer.
+    """
+
+    del force
+    if not _allocator_history_requested():
+        return False
+    _raise_allocator_history_unavailable(str(region), int(step))
+    return False  # pragma: no cover - documents the bool API
+
+
+def end_allocator_history(region: str, step: int) -> None:
+    """Leave an allocator-history region begun by ``begin_allocator_history``."""
+
+    if not _allocator_history_requested():
+        return
+    _raise_allocator_history_unavailable(str(region), int(step))
+
+
+def begin_steady_allocator_history(step: int) -> bool:
+    """Enter one explicitly selected steady checkpoint region.
+
+    Unselected iterations return immediately so enabling ordinary VRAM
+    sampling never serializes or perturbs the 10K hot path.
+    """
+
+    if not _allocator_history_requested():
+        return False
+    selected = _configured_steady_allocator_history_iters()
+    if int(step) not in selected:
+        return False
+    _raise_allocator_history_unavailable("steady", int(step))
+    return False  # pragma: no cover - documents the bool API
+
+
+def end_steady_allocator_history(step: int) -> None:
+    """Leave a selected steady allocator-history region."""
+
+    if not _allocator_history_requested():
+        return
+    if int(step) not in _configured_steady_allocator_history_iters():
+        return
+    _raise_allocator_history_unavailable("steady", int(step))
 
 
 def _alloc_trace_active() -> bool:

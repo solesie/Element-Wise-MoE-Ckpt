@@ -1114,7 +1114,14 @@ class CutoffOrchestrationMixin:
         cold_start_hist_iters = max(
             1, int(getattr(self, "_cold_start_hist_iters", 4))
         )
-        initial_cold_start = int(global_step) <= int(cold_start_hist_iters)
+        cold_start_first_step = int(
+            getattr(self, "_cold_start_first_global_step", 1)
+        )
+        initial_cold_start = (
+            cold_start_first_step
+            <= int(global_step)
+            < cold_start_first_step + cold_start_hist_iters
+        )
         use_cold_start_hist = (
             bool(getattr(cutoff_decision, "use_exact", False))
             and bool(initial_cold_start)
@@ -1133,7 +1140,6 @@ class CutoffOrchestrationMixin:
             )
             if cold_start is not None:
                 tau_center, cold_log_width = cold_start
-                self._cold_start_cutoff_ready = True
                 candidates = self._cold_start_candidate_ladder(
                     tau=float(tau_center),
                     log_bin_width=float(cold_log_width),

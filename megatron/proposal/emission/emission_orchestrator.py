@@ -125,14 +125,10 @@ class EmissionOrchestrationMixin:
             or tuple(fp32_dev.shape) != (3,)
             or tuple(step_dev.shape) != (1,)
         ):
-            fp32_host = torch.empty(3, dtype=torch.float32, pin_memory=True)
-            step_host = torch.empty(1, dtype=torch.int32, pin_memory=True)
-            fp32_dev = torch.empty(3, dtype=torch.float32, device=device)
-            step_dev = torch.empty(1, dtype=torch.int32, device=device)
-            self._direct_write_fp32_scalar_host = fp32_host
-            self._direct_write_step_host = step_host
-            self._direct_write_fp32_scalar_device = fp32_dev
-            self._direct_write_step_device = step_dev
+            raise RuntimeError(
+                "direct-write scalar buffers were not initialized for the "
+                "active device; steady checkpoint code must not reallocate them"
+            )
         fp32_host[0] = float(hparams.lr_over_bc1)
         fp32_host[1] = float(hparams.sqrt_bc2_inv)
         fp32_host[2] = float(hparams.eps)
@@ -161,8 +157,10 @@ class EmissionOrchestrationMixin:
             or ring.dtype != torch.float32
             or tuple(ring.shape) != (1,)
         ):
-            ring = torch.empty(1, dtype=torch.float32, device=device)
-            self._direct_write_total_th_ring_device = ring
+            raise RuntimeError(
+                "direct-write tau buffer was not initialized for the active "
+                "device; steady checkpoint code must not reallocate it"
+            )
         stream = self._compute_stream
         src = total_th.reshape(1)
         if stream is not None:

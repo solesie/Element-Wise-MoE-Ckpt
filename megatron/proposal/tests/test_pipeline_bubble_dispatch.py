@@ -1,6 +1,9 @@
+import threading
+
 import pytest
 
 import megatron.proposal.controller as controller
+import megatron.proposal.storage.proposal_io as proposal_io
 from deepspeed.runtime.pipe.schedule import TrainSchedule
 from megatron.proposal.controller import (
     PostStepCheckpointTask,
@@ -120,6 +123,26 @@ class _FakeHostEvent:
         return self._set
 
 
+class _BlockingHostEvent:
+    def __init__(self, calls):
+        self.calls = calls
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def is_set(self):
+        return self.released.is_set()
+
+    def set(self):
+        if not self.released.is_set():
+            self.calls.append("release")
+            self.released.set()
+
+    def wait(self, timeout=None):
+        self.calls.append("wait")
+        self.entered.set()
+        return self.released.wait(timeout)
+
+
 class _FakeEngine:
     def __init__(
         self,
@@ -158,6 +181,176 @@ class _FakeEngine:
         return None
 
 
+def test_stage0_nonexpert_d2h_waits_for_bubble_event(monkeypatch):
+    calls = []
+    dispatch_event = object()
+    boundary_event = object()
+
+    class _FakeFC:
+        def fire_nonexpert_fc_if_due(
+            self, *, step, ready_event, d2h_event_callback,
+        ):
+            calls.append(("fire", step, ready_event))
+            d2h_event_callback(None)
+
+    ctrl = controller.get_controller()
+    old_fc = ctrl._fc
+    task = PostStepCheckpointTask(
+        cuda_event=dispatch_event,
+        iter_T=7,
+        defer_stage0_emission=True,
+        stage0_emission_cuda_event=boundary_event,
+    )
+    release = _BlockingHostEvent(calls)
+    task.stage0_emission_release = release
+    task.dispatch_release_ready.set()
+    ctrl._fc = _FakeFC()
+    monkeypatch.setattr(proposal_io, "fdp_mark_writer_done", lambda *_args: None)
+
+    worker = threading.Thread(
+        target=controller._execute_non_expert_post_iter,
+        args=(task,),
+    )
+    try:
+        worker.start()
+        assert release.entered.wait(timeout=1.0)
+        assert calls == ["wait"]
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert calls == ["wait", "release", ("fire", 7, boundary_event)]
+        assert task.non_expert_read_ready.is_set()
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
+        ctrl._fc = old_fc
+
+
+def test_nonstage0_nonexpert_d2h_remains_immediate(monkeypatch):
+    calls = []
+    dispatch_event = object()
+
+    class _FakeFC:
+        def fire_nonexpert_fc_if_due(
+            self, *, step, ready_event, d2h_event_callback,
+        ):
+            calls.append(("fire", step, ready_event))
+            d2h_event_callback(None)
+
+    ctrl = controller.get_controller()
+    old_fc = ctrl._fc
+    task = PostStepCheckpointTask(
+        cuda_event=dispatch_event,
+        iter_T=8,
+        defer_stage0_emission=False,
+    )
+    task.dispatch_release_ready.set()
+    ctrl._fc = _FakeFC()
+    monkeypatch.setattr(proposal_io, "fdp_mark_writer_done", lambda *_args: None)
+    try:
+        controller._execute_non_expert_post_iter(task)
+        assert calls == [("fire", 8, dispatch_event)]
+        assert not task.stage0_emission_release.is_set()
+        assert task.non_expert_read_ready.is_set()
+    finally:
+        ctrl._fc = old_fc
+
+
+def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
+    calls = []
+    dispatch_event = object()
+    boundary_event = object()
+
+    class _FakeLosslessFC:
+        last_d2h_event = None
+
+        def plan_if_due(self, step, **_kwargs):
+            calls.append(("plan", step))
+            return [(0, 0)]
+
+        def fire_planned(self, step, fired, *, ready_event):
+            calls.append(("fire", step, tuple(fired), ready_event))
+            return fired
+
+    ctrl = controller.get_controller()
+    old_config = ctrl._config
+    old_fc = ctrl._fc
+    old_lossy_cp = ctrl._lossy_cp
+    old_lossless_fc = ctrl._expert_lossless_fc
+    ctrl._config = {
+        "writes_expert": True,
+        "expert_lossy_enabled": False,
+    }
+    ctrl._fc = None
+    ctrl._lossy_cp = None
+    ctrl._expert_lossless_fc = _FakeLosslessFC()
+    task = PostStepCheckpointTask(
+        cuda_event=dispatch_event,
+        iter_T=9,
+        sync_processes=False,
+        defer_stage0_emission=True,
+        stage0_emission_cuda_event=boundary_event,
+    )
+    release = _BlockingHostEvent(calls)
+    task.stage0_emission_release = release
+    monkeypatch.setattr(proposal_io, "fdp_mark_writer_done", lambda *_args: None)
+    worker = threading.Thread(
+        target=controller._execute_expert_post_iter,
+        args=(task,),
+    )
+    try:
+        worker.start()
+        assert release.entered.wait(timeout=1.0)
+        assert calls == [("plan", 9), "wait"]
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert calls == [
+            ("plan", 9),
+            "wait",
+            "release",
+            ("fire", 9, ((0, 0),), boundary_event),
+        ]
+        assert task.expert_read_ready.is_set()
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
+        ctrl._config = old_config
+        ctrl._fc = old_fc
+        ctrl._lossy_cp = old_lossy_cp
+        ctrl._expert_lossless_fc = old_lossless_fc
+
+
+def test_inline_worker_fallback_cannot_wait_for_future_bubble(monkeypatch):
+    calls = []
+    ctrl = controller.get_controller()
+    old_workers = ctrl._checkpoint_workers
+    ctrl._checkpoint_workers = None
+    task = PostStepCheckpointTask(
+        cuda_event=object(),
+        iter_T=10,
+        defer_stage0_emission=True,
+        stage0_emission_cuda_event=object(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_expert_post_iter",
+        lambda submitted: calls.append(("expert", submitted.defer_stage0_emission)),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_non_expert_post_iter",
+        lambda submitted: calls.append(("nonexpert", submitted.defer_stage0_emission)),
+    )
+    try:
+        controller._submit_post_step_checkpoint_task(task)
+        assert calls == [("expert", False), ("nonexpert", False)]
+        assert task.stage0_emission_release.is_set()
+        assert task.stage0_emission_cuda_event is None
+    finally:
+        ctrl._checkpoint_workers = old_workers
+
+
 def test_first_recv_is_posted_before_worker_release(monkeypatch):
     calls = []
     engine = _FakeEngine(calls)
@@ -167,10 +360,10 @@ def test_first_recv_is_posted_before_worker_release(monkeypatch):
     task = PostStepCheckpointTask(
         cuda_event=None,
         iter_T=7,
-        defer_stage0_expert_emission=True,
-        expert_emission_cuda_event=_FakeEvent(calls),
+        defer_stage0_emission=True,
+        stage0_emission_cuda_event=_FakeEvent(calls),
     )
-    task.expert_emission_release = _FakeHostEvent(calls)
+    task.stage0_emission_release = _FakeHostEvent(calls)
     ctrl._latest_post_step_checkpoint_task = task
     ctrl._enabled = False
     monkeypatch.setattr(controller.torch.cuda, "is_available", lambda: True)
@@ -178,10 +371,10 @@ def test_first_recv_is_posted_before_worker_release(monkeypatch):
     try:
         _install_pipeline_optimizer_fence([engine])
         engine._INSTRUCTION_MAP[ForwardPass](engine, buffer_id=0)
-        assert not task.expert_emission_release.is_set()
+        assert not task.stage0_emission_release.is_set()
         engine._INSTRUCTION_MAP[RecvGrad](engine, buffer_id=0)
         assert calls == ["forward", "record", "recv_grad", "release"]
-        assert task.expert_emission_release.is_set()
+        assert task.stage0_emission_release.is_set()
         engine._INSTRUCTION_MAP[RecvGrad](engine, buffer_id=0)
         assert calls == [
             "forward", "record", "recv_grad", "release", "recv_grad",
@@ -200,7 +393,7 @@ def test_release_after_first_recv_is_independent_of_pipeline_depth(monkeypatch):
     task = PostStepCheckpointTask(
         cuda_event=None,
         iter_T=9,
-        defer_stage0_expert_emission=True,
+        defer_stage0_emission=True,
     )
     ctrl._latest_post_step_checkpoint_task = task
     ctrl._enabled = False
@@ -208,9 +401,9 @@ def test_release_after_first_recv_is_independent_of_pipeline_depth(monkeypatch):
     try:
         _install_pipeline_optimizer_fence([engine])
         engine._INSTRUCTION_MAP[ForwardPass](engine, buffer_id=0)
-        assert not task.expert_emission_release.is_set()
+        assert not task.stage0_emission_release.is_set()
         engine._INSTRUCTION_MAP[RecvGrad](engine, buffer_id=0)
-        assert task.expert_emission_release.is_set()
+        assert task.stage0_emission_release.is_set()
     finally:
         ctrl._latest_post_step_checkpoint_task = old_task
         ctrl._enabled = old_enabled
@@ -226,12 +419,12 @@ def test_recv_failure_still_releases_deferred_worker(monkeypatch, failure_site):
     task = PostStepCheckpointTask(
         cuda_event=None,
         iter_T=11,
-        defer_stage0_expert_emission=True,
-        expert_emission_cuda_event=(
+        defer_stage0_emission=True,
+        stage0_emission_cuda_event=(
             _FailingEvent(calls) if failure_site == "record" else _FakeEvent(calls)
         ),
     )
-    task.expert_emission_release = _FakeHostEvent(calls)
+    task.stage0_emission_release = _FakeHostEvent(calls)
     ctrl._latest_post_step_checkpoint_task = task
     ctrl._enabled = False
     monkeypatch.setattr(controller.torch.cuda, "is_available", lambda: True)
@@ -240,7 +433,7 @@ def test_recv_failure_still_releases_deferred_worker(monkeypatch, failure_site):
         _install_pipeline_optimizer_fence([engine])
         with pytest.raises(RuntimeError):
             engine._INSTRUCTION_MAP[RecvGrad](engine, buffer_id=0)
-        assert task.expert_emission_release.is_set()
+        assert task.stage0_emission_release.is_set()
         expected = ["record", "release"]
         if failure_site == "recv":
             expected = ["record", "recv_grad", "release"]
@@ -259,7 +452,7 @@ def test_optimizer_remains_custom_schedule_release_fallback(monkeypatch):
     task = PostStepCheckpointTask(
         cuda_event=None,
         iter_T=10,
-        defer_stage0_expert_emission=True,
+        defer_stage0_emission=True,
     )
     ctrl._latest_post_step_checkpoint_task = task
     ctrl._enabled = False
@@ -267,7 +460,7 @@ def test_optimizer_remains_custom_schedule_release_fallback(monkeypatch):
     try:
         _install_pipeline_optimizer_fence([engine])
         engine._INSTRUCTION_MAP[OptimizerStep](engine)
-        assert task.expert_emission_release.is_set()
+        assert task.stage0_emission_release.is_set()
     finally:
         ctrl._latest_post_step_checkpoint_task = old_task
         ctrl._enabled = old_enabled
@@ -282,7 +475,7 @@ def test_optimizer_hook_is_deadlock_safe_release_fallback(monkeypatch):
     task = PostStepCheckpointTask(
         cuda_event=None,
         iter_T=8,
-        defer_stage0_expert_emission=True,
+        defer_stage0_emission=True,
     )
     ctrl._latest_post_step_checkpoint_task = task
     ctrl._enabled = False
@@ -290,7 +483,7 @@ def test_optimizer_hook_is_deadlock_safe_release_fallback(monkeypatch):
     try:
         _install_pipeline_optimizer_fence([engine])
         engine._INSTRUCTION_MAP[OptimizerStep](engine)
-        assert task.expert_emission_release.is_set()
+        assert task.stage0_emission_release.is_set()
         assert calls == ["optimizer"]
     finally:
         ctrl._latest_post_step_checkpoint_task = old_task

@@ -378,6 +378,7 @@ def test_direct_emission_cursor_cap_prevents_pinned_aos_overflow(tmp_path: Path)
         pinned_aos_record_capacity=4,
     )
     device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
     group_size = 4
     n_elem = 1024
     m = torch.ones(n_elem, dtype=torch.float32, device=device)
@@ -465,6 +466,7 @@ def test_direct_emission_count_matches_selection_predicate(tmp_path: Path):
         cp_target="test_dram",
     )
     device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
     group_size = 4
     m = torch.zeros(16, dtype=torch.float32, device=device)
     m[0] = 1.0
@@ -517,6 +519,16 @@ def test_direct_emission_count_matches_selection_predicate(tmp_path: Path):
         )
         assert int(prefix_count) == expected_records
         assert int(prefix_step) == 7
+        prefix_off = _first_aos_prefix_offset(state._pinned_aos)
+        record_indices = [
+            struct.unpack_from(
+                "<I",
+                state._pinned_aos.numpy(),
+                prefix_off + BLOCK_PREFIX_BYTES + i * RECORD_BYTES,
+            )[0]
+            for i in range(int(prefix_count))
+        ]
+        assert len(set(record_indices)) == len(record_indices)
         dense_p = state._dense_buffers[(0, 0)]["mlp.w"]["p"]
         assert int(torch.count_nonzero(dense_p).item()) == expected_records
     finally:
@@ -533,6 +545,7 @@ def test_theta_cp_mode_selects_by_residual_and_updates_written(tmp_path: Path):
         cp_target="test_dram",
     )
     device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
     group_size = 4
     m = torch.zeros(16, dtype=torch.float32, device=device)
     v = torch.ones(16, dtype=torch.float32, device=device)
@@ -604,6 +617,7 @@ def test_direct_emission_resets_age_only_for_actual_written(tmp_path: Path):
         cp_target="test_dram",
     )
     device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
     group_size = 4
     m = torch.zeros(16, dtype=torch.float32, device=device)
     m[0] = 4.0
@@ -662,6 +676,7 @@ def test_lfcl_fired_expert_skips_lossy_records_and_resets_age(tmp_path: Path):
         cp_target="test_dram",
     )
     device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
     group_size = 4
     m = torch.ones(16, dtype=torch.float32, device=device)
     v = torch.ones(16, dtype=torch.float32, device=device)

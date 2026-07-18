@@ -4,6 +4,7 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 ### Main configs
 ## GPT-3 models use 2K sequence length/context window
 SEQ_LEN=${SEQ_LEN:-2048}
+export DS_ACCELERATOR=${DS_ACCELERATOR:-cuda}
 
 ### The "GPT-3 XXX" below are configs from GPT-3 paper
 ### https://arxiv.org/abs/2005.14165, choose based on
@@ -19,10 +20,10 @@ SEQ_LEN=${SEQ_LEN:-2048}
 # MIN_LR=6.0e-5
 
 ## GPT-3 Medium 350M
-MODEL_SIZE=0.35
-NUM_LAYERS=24
-HIDDEN_SIZE=1024
-NUM_ATTN_HEADS=16
+MODEL_SIZE=${MODEL_SIZE:-0.35}
+NUM_LAYERS=${NUM_LAYERS:-24}
+HIDDEN_SIZE=${HIDDEN_SIZE:-1024}
+NUM_ATTN_HEADS=${NUM_ATTN_HEADS:-16}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
 # LR=3.0e-4
 # MIN_LR=3.0e-5
@@ -239,6 +240,10 @@ if [ "${NO_MEGATRON_CKPT:-0}" != "1" ]; then
     mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
     CKPT_MEGATRON_OPTIONS="--load ${CHECKPOINT_PATH} --save ${CHECKPOINT_PATH}"
 fi
+BF16_MODEL_SAVE_OPTIONS=""
+if [ -n "${FINAL_BF16_MODEL_PATH:-}" ]; then
+    BF16_MODEL_SAVE_OPTIONS="--save-bf16-model ${FINAL_BF16_MODEL_PATH}"
+fi
 
 # USE_INTERNAL_DATA="true"
 USE_INTERNAL_DATA="false"
@@ -329,6 +334,7 @@ megatron_options=" \
         --num-workers 0 \
         ${PRECISION_FLAG} \
         ${CKPT_MEGATRON_OPTIONS} \
+        ${BF16_MODEL_SAVE_OPTIONS} \
         ${TENSORBOARD_ARGS} \
         ${EXTRA_MEGATRON_FLAGS:-}"
 
@@ -380,5 +386,10 @@ fi
 
 run_cmd="deepspeed ${DEEPSPEED_LAUNCH_ARGS:-} ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options} ${EXTRA_DEEPSPEED_OPTIONS:-} &> ${OUTPUT_BASEPATH}/log/${NAME}_${host}_${current_time}.log"
 echo ${run_cmd}
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    exit 0
+fi
 eval ${run_cmd}
+run_status=$?
 set +x
+exit "${run_status}"

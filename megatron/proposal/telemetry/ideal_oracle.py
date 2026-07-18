@@ -19,6 +19,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 
+from ..refresh.fp32_state import clone_rng_tracker_states
+
 
 @dataclass
 class _OracleTensor:
@@ -1367,7 +1369,9 @@ def _capture_rng_state() -> Dict[str, Any]:
     }
     try:
         from megatron.core.tensor_parallel import get_cuda_rng_tracker
-        state["mpu_rng"] = get_cuda_rng_tracker().get_states()
+        state["mpu_rng"] = clone_rng_tracker_states(
+            get_cuda_rng_tracker().get_states()
+        )
     except Exception:
         state["mpu_rng"] = None
     return state
@@ -1382,7 +1386,9 @@ def _restore_rng_state(state: Dict[str, Any]) -> None:
         if state.get("mpu_rng") is not None:
             try:
                 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-                get_cuda_rng_tracker().set_states(state["mpu_rng"])
+                get_cuda_rng_tracker().set_states(
+                    clone_rng_tracker_states(state["mpu_rng"])
+                )
             except Exception:
                 pass
     except Exception:

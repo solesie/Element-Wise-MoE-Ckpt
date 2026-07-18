@@ -1,6 +1,8 @@
 #!/bin/bash
 MODE=${MODE:-zero0_ep}
 # Valid MODE values:
+#   zero1_ep      - 2 GPUs, ZeRO-1 + expert parallelism
+#   zero1_dp      - 2 GPUs, ZeRO-1 + data parallelism
 #   zero0_ep      - 2 GPUs, ZeRO-0 + expert parallelism
 #   zero0_dp      - 2 GPUs, ZeRO-0 + data parallelism
 #   zero0_dp_tiny - 2 GPUs, ZeRO-0 + data parallelism, reduced model
@@ -21,6 +23,8 @@ if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ] && [ "${EUID}" -ne 0 ]; then
 fi
 
 DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "${DIR}/../.." && pwd)
+PYTHON_BIN=${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}
 OUT_ROOT="${DIR}/output/ssd_uring_recovery_smoke"
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT="${OUT_ROOT}/${MODE}_${STAMP}"
@@ -34,6 +38,18 @@ cleanup_output_owner() {
 trap cleanup_output_owner EXIT
 
 case "${MODE}" in
+    zero1_ep)
+        NUM_GPUS=2
+        ZERO_STAGE=1
+        PP_SIZE=1
+        EP_PARALLEL_SIZE=2
+        ;;
+    zero1_dp)
+        NUM_GPUS=2
+        ZERO_STAGE=1
+        PP_SIZE=1
+        EP_PARALLEL_SIZE=1
+        ;;
     zero0_ep)
         NUM_GPUS=2
         ZERO_STAGE=0
@@ -73,20 +89,20 @@ case "${MODE}" in
         ;;
     *)
         echo "Unsupported MODE='${MODE}'" >&2
-        echo "Use one of: zero0_ep, zero0_dp, zero0_dp_tiny, zero0_pp, zero2_ep, zero0_single" >&2
+        echo "Use one of: zero1_ep, zero1_dp, zero0_ep, zero0_dp, zero0_dp_tiny, zero0_pp, zero2_ep, zero0_single" >&2
         exit 2
         ;;
 esac
 
-TRAIN_ITERS_VALUE=6
-EXIT_INTERVAL_VALUE=6
-NUM_LAYERS_VALUE=12
-HIDDEN_SIZE_VALUE=768
-NUM_ATTN_HEADS_VALUE=12
-SEQ_LEN_VALUE=512
-NUM_EXPERTS_VALUE=64
-GLOBAL_BATCH_SIZE_VALUE=4
-BATCH_SIZE_VALUE=1
+TRAIN_ITERS_VALUE=${TRAIN_ITERS_VALUE:-6}
+EXIT_INTERVAL_VALUE=${EXIT_INTERVAL_VALUE:-6}
+NUM_LAYERS_VALUE=${NUM_LAYERS_VALUE:-12}
+HIDDEN_SIZE_VALUE=${HIDDEN_SIZE_VALUE:-768}
+NUM_ATTN_HEADS_VALUE=${NUM_ATTN_HEADS_VALUE:-12}
+SEQ_LEN_VALUE=${SEQ_LEN_VALUE:-512}
+NUM_EXPERTS_VALUE=${NUM_EXPERTS_VALUE:-64}
+GLOBAL_BATCH_SIZE_VALUE=${GLOBAL_BATCH_SIZE_VALUE:-4}
+BATCH_SIZE_VALUE=${BATCH_SIZE_VALUE:-1}
 
 if [ "${TINY_MODEL:-0}" = "1" ]; then
     NUM_LAYERS_VALUE=2
@@ -121,19 +137,26 @@ if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ]; then
     FDP_METADATA_NLB="${PROPOSAL_FDP_METADATA_NLB:-$(( 64 * 1024 * 1024 / FDP_LBA_SIZE ))}"
     FDP_DATA_START_LBA="${PROPOSAL_FDP_DATA_START_LBA:-$(( FDP_METADATA_START_LBA + FDP_METADATA_NLB ))}"
     FDP_DATA_NLB="${PROPOSAL_FDP_DATA_NLB:-$(( FDP_NAMESPACE_NLB - FDP_DATA_START_LBA ))}"
-    FDP_MAX_IO_KB="${PROPOSAL_FDP_MAX_IO_KB:-$(cat "${FDP_SYSFS}/queue/max_sectors_kb")}"
+    # The block queue advertises 1 MiB on the current device, while raw
+    # NVMe uring passthrough rejects 1 MiB and was verified through 512 KiB.
+    # Keep the tested bound as the default; callers may override it after a
+    # device-specific passthrough probe.
+    QUEUE_MAX_IO_KB=$(cat "${FDP_SYSFS}/queue/max_sectors_kb")
+    FDP_MAX_IO_KB="${PROPOSAL_FDP_MAX_IO_KB:-$(( QUEUE_MAX_IO_KB < 512 ? QUEUE_MAX_IO_KB : 512 ))}"
     if [ ! -e /usr/include/liburing.h ]; then
         echo "liburing development headers are missing. Install with: sudo apt-get install -y liburing-dev" >&2
         exit 1
     fi
 fi
 
+FDP_NUM_MOE_LAYERS_DEFAULT=${NUM_LAYERS_VALUE}
+
 echo "[ssd-uring-recovery-smoke] MODE=${MODE}"
 echo "[ssd-uring-recovery-smoke] OUT=${OUT}"
 echo "[ssd-uring-recovery-smoke] ZeRO=${ZERO_STAGE} GPUS=${NUM_GPUS} PP=${PP_SIZE} EP=${EP_PARALLEL_SIZE}"
 if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ]; then
     echo "[ssd-uring-recovery-smoke] FDP device=${FDP_DEVICE} metadata=[${FDP_METADATA_START_LBA}, $((FDP_METADATA_START_LBA + FDP_METADATA_NLB))) data=[${FDP_DATA_START_LBA}, $((FDP_DATA_START_LBA + FDP_DATA_NLB)))"
-    echo "[ssd-uring-recovery-smoke] FDP readback validation enabled; force_format=${PROPOSAL_FDP_FORCE_FORMAT:-1}"
+    echo "[ssd-uring-recovery-smoke] FDP readback validation=${PROPOSAL_FDP_VALIDATE_READBACK:-1}; force_format=${PROPOSAL_FDP_FORCE_FORMAT:-1}"
 fi
 
 COMMON_ENV=(
@@ -170,7 +193,7 @@ COMMON_ENV=(
     EXTRA_PROPOSAL_FLAGS=""
     NSYS_PROFILE=""
     TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${OUT}/torch_extensions}"
-    PROPOSAL_FDP_VALIDATE_READBACK=1
+    PROPOSAL_FDP_VALIDATE_READBACK="${PROPOSAL_FDP_VALIDATE_READBACK:-1}"
 )
 
 if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ]; then
@@ -188,14 +211,82 @@ if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ]; then
         PROPOSAL_FDP_DATA_NLB="${FDP_DATA_NLB}"
         PROPOSAL_FDP_CHUNK_MB="${PROPOSAL_FDP_CHUNK_MB:-64}"
         PROPOSAL_FDP_MAX_IO_KB="${FDP_MAX_IO_KB}"
-        PROPOSAL_FDP_NUM_MOE_LAYERS="${PROPOSAL_FDP_NUM_MOE_LAYERS:-${NUM_LAYERS_VALUE}}"
+        PROPOSAL_FDP_NUM_MOE_LAYERS="${PROPOSAL_FDP_NUM_MOE_LAYERS:-${FDP_NUM_MOE_LAYERS_DEFAULT}}"
         PROPOSAL_FDP_EXPERTS_PER_LAYER="${PROPOSAL_FDP_EXPERTS_PER_LAYER:-${NUM_EXPERTS_VALUE}}"
         PROPOSAL_FDP_ALLOW_FORMAT="${PROPOSAL_FDP_ALLOW_FORMAT:-1}"
         PROPOSAL_FDP_FORCE_FORMAT="${PROPOSAL_FDP_FORCE_FORMAT:-1}"
     )
 fi
 
+if [ $((PP_SIZE * EP_PARALLEL_SIZE)) -le 0 ] || \
+   [ $((NUM_GPUS % (PP_SIZE * EP_PARALLEL_SIZE))) -ne 0 ]; then
+    echo "Invalid PP/EP topology for ${NUM_GPUS} GPUs" >&2
+    exit 1
+fi
+DP_SIZE=$((NUM_GPUS / (PP_SIZE * EP_PARALLEL_SIZE)))
+
+format_fdp_once() {
+    local reason=$1
+    echo "[ssd-uring-recovery-smoke] FDP invalidate: ${reason}"
+    env "${COMMON_ENV[@]}" \
+        PATH="${REPO_ROOT}/.venv/bin:/usr/local/cuda/bin:${PATH}" \
+        PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" \
+        PROPOSAL_FDP_FORCE_FORMAT=1 \
+        PROPOSAL_FDP_ALLOW_FORMAT=1 \
+        PROPOSAL_FDP_RANK=0 \
+        PROPOSAL_FDP_WORLD_SIZE="${NUM_GPUS}" \
+        PROPOSAL_FDP_DP_RANK=0 \
+        PROPOSAL_FDP_DP_SIZE="${DP_SIZE}" \
+        PROPOSAL_FDP_PP_RANK=0 \
+        PROPOSAL_FDP_PP_SIZE="${PP_SIZE}" \
+        PROPOSAL_FDP_EP_RANK=0 \
+        PROPOSAL_FDP_EP_SIZE="${EP_PARALLEL_SIZE}" \
+        PROPOSAL_FDP_EXPERT_ID_BASE=0 \
+        "${PYTHON_BIN}" - <<'PY'
+from megatron.proposal.storage import proposal_io
+
+proposal_io.open_fdp_session()
+try:
+    stats = proposal_io.fdp_stats()
+    print(
+        "[ssd-uring-recovery-smoke] FDP invalidated: "
+        f"allocated_chunks={int(stats.get('allocated_chunks', 0))}",
+        flush=True,
+    )
+finally:
+    proposal_io.close_fdp_session()
+PY
+}
+
+WORKER_FORCE_FORMAT=${PROPOSAL_FDP_FORCE_FORMAT:-1}
+WORKER_ALLOW_FORMAT=${PROPOSAL_FDP_ALLOW_FORMAT:-1}
+if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ] && \
+   [ "${WORKER_FORCE_FORMAT}" = "1" ]; then
+    # FORCE_FORMAT on every worker races a non-rank0 bootstrap against rank0's
+    # shared-metadata reset.  Format once, then let every worker load exactly
+    # that image without permission to mutate it.
+    format_fdp_once "pre-run"
+    WORKER_FORCE_FORMAT=0
+    WORKER_ALLOW_FORMAT=0
+fi
+
+cleanup_all() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if [ "${PROPOSAL_IO_BACKEND:-fdp}" = "fdp" ] && \
+       [ "${PROPOSAL_FDP_INVALIDATE_ON_EXIT:-1}" = "1" ]; then
+        format_fdp_once "post-run capacity cleanup" || \
+            echo "[ssd-uring-recovery-smoke] WARNING: FDP cleanup failed" >&2
+    fi
+    cleanup_output_owner
+    exit "${status}"
+}
+trap cleanup_all EXIT
+
 env "${COMMON_ENV[@]}" \
+    PROPOSAL_FDP_FORCE_FORMAT="${WORKER_FORCE_FORMAT}" \
+    PROPOSAL_FDP_ALLOW_FORMAT="${WORKER_ALLOW_FORMAT}" \
     NUM_GPUS="${NUM_GPUS}" \
     ZERO_STAGE="${ZERO_STAGE}" \
     PP_SIZE="${PP_SIZE}" \
@@ -203,7 +294,12 @@ env "${COMMON_ENV[@]}" \
     bash "${DIR}/proposal_test_template.sh"
 
 LOG_FILE="${OUT}/log/iter_time_debug_seed2024.log"
-if ! grep -q "FDP readback validation OK" "${LOG_FILE}"; then
+if grep -q "\[checkpoint_worker\].*task failed" "${LOG_FILE}"; then
+    echo "[ssd-uring-recovery-smoke] asynchronous checkpoint task failed; see ${LOG_FILE}" >&2
+    exit 1
+fi
+if [ "${PROPOSAL_FDP_VALIDATE_READBACK:-1}" = "1" ] && \
+   ! grep -q "FDP readback validation OK" "${LOG_FILE}"; then
     echo "[ssd-uring-recovery-smoke] missing FDP readback validation marker in ${LOG_FILE}" >&2
     exit 1
 fi
@@ -211,6 +307,32 @@ if ! grep -q "\\[proposal\\] FAULT@4" "${LOG_FILE}"; then
     echo "[ssd-uring-recovery-smoke] missing recovery fault marker in ${LOG_FILE}" >&2
     exit 1
 fi
+"${PYTHON_BIN}" - "${LOG_FILE}" "${NUM_GPUS}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+log_path = Path(sys.argv[1])
+expected_ranks = int(sys.argv[2])
+lines = [
+    line for line in log_path.read_text(errors="replace").splitlines()
+    if line.startswith("[recovery]")
+]
+if len(lines) != expected_ranks:
+    raise SystemExit(
+        f"expected {expected_ranks} recovery summaries, found {len(lines)}"
+    )
+pattern = re.compile(
+    r"gpu_replay=([1-9][0-9]*)e/.*experts=([0-9]+)/([0-9]+) missing=([0-9]+)"
+)
+for line in lines:
+    match = pattern.search(line)
+    if match is None:
+        raise SystemExit(f"incomplete GPU recovery summary: {line}")
+    loaded, expected, missing = map(int, match.groups()[1:])
+    if loaded != expected or missing != 0:
+        raise SystemExit(f"partial expert recovery: {line}")
+PY
 
 echo "[ssd-uring-recovery-smoke] done"
 echo "[ssd-uring-recovery-smoke] log dir: ${OUT}/log"

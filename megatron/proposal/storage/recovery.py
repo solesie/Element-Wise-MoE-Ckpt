@@ -5,8 +5,8 @@ Rebuilds (model, optimizer) state at iteration ``t_fault`` by:
   1. Loading latest non-expert FC (``fc_nonexpert_iter{t}.bin``) with t ≤ t_fault.
   2. For each (L, E) expert, loading the most-recent LFCL compaction baseline
      (``fc_expert_L{L:02d}_E{E:02d}.bin``) and replaying its LFSY append
-     log (``lossy_expert_L{L:02d}_E{E:02d}.bin``) in order via
-     ``expert_state.read_expert_state``.
+     log (``lossy_expert_L{L:02d}_E{E:02d}.bin``). Fresh FDP logs use
+     rank-local GPU replay; legacy/file logs retain the CPU reference path.
 
 ``cp_target=test_dram`` bypasses filesystem recovery and consumes the pinned
 dense expert image maintained by ``ExpertState`` directly; it performs no LFSY
@@ -18,7 +18,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -40,6 +40,12 @@ _NONEXPERT_FC_LEGACY_EP_SHARD_RE = re.compile(
 )
 ExpertId = Tuple[int, int]
 
+# A single dense LFCL already contributes enough max-I/O-sized commands
+# (default 256 KiB) to fill the FDP expert ring (default QD 64).  Pairing
+# experts also interleaves LFCL/LFSY reads while bounding the extra raw CPU
+# buffers held before batch completion.
+_FDP_EXPERT_READ_BATCH_SIZE = 2
+
 
 @dataclass
 class RecoveryDiagnostics:
@@ -53,6 +59,77 @@ class RecoveryDiagnostics:
     rolling_experts_loaded: int = 0
     errors_vs_gt: Dict[str, Dict[str, float]] = field(default_factory=dict)
     summary: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class _DecodedExpertState:
+    """Either a legacy CPU payload or validated direct-GPU recovery plans."""
+
+    payload: Optional[Dict[str, Any]] = None
+    lfcl_plan: Optional[Any] = None
+    replay_plan: Optional[Any] = None
+
+
+class _GpuReplayLanePool:
+    """Own source lifetimes and back-pressure for two fixed replay lanes."""
+
+    def __init__(self, lanes: Iterable[Tuple[Any, Any, Any]]) -> None:
+        self._lanes = tuple(lanes)
+        if len(self._lanes) != 2:
+            raise RuntimeError("FDP GPU replay requires exactly two lanes")
+        for staging, stream, done in self._lanes:
+            if (
+                not isinstance(staging, torch.Tensor)
+                or staging.device.type != "cuda"
+                or staging.dtype != torch.uint8
+                or not staging.is_contiguous()
+            ):
+                raise ValueError("invalid FDP GPU replay staging buffer")
+            if not callable(getattr(stream, "synchronize", None)):
+                raise ValueError("invalid FDP GPU replay stream")
+            if not callable(getattr(done, "record", None)) or not callable(
+                getattr(done, "synchronize", None)
+            ):
+                raise ValueError("invalid FDP GPU replay event")
+        self._busy = [False, False]
+        self._recorded = [False, False]
+        self._keepalive: List[Optional[Any]] = [None, None]
+
+    def acquire(self, index: int, keepalive: Any) -> Tuple[Any, Any]:
+        self.wait(index)
+        self._busy[index] = True
+        self._recorded[index] = False
+        self._keepalive[index] = keepalive
+        staging, stream, _done = self._lanes[index]
+        return staging, stream
+
+    def record(self, index: int) -> None:
+        _staging, stream, done = self._lanes[index]
+        done.record(stream)
+        self._recorded[index] = True
+
+    def wait(self, index: int) -> None:
+        if not self._busy[index]:
+            return
+        _staging, stream, done = self._lanes[index]
+        if self._recorded[index]:
+            done.synchronize()
+        else:
+            stream.synchronize()
+        self._keepalive[index] = None
+        self._busy[index] = False
+        self._recorded[index] = False
+
+    def drain(self) -> None:
+        first_error: Optional[Exception] = None
+        for index in range(2):
+            try:
+                self.wait(index)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def _scan_cp_dir(
@@ -154,13 +231,27 @@ def _ensure_optimizer_state(
 
 def _classify_params(
     model: torch.nn.Module,
+    expert_id_map: Optional[Mapping[str, ExpertId]] = None,
 ) -> Tuple[Dict[str, torch.nn.Parameter], Dict[ExpertId, Dict[str, torch.nn.Parameter]]]:
     non_expert: Dict[str, torch.nn.Parameter] = {}
     by_expert: Dict[ExpertId, Dict[str, torch.nn.Parameter]] = {}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        ids = _ids_from_param_name(name)
+        ids = (
+            expert_id_map.get(name)
+            if expert_id_map is not None
+            else _ids_from_param_name(name)
+        )
+        if (
+            expert_id_map is not None
+            and ids is None
+            and _DS_EXPERT_IDX_RE.search(name) is not None
+        ):
+            raise RuntimeError(
+                f"expert parameter {name!r} is missing from the canonical "
+                "layer/expert mapping"
+            )
         if ids is None:
             non_expert[name] = p
         else:
@@ -236,6 +327,84 @@ def _apply_payload_dict_to_model(
                     state[field_name] = slot
                 slot.copy_(value.to(dtype=slot.dtype), non_blocking=True)
     return rolling_step
+
+
+def _build_gpu_replay_targets(
+    schema_plan: Any,
+    target_params: Dict[str, torch.nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+) -> List[Any]:
+    """Map expert-local disk intervals to resident rank-owned GPU state."""
+
+    from .gpu_replay import ReplayTarget
+
+    metadata = dict(schema_plan.metadata)
+    entries = list(metadata.get("tensors", []) or [])
+    mapper = get_mapper()
+    targets: List[Any] = []
+    cursor = 0
+
+    if str(metadata.get("payload_kind", "")) == "zero12_expert_partition":
+        if mapper is None:
+            raise RuntimeError("ZeRO partition GPU replay requires FP32 mapper")
+        fragments = list(metadata.get("fragments", []) or [])
+        if len(fragments) != len(entries):
+            raise RuntimeError(
+                "ZeRO partition replay schema/fragment count mismatch: "
+                f"entries={len(entries)} fragments={len(fragments)}"
+            )
+        for entry, fragment in zip(entries, fragments):
+            numel = int(entry["numel"])
+            if int(fragment.get("numel", numel)) != numel:
+                raise RuntimeError("ZeRO partition replay fragment size mismatch")
+            group_idx = int(fragment["group_idx"])
+            local_offset = int(fragment["local_offset"])
+            p = mapper.zero12_partition_view(
+                group_idx, local_offset, numel,
+            )
+            m = mapper.zero12_partition_view(
+                group_idx, local_offset, numel, state_key="exp_avg",
+            )
+            v = mapper.zero12_partition_view(
+                group_idx, local_offset, numel, state_key="exp_avg_sq",
+            )
+            if p is None or m is None or v is None:
+                raise RuntimeError(
+                    "ZeRO partition replay destination does not match local "
+                    f"optimizer layout: group={group_idx} "
+                    f"offset={local_offset} n={numel}"
+                )
+            targets.append(ReplayTarget(cursor, p, m, v))
+            cursor += numel
+    else:
+        for entry in entries:
+            name = str(entry["name"])
+            numel = int(entry["numel"])
+            param = target_params.get(name)
+            if param is None:
+                raise RuntimeError(f"GPU replay target parameter is missing: {name}")
+            if mapper is not None:
+                p = mapper.get_local_param_view(param)
+                m = mapper.get_local_state_view(param, "exp_avg")
+                v = mapper.get_local_state_view(param, "exp_avg_sq")
+            else:
+                p = param.data
+                state = optimizer.state.get(param, {})
+                m = state.get("exp_avg")
+                v = state.get("exp_avg_sq")
+            if p is None or m is None or v is None:
+                raise RuntimeError(f"GPU replay destination is unavailable: {name}")
+            if any(int(t.numel()) != numel for t in (p, m, v)):
+                raise RuntimeError(f"GPU replay destination size mismatch: {name}")
+            targets.append(ReplayTarget(cursor, p, m, v))
+            cursor += numel
+
+    if cursor != int(schema_plan.total_numel):
+        raise RuntimeError(
+            "GPU replay schema coverage mismatch: "
+            f"covered={cursor} expected={int(schema_plan.total_numel)}"
+        )
+    return targets
 
 
 def _apply_zero12_partition_payload(
@@ -333,6 +502,27 @@ def _fdp_entry_matches_current_topology(entry: Dict[str, Any]) -> bool:
     )
 
 
+def _nefc_shards_to_read(
+    entries: Iterable[Dict[str, Any]], *, partitioned: bool
+) -> List[Dict[str, Any]]:
+    shards = [dict(entry) for entry in entries]
+    if not partitioned:
+        return shards
+    dp = _env_int("PROPOSAL_FDP_DP_RANK", 0)
+    ep = _env_int("PROPOSAL_FDP_EP_RANK", 0)
+    owned = [
+        entry for entry in shards
+        if int(entry.get("dp_rank", dp)) == dp
+        and int(entry.get("ep_rank", ep)) == ep
+    ]
+    if len(owned) != 1:
+        raise RuntimeError(
+            "FDP recovery: expected exactly one owned partitioned NEFC shard, "
+            f"got {len(owned)} for dp={dp}, ep={ep}"
+        )
+    return owned
+
+
 def _load_fc_payload_into(
     payload_path: Path,
     target_params: Dict[str, torch.nn.Parameter],
@@ -368,6 +558,136 @@ def _load_fc_payload_into(
     )
 
 
+def _read_fdp_expert_states_batched(
+    expert_ids: Iterable[ExpertId],
+    *,
+    lfcs_by_eid: Dict[ExpertId, Dict[str, Any]],
+    lfsy_by_eid: Dict[ExpertId, Dict[str, Any]],
+    t_fault: int,
+    begin_batch: Any,
+    end_batch: Any,
+    read_lfcs: Any,
+    read_lfsy: Any,
+    decode: Any,
+    consume_batch: Optional[Callable[[Dict[ExpertId, Any]], None]] = None,
+    batch_size: int = _FDP_EXPERT_READ_BATCH_SIZE,
+) -> Tuple[Dict[ExpertId, Any], Dict[str, float]]:
+    """Read FDP expert blobs with one completion fence per bounded batch.
+
+    Read functions allocate the sector-aligned destination and enqueue raw
+    NVMe commands.  ``pending`` retains every destination until ``end_batch``
+    confirms completion; decoding starts only after that fence.  A
+    ``consume_batch`` callback may retain decoded sources until its own GPU
+    completion event, allowing the next bounded read window to overlap.
+    """
+    import time as _time
+
+    eids = list(expert_ids)
+    if not eids:
+        return {}, {}
+    if int(batch_size) <= 0:
+        raise ValueError("FDP expert read batch size must be positive")
+
+    # Reject a future baseline before opening an io_uring batch.
+    for layer, expert in eids:
+        global_eid = (layer, _fdp_global_expert_id(expert))
+        lfcs = lfcs_by_eid.get(global_eid)
+        if lfcs is None:
+            continue
+        lfcs_iter = int(lfcs.get("iter", -1))
+        if lfcs_iter > int(t_fault):
+            raise RuntimeError(
+                "FDP recovery: latest LFCS "
+                f"L{layer}/E{expert} iter {lfcs_iter} is newer than "
+                f"requested fault step {int(t_fault)}"
+            )
+
+    out: Dict[ExpertId, Any] = {}
+    batch_count = 0
+    command_count = 0
+    submit_count = 0
+    submit_calls = 0
+    logical_bytes = 0
+    io_ms = 0.0
+
+    for start in range(0, len(eids), int(batch_size)):
+        pending: List[
+            Tuple[ExpertId, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = []
+        batch_keepalive: List[torch.Tensor] = []
+        batch_open = False
+        io_t0 = _time.perf_counter()
+        try:
+            begin_batch()
+            batch_open = True
+            for layer, expert in eids[start:start + int(batch_size)]:
+                global_eid = (layer, _fdp_global_expert_id(expert))
+                lfcs = lfcs_by_eid.get(global_eid)
+                lfsy = lfsy_by_eid.get(global_eid)
+                lfcl_blob: Optional[torch.Tensor] = None
+                lfsy_blob: Optional[torch.Tensor] = None
+
+                if lfcs is not None:
+                    nbytes = int(lfcs["logical_bytes"])
+                    lfcl_blob = read_lfcs(
+                        layer,
+                        expert,
+                        nbytes,
+                        _batch_keepalive=batch_keepalive,
+                    )
+                    logical_bytes += nbytes
+                if lfsy is not None:
+                    nbytes = int(lfsy["logical_tail"])
+                    lfsy_blob = read_lfsy(
+                        layer,
+                        expert,
+                        nbytes,
+                        _batch_keepalive=batch_keepalive,
+                    )
+                    logical_bytes += nbytes
+                pending.append(((layer, expert), lfcl_blob, lfsy_blob))
+
+            stats = dict(end_batch())
+            batch_open = False
+        except BaseException:
+            if batch_open:
+                # Drain commands already submitted so their destination
+                # tensors cannot be released while the device still owns them.
+                try:
+                    end_batch()
+                except BaseException:
+                    pass
+            raise
+
+        io_ms += (_time.perf_counter() - io_t0) * 1000.0
+        batch_count += 1
+        command_count += int(stats.get("commands", 0))
+        submit_count += int(stats.get("submitted", 0))
+        submit_calls += int(stats.get("submit_calls", 0))
+        decoded_batch: Dict[ExpertId, Any] = {}
+        for (layer, expert), lfcl_blob, lfsy_blob in pending:
+            decoded_batch[(layer, expert)] = decode(
+                lfcl_blob,
+                lfsy_blob,
+                layer=layer,
+                expert=expert,
+                source="fdp",
+            )
+        if consume_batch is None:
+            out.update(decoded_batch)
+        else:
+            consume_batch(decoded_batch)
+
+    return out, {
+        "fdp_expert_read_batches": float(batch_count),
+        "fdp_expert_read_commands": float(command_count),
+        "fdp_expert_read_submitted": float(submit_count),
+        "fdp_expert_read_submit_calls": float(submit_calls),
+        "fdp_expert_read_bytes": float(logical_bytes),
+        "fdp_expert_read_io_ms": float(io_ms),
+    }
+
+
 def _recover_from_fdp(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -375,6 +695,8 @@ def _recover_from_fdp(
     t_fault: int,
     load_expert_fcs: bool,
     expected_expert_ids: Optional[Iterable[ExpertId]],
+    expert_id_map: Optional[Mapping[str, ExpertId]],
+    gpu_replay_lanes: Optional[Iterable[Tuple[Any, Any, Any]]],
     diag: RecoveryDiagnostics,
     t_all0: float,
 ) -> RecoveryDiagnostics:
@@ -389,13 +711,18 @@ def _recover_from_fdp(
     _phase: Dict[str, float] = {}
 
     _t0 = _time.perf_counter()
-    non_expert_params, by_expert_params = _classify_params(model)
+    non_expert_params, by_expert_params = _classify_params(
+        model,
+        expert_id_map,
+    )
     owned_expert_params = _partition_owned_expert_params(
         by_expert_params,
         expected_expert_ids,
     )
     diag.expert_expected_count = len(owned_expert_params)
     from .proposal_io import (
+        fdp_begin_expert_read_batch,
+        fdp_end_expert_read_batch_stats,
         fdp_read_lfcs_blob,
         fdp_read_lfsy_blob,
         fdp_read_nefc_blob,
@@ -442,17 +769,26 @@ def _recover_from_fdp(
                 f"{best_ne_iter}: {missing}"
             )
     applied_steps: List[int] = []
-    for shard in sorted(
+    mapper = get_mapper()
+    read_nefc = _nefc_shards_to_read(
         best_nefc,
+        partitioned=(
+            mapper is not None and getattr(mapper, "mode", "") == "zero12"
+        ),
+    )
+    sorted_nefc = sorted(
+        read_nefc,
         key=lambda e: (
             int(e.get("dp_rank", 0)),
             int(e.get("ep_rank", 0)),
             int(e.get("shard_index", 0)),
         ),
-    ):
+    )
+    for shard in sorted_nefc:
         shard_index = int(shard.get("shard_index", 0))
+        nefc_nbytes = int(shard["logical_bytes"])
         ne_blob = fdp_read_nefc_blob(
-            int(shard["logical_bytes"]),
+            nefc_nbytes,
             shard_index=shard_index,
         )
         ne_payload, ne_scalars = load_binary_blob(
@@ -468,14 +804,29 @@ def _recover_from_fdp(
     diag.nonexpert_fc_iter = int(best_ne_iter)
     diag.nonexpert_fc_path = ",".join(
         f"fdp:nefc_shard{int(e.get('shard_index', 0))}"
-        for e in sorted(best_nefc, key=lambda x: int(x.get("shard_index", 0)))
+        for e in sorted_nefc
     )
     _phase["nonexpert_fc_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     log_loaded: Dict[ExpertId, int] = {}
     _t0 = _time.perf_counter()
     if load_expert_fcs:
-        from .expert_writer import read_expert_state_from_blobs
+        from .expert_writer import (
+            read_expert_state_from_blobs,
+        )
+        from .gpu_replay import (
+            prepare_lfcl_restore,
+            prepare_lfsy_replay,
+            replay_lfsy_in_place,
+            restore_lfcl_in_place,
+        )
+
+        lane_pool = (
+            _GpuReplayLanePool(gpu_replay_lanes)
+            if gpu_replay_lanes is not None and torch.cuda.is_available()
+            else None
+        )
+        use_gpu_replay = lane_pool is not None
 
         lfcs_by_eid: Dict[ExpertId, Dict[str, Any]] = {}
         for raw in entries.get("lfcs", []):
@@ -505,55 +856,180 @@ def _recover_from_fdp(
             )
         ]
 
-        _t_read0 = _time.perf_counter()
-        new_pair_data: Dict[ExpertId, Dict[str, Any]] = {}
-        for L, E in eids_with_fdp_state:
-            global_eid = (L, _fdp_global_expert_id(E))
-            lfcs = lfcs_by_eid.get(global_eid)
-            lfsy = lfsy_by_eid.get(global_eid)
-            lfcl_blob: Optional[torch.Tensor] = None
-            lfsy_blob: Optional[torch.Tensor] = None
-
-            if lfcs is not None:
-                lfcs_iter = int(lfcs.get("iter", -1))
-                if lfcs_iter > int(t_fault):
-                    raise RuntimeError(
-                        "FDP recovery: latest LFCS "
-                        f"L{L}/E{E} iter {lfcs_iter} is newer than "
-                        f"requested fault step {int(t_fault)}"
-                    )
-                lfcl_blob = fdp_read_lfcs_blob(
-                    L, E, int(lfcs["logical_bytes"])
-                )
-            if lfsy is not None:
-                lfsy_blob = fdp_read_lfsy_blob(
-                    L, E, int(lfsy["logical_tail"])
-                )
-
-            new_pair_data[(L, E)] = read_expert_state_from_blobs(
-                lfcl_blob,
+        def _decode_expert(
+            lfcl_blob: Optional[torch.Tensor],
+            lfsy_blob: Optional[torch.Tensor],
+            *,
+            layer: int,
+            expert: int,
+            source: str,
+        ) -> _DecodedExpertState:
+            replay_plan = prepare_lfsy_replay(
                 lfsy_blob,
-                layer=L,
-                expert=E,
-                source="fdp",
+                t_fault=int(t_fault),
+                source=f"{source}:L{int(layer)}/E{int(expert)}",
             )
-        _phase["expert_read_ms"] = (_time.perf_counter() - _t_read0) * 1000.0
-
-        _t_apply0 = _time.perf_counter()
-        for eid in eids_with_fdp_state:
-            data = new_pair_data[eid]
-            log_step = _apply_payload_dict_to_model(
-                data, owned_expert_params[eid], optimizer, sync_lp=False
-            )
-            if log_step > int(t_fault):
-                raise RuntimeError(
-                    f"FDP recovery: expert L{eid[0]}/E{eid[1]} recovered "
-                    f"step {log_step} is newer than requested fault step "
-                    f"{int(t_fault)}"
+            if (
+                use_gpu_replay
+                and (
+                    replay_plan is None
+                    or bool(replay_plan.unique_idx_per_block)
                 )
-            log_loaded[eid] = int(log_step)
-            diag.expert_fc_iters[eid] = int(log_step)
-        _phase["expert_apply_ms"] = (_time.perf_counter() - _t_apply0) * 1000.0
+            ):
+                lfcl_plan = prepare_lfcl_restore(
+                    lfcl_blob,
+                    expected_metadata=(
+                        None if replay_plan is None else replay_plan.metadata
+                    ),
+                    t_fault=int(t_fault),
+                    source=f"{source}:L{int(layer)}/E{int(expert)}",
+                )
+                if lfcl_plan is None:
+                    raise RuntimeError(
+                        f"{source}: L{int(layer)}/E{int(expert)} has no "
+                        "recoverable LFCL or LFSY schema"
+                    )
+                return _DecodedExpertState(
+                    lfcl_plan=lfcl_plan,
+                    replay_plan=replay_plan,
+                )
+            # Legacy objects lack the per-block uniqueness contract.  Keep the
+            # exact CPU reverse/seen implementation for those files.
+            return _DecodedExpertState(
+                payload=read_expert_state_from_blobs(
+                    lfcl_blob,
+                    lfsy_blob,
+                    layer=int(layer),
+                    expert=int(expert),
+                    source=source,
+                ),
+            )
+
+        gpu_replay_blocks = 0
+        gpu_replay_records = 0
+        gpu_replay_bytes = 0
+        gpu_replay_experts = 0
+        expert_apply_ms = 0.0
+
+        def _apply_decoded_batch(
+            decoded_batch: Dict[ExpertId, _DecodedExpertState],
+        ) -> None:
+            nonlocal gpu_replay_blocks, gpu_replay_records
+            nonlocal gpu_replay_bytes, gpu_replay_experts, expert_apply_ms
+            apply_t0 = _time.perf_counter()
+            legacy_enqueued = False
+            try:
+                if lane_pool is not None and len(decoded_batch) > 2:
+                    raise RuntimeError("FDP replay batch exceeds two GPU lanes")
+                for lane_index, (eid, decoded) in enumerate(decoded_batch.items()):
+                    if decoded.lfcl_plan is not None:
+                        replay_targets = _build_gpu_replay_targets(
+                            decoded.lfcl_plan,
+                            owned_expert_params[eid],
+                            optimizer,
+                        )
+                        if lane_pool is None:
+                            raise RuntimeError(
+                                "FDP direct GPU replay has no staging lanes"
+                            )
+                        staging, stream = lane_pool.acquire(
+                            lane_index,
+                            (decoded, replay_targets),
+                        )
+                        try:
+                            log_step = restore_lfcl_in_place(
+                                decoded.lfcl_plan,
+                                replay_targets,
+                                stream=stream,
+                            )
+                            if decoded.replay_plan is not None:
+                                replay_stats = replay_lfsy_in_place(
+                                    decoded.replay_plan,
+                                    replay_targets,
+                                    staging,
+                                    stream=stream,
+                                )
+                                log_step = max(
+                                    log_step,
+                                    int(decoded.replay_plan.max_step),
+                                )
+                                gpu_replay_blocks += int(replay_stats.blocks)
+                                gpu_replay_records += int(replay_stats.records)
+                                gpu_replay_bytes += int(replay_stats.bytes_staged)
+                                gpu_replay_experts += 1
+                        finally:
+                            lane_pool.record(lane_index)
+                    else:
+                        if decoded.payload is None:
+                            raise RuntimeError(
+                                f"FDP recovery: expert {eid} has no payload"
+                            )
+                        if lane_pool is not None:
+                            lane_pool.drain()
+                        log_step = _apply_payload_dict_to_model(
+                            decoded.payload,
+                            owned_expert_params[eid],
+                            optimizer,
+                            sync_lp=False,
+                        )
+                        legacy_enqueued = True
+                    if log_step > int(t_fault):
+                        raise RuntimeError(
+                            f"FDP recovery: expert L{eid[0]}/E{eid[1]} "
+                            f"recovered step {log_step} is newer than "
+                            f"requested fault step {int(t_fault)}"
+                        )
+                    log_loaded[eid] = int(log_step)
+                    diag.expert_fc_iters[eid] = int(log_step)
+            finally:
+                # Legacy CPU payloads are not retained by a replay lane.
+                if legacy_enqueued and torch.cuda.is_available():
+                    torch.cuda.current_stream().synchronize()
+                expert_apply_ms += (
+                    _time.perf_counter() - apply_t0
+                ) * 1000.0
+
+        _t_read0 = _time.perf_counter()
+        try:
+            _unused_pair_data, read_batch_stats = _read_fdp_expert_states_batched(
+                eids_with_fdp_state,
+                lfcs_by_eid=lfcs_by_eid,
+                lfsy_by_eid=lfsy_by_eid,
+                t_fault=int(t_fault),
+                begin_batch=fdp_begin_expert_read_batch,
+                end_batch=fdp_end_expert_read_batch_stats,
+                read_lfcs=fdp_read_lfcs_blob,
+                read_lfsy=fdp_read_lfsy_blob,
+                decode=_decode_expert,
+                consume_batch=_apply_decoded_batch,
+            )
+        finally:
+            if lane_pool is not None:
+                drain_t0 = _time.perf_counter()
+                lane_pool.drain()
+                expert_apply_ms += (
+                    _time.perf_counter() - drain_t0
+                ) * 1000.0
+        expert_pipeline_ms = (_time.perf_counter() - _t_read0) * 1000.0
+        _phase["expert_read_ms"] = float(
+            read_batch_stats.get("fdp_expert_read_io_ms", 0.0)
+        )
+        _phase["expert_apply_ms"] = float(expert_apply_ms)
+        _phase["expert_pipeline_ms"] = float(expert_pipeline_ms)
+        _phase.update(read_batch_stats)
+        read_io_ms = read_batch_stats.get("fdp_expert_read_io_ms", 0.0)
+        if read_io_ms > 0.0:
+            _phase["fdp_expert_read_gib_s"] = (
+                read_batch_stats.get("fdp_expert_read_bytes", 0.0)
+                / (1024.0 ** 3)
+                / (read_io_ms / 1000.0)
+            )
+
+        _phase["gpu_replay_experts"] = float(gpu_replay_experts)
+        _phase["gpu_replay_blocks"] = float(gpu_replay_blocks)
+        _phase["gpu_replay_records"] = float(gpu_replay_records)
+        _phase["gpu_replay_bytes"] = float(gpu_replay_bytes)
+        _phase["gpu_replay_lanes"] = float(2 if lane_pool is not None else 0)
 
         diag.rolling_experts_loaded = len(log_loaded)
         diag.expert_fc_count = len(log_loaded)
@@ -561,8 +1037,13 @@ def _recover_from_fdp(
             0,
             diag.expert_expected_count - diag.expert_fc_count,
         )
-        if diag.expert_fc_count == 0:
-            raise RuntimeError("FDP recovery: no expert LFCS/LFSY state found")
+        if diag.expert_missing_count != 0:
+            missing = sorted(set(owned_expert_params) - set(log_loaded))
+            raise RuntimeError(
+                "FDP recovery: missing rank-owned expert state: "
+                f"loaded={diag.expert_fc_count}/"
+                f"{diag.expert_expected_count} missing={missing}"
+            )
     _phase["expert_load_ms"] = (_time.perf_counter() - _t0) * 1000.0
 
     diag.min_fc_iter = int(diag.nonexpert_fc_iter)
@@ -587,6 +1068,8 @@ def recover(
     nonexpert_dir: Optional[Path] = None,
     expert_dir: Optional[Path] = None,
     expected_expert_ids: Optional[Iterable[ExpertId]] = None,
+    expert_id_map: Optional[Mapping[str, ExpertId]] = None,
+    gpu_replay_lanes: Optional[Iterable[Tuple[Any, Any, Any]]] = None,
 ) -> RecoveryDiagnostics:
     """Rebuild state from CP files at ``t_fault``.
 
@@ -618,6 +1101,8 @@ def recover(
                 t_fault=int(t_fault),
                 load_expert_fcs=bool(load_expert_fcs),
                 expected_expert_ids=expected_expert_ids,
+                expert_id_map=expert_id_map,
+                gpu_replay_lanes=gpu_replay_lanes,
                 diag=diag,
                 t_all0=_t_all0,
             )
@@ -629,7 +1114,10 @@ def recover(
         nonexpert_dir=nonexpert_dir,
         expert_dir=expert_dir,
     )
-    non_expert_params, by_expert_params = _classify_params(model)
+    non_expert_params, by_expert_params = _classify_params(
+        model,
+        expert_id_map,
+    )
     owned_expert_params = _partition_owned_expert_params(
         by_expert_params,
         expected_expert_ids,
@@ -769,11 +1257,14 @@ def recover(
                 2,
                 max(1, len(eids_with_new_pair)),
             )
-
             def _read_one(eid: ExpertId) -> Tuple[ExpertId, Dict[str, Any]]:
                 L, E = eid
                 pair = expert_pairs[eid]
-                data = read_expert_state(pair[0].parent, layer=L, expert=E)
+                data = read_expert_state(
+                    pair[0].parent,
+                    layer=L,
+                    expert=E,
+                )
                 return eid, data
 
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -822,12 +1313,27 @@ def recover(
 def _print_recovery_phases(phase: Dict[str, float], diag: RecoveryDiagnostics) -> None:
     """Emit a one-line phase breakdown for recover() — used by benchmarks
     to separate scan / non-expert FC load / expert load."""
+    fdp_read = ""
+    if "fdp_expert_read_gib_s" in phase:
+        fdp_read = (
+            f"fdp_read={phase['fdp_expert_read_gib_s']:.2f}GiB/s "
+            f"cmds={phase.get('fdp_expert_read_commands', 0.0):.0f} "
+        )
+    gpu_replay = ""
+    if phase.get("gpu_replay_experts", 0.0) > 0.0:
+        gpu_replay = (
+            f"gpu_replay={phase['gpu_replay_experts']:.0f}e/"
+            f"{phase.get('gpu_replay_records', 0.0):.0f}r/"
+            f"{phase.get('gpu_replay_bytes', 0.0) / (1024.0 ** 3):.2f}GiB "
+        )
     print(
         f"[recovery] total={phase.get('total_ms', 0.0):.1f}ms  "
         f"scan={phase.get('scan_classify_ms', 0.0):.1f} "
         f"ne_fc={phase.get('nonexpert_fc_ms', 0.0):.1f} "
         f"expert_load={phase.get('expert_load_ms', 0.0):.1f}"
         f"(read={phase.get('expert_read_ms', 0.0):.1f}+apply={phase.get('expert_apply_ms', 0.0):.1f}) "
+        f"{fdp_read}"
+        f"{gpu_replay}"
         f"lp_sync={phase.get('lp_sync_ms', 0.0):.1f} "
         f"experts={diag.expert_fc_count}/{diag.expert_expected_count} "
         f"missing={diag.expert_missing_count}",

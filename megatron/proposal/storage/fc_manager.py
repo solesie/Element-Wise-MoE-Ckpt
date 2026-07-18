@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
 
@@ -18,8 +18,14 @@ import math
 
 from ..runtime import CheckpointWorkerPool, WriteRecord, get_d2h_stream
 from . import proposal_io as binary_io  # facade keeps existing callsites unchanged
-from ..expert_id import DS_EXPERT_IDX_RE, LAYER_RE, ids_from_name
+from ..expert_id import DS_EXPERT_IDX_RE, ids_from_name
 from ..refresh.fp32_state import get_mapper
+from ..telemetry.io_backlog import (
+    WriteObject,
+    capture_timestamp,
+    io_backlog_enabled,
+    record_write_batch,
+)
 from .expert_writer import ExpertState, HEADER_BLOCK_BYTES
 from .expert_partition import build_expert_partition_plan
 from .zero12_nonexpert import Zero12NonExpertCollector
@@ -221,6 +227,8 @@ class FCManager:
         nonexpert_shard_rank: int = 0,
         nonexpert_shard_count: int = 1,
         lfcl_capacity_world_size: int = 1,
+        expert_id_map: Optional[Mapping[str, ExpertId]] = None,
+        defer_initial_expert_bootstrap: bool = False,
     ) -> None:
         if nonexpert_fc_W < 1:
             raise ValueError(f"nonexpert_fc_W must be ≥1, got {nonexpert_fc_W}")
@@ -240,6 +248,10 @@ class FCManager:
         self.keep_last_per_expert = int(keep_last_per_expert)
         self.keep_last_nonexpert = int(keep_last_nonexpert)
         self._named_params_cache: Optional[Dict[str, torch.nn.Parameter]] = None
+        self._expert_id_map = expert_id_map
+        self._defer_initial_expert_bootstrap = bool(
+            defer_initial_expert_bootstrap
+        )
 
         self._expert_tensors_by_layer: Dict[int, List[str]] = {}
         self._non_expert_names: List[str] = []
@@ -376,6 +388,11 @@ class FCManager:
         self._nonexpert_test_dram_payload: Optional[Dict[str, torch.Tensor]] = None
         self._nonexpert_test_dram_step: int = -1
         self._expert_state: Optional[ExpertState] = None
+        self._expert_tensor_map: Dict[
+            ExpertId, List[Tuple[str, torch.Size, int]]
+        ] = {}
+        self._commit_expert_lossy_records = bool(commit_expert_lossy_records)
+        self._test_skip_expert_d2h = bool(test_skip_expert_d2h)
         if enable_expert_state:
             named_params = dict(self.model.named_parameters())
             self._named_params_cache = named_params
@@ -407,6 +424,7 @@ class FCManager:
                 self._expert_partition_fragment_to_expert = dict(
                     partition_plan.fragment_to_expert
                 )
+            self._expert_tensor_map = expert_tensor_map
             self._init_lfcl_batch_pinned(expert_tensor_map)
             pinned_aos_record_capacity: Optional[int] = None
             if pinned_aos_capacity_ratio is not None:
@@ -440,27 +458,52 @@ class FCManager:
             )
             if commit_expert_lossy_records:
                 self._warm_lfcl_adam_source_cache_once()
-                if cp_target == "test_dram":
-                    seeded = self._expert_state.seed_test_dram_dense_image_from_live(
-                        self._lfcl_field_cache_by_expert,
-                        step=0,
-                    )
-                    print(
-                        f"[proposal] ExpertState test_dram initial dense seed: "
-                        f"{seeded}/{len(expert_tensor_map)} experts",
-                        flush=True,
-                    )
-                elif fresh_expert_state and not bool(test_skip_expert_d2h):
-                    bootstrapped = self._bootstrap_expert_lfcl_baselines(
-                        expert_tensor_map,
-                        step=0,
-                    )
-                    print(
-                        f"[proposal] ExpertState disk/FDP initial LFCL bootstrap: "
-                        f"{bootstrapped}/{len(expert_tensor_map)} experts",
-                        flush=True,
-                    )
+                if (
+                    not self._defer_initial_expert_bootstrap
+                    and (cp_target == "test_dram" or fresh_expert_state)
+                ):
+                    self.bootstrap_expert_recovery_baseline(step=0)
         self._init_nonexpert_pinned_buffers()
+
+    def bootstrap_expert_recovery_baseline(self, *, step: int) -> int:
+        """Materialize the exact rank-local expert recovery baseline once."""
+
+        state = self._expert_state
+        if state is None or not self._commit_expert_lossy_records:
+            return 0
+        adam_sources_ready = self._warm_lfcl_adam_source_cache_once()
+        if int(step) > 0 and not adam_sources_ready:
+            raise RuntimeError(
+                "exact expert recovery bootstrap requires live Adam m/v "
+                f"state after optimizer initialization (step={int(step)})"
+            )
+        expected = len(self._expert_tensor_map)
+        if self.cp_target == "test_dram":
+            completed = state.seed_test_dram_dense_image_from_live(
+                self._lfcl_field_cache_by_expert,
+                step=int(step),
+            )
+            target = "test_dram dense"
+        elif not self._test_skip_expert_d2h:
+            completed = self._bootstrap_expert_lfcl_baselines(
+                self._expert_tensor_map,
+                step=int(step),
+            )
+            target = "disk/FDP LFCL"
+        else:
+            return 0
+        if int(completed) != int(expected):
+            raise RuntimeError(
+                "incomplete expert recovery bootstrap: "
+                f"target={target} step={int(step)} "
+                f"completed={int(completed)} expected={int(expected)}"
+            )
+        print(
+            f"[proposal] ExpertState {target} bootstrap @iter{int(step)}: "
+            f"{int(completed)}/{int(expected)} experts",
+            flush=True,
+        )
+        return int(completed)
 
     def _install_active_expert_ids(self, expert_ids: Iterable[ExpertId]) -> None:
         """Replace expert-slot metadata with the rank-owned active IDs."""
@@ -498,7 +541,7 @@ class FCManager:
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            ids = ids_from_name(name)
+            ids = ids_from_name(name, self._expert_id_map)
             if ids is None:
                 continue
             layer, expert_idx = ids
@@ -724,14 +767,17 @@ class FCManager:
         field[key] = src
         return src
 
-    def _warm_lfcl_adam_source_cache_once(self) -> None:
+    def _warm_lfcl_adam_source_cache_once(self) -> bool:
         if self._lfcl_adam_source_cache_warmed:
-            return
+            return True
+        complete = True
         for fields in self._lfcl_field_cache_by_expert.values():
             for field in fields:
-                self._lfcl_cached_state_source(field, "exp_avg")
-                self._lfcl_cached_state_source(field, "exp_avg_sq")
-        self._lfcl_adam_source_cache_warmed = True
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if self._lfcl_cached_state_source(field, key) is None:
+                        complete = False
+        self._lfcl_adam_source_cache_warmed = complete
+        return complete
 
     def _slot_of(self, layer: int, expert_idx: int) -> int:
         return self._slot_index[(layer, expert_idx)]
@@ -974,6 +1020,19 @@ class FCManager:
         return int(bootstrapped)
 
     # ------------------------------------------------------------------
+    def bootstrap_nonexpert_recovery_baseline(
+        self,
+        *,
+        step: int,
+        ready_event: Optional["torch.cuda.Event"] = None,
+    ) -> bool:
+        """Materialize the exact non-expert baseline regardless of cadence."""
+
+        if not self._non_expert_names and not self._nonexpert_partition_payload:
+            return False
+        self._fire_nonexpert_fc(int(step), ready_event=ready_event)
+        return True
+
     def fire_nonexpert_fc_if_due(
         self,
         step: int,
@@ -1479,6 +1538,31 @@ class FCManager:
             return None
         return getattr(tls, "pinned_info", None)
 
+    def _record_nonexpert_write(
+        self,
+        *,
+        step: int,
+        payload_bytes: int,
+    ) -> None:
+        """Record the logical NEFC write once its pinned payload is available."""
+
+        logical_bytes = int(HEADER_BLOCK_BYTES) + int(payload_bytes)
+        io_bytes = _round_up_bytes(logical_bytes, int(binary_io.SECTOR_BYTES))
+        if not io_backlog_enabled():
+            return
+        record_write_batch(
+            (
+                WriteObject(
+                    kind="nefc",
+                    op="replace",
+                    io_bytes=int(io_bytes),
+                    offset=0,
+                ),
+            ),
+            step=int(step),
+            timestamp=capture_timestamp(),
+        )
+
     def _fire_nonexpert_fc(
         self,
         step: int,
@@ -1643,6 +1727,10 @@ class FCManager:
                         _cuda_event.synchronize()
                     pinned_tensor = _pinned_info["pinned"]
                     payload_bytes_local = _pinned_info["payload_bytes"]
+                    self._record_nonexpert_write(
+                        step=int(_step),
+                        payload_bytes=int(payload_bytes_local),
+                    )
                     _rec.file_bytes = int(binary_io.write_prptens_from_pinned(
                         _path, pinned_tensor, _header, payload_bytes_local,
                         step=_step, fsync=True,
@@ -1674,6 +1762,10 @@ class FCManager:
                     _cuda_event.synchronize()
                 pinned_tensor = _pinned_info["pinned"]
                 payload_bytes_local = _pinned_info["payload_bytes"]
+                self._record_nonexpert_write(
+                    step=int(_step),
+                    payload_bytes=int(payload_bytes_local),
+                )
                 if self.cp_target == "disk":
                     fdp_batch = bool(binary_io.fdp_metadata_mmap_enabled())
                     if fdp_batch:

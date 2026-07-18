@@ -252,6 +252,9 @@ public:
     void begin_expert_batch();
     uint32_t end_expert_batch();
     UcmdRingBatchStats end_expert_batch_stats();
+    void begin_expert_read_batch();
+    uint32_t end_expert_read_batch();
+    UcmdRingBatchStats end_expert_read_batch_stats();
     void begin_checkpoint_iter(uint64_t iter);
     bool mark_writer_done(uint64_t iter, const std::string& writer_kind);
     size_t write_nefc(const std::string& object_name,
@@ -375,6 +378,8 @@ private:
                                     uint32_t layer_id,
                                     uint32_t expert_id,
                                     uint64_t generation);
+    void begin_expert_batch_impl(bool read_only);
+    UcmdRingBatchStats end_expert_batch_stats_impl(bool read_only);
 
     uint8_t* metadata_bytes();
     const uint8_t* metadata_bytes() const;
@@ -432,6 +437,7 @@ private:
     std::atomic<size_t> batch_owner_token_{0};
     std::atomic<size_t> nefc_batch_owner_token_{0};
     std::atomic<size_t> expert_batch_owner_token_{0};
+    bool expert_batch_read_only_ = false;
     std::string global_lock_path_;
     int global_lock_fd_ = -1;
     uint32_t global_lock_depth_ = 0;

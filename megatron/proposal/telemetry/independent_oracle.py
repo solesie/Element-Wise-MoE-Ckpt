@@ -2943,6 +2943,7 @@ def _rank_metric_rows(
     prefix = "m_t"
     score_age = score_agebit
     score_true = score_m_diag
+    score_magnitude = np.abs(e)
     target_directional_name = "m_t_hvp_directional"
     linear = m
     target_directional = np.maximum(
@@ -2955,6 +2956,7 @@ def _rank_metric_rows(
 
     comparisons = (
         (f"{prefix}+diag_abs_h+true_e", f"{prefix}_true_e_diag_abs_h", score_true, target_directional_name, target_directional, None),
+        ("abs_true_checkpoint_error", "abs_true_checkpoint_error", score_magnitude, target_directional_name, target_directional, None),
         (f"{prefix}+diag_abs_h+agebit", f"agebit_{prefix}_diag_abs_h", score_age, target_directional_name, target_directional, None),
         (f"{prefix}+diag_abs_h+agebit+force", f"agebit_{prefix}_diag_abs_h_force", score_age_force, target_directional_name, target_directional, force),
         (f"{prefix}+hvp_directional+true_e", target_directional_name, target_directional, target_directional_name, target_directional, None),
@@ -2967,7 +2969,9 @@ def _rank_metric_rows(
             "rank": int(rank),
             "world": int(world),
             "policy": policy_name,
-            "score_first_order_source": score_source,
+            "score_first_order_source": (
+                "none" if score_name == "abs_true_checkpoint_error" else score_source
+            ),
             "topk_ratio": float(getattr(proposal_config, "topk_ratio", 0.0)),
             "score": score_name,
             "target": target_label,

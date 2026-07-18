@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -30,8 +30,8 @@ from .step_context import (
     LossyStepStats,
     fp32_param,
     fp32_v_t,
-    ids_from_name,
 )
+from ..expert_id import ids_from_name
 from ..storage.expert_partition import build_expert_partition_plan
 
 _APPROX_PROBE_DEFAULT_SAMPLE_FRACTION = 0.01
@@ -61,10 +61,12 @@ class LossyCheckpointPipeline(
         checkpoint_workers: Optional[Any] = None,
         group_size: int = 1,
         proposal_config: Optional[Any] = None,
+        expert_id_map: Optional[Mapping[str, Tuple[int, int]]] = None,
     ) -> None:
         self._random_seed_salt = int(random_seed) * 2654435761 & 0xFFFFFFFF
         self.model = model
         self.proposal_config = proposal_config
+        self._expert_id_map = expert_id_map
         self.topk_ratio = float(topk_ratio)
         if not (0.0 < self.topk_ratio <= 1.0):
             raise ValueError(
@@ -172,7 +174,7 @@ class LossyCheckpointPipeline(
         self._local_selection_element_count_host: Optional[int] = None
         self._selection_candidate_capacity = 16
         self._cold_start_hist_iters = 4
-        self._cold_start_cutoff_ready = False
+        self._cold_start_first_global_step = 1
         self.test_expert_selection_only = bool(
             getattr(proposal_config, "test_expert_selection_only", False)
             if proposal_config is not None else False
@@ -266,7 +268,7 @@ class LossyCheckpointPipeline(
         # scatter updates in .step(). O(num_tracked_tensors), runs once.
         self._tname_to_eid: Dict[str, Tuple[int, int]] = {}
         for name in self._tracked_names:
-            eid = ids_from_name(name)
+            eid = ids_from_name(name, self._expert_id_map)
             if eid is not None:
                 self._tname_to_eid[name] = eid
 
@@ -614,7 +616,7 @@ class LossyCheckpointPipeline(
         buckets: Dict[int, Dict[str, list]] = {}
         separated: Dict[Tuple[int, int], List[str]] = {}
         for n in self._tracked_names:
-            eid = ids_from_name(n)
+            eid = ids_from_name(n, self._expert_id_map)
             if eid is not None:
                 separated.setdefault(eid, []).append(n)
         partition_plan = (
@@ -1058,6 +1060,27 @@ class LossyCheckpointPipeline(
         self._h_quantile_values = torch.zeros(
             self._N_Q, dtype=torch.float32, device=device,
         )
+        # Anchor validation scratch.  H refresh scans the resident gradient
+        # views with Triton and atomically marks this scalar on NaN/Inf.  Keep
+        # it resident so validation never materializes a model-sized bool
+        # tensor (``torch.isfinite(view)``) or allocates per refresh.
+        self._h_refresh_nonfinite_flag = torch.zeros(
+            1, dtype=torch.int32, device=device,
+        )
+        # One int per tracked tensor is enough to retain exact zero/nonzero
+        # coverage without reducing each model-sized H view into a newly
+        # allocated CUDA scalar.  The pinned mirror is the only D2H target.
+        _h_refresh_view_capacity = max(1, len(self._tracked_names))
+        self._h_refresh_view_coverage = torch.zeros(
+            _h_refresh_view_capacity, dtype=torch.int32, device=device,
+        )
+        _anchor_validation_pin = bool(torch.cuda.is_available())
+        self._h_refresh_view_coverage_host = torch.empty(
+            _h_refresh_view_capacity,
+            dtype=torch.int32,
+            pin_memory=_anchor_validation_pin,
+        )
+        self._last_h_quantile_summary = None
         self._selection_v_q_for_write = self._v_quantile_values
         self._selection_h_q_for_write = self._h_quantile_values
         self._h_anchor_initialised = False
@@ -1090,20 +1113,11 @@ class LossyCheckpointPipeline(
             )
             theta_values = self._theta_cp_score_state.values
             for grp in self._groups:
-                p_flat = grp["p_flat"]
-                for elem_start, age_start, group_count in zip(
-                    grp.get("entry_elem_start_host", ()),
-                    grp.get("entry_age_elem_start_host", ()),
-                    grp.get("entry_group_count_host", ()),
-                ):
-                    n_elem = int(group_count) * int(g)
-                    if n_elem <= 0:
-                        continue
-                    theta_values.narrow(0, int(age_start), n_elem).copy_(
-                        p_flat.narrow(0, int(elem_start), n_elem),
-                        non_blocking=True,
-                    )
                 grp["theta_cp_flat"] = theta_values
+            if int(
+                getattr(self.proposal_config, "h_refresh_warmup_iters", 0) or 0
+            ) <= 0:
+                self.reset_checkpoint_score_state_from_live()
         else:
             self._theta_cp_score_state = None
             for grp in self._groups:
@@ -1174,6 +1188,38 @@ class LossyCheckpointPipeline(
         # ``LossyCpState.index.n_total_elements``.
         self._invalidate_global_selection_element_count_cache()
         self._flat_layout_done = True
+
+    @torch.no_grad()
+    def reset_checkpoint_score_state_from_live(
+        self, *, next_global_step: int = 1,
+    ) -> None:
+        """Start selection from the current exact recovery baseline."""
+
+        theta_state = getattr(self, "_theta_cp_score_state", None)
+        if theta_state is not None:
+            theta_values = theta_state.values
+            group_size = max(1, int(self.group_size))
+            for grp in self._groups:
+                p_flat = grp["p_flat"]
+                for elem_start, age_start, group_count in zip(
+                    grp.get("entry_elem_start_host", ()),
+                    grp.get("entry_age_elem_start_host", ()),
+                    grp.get("entry_group_count_host", ()),
+                ):
+                    n_elem = int(group_count) * group_size
+                    if n_elem <= 0:
+                        continue
+                    theta_values.narrow(0, int(age_start), n_elem).copy_(
+                        p_flat.narrow(0, int(elem_start), n_elem),
+                        non_blocking=True,
+                    )
+                grp["theta_cp_flat"] = theta_values
+        age_state = getattr(self, "_age2bit_score_state", None)
+        if age_state is not None:
+            age_state.age_words.zero_()
+        # Preserve the original four-global-step cutoff bootstrap window,
+        # shifted so its first step is the first proposal selection.
+        self._cold_start_first_global_step = int(next_global_step)
 
     @torch.no_grad()
     def _refresh_lossy_cp_state_refs(self) -> None:

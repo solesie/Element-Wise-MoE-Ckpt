@@ -2,6 +2,7 @@
 
 """Input/output checkpointing."""
 
+from contextlib import contextmanager
 import os
 import random
 import sys
@@ -25,6 +26,28 @@ from deepspeed.checkpoint import (
 )
 
 _CHECKPOINT_VERSION = None
+
+
+@contextmanager
+def deepspeed_checkpoint_state_dict(engine, no_pipeline_parallel):
+    """Use Megatron's checkpoint schema for a non-pipeline DeepSpeed model."""
+    if not no_pipeline_parallel:
+        yield
+        return
+
+    module = engine.module
+    original_state_dict = module.state_dict
+
+    def state_dict_for_save_checkpoint_deepspeed(
+            destination=None, prefix='', keep_vars=False):
+        return module.state_dict_for_save_checkpoint(
+            prefix=prefix, keep_vars=keep_vars)
+
+    module.state_dict = state_dict_for_save_checkpoint_deepspeed
+    try:
+        yield
+    finally:
+        module.state_dict = original_state_dict
 
 
 def set_checkpoint_version(value):
@@ -286,24 +309,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
             torch.save(state_dict, checkpoint_name)
 
     if args.deepspeed:
-        #megatron model uses state_dict_for_save_checkpointing instead of the standard state_dict
-        #state_dict is used by deepspeed for module saving so it needs to point to the right function
-        if args.no_pipeline_parallel:
-            original_state_dict = model[0].module.state_dict
-            def state_dict_for_save_checkpoint_deepspeed(destination=None, prefix='', keep_vars=False):
-                return model[0].module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
-            model[0].module.state_dict = state_dict_for_save_checkpoint_deepspeed
-
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
 
         # Trim off the filename and mp_rank_* directory.
         for _ in range(3):
             checkpoint_name = os.path.dirname(checkpoint_name)
-        model[0].save_checkpoint(checkpoint_name, client_state=state_dict)
-
-        if args.no_pipeline_parallel:
-            model[0].module.state_dict = original_state_dict
+        with deepspeed_checkpoint_state_dict(
+                model[0], args.no_pipeline_parallel):
+            model[0].save_checkpoint(checkpoint_name, client_state=state_dict)
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():

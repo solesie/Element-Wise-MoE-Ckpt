@@ -15,6 +15,14 @@ def init_proposal(model: Any, optimizer: Any, args: Any, cp_root: str) -> None:
     get_controller().init(model, optimizer, args, cp_root)
 
 
+def proposal_activate_after_warmup(model: Any, iteration: int) -> bool:
+    return get_controller().activate_after_warmup(model, int(iteration))
+
+
+def proposal_prepare_after_optimizer() -> None:
+    get_controller().prepare_after_optimizer()
+
+
 def proposal_dispatch_post_iter(
     model: Any,
     iter_T: int,
@@ -28,6 +36,10 @@ def proposal_dispatch_post_iter(
         sync_processes=bool(sync_processes),
         defer_stage0_emission=bool(defer_stage0_emission),
     )
+
+
+def proposal_finalize_post_iter(model: Any, iteration: int) -> None:
+    get_controller().finalize_post_step(model, int(iteration))
 
 
 def proposal_wait_d2h_before_optimizer() -> None:
@@ -48,6 +60,10 @@ def proposal_vram_audit_iter_begin(step: int) -> None:
 
 def proposal_vram_audit_iter_end(step: int) -> None:
     get_controller().vram_audit_iter_end(step)
+
+
+def proposal_vram_audit_dispatch_post_iter(model: Any, iter_T: int) -> bool:
+    return get_controller().vram_audit_dispatch_post_iter(model, int(iter_T))
 
 
 def proposal_refresh_h_quantile(*args: Any, **kwargs: Any) -> Any:
@@ -76,12 +92,16 @@ def proposal_shutdown() -> Dict[str, Any]:
 
 __all__ = [
     "init_proposal",
+    "proposal_activate_after_warmup",
+    "proposal_prepare_after_optimizer",
     "proposal_dispatch_post_iter",
+    "proposal_finalize_post_iter",
     "proposal_wait_d2h_before_optimizer",
     "proposal_record_loss",
     "proposal_run_independent_oracle",
     "proposal_vram_audit_iter_begin",
     "proposal_vram_audit_iter_end",
+    "proposal_vram_audit_dispatch_post_iter",
     "proposal_refresh_h_quantile",
     "proposal_set_anchor_data_iter",
     "proposal_set_oracle_data_iter",

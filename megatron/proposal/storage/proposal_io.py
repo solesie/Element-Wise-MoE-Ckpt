@@ -174,7 +174,7 @@ def _require_pinned_aligned_buffer(
         raise ValueError(f"{where}: tensor must be on CPU")
     if not tensor.is_contiguous():
         raise ValueError(f"{where}: tensor must be contiguous")
-    if not tensor.is_pinned():
+    if torch.cuda.is_available() and not tensor.is_pinned():
         raise ValueError(f"{where}: tensor must be pinned")
     if (int(tensor.data_ptr()) & (SECTOR_BYTES - 1)) != 0:
         raise ValueError(f"{where}: base pointer is not 4 KiB aligned")
@@ -211,11 +211,17 @@ def alloc_pinned_uint8_sector_aligned(nbytes: int) -> torch.Tensor:
     over-allocate by SECTOR_BYTES-1 and slice forward to the next
     4 KiB-aligned offset. The returned tensor's storage holds the full
     over-allocated buffer so the slice stays valid.
-    Pad tail is zero-filled for determinism.
+    Pad tail is zero-filled for determinism.  CPU-only unit/recovery tests use
+    the same aligned layout without pinning when CUDA is unavailable; every
+    production CUDA run still takes the pinned branch.
     """
     n = int(nbytes)
     padded = _round_up_sector(n)
-    over = torch.empty(padded + SECTOR_BYTES - 1, dtype=torch.uint8, pin_memory=True)
+    over = torch.empty(
+        padded + SECTOR_BYTES - 1,
+        dtype=torch.uint8,
+        pin_memory=torch.cuda.is_available(),
+    )
     base = int(over.data_ptr())
     misalign = base & (SECTOR_BYTES - 1)
     skip = 0 if misalign == 0 else (SECTOR_BYTES - misalign)
@@ -964,6 +970,35 @@ def fdp_end_expert_batch_stats() -> Dict[str, Any]:
     return stats
 
 
+def fdp_begin_expert_read_batch() -> None:
+    """Begin a read-only expert ring batch for FDP recovery."""
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_begin_expert_read_batch requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    _get_fdp().begin_expert_read_batch()
+
+
+def fdp_end_expert_read_batch() -> int:
+    """Wait for all queued expert reads without touching FDP metadata."""
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_end_expert_read_batch requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    return int(_get_fdp().end_expert_read_batch())
+
+
+def fdp_end_expert_read_batch_stats() -> Dict[str, Any]:
+    """Finish a read-only expert batch and return its io_uring statistics."""
+    if backend_kind() != "fdp":
+        raise RuntimeError(
+            "fdp_end_expert_read_batch_stats requires PROPOSAL_IO_BACKEND=fdp"
+        )
+    # This is deliberately separate from the write batch wrapper: recovery
+    # reads neither mutate metadata nor invoke the write readback validator.
+    return dict(_get_fdp().end_expert_read_batch_stats())
+
+
 def fdp_stats() -> Dict[str, Any]:
     if backend_kind() != "fdp":
         return {"backend": "file"}
@@ -1011,17 +1046,29 @@ def _fdp_read_object_blob(
     read_fn,
     *,
     source: str,
+    pin_memory: bool = False,
+    batch_keepalive: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     logical = int(logical_bytes)
     if logical <= 0:
         return torch.empty(0, dtype=torch.uint8)
     padded = _round_up_sector(logical)
-    buf = alloc_cpu_uint8_sector_aligned(padded)
+    buf = alloc_cpu_uint8_sector_aligned(
+        padded,
+        pin_memory=bool(pin_memory),
+    )
+    if pin_memory and torch.cuda.is_available() and not buf.is_pinned():
+        raise RuntimeError(f"{source}: pinned recovery buffer allocation failed")
     _require_cpu_aligned_buffer(
         buf,
         where=source,
         total_padded=int(padded),
     )
+    if batch_keepalive is not None:
+        # Retain the destination before the first asynchronous submission.  If
+        # a later command fails, the batch owner can drain safely before this
+        # buffer is released.
+        batch_keepalive.append(buf)
     got = int(read_fn(int(buf.data_ptr()), int(padded)))
     if got < 0 or got > padded:
         raise RuntimeError(f"{source}: invalid read byte count {got}")
@@ -1078,6 +1125,8 @@ def fdp_read_lfcs_blob(
     layer: int,
     expert: int,
     logical_bytes: Optional[int] = None,
+    *,
+    _batch_keepalive: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Read one LFCS/LFCL baseline object from FDP chunks."""
     if backend_kind() != "fdp":
@@ -1107,6 +1156,8 @@ def fdp_read_lfcs_blob(
             int(layer), int(expert), int(addr), int(nbytes)
         ),
         source=f"fdp_read_lfcs_blob(L{int(layer)}/E{int(expert)})",
+        pin_memory=torch.cuda.is_available(),
+        batch_keepalive=_batch_keepalive,
     )
 
 
@@ -1114,6 +1165,8 @@ def fdp_read_lfsy_blob(
     layer: int,
     expert: int,
     logical_bytes: Optional[int] = None,
+    *,
+    _batch_keepalive: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Read one LFSY append log object from FDP chunks."""
     if backend_kind() != "fdp":
@@ -1143,6 +1196,8 @@ def fdp_read_lfsy_blob(
             int(layer), int(expert), int(addr), int(nbytes)
         ),
         source=f"fdp_read_lfsy_blob(L{int(layer)}/E{int(expert)})",
+        pin_memory=torch.cuda.is_available(),
+        batch_keepalive=_batch_keepalive,
     )
 
 

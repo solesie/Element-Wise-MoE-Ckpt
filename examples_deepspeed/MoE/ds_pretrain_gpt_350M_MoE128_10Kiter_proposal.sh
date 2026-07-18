@@ -25,7 +25,7 @@ fi
 export TRAIN_ITERS=${TRAIN_ITERS:-10000}
 export SEQ_LEN=${SEQ_LEN:-2048}
 export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
-export WARMUP_ITERS=${WARMUP_ITERS:-100}
+export WARMUP_ITERS=${WARMUP_ITERS:-80}
 export TRAIN_TOKENS=${TRAIN_TOKENS:-$((TRAIN_ITERS * GLOBAL_BATCH_SIZE * SEQ_LEN))}
 export WARMUP_TOKENS=${WARMUP_TOKENS:-$((WARMUP_ITERS * GLOBAL_BATCH_SIZE * SEQ_LEN))}
 export LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-${TRAIN_TOKENS}}
@@ -61,6 +61,11 @@ export SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
 export NO_MEGATRON_CKPT=1
 export NO_TENSORBOARD=${NO_TENSORBOARD:-1}
 export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${REPO_ROOT}/results/ds_pretrain_gpt_350M_MoE128_10Kiter_proposal"}
+DEFAULT_FINAL_BF16_MODEL_PATH=""
+if [ "${TRAIN_ITERS}" -eq 10000 ]; then
+    DEFAULT_FINAL_BF16_MODEL_PATH="${OUTPUT_BASEPATH}/bf16_model"
+fi
+export FINAL_BF16_MODEL_PATH=${FINAL_BF16_MODEL_PATH-${DEFAULT_FINAL_BF16_MODEL_PATH}}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
 export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
@@ -69,9 +74,10 @@ export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 export PROPOSAL_IO_BACKEND=${PROPOSAL_IO_BACKEND:-file}
 export PROPOSAL_CP_TARGET=${PROPOSAL_CP_TARGET:-test_dram}
 export PROPOSAL_CP_DIR=${PROPOSAL_CP_DIR:-"${OUTPUT_BASEPATH}/proposal_cp"}
+# Logical write-only trace for offline SSD WAF replay. Empty disables it.
+export PROPOSAL_IO_BACKLOG_TRACE_DIR=${PROPOSAL_IO_BACKLOG_TRACE_DIR-"${OUTPUT_BASEPATH}/waf_trace"}
 export PROPOSAL_TOPK=${PROPOSAL_TOPK:-0.04}
 export LFCL_PLAN_POLICY=${LFCL_PLAN_POLICY:-lossy_log_size}
-export HESSIAN_REFRESH_WARMUP_EVERY=${HESSIAN_REFRESH_WARMUP_EVERY:-20}
 export HESSIAN_REFRESH_EVERY=${HESSIAN_REFRESH_EVERY:-100}
 export FAULT_INTERVAL=${FAULT_INTERVAL:-100}
 export FAULT_WARMUP=${FAULT_WARMUP:-0}
@@ -100,7 +106,6 @@ EXTRA_PROPOSAL_FLAGS=" \
     --proposal-e-hat-proxy-off \
     --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
     --proposal-lfcl-plan-policy ${LFCL_PLAN_POLICY} \
-    --proposal-hessian-refresh-warmup-every ${HESSIAN_REFRESH_WARMUP_EVERY} \
     --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY} \
     --proposal-fault-interval ${FAULT_INTERVAL} \
     --proposal-fault-warmup ${FAULT_WARMUP} \
@@ -121,5 +126,7 @@ echo "[350M-10K-proposal] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_S
 echo "[350M-10K-proposal] iters=${TRAIN_ITERS} tokens=${TRAIN_TOKENS} warmup=${WARMUP_TOKENS} decay=${LR_DECAY_TOKENS}"
 echo "[350M-10K-proposal] micro_batch=${BATCH_SIZE} zero=${ZERO_STAGE} activation_checkpoint=${ACTIVATION_CHECKPOINT} precision=${TRAIN_PRECISION}"
 echo "[350M-10K-proposal] eval=${EVAL_INTERVAL}x${EVAL_ITERS} cp_target=${PROPOSAL_CP_TARGET} h_refresh=${HESSIAN_REFRESH_EVERY} fault=${FAULT_INTERVAL} oracle=${ORACLE_INTERVAL}:${ORACLE_ITERS}"
+echo "[350M-10K-proposal] waf_trace=${PROPOSAL_IO_BACKLOG_TRACE_DIR:-disabled}"
+echo "[350M-10K-proposal] final_bf16_model=${FINAL_BF16_MODEL_PATH:-disabled}"
 
 exec bash "${BASE_SCRIPT}"

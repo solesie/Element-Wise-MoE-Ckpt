@@ -168,3 +168,33 @@ def test_sample_only_hvp_skips_full_quadratic_collective(monkeypatch):
     assert r2 == 0.0
     assert np.array_equal(sample, np.zeros(4, dtype=np.float32))
     assert calls == [False, False]
+
+
+def test_rank_metrics_include_checkpoint_error_magnitude_baseline():
+    e = np.asarray([-4.0, -1.0, 2.0, 3.0], dtype=np.float32)
+    rows = oracle._rank_metric_rows(
+        sample_payload={
+            "e": e,
+            "m": np.zeros_like(e),
+            "force": np.zeros(e.size, dtype=bool),
+            "score_agebit": np.zeros_like(e),
+            "score_m_diag": np.zeros_like(e),
+        },
+        hvp_sample=e.copy(),
+        proposal_config=SimpleNamespace(topk_ratio=0.5),
+        iteration=50,
+        rank=0,
+        world=1,
+        score_source="momentum",
+    )
+
+    row = next(
+        item for item in rows
+        if item["score"] == "abs_true_checkpoint_error"
+    )
+    assert row["policy"] == "abs_true_checkpoint_error"
+    assert row["target"] == "m_t_hvp_directional"
+    assert row["score_first_order_source"] == "none"
+    assert np.isclose(row["spearman"], 1.0)
+    assert row["top_overlap@0.50"] == 1.0
+    assert row["oracle_mass_capture@0.50"] == 1.0

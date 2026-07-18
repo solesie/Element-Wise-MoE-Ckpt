@@ -34,6 +34,7 @@ from megatron import print_rank_0, is_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
+from megatron.model_only_checkpoint import save_bf16_model_checkpoint
 from megatron.model import Float16Module
 from megatron.model import GPTModel
 from megatron.core.enums import ModelType
@@ -48,13 +49,19 @@ from megatron.utils import unwrap_model, found_kill_switch
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.deepspeed_compat import (
+    configure_pipeline_gradient_scaling,
+)
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
 from megatron.proposal.config import lr_warmup_iters_from_args
 from megatron.proposal.hooks import (
     init_proposal,
+    proposal_activate_after_warmup,
+    proposal_prepare_after_optimizer,
     proposal_dispatch_post_iter,
+    proposal_finalize_post_iter,
     proposal_wait_d2h_before_optimizer,
     proposal_recover, proposal_simulate_fault, proposal_record_loss,
     proposal_run_independent_oracle,
@@ -62,6 +69,7 @@ from megatron.proposal.hooks import (
     proposal_refresh_h_quantile, proposal_set_anchor_data_iter,
     proposal_set_oracle_data_iter,
     proposal_vram_audit_iter_begin, proposal_vram_audit_iter_end,
+    proposal_vram_audit_dispatch_post_iter,
 )
 
 import deepspeed
@@ -79,18 +87,18 @@ def print_datetime(string):
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def _proposal_h_refresh_every_for_iter(args, iteration):
+def _proposal_h_refresh_due(args, iteration):
     h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
     if h_refresh_every <= 0:
-        return 0
-
-    warmup_every = int(
-        getattr(args, 'proposal_hessian_refresh_warmup_every', 20) or 0
-    )
-    if warmup_every > 0 and int(iteration) <= lr_warmup_iters_from_args(args):
-        return warmup_every
-
-    return h_refresh_every
+        return False
+    iteration = int(iteration)
+    warmup_end = int(lr_warmup_iters_from_args(args))
+    if warmup_end > 0:
+        return (
+            iteration == warmup_end
+            or (iteration > warmup_end and iteration % h_refresh_every == 0)
+        )
+    return iteration == 1 or iteration % h_refresh_every == 0
 
 '''
 Since v0.9.0, deepspeed.initialize() has forbidden simultaneous setting of args.deepspeed_config (Path) and ds_config dict.
@@ -287,6 +295,11 @@ def pretrain(train_valid_test_dataset_provider,
                             train_data_iterator, valid_data_iterator,
                             process_non_loss_data_func)
 
+            # The steady cadence dispatches iter T at the beginning of T+1.
+            # There is no next-loop prologue for the final optimizer result,
+            # so make it durable before checkpoint save or final evaluation.
+            proposal_finalize_post_iter(model, iteration)
+
         print_datetime('after training is done')
         # Clean the model
         if args.compression_training:
@@ -294,6 +307,14 @@ def pretrain(train_valid_test_dataset_provider,
 
         if args.save and iteration != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+        if args.save_bf16_model:
+            if iteration == args.train_iters:
+                save_bf16_model_checkpoint(iteration, model)
+            else:
+                print_rank_0(
+                    f'skipping BF16 model-only save because training ended at '
+                    f'iteration {iteration}, before requested iteration {args.train_iters}'
+                )
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
@@ -677,6 +698,8 @@ def setup_model_and_optimizer(model_provider_func,
                 config=args.deepspeed_config_dict,
             )
         if isinstance(model, deepspeed.PipelineEngine):
+            configure_pipeline_gradient_scaling(model)
+
             # hack to get batch_fn from pretrain_gpt.py
             model.set_batch_fn(model.module._megatron_batch_fn)
 
@@ -1322,7 +1345,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
-        if getattr(args, 'proposal_enable', False):
+        if (
+            getattr(args, 'proposal_enable', False)
+            or os.environ.get('PROPOSAL_VRAM_AUDIT', '') in ('1', 'true', 'True')
+        ):
             proposal_vram_audit_iter_begin(iteration + 1)
         trigger(on_step_begin)
         update_num_microbatches(args.consumed_train_samples)
@@ -1341,15 +1367,24 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        if getattr(args, 'proposal_enable', False) and iteration > 0:
-            proposal_dispatch_post_iter(
+        proposal_warmup_end = int(lr_warmup_iters_from_args(args))
+        if (
+            getattr(args, 'proposal_enable', False)
+            and iteration > proposal_warmup_end
+        ):
+            _audit_dispatched = proposal_vram_audit_dispatch_post_iter(
                 model,
                 iter_T=iteration,
-                # Only the normal next-iteration dispatch has a following
-                # pipeline fwd0/bwd bubble. Refresh/oracle/fault dispatches
-                # below remain immediate to avoid drain deadlocks.
-                defer_stage0_emission=True,
             )
+            if not _audit_dispatched:
+                proposal_dispatch_post_iter(
+                    model,
+                    iter_T=iteration,
+                    # Only the normal next-iteration dispatch has a following
+                    # pipeline fwd0/bwd bubble. Refresh/oracle/fault dispatches
+                    # below remain immediate to avoid drain deadlocks.
+                    defer_stage0_emission=True,
+                )
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -1359,6 +1394,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        config)
         iteration += 1
         args.iteration = iteration
+
+        if getattr(args, 'proposal_enable', False):
+            proposal_prepare_after_optimizer()
 
         # Resolve current iter's loss (flushes post-fault loss + cpu mem samples).
         cur_loss_value = None
@@ -1370,26 +1408,38 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if getattr(args, 'proposal_enable', False):
             proposal_record_loss(step=iteration, loss=cur_loss_value)
 
-        # H cache refresh for selection_mode='hessian'. Uses valid data so
-        # it does not consume/advance the training data iterator. The first
-        # refresh happens at iter=1 so lossy selection has a populated H cache.
-        h_refresh_every = _proposal_h_refresh_every_for_iter(args, iteration)
+        activated_now = False
         if (
             getattr(args, 'proposal_enable', False)
-            and h_refresh_every > 0
-            and (iteration == 1 or iteration % h_refresh_every == 0)
+            and proposal_warmup_end > 0
+            and iteration == proposal_warmup_end
+        ):
+            activated_now = proposal_activate_after_warmup(model, iteration)
+
+        # H cache refresh uses validation data and never advances the training
+        # iterator.  With LR warmup, establish the learned dense baseline and
+        # initial H at the warmup boundary; later refreshes keep the existing
+        # absolute iteration cadence (e.g. 80, 100, 200, ...).
+        h_refresh_due = _proposal_h_refresh_due(args, iteration)
+        if (
+            getattr(args, 'proposal_enable', False)
+            and h_refresh_due
         ):
             # H-refresh runs immediately after this optimizer step, before the
             # next-loop dispatch point.  Flush the current post-step checkpoint
             # first so any grad-score lease from this step is consumed/released
             # before the anchor backward starts.
-            proposal_dispatch_post_iter(model, iter_T=iteration)
+            if not activated_now:
+                proposal_dispatch_post_iter(model, iter_T=iteration)
             proposal_refresh_h_quantile(
                 model, forward_step_func, valid_data_iterator, iteration,
             )
         if getattr(args, 'proposal_enable', False):
             proposal_run_independent_oracle(model, valid_data_iterator, iteration)
-        if getattr(args, 'proposal_enable', False):
+        if (
+            getattr(args, 'proposal_enable', False)
+            or os.environ.get('PROPOSAL_VRAM_AUDIT', '') in ('1', 'true', 'True')
+        ):
             proposal_vram_audit_iter_end(iteration)
 
         # Exp 2 fault injection: every N iter (after warmup), reconstruct state from CP and continue.
@@ -1398,6 +1448,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if (
             getattr(args, 'proposal_enable', False)
             and fault_interval > 0
+            and iteration > proposal_warmup_end
             and iteration >= fault_warmup
             and iteration % fault_interval == 0
             and iteration < args.train_iters
@@ -1471,6 +1522,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.exit_signal_handler:
             signal_handler = get_signal_handler()
             if any(signal_handler.signals_received()):
+                proposal_finalize_post_iter(model, iteration)
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
@@ -1493,6 +1545,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
             done = done_cuda.item()
             if done:
+                proposal_finalize_post_iter(model, iteration)
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
@@ -1503,6 +1556,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
+            proposal_finalize_post_iter(model, iteration)
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
@@ -1515,6 +1569,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Exiting based on kill switch file
         if found_kill_switch():
+            proposal_finalize_post_iter(model, iteration)
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)

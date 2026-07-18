@@ -74,6 +74,27 @@ class SegmentD2H:
     def num_buffers(self) -> int:
         return len(self._gpu_bufs)
 
+    def warmup(self) -> None:
+        """Create reusable events before steady checkpoint/recovery work."""
+
+        self._ensure_events()
+
+    def recovery_lanes(self) -> Tuple[
+        Tuple[torch.Tensor, "torch.cuda.Stream", "torch.cuda.Event"],
+        Tuple[torch.Tensor, "torch.cuda.Stream", "torch.cuda.Event"],
+    ]:
+        """Lease the two existing buffers as independent recovery lanes."""
+
+        if len(self._gpu_bufs) != 2:
+            raise RuntimeError(
+                "GPU replay requires exactly two segment staging buffers"
+            )
+        self._ensure_events()
+        return (
+            (self._gpu_bufs[0], self._compute_stream, self._prod_done[0]),
+            (self._gpu_bufs[1], self._d2h_stream, self._prod_done[1]),
+        )
+
     def run(
         self,
         producer: Callable[[torch.Tensor, int, int], None],

@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from .fp32_state import (
+    clone_rng_tracker_states,
     discard_zero12_grad_state,
     get_engine_optimizer,
     get_mapper,
@@ -105,9 +106,12 @@ def _capture_anchor_rng_state() -> Dict[str, Any]:
     }
     try:
         from megatron.core.tensor_parallel import get_cuda_rng_tracker
-        state["mpu"] = get_cuda_rng_tracker().get_states()
-    except Exception:
+    except ImportError:
         state["mpu"] = None
+    else:
+        state["mpu"] = clone_rng_tracker_states(
+            get_cuda_rng_tracker().get_states()
+        )
     return state
 
 
@@ -119,11 +123,11 @@ def _restore_anchor_rng_state(state: Optional[Dict[str, Any]]) -> None:
         if torch.cuda.is_available() and state.get("cuda") is not None:
             torch.cuda.set_rng_state_all(state["cuda"])
         if state.get("mpu") is not None:
-            try:
-                from megatron.core.tensor_parallel import get_cuda_rng_tracker
-                get_cuda_rng_tracker().set_states(state["mpu"])
-            except Exception:
-                pass
+            from megatron.core.tensor_parallel import get_cuda_rng_tracker
+
+            get_cuda_rng_tracker().set_states(
+                clone_rng_tracker_states(state["mpu"])
+            )
     except Exception:
         pass
 
@@ -175,7 +179,10 @@ def _collect_anchor_h_named_views(
     views: List[torch.Tensor] = []
     for name, param in zip(names, params):
         try:
-            view = mapper.get_grad_accum_view(param).view(-1)
+            view = mapper.get_grad_accum_view(
+                param,
+                allow_create=False,
+            ).view(-1)
         except Exception:
             if allow_create:
                 raise
@@ -193,28 +200,15 @@ def _register_fd_grad_transform_hook(
     global_offset: int,
     rng_seed: int,
     k: int,
-    scale_probe: Optional[Dict[str, Any]] = None,
 ):
     def _pre_accumulate_hook(raw_grad):
-        if scale_probe is not None and not bool(scale_probe.get("captured", False)):
-            try:
-                scale_probe["raw_abs_mean"] = float(raw_grad.detach().float().abs().mean().item())
-            except Exception:
-                scale_probe["raw_abs_mean"] = 0.0
-        out = _scale_grad_inplace_with_pcg_z(
+        return _scale_grad_inplace_with_pcg_z(
             raw_grad,
             sign_scale=sign_scale,
             global_offset=global_offset,
             rng_seed=int(rng_seed),
             k=int(k),
         )
-        if scale_probe is not None and not bool(scale_probe.get("captured", False)):
-            try:
-                scale_probe["scaled_abs_mean"] = float(out.detach().float().abs().mean().item())
-            except Exception:
-                scale_probe["scaled_abs_mean"] = 0.0
-            scale_probe["captured"] = True
-        return out
 
     return param.register_hook(_pre_accumulate_hook)
 
@@ -264,47 +258,37 @@ def proposal_set_anchor_data_iter(it: Any) -> None:
     _config["_hessian_dedicated_valid_iter"] = it
 
 
-def _fold_h(names: List[str], h_new_list: List[torch.Tensor]) -> Dict[str, Any]:
-    """Return anchor diagnostics for compatibility with existing logs."""
+def _fold_h(names: List[str], coverage_flags: List[bool]) -> Dict[str, Any]:
+    """Return allocation-free anchor coverage diagnostics.
+
+    Coverage is produced by the same Triton scan that validates finiteness;
+    this function deliberately performs no reduction over resident H views.
+    """
     _lossy_cp = _pipe()._lossy_cp
     if _lossy_cp is None:
         return {"expert_coverage": 0.0, "skip_ratio": 0.0, "n_skipped": 0}
 
-    # Compute per-tensor Hz norms (mean abs) on GPU.
-    hz_norms = []
-    coverage_flags = []
-    for h in h_new_list:
-        s = float(h.detach().abs().mean().item()) if h.numel() > 0 else 0.0
-        hz_norms.append(s)
-        coverage_flags.append(s > 0)
-    n = len(h_new_list)
+    n = len(names)
+    coverage_flags = [
+        bool(coverage_flags[i]) if i < len(coverage_flags) else False
+        for i in range(n)
+    ]
     expert_coverage = float(sum(coverage_flags)) / max(n, 1)
-    skip_mask = [False] * n
     # H_DIAG: per-anchor, list zero-coverage tensors.
     import os as _os_h_diag
     if _os_h_diag.environ.get("PROPOSAL_H_DIAG", "") in ("1",):
-        n_zero = sum(1 for v in hz_norms if v == 0)
-        n_flip = sum(1 for v in skip_mask if v)
-        positives = sorted([v for v in hz_norms if v > 0])
-        if positives:
-            mn = positives[0]; mx = positives[-1]
-            md = positives[len(positives)//2]
-            print(f"[H_DIAG] n_total={n} n_zero={n_zero} n_flip={n_flip} "
-                  f"hz_norm: min={mn:.3e} median={md:.3e} max={mx:.3e}",
-                  flush=True)
-            # List first 8 zero-coverage tensor names
-            zero_names = [names[i] for i in range(n) if hz_norms[i] == 0][:8]
-            if zero_names:
-                print(f"[H_DIAG] zero_names (first 8): {zero_names}", flush=True)
-    n_skipped = 0
-    for i, (name, h_new) in enumerate(zip(names, h_new_list)):
-        if not coverage_flags[i] or skip_mask[i]:
-            # H=0 or non-finite: skip fold (keep existing H). The cached
-            # anchor-boundary v_q/H LUT still maps Adam v_t to nonzero scores
-            # for later selection. Explicit floor was tested and proven
-            # redundant.
-            n_skipped += 1
-            continue
+        n_zero = sum(1 for covered in coverage_flags if not covered)
+        print(
+            f"[H_DIAG] n_total={n} n_zero={n_zero}",
+            flush=True,
+        )
+        zero_names = [
+            names[i] for i, covered in enumerate(coverage_flags)
+            if not covered
+        ][:8]
+        if zero_names:
+            print(f"[H_DIAG] zero_names (first 8): {zero_names}", flush=True)
+    n_skipped = sum(1 for covered in coverage_flags if not covered)
     return {
         "expert_coverage": expert_coverage,
         "skip_ratio": float(n_skipped) / max(n, 1),
@@ -383,24 +367,11 @@ def _refresh_h_quantile_from_finite_diff(
     if not tracked:
         return None
 
-    _cpu_rng_state = torch.get_rng_state()
-    _cuda_rng_state = (torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
     if hasattr(m0, "module"):
         net = m0.module
     else:
         net = m0
     was_training = net.training
-    net.train()
-    def _restore_rng():
-        try:
-            torch.set_rng_state(_cpu_rng_state)
-            if _cuda_rng_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(_cuda_rng_state)
-        except Exception: pass
-
-    def _finalize(ret):
-        net.train(was_training); _restore_rng()
-        return ret
 
     expert_ps = [p for _, p in tracked]
     names = [n for n, _ in tracked]
@@ -412,7 +383,12 @@ def _refresh_h_quantile_from_finite_diff(
     t0 = _time.perf_counter()
     # Audit: pre-anchor snapshot.
     from ..telemetry import diagnostics as _proposal_diagnostics
-    _proposal_diagnostics.vram_audit_step("pre_anchor", dump_breakdown=True, lossy_cp=_lossy_cp)
+    _proposal_diagnostics.vram_audit_step(
+        "pre_anchor",
+        dump_breakdown=True,
+        lossy_cp=_lossy_cp,
+        synchronize=True,
+    )
     # FD core accumulates hook-scaled per-element values into training grad storage.
     # K is fixed to one; robustness comes from the multi-batch anchor loop.
     _group_size_for_fd = max(
@@ -428,14 +404,17 @@ def _refresh_h_quantile_from_finite_diff(
 
     import os as _os_off
 
-    # Suppress proposal dispatch side work for the anchor's +eps/-eps forwards.
-    _config["_in_anchor_refresh"] = True
     # Snapshot training state — anchor's multiple forward/backward passes
     # advance Megatron's CudaRNGTracker and may write into model param
     # .grad / DeepSpeed hp_grad. Restore in finally so training continues
-    # bit-exact regardless of how many anchor passes fired.
-    _train_state_snap = snapshot_training_state(_config.get("_inner_opt"), model=model)
+    # bit-exact regardless of how many anchor passes fired.  This acquisition
+    # happens before changing model mode or the anchor flag, so a pinned-host
+    # OOM cannot strand the training state half-entered.
     _ds_engine_opt = get_engine_optimizer(model)
+    _train_state_snap = snapshot_training_state(
+        _config.get("_inner_opt"),
+        model=model,
+    )
     # FULL STATE DIFF DIAGNOSTIC — capture every state hash pre/post anchor
     # to pinpoint what per-chunk's N×backward changes. Caller runs once on
     # first per-chunk anchor; output identifies which buffers / optimizer
@@ -461,7 +440,10 @@ def _refresh_h_quantile_from_finite_diff(
                         st["DS:" + attr] = getattr(_dso, attr)
                     except Exception:
                         pass
-            for fa in ("fp32_groups_flat", "fp32_groups_gradients_flat"):
+            for fa in (
+                "fp32_groups_flat",
+                "fp32_groups_gradients_flat",
+            ):
                 gl = getattr(_dso, fa, None)
                 if gl:
                     for i, t in enumerate(gl):
@@ -481,7 +463,9 @@ def _refresh_h_quantile_from_finite_diff(
         if torch.cuda.is_available():
             try:
                 import hashlib
-                st["RNG:cuda"] = hashlib.sha256(torch.cuda.get_rng_state(0).numpy().tobytes()).hexdigest()[:16]
+                st["RNG:cuda"] = hashlib.sha256(
+                    torch.cuda.get_rng_state(0).numpy().tobytes()
+                ).hexdigest()[:16]
             except Exception:
                 pass
         return st
@@ -490,17 +474,35 @@ def _refresh_h_quantile_from_finite_diff(
     _pre_state = _capture_full_state(_ds_engine_opt) if _full_diag else None
     _ds_attr_snapshot: Dict[str, Any] = {}
     if _ds_engine_opt is not None:
-        for _attr in ("micro_steps", "global_steps", "loss_scale",
-                      "cur_iter", "cur_scale"):
+        for _attr in (
+            "micro_steps",
+            "global_steps",
+            "loss_scale",
+            "cur_iter",
+            "cur_scale",
+            "micro_step_id",
+        ):
             if hasattr(_ds_engine_opt, _attr):
                 try:
                     _ds_attr_snapshot[_attr] = getattr(_ds_engine_opt, _attr)
                 except Exception:
                     pass
+    # This region is H-refresh only.  It ends before the caller can run the
+    # independent oracle, and the nested cleanup below closes it even when an
+    # FD pass or state restoration raises.  Snapshot/full-diag acquisition
+    # precedes the trace because it is setup, not production H-refresh work.
+    _h_refresh_allocator_trace = _proposal_diagnostics.begin_allocator_history(
+        "h_refresh",
+        int(iteration),
+        force=True,
+    )
     try:
-        # MULTI-BATCH ANCHOR: each batch's routing activates only ~67% of
-        # experts; averaging over N batches (each with a different routing)
-        # raises H coverage to ≥0.93. N = mb_per_iter/2 (set at init_proposal).
+        # Suppress proposal dispatch side work for the anchor's +/- forwards.
+        net.train()
+        _config["_in_anchor_refresh"] = True
+        # Each call below consumes one cached anchor batch.  With a
+        # PipelineEngine that call expands to the engine's full micro-batch
+        # schedule, so ProposalConfig owns the outer repetition count.
         _n_anchor_batches = max(1, int(_proposal_config.n_anchor_batches))
         # Routing freeze defaults ON (production): the +εz/−εz pair must share
         # one routing decision, else the FD estimate absorbs routing noise.
@@ -635,10 +637,19 @@ def _refresh_h_quantile_from_finite_diff(
                     print(f"[MB_TIMING] batch={_bi} {(_time_mb.perf_counter()-_mb_t0)*1000:.0f}ms",
                           flush=True)
                 if _ret is None:
-                    continue
+                    raise RuntimeError(
+                        "H-quantile anchor finite-difference batch failed; "
+                        f"refusing partial curvature (batch {_bi + 1}/"
+                        f"{_n_anchor_batches})"
+                    )
                 _n_succ += 1
                 # FD hooks accumulate the signed z·(g₊−g₋)/(2εK) into the
                 # same FP32 grad storage training uses; _ret is just a success sentinel.
+            if _n_succ != _n_anchor_batches:
+                raise RuntimeError(
+                    "H-quantile anchor did not complete every requested batch: "
+                    f"{_n_succ}/{_n_anchor_batches}"
+                )
             if _zero12_mode:
                 _final_names, _final_views = _zero12_expert_h_views_from_table(
                     _ds_engine_opt,
@@ -661,7 +672,28 @@ def _refresh_h_quantile_from_finite_diff(
                     _grad_accum_views = _final_views
             # After all batches: divide by the success count and take abs in
             # place, then build h_q from the per-expert grad accumulation views.
-            if _grad_accum_views and _n_succ > 0:
+            if not _grad_accum_views:
+                raise RuntimeError(
+                    "H-quantile anchor completed backward but produced no "
+                    "resident curvature views"
+                )
+            if _n_succ > 0:
+                _finite_flag = getattr(
+                    _lossy_cp,
+                    "_h_refresh_nonfinite_flag",
+                    None,
+                )
+                _views_finite, _coverage_flags = _resident_views_are_finite(
+                    _grad_accum_views,
+                    _finite_flag,
+                    getattr(_lossy_cp, "_h_refresh_view_coverage", None),
+                    getattr(_lossy_cp, "_h_refresh_view_coverage_host", None),
+                )
+                if not _views_finite:
+                    raise RuntimeError(
+                        "H-quantile anchor produced NaN/Inf in resident "
+                        "curvature views"
+                    )
                 _inv_succ = 1.0 / float(_n_succ)
                 _curvature_telemetry = (
                     getattr(_lossy_cp, "_curvature_progress_telemetry", None)
@@ -688,17 +720,12 @@ def _refresh_h_quantile_from_finite_diff(
                         _grad_accum_views,
                         refresh_step=int(iteration),
                     )
-                _fold_diag = _fold_h(_h_view_names, _grad_accum_views)
-                try:
-                    import statistics as _st
-                    _h_abs_means = [float(_h.mean().item()) for _h in _grad_accum_views]
-                    _h_abs_maxs = [float(_h.max().item()) for _h in _grad_accum_views]
-                    _h_scale_stats = (
-                        float(_st.mean(_h_abs_means)) if _h_abs_means else 0.0,
-                        float(max(_h_abs_maxs)) if _h_abs_maxs else 0.0,
-                    )
-                except Exception:
-                    _h_scale_stats = None
+                _fold_diag = _fold_h(_h_view_names, _coverage_flags)
+                _h_scale_stats = getattr(
+                    _lossy_cp,
+                    "_last_h_quantile_summary",
+                    None,
+                )
                 fd_ret = []
         finally:
             if _zero12_mode:
@@ -722,8 +749,6 @@ def _refresh_h_quantile_from_finite_diff(
             _final_views = None
             _view = None
             _h = None
-            _h_abs_means = None
-            _h_abs_maxs = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         # Average
@@ -733,28 +758,40 @@ def _refresh_h_quantile_from_finite_diff(
         if _should_write() and _n_anchor_batches > 1:
             print(f"[proposal] anchor multi-batch: N={_n_anchor_batches} succ={_n_succ}",
                   flush=True)
-        _proposal_diagnostics.vram_audit_step("inside_anchor_fd_peak", dump_breakdown=False)
+        _proposal_diagnostics.vram_audit_step(
+            "inside_anchor_fd_peak",
+            dump_breakdown=False,
+            synchronize=True,
+        )
     finally:
-        _config["_in_anchor_refresh"] = False
-        if _ds_engine_opt is not None:
-            for _attr, _value in _ds_attr_snapshot.items():
-                try:
-                    setattr(_ds_engine_opt, _attr, _value)
-                except Exception:
-                    pass
-        restore_training_state(_config.get("_inner_opt"), _train_state_snap)
-        discard_zero12_grad_state(_ds_engine_opt)
-        # Final belt-and-suspenders: force-clear any residual lp.grad.
-        # model may be a list/tuple (Megatron DDP wrapper) — unwrap first.
-        _m_clear = model[0] if isinstance(model, (list, tuple)) else model
         try:
-            for _p in _m_clear.parameters():
-                if _p.grad is not None:
-                    _p.grad = None
-                if hasattr(_p, "grad_accum"):
-                    _p.grad_accum = None
-        except Exception as _exc:
-            print(f"[proposal] anchor grad clear err: {_exc}", flush=True)
+            _config["_in_anchor_refresh"] = False
+            if _ds_engine_opt is not None:
+                for _attr, _value in _ds_attr_snapshot.items():
+                    try:
+                        setattr(_ds_engine_opt, _attr, _value)
+                    except Exception:
+                        pass
+            # Drop anchor-owned ZeRO/LP gradient state before restoring the
+            # exact pre-anchor gradient snapshot.
+            discard_zero12_grad_state(_ds_engine_opt)
+            _m_clear = model[0] if isinstance(model, (list, tuple)) else model
+            try:
+                for _p in _m_clear.parameters():
+                    if _p.grad is not None:
+                        _p.grad = None
+                    if hasattr(_p, "grad_accum"):
+                        _p.grad_accum = None
+            except Exception as _exc:
+                print(f"[proposal] anchor grad clear err: {_exc}", flush=True)
+            restore_training_state(_config.get("_inner_opt"), _train_state_snap)
+        finally:
+            net.train(was_training)
+            if _h_refresh_allocator_trace:
+                _proposal_diagnostics.end_allocator_history(
+                    "h_refresh",
+                    int(iteration),
+                )
         # DIFF report — print any state that changed across anchor.
         if _full_diag and _pre_state is not None:
             _post_state = _capture_full_state(_ds_engine_opt)
@@ -776,12 +813,13 @@ def _refresh_h_quantile_from_finite_diff(
     _proposal_diagnostics.vram_audit_step(
         "post_anchor", dump_breakdown=False,
         extra={"anchor_total_ms": (_time.perf_counter() - t0) * 1000.0},
+        synchronize=True,
     )
     t1 = _time.perf_counter()
     if fd_ret is None:
         if _should_write():
             print(f"[proposal] finite_diff failed @iter{iteration}", flush=True)
-        return _finalize(None)
+        return None
 
     # _fold_h is now mainly diagnostic; h_q was built from DS grad views above.
     if _fold_diag is None:
@@ -810,7 +848,7 @@ def _refresh_h_quantile_from_finite_diff(
         if _h_scale_stats is not None:
             print(
                 f"[proposal] scale @iter{iteration} (finite_diff): "
-                f"|H| mean={_h_scale_stats[0]:.3e} max={_h_scale_stats[1]:.3e}  "
+                f"|H| qmean={_h_scale_stats[0]:.3e} qmax={_h_scale_stats[1]:.3e}  "
                 f"(eps={eps_actual:.3e}, coverage={_fold_diag['expert_coverage']:.3f}, "
                 f"skip_ratio={_fold_diag['skip_ratio']:.4f})",
                 flush=True,
@@ -823,9 +861,9 @@ def _refresh_h_quantile_from_finite_diff(
             flush=True,
         )
 
-    ret = _finalize({"iter": iteration, "k_samples": k_samples,
-                     "ms": elapsed_ms, "numel": n_elem,
-                     "diag": diag_record})
+    ret = {"iter": iteration, "k_samples": k_samples,
+           "ms": elapsed_ms, "numel": n_elem,
+           "diag": diag_record}
 
     if _lossy_cp is None:
         return ret
@@ -975,6 +1013,26 @@ def _schedule_backward_inplace(
 
 if _HAS_TRITON_HESSIAN:
     @triton.jit
+    def _mark_nonfinite_kernel(
+        values_ptr,
+        n_elements,
+        nonfinite_flag_ptr,
+        coverage_ptr,
+        coverage_index,
+        BLOCK: tl.constexpr,
+    ):
+        """Mark global finiteness and per-view nonzero coverage."""
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n_elements
+        values = tl.load(values_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        bad = mask & ((values != values) | (tl.abs(values) == float("inf")))
+        block_has_nonfinite = tl.max(bad.to(tl.int32), axis=0)
+        tl.atomic_max(nonfinite_flag_ptr, block_has_nonfinite)
+        block_has_signal = tl.max((mask & (values != 0.0)).to(tl.int32), axis=0)
+        tl.atomic_max(coverage_ptr + coverage_index, block_has_signal)
+
+
+    @triton.jit
     def _flat_z_perturb_kernel(
         lp_ptr,          # *bf16, n_elem (in-place add)
         n_elem,
@@ -1006,6 +1064,77 @@ if _HAS_TRITON_HESSIAN:
                  (lp + eps_signed * z).to(tl.bfloat16), mask=mask)
 
 
+def _resident_views_are_finite(
+    views: List[torch.Tensor],
+    nonfinite_flag: torch.Tensor,
+    coverage: torch.Tensor,
+    coverage_host: torch.Tensor,
+) -> Tuple[bool, List[bool]]:
+    """Allocation-free finite/coverage scan over resident gradient views.
+
+    All destinations are allocated once by ``LossyCheckpointPipeline``.  The
+    blocking copy into the pinned host mirror is an allowed anchor transition;
+    no result tensor is allocated on CUDA per refresh.
+    """
+    if not _HAS_TRITON_HESSIAN:
+        raise RuntimeError("H-quantile finite validation requires Triton")
+    if (
+        not isinstance(nonfinite_flag, torch.Tensor)
+        or nonfinite_flag.numel() != 1
+        or nonfinite_flag.dtype != torch.int32
+        or not nonfinite_flag.is_cuda
+    ):
+        raise RuntimeError(
+            "H-quantile finite validation requires a resident CUDA int32 flag"
+        )
+    n_views = len(views)
+    if (
+        not isinstance(coverage, torch.Tensor)
+        or coverage.dtype != torch.int32
+        or not coverage.is_cuda
+        or coverage.device != nonfinite_flag.device
+        or coverage.numel() < n_views
+        or not isinstance(coverage_host, torch.Tensor)
+        or coverage_host.dtype != torch.int32
+        or coverage_host.device.type != "cpu"
+        or not coverage_host.is_pinned()
+        or coverage_host.numel() < n_views
+    ):
+        raise RuntimeError(
+            "H-quantile coverage validation requires resident CUDA and pinned host scratch"
+        )
+
+    nonfinite_flag.zero_()
+    coverage[:n_views].zero_()
+    block = 8192
+    for view_index, view in enumerate(views):
+        if view.numel() == 0:
+            continue
+        if not view.is_cuda or view.device != nonfinite_flag.device:
+            raise RuntimeError(
+                "H-quantile view and finite-validation flag must share a CUDA device"
+            )
+        if not view.is_contiguous():
+            raise RuntimeError(
+                "H-quantile finite validation requires contiguous resident views"
+            )
+        n_elements = int(view.numel())
+        _mark_nonfinite_kernel[(triton.cdiv(n_elements, block),)](
+            view,
+            n_elements,
+            nonfinite_flag,
+            coverage,
+            int(view_index),
+            BLOCK=block,
+        )
+    coverage_host[:n_views].copy_(
+        coverage[:n_views],
+        non_blocking=False,
+    )
+    flags = [bool(value) for value in coverage_host[:n_views].tolist()]
+    return int(nonfinite_flag.item()) == 0, flags
+
+
 def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
                     global_offset: int,
                     rng_seed: int, k: int) -> None:
@@ -1016,13 +1145,7 @@ def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
     if n == 0:
         return
     if not _HAS_TRITON_HESSIAN:
-        gen = torch.Generator(device=lp_tensor.device).manual_seed(
-            int(rng_seed) ^ int(k) ^ int(global_offset))
-        z = (torch.randint(0, 2, (n,), generator=gen,
-                           device=lp_tensor.device,
-                           dtype=torch.bfloat16) * 2 - 1)
-        lp_tensor.view(-1).add_(z, alpha=float(eps_signed))
-        return
+        raise RuntimeError("H-quantile perturb requires Triton")
     BLOCK = 8192
     n_progs = (n + BLOCK - 1) // BLOCK
     seed64 = int(rng_seed) & ((1 << 64) - 1)
@@ -1109,8 +1232,7 @@ def _pipeline_exec_batch(
         engine.total_loss = old_total_loss
         engine.total_additional_losses = old_total_additional
         engine._compute_loss = old_compute_loss
-        if old_outputs is not None:
-            engine.fwd_outputs = old_outputs
+        engine.fwd_outputs = old_outputs
 
 
 if _HAS_TRITON_HESSIAN:
@@ -1203,7 +1325,10 @@ def _compute_fd_fast_flat(
 
     if grad_accum_views is None:
         raise RuntimeError("H-quantile anchor requires resident FP32 grad views")
-    preserve_param_grad_storage = any(
+    # Pipeline ZeRO-1 skips ReduceGrads for every non-final +/- pass, so its
+    # BF16 param.grad is the only cross-pass accumulator.  Keep it resident
+    # until the final ReduceGrads copies the result to averaged_gradients.
+    preserve_param_grad_storage = pipeline_engine is not None or any(
         isinstance(view, torch.Tensor) and view.dtype != torch.float32
         for view in grad_accum_views
     )
@@ -1304,10 +1429,6 @@ def _compute_fd_fast_flat(
                 else nullcontext()
             )
             with ds_window_ctx as ds_window:
-                _scale_probe_on = str(os.environ.get("PROPOSAL_H_REFRESH_SCALE_PROBE", "0")).lower() in (
-                    "1", "true", "yes", "on",
-                )
-                _scale_probe_printed = False
                 for k in range(max(1, int(k_samples))):
                     for sign in (+1.0, -1.0):
                         pass_idx += 1
@@ -1339,16 +1460,6 @@ def _compute_fd_fast_flat(
                             if use_engine_backward else 1.0
                         )
                         sign_scale = sign * inv_step * inv_k * float(gas_scale) / float(loss_scale)
-                        scale_probe = None
-                        if _scale_probe_on and not _scale_probe_printed:
-                            scale_probe = {
-                                "captured": False,
-                                "loss_scale": float(loss_scale),
-                                "gas_scale": float(gas_scale),
-                                "inv_step": float(inv_step),
-                                "inv_k": float(inv_k),
-                                "sign_scale": float(sign_scale),
-                            }
                         for hook_i, hook_param in enumerate(expert_ps):
                             hook_global_offset = int(grad_offsets[hook_i])
                             handles.append(
@@ -1358,7 +1469,6 @@ def _compute_fd_fast_flat(
                                     global_offset=hook_global_offset,
                                     rng_seed=int(rng_seed),
                                     k=int(k),
-                                    scale_probe=scale_probe,
                                 )
                             )
                         for hook_param in nonexpert_params:
@@ -1369,7 +1479,6 @@ def _compute_fd_fast_flat(
                                     global_offset=int(nonexpert_offsets[id(hook_param)]),
                                     rng_seed=int(rng_seed),
                                     k=int(k),
-                                    scale_probe=scale_probe,
                                 )
                             )
                         _sync(); _t_hook = _time.perf_counter()
@@ -1416,19 +1525,6 @@ def _compute_fd_fast_flat(
                                 for p in expert_ps:
                                     p.grad = None
                         _sync(); _t2 = _time.perf_counter()
-                        if scale_probe is not None and not _scale_probe_printed:
-                            print(
-                                "[proposal] h_refresh_scale_probe "
-                                f"loss_scale={scale_probe.get('loss_scale', 1.0):.6g} "
-                                f"gas={scale_probe.get('gas_scale', 1.0):.6g} "
-                                f"inv_step={scale_probe.get('inv_step', 0.0):.6g} "
-                                f"inv_k={scale_probe.get('inv_k', 0.0):.6g} "
-                                f"sign_scale={scale_probe.get('sign_scale', 0.0):.6e} "
-                                f"raw_abs_mean={scale_probe.get('raw_abs_mean', 0.0):.6e} "
-                                f"scaled_abs_mean={scale_probe.get('scaled_abs_mean', 0.0):.6e}",
-                                flush=True,
-                            )
-                            _scale_probe_printed = True
                         _tsum["perturb"] += (_t1 - _t0)
                         _tsum["hook"]    += (_t_hook - _t1)
                         _tsum["bwd"]     += (_t2 - _t_hook)
@@ -1449,12 +1545,9 @@ def _compute_fd_fast_flat(
     # NB: lp left in stale -εz state; caller's finally restores from snaps.
     # DeepSpeed-owned grad accumulation views carry the signed running sum
     # across the multi-batch loop.
-    # The caller takes the final abs + quantile build after dividing by the
-    # success count. Sentinel non-None return signals success.
-    for view in grad_accum_views:
-        if not bool(torch.isfinite(view).all()):
-            print("[proposal] finite_diff: NaN/Inf in resident grad result", flush=True)
-            return None
+    # The caller validates the final multi-batch accumulation once, then
+    # takes abs and builds the quantiles.  Validating every partial batch via
+    # torch.isfinite(view) materialized a full-size bool tensor per view.
     return []  # success sentinel; h_refresh owns final reduction
 
 

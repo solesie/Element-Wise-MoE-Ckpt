@@ -560,8 +560,18 @@ class Fp32StateMapper:
                     except AttributeError:
                         continue
 
-    def get_grad_accum_view(self, param: torch.nn.Parameter) -> torch.Tensor:
-        """Return the FP32 storage where training normally accumulates grad."""
+    def get_grad_accum_view(
+        self,
+        param: torch.nn.Parameter,
+        *,
+        allow_create: bool = True,
+    ) -> torch.Tensor:
+        """Return the storage where training normally accumulates grad.
+
+        H refresh passes ``allow_create=False``: its allocation contract is to
+        reuse training-owned storage, never manufacture a model-sized
+        ``param.grad`` merely to hold curvature.
+        """
 
         coord = self._coords.get(id(param))
         if (
@@ -596,6 +606,10 @@ class Fp32StateMapper:
             return main_grad.view(-1)
 
         if param.grad is None:
+            if not allow_create:
+                raise RuntimeError(
+                    "anchor could not locate resident training grad storage"
+                )
             if param.dtype not in (torch.float32, torch.float16, torch.bfloat16):
                 raise RuntimeError(
                     "anchor could not locate supported training grad accumulation "
@@ -694,6 +708,23 @@ def get_mapper() -> Optional[Fp32StateMapper]:
 _PINNED_POOL: Dict[Any, torch.Tensor] = {}
 
 
+def clone_rng_tracker_states(states: Any) -> Any:
+    """Clone the tracker tensor map before handing it to ``set_states``.
+
+    Megatron's RNG tracker keeps the dictionary object passed to
+    ``set_states`` and replaces entries in that dictionary as dropout runs.
+    Reusing one saved dictionary for the paired +epsilon/-epsilon forwards
+    would therefore replay the already-advanced state on the second pass.
+    """
+
+    if not isinstance(states, dict):
+        return states
+    return {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in states.items()
+    }
+
+
 def pinned_snapshot(tensor: torch.Tensor, key: Any) -> torch.Tensor:
     """Copy ``tensor`` into a reusable pinned CPU buffer keyed by ``key``."""
 
@@ -716,8 +747,9 @@ def snapshot_training_state(optimizer: Any, model: Any = None) -> TrainingStateS
     snap["torch_rng"] = torch.get_rng_state()
     try:
         from megatron.core.tensor_parallel import get_cuda_rng_tracker
-
-        snap["mpu_rng"] = get_cuda_rng_tracker().get_states()
+        snap["mpu_rng"] = clone_rng_tracker_states(
+            get_cuda_rng_tracker().get_states()
+        )
     except Exception:
         snap["mpu_rng"] = None
 
@@ -803,7 +835,9 @@ def restore_training_state(optimizer: Any, snap: TrainingStateSnapshot) -> None:
         try:
             from megatron.core.tensor_parallel import get_cuda_rng_tracker
 
-            get_cuda_rng_tracker().set_states(snap["mpu_rng"])
+            get_cuda_rng_tracker().set_states(
+                clone_rng_tracker_states(snap["mpu_rng"])
+            )
         except Exception:
             pass
 

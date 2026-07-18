@@ -19,7 +19,7 @@ Binary formats:
 
 ``LFCL`` (pinned live-GPU payload compaction):
     [magic 4B "LFCL"][version u32][header_len u32][pickled meta]
-    [pad to HEADER_BLOCK_BYTES = 4096]
+    [pad to HEADER_BLOCK_BYTES = 65536 (current format constant)]
     [fp32 payload: for each tensor in schema order,
         param_flat (numel × 4B), m_flat, v_flat]
 
@@ -48,9 +48,10 @@ import os
 import pickle
 import struct
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -75,6 +76,12 @@ from .proposal_io import (
 from ..emission.segment_d2h import DEFAULT_SEGMENT_BYTES
 from ..emission.aos_emitter import AosEmitter
 from ..emission.aos_layout import PinnedAosLayoutMirror, read_lfsy_prefix_count
+from ..telemetry.io_backlog import (
+    WriteObject,
+    capture_timestamp,
+    io_backlog_enabled,
+    record_write_batch,
+)
 
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
@@ -95,7 +102,9 @@ def _require_pinned_cpu_tensor(
     name: str,
     dtype: Optional[torch.dtype] = None,
 ) -> None:
-    if tensor.device.type != "cpu" or not tensor.is_pinned():
+    if tensor.device.type != "cpu":
+        raise RuntimeError(f"{name} must be a CPU tensor")
+    if torch.cuda.is_available() and not tensor.is_pinned():
         raise RuntimeError(f"{name} must be a pinned CPU tensor")
     if dtype is not None and tensor.dtype != dtype:
         raise RuntimeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
@@ -123,7 +132,7 @@ def _lossy_name(layer: int, expert: int) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Header pack / unpack (4 KiB prefix)
+# Header pack / unpack (64 KiB with the current binary-format constant)
 # ----------------------------------------------------------------------------
 def _pack_header(magic: bytes, meta: Dict[str, Any]) -> bytes:
     payload = pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL)
@@ -144,7 +153,9 @@ def _unpack_header(block: bytes) -> Tuple[bytes, int, Dict[str, Any]]:
     if magic not in (MAGIC_LFCL, MAGIC_LFSY):
         raise ValueError(f"unknown expert_state magic: {magic!r}")
     if 12 + pickle_len > HEADER_BLOCK_BYTES:
-        raise ValueError(f"pickle_len {pickle_len} overflows 4 KiB block")
+        raise ValueError(
+            f"pickle_len {pickle_len} overflows {HEADER_BLOCK_BYTES}-byte block"
+        )
     meta = pickle.loads(block[12:12 + pickle_len])
     return magic, version, meta
 
@@ -314,6 +325,7 @@ class ExpertState:
         )
         self._pinned_aos_ready = threading.Event()
         self._pinned_aos_ready.set()
+        self._recovery_staging_lock = threading.Lock()
         self._pinned_aos_layout_mirror = PinnedAosLayoutMirror(
             max_experts=len(expert_tensor_map)
         )
@@ -396,6 +408,60 @@ class ExpertState:
 
     def warmup_record_pipeline(self, device: torch.device) -> None:
         self._record_pipeline.warmup(device)
+        self._ensure_direct_emission_counters(device)
+        self._ensure_lossy_log_byte_device_counter(device)
+
+    @contextmanager
+    def acquire_recovery_lanes(
+        self,
+    ) -> Iterator[
+        Optional[
+            Tuple[Tuple[Any, Any, Any], Tuple[Any, Any, Any]]
+        ]
+    ]:
+        """Lease both preallocated GPU replay lanes while writers are drained."""
+
+        if not self._recovery_staging_lock.acquire(blocking=False):
+            raise RuntimeError("expert recovery staging is already leased")
+        try:
+            yield self._record_pipeline.recovery_lanes()
+        finally:
+            self._recovery_staging_lock.release()
+
+    def _require_direct_emission_counters(self, device: torch.device) -> None:
+        """Validate init-time counter ownership without allocating in steady code."""
+
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        n = max(1, len(self._entries))
+        ready = (
+            device.type == "cuda"
+            and self._direct_record_cursor_device is not None
+            and self._direct_record_cursor_device.device == device
+            and self._direct_record_cursor_device.numel() >= n
+            and self._direct_overflow_count_device is not None
+            and self._direct_overflow_count_device.device == device
+            and self._direct_overflow_count_device.numel() >= n
+            and self._direct_record_cursor_pinned is not None
+            and self._direct_record_cursor_pinned.numel() >= n
+            and self._direct_overflow_count_pinned is not None
+            and self._direct_overflow_count_pinned.numel() >= n
+            and self._direct_total_th_pinned is not None
+            and self._direct_feedback_event is not None
+        )
+        if self._direct_layout_feedback_enabled:
+            ready = bool(
+                ready
+                and self._direct_capacity_pinned is not None
+                and self._direct_capacity_pinned.numel() >= n
+                and self._direct_offset_pinned is not None
+                and self._direct_offset_pinned.numel() >= n
+            )
+        if not ready:
+            raise RuntimeError(
+                "direct-emission counters were not initialized by proposal "
+                "warmup; steady checkpoint code must not allocate them"
+            )
 
     @property
     def pinned_aos_total_bytes(self) -> int:
@@ -628,6 +694,7 @@ class ExpertState:
         if self.cp_target != "test_dram" or not self.commit_lossy_records:
             return 0
         seeded = 0
+        trace_enabled = io_backlog_enabled()
         for eid, ent in self._entries.items():
             buffers = self._dense_buffers.get(eid)
             fields = fields_by_expert.get(eid)
@@ -665,6 +732,31 @@ class ExpertState:
                     dst.copy_(src_flat, non_blocking=False)
             ent.step = int(step)
             ent.lossless_step = max(int(ent.lossless_step), int(step))
+            ent.lossy_start_step = int(step)
+            self._set_lossy_log_bytes(ent.expert_id, 0)
+            if trace_enabled:
+                layer, expert = ent.expert_id
+                lfcl_logical = (
+                    int(HEADER_BLOCK_BYTES) + int(ent.total_numel) * 3 * 4
+                )
+                record_write_batch(
+                    (
+                        WriteObject(
+                            kind="lfcl", op="replace",
+                            io_bytes=self._round_io_bytes(lfcl_logical),
+                            layer=int(layer), local_expert=int(expert),
+                            offset=0,
+                        ),
+                        WriteObject(
+                            kind="lfsy", op="create",
+                            io_bytes=self._round_io_bytes(HEADER_BLOCK_BYTES),
+                            layer=int(layer), local_expert=int(expert),
+                            offset=0,
+                        ),
+                    ),
+                    step=int(step),
+                    timestamp=capture_timestamp(),
+                )
             seeded += 1
         return int(seeded)
 
@@ -738,6 +830,102 @@ class ExpertState:
     def has_lossless_fc(self, expert_id: ExpertId) -> bool:
         ent = self._entries.get(expert_id)
         return ent is not None and ent.lossless_step >= 0
+
+    @staticmethod
+    def _round_io_bytes(nbytes: int) -> int:
+        n = max(0, int(nbytes))
+        sector = int(_BIN_SECTOR_BYTES)
+        return ((n + sector - 1) // sector) * sector
+
+    def _record_lfcl_writes(
+        self,
+        entries: List[Tuple["_ExpertEntry", int]],
+        *,
+        step: int,
+        timestamp: int,
+    ) -> None:
+        writes: List[WriteObject] = []
+        for ent, payload_bytes in entries:
+            layer, expert = ent.expert_id
+            logical = int(HEADER_BLOCK_BYTES) + int(payload_bytes)
+            common = {
+                "layer": int(layer),
+                "local_expert": int(expert),
+                "offset": 0,
+            }
+            writes.extend((
+                WriteObject(
+                    kind="lfcl", op="replace",
+                    io_bytes=self._round_io_bytes(logical),
+                    **common,
+                ),
+                WriteObject(
+                    kind="lfsy", op="create",
+                    io_bytes=self._round_io_bytes(HEADER_BLOCK_BYTES),
+                    **common,
+                ),
+            ))
+        if writes:
+            record_write_batch(
+                writes,
+                step=int(step),
+                timestamp=timestamp,
+            )
+
+    def _record_lfsy_writes(
+        self,
+        *,
+        step: int,
+        layout_mirror: PinnedAosLayoutMirror,
+        pinned_aos: torch.Tensor,
+        timestamp: int,
+        counted_rows: Optional[List[Tuple[Any, "_ExpertEntry", int]]] = None,
+    ) -> None:
+        rows = counted_rows
+        if rows is None:
+            rows = list(self._iter_lossy_rows(layout_mirror, pinned_aos))
+        writes = tuple(
+            WriteObject(
+                kind="lfsy",
+                op="append",
+                io_bytes=self._lossy_blob_padded_bytes_for_count(count),
+                layer=int(ent.expert_id[0]),
+                local_expert=int(ent.expert_id[1]),
+                offset=int(HEADER_BLOCK_BYTES) + self.lossy_log_bytes(ent.expert_id),
+            )
+            for _row, ent, count in rows
+        )
+        if writes:
+            record_write_batch(
+                writes,
+                step=int(step),
+                timestamp=timestamp,
+            )
+
+    def _iter_lossy_rows(
+        self,
+        layout_mirror: PinnedAosLayoutMirror,
+        pinned_aos: torch.Tensor,
+    ) -> Iterator[Tuple[Any, "_ExpertEntry", int]]:
+        """Yield each non-empty GPU-stamped expert row exactly once."""
+
+        for row in layout_mirror.rows():
+            if int(row.aos_byte_off) < 0:
+                continue
+            ent = self._entries.get(row.expert_id)
+            if ent is None:
+                raise RuntimeError(
+                    f"missing expert entry for AOS layout row {row.expert_id}"
+                )
+            count = read_lfsy_prefix_count(
+                pinned_aos,
+                aos_byte_off=row.aos_byte_off,
+                record_capacity=row.record_capacity,
+                prefix_bytes=BLOCK_PREFIX_BYTES,
+            )
+            if count <= 0:
+                continue
+            yield row, ent, int(count)
 
     @property
     def total_bytes(self) -> int:
@@ -872,6 +1060,12 @@ class ExpertState:
             ],
             "global_offsets": dict(ent.global_offsets),
             "total_numel": int(ent.total_numel),
+            # Production direct emission evaluates every expert-local element
+            # exactly once per iteration.  GPU chronological replay relies on
+            # this format invariant to parallelize one block without changing
+            # physical last-write-wins semantics.  Older files without the
+            # marker stay on the CPU reference replayer.
+            "unique_idx_per_block": True,
         }
         if ent.partition_fragments:
             meta["payload_kind"] = "zero12_expert_partition"
@@ -952,6 +1146,12 @@ class ExpertState:
         try:
             if cuda_event is not None:
                 cuda_event.synchronize()
+            if io_backlog_enabled():
+                self._record_lfcl_writes(
+                    [(ent, int(pinned_info["payload_bytes"]))],
+                    step=int(step),
+                    timestamp=capture_timestamp(),
+                )
             self._commit_lfcl_payload_from_ready_pinned(
                 ent,
                 int(step),
@@ -981,12 +1181,28 @@ class ExpertState:
                 return
             if cuda_event is not None:
                 cuda_event.synchronize()
+            items = list(batch_info.get("entries", []))
+            if io_backlog_enabled():
+                write_timestamp = capture_timestamp()
+                ready_entries: List[Tuple[_ExpertEntry, int]] = []
+                for item in items:
+                    expert_id = tuple(item.get("expert_id"))  # type: ignore[arg-type]
+                    ent = self._entries.get(expert_id)
+                    if ent is not None:
+                        ready_entries.append(
+                            (ent, int(item["pinned_info"]["payload_bytes"]))
+                        )
+                self._record_lfcl_writes(
+                    ready_entries,
+                    step=int(step),
+                    timestamp=write_timestamp,
+                )
             fdp_batch = (
                 bool(fdp_metadata_mmap_enabled()) and self.cp_target != "test_dram"
             )
             if fdp_batch:
                 fdp_begin_expert_batch()
-            for item in list(batch_info.get("entries", [])):
+            for item in items:
                 expert_id = tuple(item.get("expert_id"))  # type: ignore[arg-type]
                 ent = self._entries.get(expert_id)
                 if ent is None:
@@ -997,6 +1213,7 @@ class ExpertState:
                     ent.lossless_step = int(step)
                     ent.step = int(step)
                     self._set_lossy_log_bytes(ent.expert_id, 0)
+                    ent.lossy_start_step = int(step)
                 else:
                     self._commit_lfcl_payload_from_ready_pinned(
                         ent,
@@ -1030,10 +1247,17 @@ class ExpertState:
         try:
             if cuda_event is not None:
                 cuda_event.synchronize()
+            if io_backlog_enabled():
+                self._record_lfcl_writes(
+                    [(ent, int(pinned_info["payload_bytes"]))],
+                    step=int(step),
+                    timestamp=capture_timestamp(),
+                )
             self._copy_lfcl_payload_to_dense_image(ent, pinned_info)
             ent.lossless_step = int(step)
             ent.step = int(step)
             self._set_lossy_log_bytes(ent.expert_id, 0)
+            ent.lossy_start_step = int(step)
         finally:
             if ready_event is not None:
                 ready_event.set()
@@ -1195,6 +1419,15 @@ class ExpertState:
             seg["v"] = v_cpu.numpy()
             cursor += n
 
+        # Keep the offline/test writer inside the same on-disk contract as
+        # production direct emission.  Cross-iteration repeats are expected;
+        # duplicate expert-local indices inside one append block are not.
+        if int(np.unique(recs["idx"]).size) != int(total_n):
+            raise ValueError(
+                f"duplicate lossy record idx in one block for expert "
+                f"{expert_id} at step {int(step)}"
+            )
+
         ent.step = int(step)
         if self.cp_target == "test_dram":
             blob_nbytes = BLOCK_PREFIX_BYTES + int(total_n) * RECORD_BYTES
@@ -1319,7 +1552,7 @@ class ExpertState:
                         device = mvph[0].device
                         break
                 if device is not None:
-                    self._ensure_direct_emission_counters(device)
+                    self._require_direct_emission_counters(device)
                 lossy_state.direct_record_cursor = self._direct_record_cursor_device
                 lossy_state.direct_overflow_count = self._direct_overflow_count_device
             self._direct_feedback_expert_ids = [
@@ -1616,6 +1849,9 @@ class ExpertState:
                 return
             if d2h_done_event is not None:
                 d2h_done_event.synchronize()
+            trace_timestamp = (
+                capture_timestamp() if io_backlog_enabled() else None
+            )
             _t_ready = (
                 _time_profile.perf_counter()
                 if _profile and _time_profile is not None else 0.0
@@ -1625,10 +1861,22 @@ class ExpertState:
                 prepared=prepared,
                 max_records_by_expert=self._expert_max_records_by_id,
             )
+            counted_rows = None
+            if trace_timestamp is not None:
+                counted_rows = list(
+                    self._iter_lossy_rows(layout_mirror, pinned_aos)
+                )
+                self._record_lfsy_writes(
+                    step=int(step),
+                    layout_mirror=layout_mirror,
+                    pinned_aos=pinned_aos,
+                    timestamp=trace_timestamp,
+                    counted_rows=counted_rows,
+                )
             if self.cp_target == "test_dram":
                 self._scatter_lossy_aos_to_dense(
-                    step,
-                    layout_mirror, prepared, pinned_aos,
+                    step, layout_mirror, pinned_aos,
+                    counted_rows=counted_rows,
                 )
                 if _profile and _time_profile is not None:
                     _t_done = _time_profile.perf_counter()
@@ -1643,25 +1891,17 @@ class ExpertState:
             if fdp_batch:
                 fdp_begin_expert_batch()
             try:
-                for row in layout_mirror.rows():
-                    if int(row.aos_byte_off) < 0:
-                        continue
-                    ent = self._entries.get(row.expert_id)
-                    if ent is None:
-                        raise RuntimeError(
-                            f"missing expert entry for AOS layout row "
-                            f"{row.expert_id}"
-                        )
-                    count = read_lfsy_prefix_count(
-                        pinned_aos,
-                        aos_byte_off=row.aos_byte_off,
-                        record_capacity=row.record_capacity,
-                        prefix_bytes=BLOCK_PREFIX_BYTES,
-                    )
-                    if count <= 0:
-                        continue
+                rows = (
+                    counted_rows
+                    if counted_rows is not None
+                    else self._iter_lossy_rows(layout_mirror, pinned_aos)
+                )
+                for row, ent, count in rows:
                     append_nbytes = self._lossy_blob_padded_bytes_for_count(count)
-                    if int(row.blob_padded_bytes) > 0 and append_nbytes > int(row.blob_padded_bytes):
+                    if (
+                        int(row.blob_padded_bytes) > 0
+                        and append_nbytes > int(row.blob_padded_bytes)
+                    ):
                         raise RuntimeError(
                             f"GPU-stamped count exceeds reserved blob: "
                             f"expert={ent.expert_id} count={count} "
@@ -1717,22 +1957,18 @@ class ExpertState:
         self,
         step: int,
         layout_mirror: PinnedAosLayoutMirror,
-        prepared,
         pinned_aos: torch.Tensor,
+        *,
+        counted_rows: Optional[List[Tuple[Any, "_ExpertEntry", int]]] = None,
     ) -> None:
         """Apply selected lossy records to the host dense recovery image."""
 
-        for row, (ent, _total_n, _filtered) in zip(layout_mirror.rows(), prepared):
-            if int(row.aos_byte_off) < 0:
-                continue
-            n_recs_total = read_lfsy_prefix_count(
-                pinned_aos,
-                aos_byte_off=row.aos_byte_off,
-                record_capacity=row.record_capacity,
-                prefix_bytes=BLOCK_PREFIX_BYTES,
-            )
-            if n_recs_total == 0:
-                continue
+        rows = (
+            counted_rows
+            if counted_rows is not None
+            else self._iter_lossy_rows(layout_mirror, pinned_aos)
+        )
+        for row, ent, n_recs_total in rows:
             self._scatter_records_to_dense_with_cpp(
                 ent,
                 pinned_aos,
@@ -1972,27 +2208,35 @@ class ExpertState:
 # ----------------------------------------------------------------------------
 # Recovery reader
 # ----------------------------------------------------------------------------
-def read_expert_state_from_blobs(
+@dataclass
+class _DenseExpertBaseline:
+    metadata: Dict[str, Any]
+    tensors_meta: List[Dict[str, Any]]
+    p_flat: torch.Tensor
+    m_flat: torch.Tensor
+    v_flat: torch.Tensor
+    base_step: int
+
+
+def _expert_header_bytes(blob: torch.Tensor) -> bytes:
+    n = min(int(blob.numel()), int(HEADER_BLOCK_BYTES))
+    return bytes(blob.narrow(0, 0, n).numpy().tobytes())
+
+
+def _read_expert_dense_baseline(
     lfcl_blob: Optional[torch.Tensor],
     lfsy_blob: Optional[torch.Tensor],
     *,
     layer: int,
     expert: int,
     source: str = "expert_state",
-) -> Dict[str, Any]:
-    """Reconstruct one expert from already-read LFCL/LFSY byte blobs."""
+) -> Optional[_DenseExpertBaseline]:
+    """Decode only the dense LFCL baseline; never inspect LFSY records."""
 
-    def _header_bytes(blob: torch.Tensor) -> bytes:
-        n = min(int(blob.numel()), int(HEADER_BLOCK_BYTES))
-        return bytes(blob.narrow(0, 0, n).numpy().tobytes())
-
-    from .proposal_io import (
-        load_lfcl_payload_interleaved,
-        replay_lfsy_log_into_dense,
-    )
+    from .proposal_io import load_lfcl_payload_interleaved
 
     if lfcl_blob is not None and int(lfcl_blob.numel()) > 0:
-        header_block = _header_bytes(lfcl_blob)
+        header_block = _expert_header_bytes(lfcl_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFCL:
             raise ValueError(
@@ -2019,10 +2263,10 @@ def read_expert_state_from_blobs(
     elif lfsy_blob is not None and int(lfsy_blob.numel()) > 0:
         # No LFCL compaction baseline yet: recover schema from LFSY header and
         # seed dense tensors with zeros before replaying sparse records.
-        header_block = _header_bytes(lfsy_blob)
+        header_block = _expert_header_bytes(lfsy_blob)
         magic, _ver, meta = _unpack_header(header_block)
         if magic != MAGIC_LFSY:
-            return {"_rolling_step": 0}
+            return None
         tensors_meta = meta["tensors"]
         total_numel = int(meta["total_numel"])
         p_flat = torch.zeros(total_numel, dtype=torch.float32)
@@ -2030,25 +2274,29 @@ def read_expert_state_from_blobs(
         v_flat = torch.zeros(total_numel, dtype=torch.float32)
         base_step = 0
     else:
-        return {"_rolling_step": 0}
+        return None
 
-    max_step = base_step
-    if lfsy_blob is not None and int(lfsy_blob.numel()) > 0:
-        header_block = _header_bytes(lfsy_blob)
-        magic, _ver, _meta = _unpack_header(header_block)
-        if magic != MAGIC_LFSY:
-            return {"_rolling_step": int(max_step)}
-        replay = replay_lfsy_log_into_dense(
-            lfsy_blob,
-            total_numel=int(total_numel),
-            p_flat=p_flat,
-            m_flat=m_flat,
-            v_flat=v_flat,
-        )
-        if int(replay.get("max_step", 0)) > max_step:
-            max_step = int(replay["max_step"])
+    return _DenseExpertBaseline(
+        metadata=dict(meta),
+        tensors_meta=list(tensors_meta),
+        p_flat=p_flat,
+        m_flat=m_flat,
+        v_flat=v_flat,
+        base_step=int(base_step),
+    )
 
-    payload: Dict[str, Any] = {"_rolling_step": int(max_step)}
+
+def _expert_dense_payload(
+    dense: _DenseExpertBaseline,
+    *,
+    rolling_step: int,
+) -> Dict[str, Any]:
+    """Expose one dense recovery image in the existing apply payload schema."""
+
+    meta = dense.metadata
+    tensors_meta = dense.tensors_meta
+    p_flat, m_flat, v_flat = dense.p_flat, dense.m_flat, dense.v_flat
+    payload: Dict[str, Any] = {"_rolling_step": int(rolling_step)}
     payload_kind = str(meta.get("payload_kind", ""))
     if payload_kind == "zero12_expert_partition":
         fragments = list(meta.get("fragments", []) or [])
@@ -2077,6 +2325,68 @@ def read_expert_state_from_blobs(
         payload[f"{tname}:exp_avg_sq"] = v_flat.narrow(0, cursor, numel).view(shape)
         cursor += numel
     return payload
+
+
+def read_expert_baseline_from_blobs(
+    lfcl_blob: Optional[torch.Tensor],
+    lfsy_blob: Optional[torch.Tensor],
+    *,
+    layer: int,
+    expert: int,
+    source: str = "expert_state",
+) -> Dict[str, Any]:
+    """Decode LFCL (or a zero seed) without performing LFSY replay."""
+
+    dense = _read_expert_dense_baseline(
+        lfcl_blob,
+        lfsy_blob,
+        layer=int(layer),
+        expert=int(expert),
+        source=source,
+    )
+    if dense is None:
+        return {"_rolling_step": 0}
+    return _expert_dense_payload(dense, rolling_step=int(dense.base_step))
+
+
+def read_expert_state_from_blobs(
+    lfcl_blob: Optional[torch.Tensor],
+    lfsy_blob: Optional[torch.Tensor],
+    *,
+    layer: int,
+    expert: int,
+    source: str = "expert_state",
+) -> Dict[str, Any]:
+    """Reconstruct one expert with the authoritative CPU replay path."""
+
+    from .proposal_io import replay_lfsy_log_into_dense
+
+    dense = _read_expert_dense_baseline(
+        lfcl_blob,
+        lfsy_blob,
+        layer=int(layer),
+        expert=int(expert),
+        source=source,
+    )
+    if dense is None:
+        return {"_rolling_step": 0}
+
+    max_step = int(dense.base_step)
+    if lfsy_blob is not None and int(lfsy_blob.numel()) > 0:
+        header_block = _expert_header_bytes(lfsy_blob)
+        magic, _ver, _meta = _unpack_header(header_block)
+        if magic != MAGIC_LFSY:
+            return {"_rolling_step": int(max_step)}
+        replay = replay_lfsy_log_into_dense(
+            lfsy_blob,
+            total_numel=int(dense.p_flat.numel()),
+            p_flat=dense.p_flat,
+            m_flat=dense.m_flat,
+            v_flat=dense.v_flat,
+        )
+        if int(replay.get("max_step", 0)) > max_step:
+            max_step = int(replay["max_step"])
+    return _expert_dense_payload(dense, rolling_step=int(max_step))
 
 
 def read_expert_state(

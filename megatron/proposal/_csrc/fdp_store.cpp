@@ -440,6 +440,7 @@ void FdpStore::close() {
     }
     if (expert_batch_lock_.owns_lock()) {
         expert_batch_owner_token_.store(0, std::memory_order_release);
+        expert_batch_read_only_ = false;
         if (expert_batch_ring_lock_.owns_lock()) {
             expert_batch_ring_lock_.unlock();
         }
@@ -1259,7 +1260,7 @@ uint32_t FdpStore::end_nefc_batch() {
     return end_nefc_batch_stats().commands;
 }
 
-void FdpStore::begin_expert_batch() {
+void FdpStore::begin_expert_batch_impl(bool read_only) {
     std::shared_lock<std::shared_mutex> lock(op_mutex_);
     std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
     if (batch_lock_.owns_lock()) {
@@ -1273,31 +1274,60 @@ void FdpStore::begin_expert_batch() {
     if (!open_) {
         throw std::runtime_error("begin_expert_batch: FDP session is not open");
     }
-    if (!cfg_.metadata_mmap) {
+    const bool write_metadata_lock = !read_only && !cfg_.metadata_mmap;
+    if (write_metadata_lock) {
         acquire_global_metadata_lock();
     }
     expert_batch_ring_lock_ =
         std::unique_lock<std::recursive_mutex>(expert_ring_mutex_);
-    batch_owned_buffers_.clear();
+    if (read_only) {
+        // Match the writer's ring -> metadata order in mmap mode.  Holding
+        // this lock through end_batch keeps chunk lists stable until every
+        // queued DMA has completed.
+        try {
+            acquire_global_metadata_lock();
+        } catch (...) {
+            expert_batch_ring_lock_.unlock();
+            throw;
+        }
+    }
+    if (!read_only) {
+        batch_owned_buffers_.clear();
+    }
     try {
         expert_data_ring_.begin_batch();
     } catch (...) {
         expert_batch_ring_lock_.unlock();
-        if (!cfg_.metadata_mmap) {
+        if (read_only || write_metadata_lock) {
             release_global_metadata_lock();
         }
         throw;
     }
-    expert_batch_owner_token_.store(current_thread_token(),
-                                    std::memory_order_release);
+    expert_batch_read_only_ = read_only;
+    expert_batch_owner_token_.store(
+        read_only ? 0 : current_thread_token(), std::memory_order_release);
     expert_batch_lock_ = std::move(lock);
 }
 
-UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
+void FdpStore::begin_expert_batch() {
+    begin_expert_batch_impl(false);
+}
+
+void FdpStore::begin_expert_read_batch() {
+    begin_expert_batch_impl(true);
+}
+
+UcmdRingBatchStats FdpStore::end_expert_batch_stats_impl(bool read_only) {
     {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
         if (!expert_batch_lock_.owns_lock()) {
             throw std::runtime_error("end_expert_batch: no active expert batch");
+        }
+        if (expert_batch_read_only_ != read_only) {
+            throw std::runtime_error(
+                read_only
+                    ? "end_expert_read_batch: active batch is write-only"
+                    : "end_expert_batch: active batch is read-only");
         }
         if (!open_) {
             throw std::runtime_error(
@@ -1305,18 +1335,40 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
         }
     }
     std::exception_ptr first_error;
-    if (cfg_.metadata_mmap) {
-        try {
-            prepare_io_plans(expert_batch_plans_);
-        } catch (...) {
+    // A read batch only needs the ring completion fence.  In particular, it
+    // must not prepare write plans or persist metadata during recovery.
+    if (!read_only) {
+        if (cfg_.metadata_mmap) {
+            try {
+                prepare_io_plans(expert_batch_plans_);
+            } catch (...) {
+                first_error = std::current_exception();
+            }
+        } else {
+            try {
+                persist_metadata_image_locked(last_flush_iter_, true);
+            } catch (...) {
+                first_error = std::current_exception();
+            }
+            try {
+                release_global_metadata_lock();
+            } catch (...) {
+                if (!first_error) {
+                    first_error = std::current_exception();
+                }
+            }
+        }
+    }
+    UcmdRingBatchStats stats;
+    try {
+        (void)expert_data_ring_.end_batch();
+        stats = expert_data_ring_.last_batch_stats();
+    } catch (...) {
+        if (!first_error) {
             first_error = std::current_exception();
         }
-    } else {
-        try {
-            persist_metadata_image_locked(last_flush_iter_, true);
-        } catch (...) {
-            first_error = std::current_exception();
-        }
+    }
+    if (read_only) {
         try {
             release_global_metadata_lock();
         } catch (...) {
@@ -1325,32 +1377,37 @@ UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
             }
         }
     }
-    try {
-        (void)expert_data_ring_.end_batch();
-        const UcmdRingBatchStats stats = expert_data_ring_.last_batch_stats();
+    {
         std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
-        batch_owned_buffers_.clear();
-        expert_batch_plans_.clear();
-        expert_batch_owner_token_.store(0, std::memory_order_release);
-        expert_batch_ring_lock_.unlock();
-        expert_batch_lock_.unlock();
-        if (first_error) {
-            std::rethrow_exception(first_error);
+        if (!read_only) {
+            batch_owned_buffers_.clear();
+            expert_batch_plans_.clear();
         }
-        return stats;
-    } catch (...) {
-        std::lock_guard<std::mutex> state_lock(batch_state_mutex_);
-        batch_owned_buffers_.clear();
-        expert_batch_plans_.clear();
         expert_batch_owner_token_.store(0, std::memory_order_release);
+        expert_batch_read_only_ = false;
         expert_batch_ring_lock_.unlock();
         expert_batch_lock_.unlock();
-        throw;
     }
+    if (first_error) {
+        std::rethrow_exception(first_error);
+    }
+    return stats;
+}
+
+UcmdRingBatchStats FdpStore::end_expert_batch_stats() {
+    return end_expert_batch_stats_impl(false);
 }
 
 uint32_t FdpStore::end_expert_batch() {
     return end_expert_batch_stats().commands;
+}
+
+UcmdRingBatchStats FdpStore::end_expert_read_batch_stats() {
+    return end_expert_batch_stats_impl(true);
+}
+
+uint32_t FdpStore::end_expert_read_batch() {
+    return end_expert_read_batch_stats().commands;
 }
 
 void FdpStore::begin_checkpoint_iter(uint64_t iter) {
@@ -2009,32 +2066,54 @@ size_t FdpStore::read_nefc_shard_into(uint32_t shard_index,
 
 size_t FdpStore::read_lfcs_into(uint32_t layer_id, uint32_t expert_id,
                                 int64_t dst_addr, uint64_t dst_bytes) {
+    std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
     if (!open_) {
         throw std::runtime_error("read_lfcs_into: FDP session is not open");
     }
-    const uint32_t slot = expert_slot(layer_id, expert_id);
-    const LfcsEntry* entry = lfcs_entry(slot);
-    if (!entry->valid) {
-        throw std::runtime_error("read_lfcs_into: LFCS entry is not valid");
+    acquire_global_metadata_lock();
+    size_t result = 0;
+    try {
+        const uint32_t slot = expert_slot(layer_id, expert_id);
+        const LfcsEntry* entry = lfcs_entry(slot);
+        if (!entry->valid) {
+            throw std::runtime_error(
+                "read_lfcs_into: LFCS entry is not valid");
+        }
+        result = read_chunk_list_into(
+            expert_data_ring_, entry->chunks, entry->chunk_count,
+            entry->logical_bytes, dst_addr, dst_bytes, "read_lfcs_into");
+    } catch (...) {
+        release_global_metadata_lock();
+        throw;
     }
-    return read_chunk_list_into(expert_data_ring_, entry->chunks,
-                                entry->chunk_count, entry->logical_bytes,
-                                dst_addr, dst_bytes, "read_lfcs_into");
+    release_global_metadata_lock();
+    return result;
 }
 
 size_t FdpStore::read_lfsy_into(uint32_t layer_id, uint32_t expert_id,
                                 int64_t dst_addr, uint64_t dst_bytes) {
+    std::lock_guard<std::recursive_mutex> ring_lock(expert_ring_mutex_);
     if (!open_) {
         throw std::runtime_error("read_lfsy_into: FDP session is not open");
     }
-    const uint32_t slot = expert_slot(layer_id, expert_id);
-    const LfsyEntry* entry = lfsy_entry(slot);
-    if (!entry->valid) {
-        throw std::runtime_error("read_lfsy_into: LFSY entry is not valid");
+    acquire_global_metadata_lock();
+    size_t result = 0;
+    try {
+        const uint32_t slot = expert_slot(layer_id, expert_id);
+        const LfsyEntry* entry = lfsy_entry(slot);
+        if (!entry->valid) {
+            throw std::runtime_error(
+                "read_lfsy_into: LFSY entry is not valid");
+        }
+        result = read_chunk_list_into(
+            expert_data_ring_, entry->chunks, entry->chunk_count,
+            entry->logical_tail, dst_addr, dst_bytes, "read_lfsy_into");
+    } catch (...) {
+        release_global_metadata_lock();
+        throw;
     }
-    return read_chunk_list_into(expert_data_ring_, entry->chunks,
-                                entry->chunk_count, entry->logical_tail,
-                                dst_addr, dst_bytes, "read_lfsy_into");
+    release_global_metadata_lock();
+    return result;
 }
 
 void FdpStore::validate_metadata_range(uint64_t slba, uint64_t nlb,

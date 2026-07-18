@@ -252,6 +252,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         }
         return batch_stats_to_dict(stats);
     });
+    m.def("begin_expert_read_batch", []() {
+        py::gil_scoped_release rel;
+        fdp::global_store().begin_expert_read_batch();
+    });
+    m.def("end_expert_read_batch", []() {
+        py::gil_scoped_release rel;
+        return fdp::global_store().end_expert_read_batch();
+    });
+    m.def("end_expert_read_batch_stats", []() {
+        fdp::UcmdRingBatchStats stats;
+        {
+            py::gil_scoped_release rel;
+            stats = fdp::global_store().end_expert_read_batch_stats();
+        }
+        return batch_stats_to_dict(stats);
+    });
     m.def("write_nefc", [](const std::string& object_name,
                            int64_t pinned_addr,
                            const std::string& header,
