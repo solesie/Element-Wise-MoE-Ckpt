@@ -25,7 +25,7 @@ export DATA_CACHE_PATH=${DATA_CACHE_PATH:-"${REPO_ROOT}/results/data-cache"}
 export TRAIN_ITERS=${TRAIN_ITERS:-10000}
 export SEQ_LEN=${SEQ_LEN:-2048}
 export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
-export WARMUP_ITERS=${WARMUP_ITERS:-100}
+export WARMUP_ITERS=${WARMUP_ITERS:-80}
 export TRAIN_TOKENS=${TRAIN_TOKENS:-$((TRAIN_ITERS * GLOBAL_BATCH_SIZE * SEQ_LEN))}
 export WARMUP_TOKENS=${WARMUP_TOKENS:-$((WARMUP_ITERS * GLOBAL_BATCH_SIZE * SEQ_LEN))}
 export LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-${TRAIN_TOKENS}}
@@ -37,9 +37,11 @@ export PP_SIZE=${PP_SIZE:-2}
 export EP_SIZE=${EP_SIZE:-64}
 export MOE_EXPERT_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE:-2}
 export ZERO_STAGE=${ZERO_STAGE:-0}
-export BATCH_SIZE=${BATCH_SIZE:-4}
+export BATCH_SIZE=${BATCH_SIZE:-8}
 export ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-false}
 export TRAIN_PRECISION=${TRAIN_PRECISION:-bf16}
+export LR=${LR:-4.5e-4}
+export MIN_LR=${MIN_LR:-4.5e-06}
 
 DENOM=$((MP_SIZE * PP_SIZE * MOE_EXPERT_PARALLEL_SIZE))
 if [ "${DENOM}" -le 0 ] || [ $((NUM_GPUS % DENOM)) -ne 0 ]; then
@@ -48,28 +50,34 @@ if [ "${DENOM}" -le 0 ] || [ $((NUM_GPUS % DENOM)) -ne 0 ]; then
 fi
 DP_SIZE=$((NUM_GPUS / DENOM))
 if [ "${DP_SIZE}" -ne 2 ]; then
-    echo "warning: requested defaults target DP=2, current computed DP=${DP_SIZE}" >&2
+    echo "Expected DP=2, got DP=${DP_SIZE}" >&2
+    exit 2
 fi
 
-export EVAL_INTERVAL=${EVAL_INTERVAL:-1000}
-export EVAL_ITERS=${EVAL_ITERS:-20}
+export EVAL_INTERVAL=${EVAL_INTERVAL:-100}
+export EVAL_ITERS=${EVAL_ITERS:-10}
 export LOG_INTERVAL=${LOG_INTERVAL:-10}
 export SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
 export NO_MEGATRON_CKPT=1
 export NO_TENSORBOARD=${NO_TENSORBOARD:-1}
 export OUTPUT_BASEPATH=${OUTPUT_BASEPATH:-"${REPO_ROOT}/results/ds_pretrain_gpt_125M_MoE64_10Kiter_baseline"}
+DEFAULT_FINAL_BF16_MODEL_PATH=""
+if [ "${TRAIN_ITERS}" -eq 10000 ]; then
+    DEFAULT_FINAL_BF16_MODEL_PATH="${OUTPUT_BASEPATH}/bf16_model"
+fi
+export FINAL_BF16_MODEL_PATH=${FINAL_BF16_MODEL_PATH-${DEFAULT_FINAL_BF16_MODEL_PATH}}
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
 export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
-# Hard baseline: no proposal flags and no Megatron checkpoint save/load.
-export EXTRA_MEGATRON_FLAGS=${BASELINE_EXTRA_MEGATRON_FLAGS:-}
+export EXTRA_MEGATRON_FLAGS="--use-flash-attn-v2 ${BASELINE_EXTRA_MEGATRON_FLAGS:-}"
 
 echo "[10K-baseline] dataset=${DATA_PATH}"
 echo "[10K-baseline] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_SIZE} experts=${EP_SIZE} gpus=${NUM_GPUS}"
 echo "[10K-baseline] train_iters=${TRAIN_ITERS} warmup_iters=${WARMUP_ITERS} warmup_tokens=${WARMUP_TOKENS} decay_tokens=${LR_DECAY_TOKENS}"
 echo "[10K-baseline] validation_interval=${EVAL_INTERVAL} validation_iters=${EVAL_ITERS}"
-echo "[10K-baseline] precision=${TRAIN_PRECISION} proposal=off megatron_ckpt=off"
+echo "[10K-baseline] micro_batch=${BATCH_SIZE} zero=${ZERO_STAGE} precision=${TRAIN_PRECISION} proposal=off"
+echo "[10K-baseline] final_bf16_model=${FINAL_BF16_MODEL_PATH:-disabled}"
 
 exec bash "${BASE_SCRIPT}"

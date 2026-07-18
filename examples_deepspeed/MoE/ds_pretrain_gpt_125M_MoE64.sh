@@ -230,6 +230,10 @@ if [ "${NO_MEGATRON_CKPT:-0}" != "1" ]; then
     mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
     CKPT_MEGATRON_OPTIONS="--load ${CHECKPOINT_PATH} --save ${CHECKPOINT_PATH}"
 fi
+BF16_MODEL_SAVE_OPTIONS=""
+if [ -n "${FINAL_BF16_MODEL_PATH:-}" ]; then
+    BF16_MODEL_SAVE_OPTIONS="--save-bf16-model ${FINAL_BF16_MODEL_PATH}"
+fi
 
 # USE_INTERNAL_DATA="true"
 USE_INTERNAL_DATA="false"
@@ -323,6 +327,7 @@ megatron_options=" \
         --num-workers 0 \
         ${PRECISION_FLAG} \
         ${CKPT_MEGATRON_OPTIONS} \
+        ${BF16_MODEL_SAVE_OPTIONS} \
         ${TENSORBOARD_ARGS} \
         ${EXTRA_MEGATRON_FLAGS:-}"
 
