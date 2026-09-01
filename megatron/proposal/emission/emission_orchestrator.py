@@ -301,6 +301,7 @@ class EmissionOrchestrationMixin:
                 ),
                 use_e_hat_proxy=bool(getattr(self, "e_hat_proxy", True)),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                age_force_period=int(getattr(self, "age_force_period", 128)),
                 lfcl_fired_epoch=getattr(self, "_lfcl_fired_epoch_device", None),
             )
 

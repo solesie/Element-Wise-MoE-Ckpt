@@ -8,7 +8,7 @@ and reports a percentage for each task.
 
 The training environment is not modified.  lm-eval 0.2.0 is installed into a
 small overlay under `$HOME/.cache`, while task data is converted to explicit
-JSONL files under `/home/paul/data`.
+JSONL files under `$HOME/data`.
 
 ```bash
 tasks/eval_harness/setup_paper_eval_env.sh
@@ -17,7 +17,7 @@ tasks/eval_harness/setup_paper_eval_env.sh
 
 The download script pins every Hugging Face repository revision and writes
 source/output checksums and row counts to
-`/home/paul/data/lm_eval_paper_6tasks/manifest.json`.  Evaluation does not use
+`$HOME/data/lm_eval_paper_6tasks/manifest.json`.  Evaluation does not use
 the Hugging Face datasets library and can run offline.
 
 ## Evaluation

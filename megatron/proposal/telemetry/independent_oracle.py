@@ -1049,7 +1049,7 @@ def _gather_sample_payload(
         force = (age_code == 3) & _age2_phase_hit_np(
             global_ids,
             step=int(iteration),
-            period=128,
+            period=int(getattr(lossy_cp, "age_force_period", 128)),
             salt=0x51ED270B,
         )
         out["e"][pos] = e
@@ -1717,7 +1717,7 @@ def _agebit_score_parts(
         force = (age_code == 3) & _age2_phase_hit_np(
             global_ids,
             step=int(iteration),
-            period=128,
+            period=int(getattr(lossy_cp, "age_force_period", 128)),
             salt=0x51ED270B,
         )
         score = np.maximum(-lin * e_age + np.float32(0.5) * h_abs * e_age * e_age, np.float32(0.0))
@@ -2278,7 +2278,7 @@ def _agebit_score_tensor(
     force = (age_code == 3) & _age2_phase_hit_tensor(
         global_ids,
         step=int(iteration),
-        period=128,
+        period=int(getattr(lossy_cp, "age_force_period", 128)),
         salt=0x51ED270B,
     )
     return score, force
@@ -3329,8 +3329,11 @@ def _ehat_diagnostic_row(
         "world": int(world),
         "policy": "m_t+diag_abs_h+agebit",
         "target": str(target_name),
-            "score_first_order_source": score_source,
+        "score_first_order_source": score_source,
         "topk_ratio": float(ratio),
+        "age_force_period": int(
+            getattr(proposal_config, "age_force_period", 128)
+        ),
         "sample_elements": int(e.size),
         "ehat_abs_mean": float(np.mean(abs_e_age)) if e_age.size else 0.0,
         "true_e_abs_mean": float(np.mean(abs_e)) if e.size else 0.0,

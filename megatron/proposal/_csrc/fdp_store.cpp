@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <time.h>
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -87,6 +88,15 @@ uint64_t env_u64_required(const char* name) {
 uint64_t env_u64_default(const char* name, uint64_t default_value) {
     const char* v = getenv_raw(name);
     return v == nullptr ? default_value : parse_u64(name, v);
+}
+
+uint64_t monotonic_raw_ns() {
+    timespec ts{};
+    if (::clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+        throw std::runtime_error("clock_gettime(CLOCK_MONOTONIC_RAW) failed");
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
 }
 
 bool env_bool_default(const char* name, bool default_value) {
@@ -217,6 +227,7 @@ void FdpStore::load_config_from_env() {
                             "PROPOSAL_FDP_NSID");
     cfg_.metadata_mmap = env_bool_default(
         "PROPOSAL_FDP_METADATA_MMAP", false);
+    perf_diag_ = env_bool_default("PROPOSAL_FDP_PERF_DIAG", false);
     cfg_.metadata_start_lba =
         env_u64_required("PROPOSAL_FDP_METADATA_START_LBA");
     cfg_.data_start_lba = env_u64_required("PROPOSAL_FDP_DATA_START_LBA");
@@ -1028,12 +1039,43 @@ bool FdpStore::global_metadata_lock_held() const {
 }
 
 void FdpStore::persist_metadata_image_locked(uint64_t iter, bool bump_seq) {
+    MetadataCommitPerfStats perf;
+    if (perf_diag_) {
+        perf.valid = true;
+        perf.iter = iter;
+        perf.owner_rank = cfg_.rank;
+        perf.metadata_image_bytes = layout_.image_bytes;
+        perf.nvme_flush_enabled = cfg_.nvme_flush;
+        perf.start_mono_raw_ns = monotonic_raw_ns();
+    }
     allocated_chunks_ = recalc_allocated_chunks();
+    if (perf_diag_) perf.recalc_done_mono_raw_ns = monotonic_raw_ns();
     update_metadata_header(iter, bump_seq);
+    if (perf_diag_) perf.header_done_mono_raw_ns = monotonic_raw_ns();
     write_metadata_image();
+    if (perf_diag_) perf.image_write_done_mono_raw_ns = monotonic_raw_ns();
     if (cfg_.nvme_flush) {
         device_.flush(metadata_ring_, ns_.nsid);
     }
+    if (perf_diag_) {
+        perf.flush_done_mono_raw_ns = monotonic_raw_ns();
+        perf.end_mono_raw_ns = perf.flush_done_mono_raw_ns;
+        std::lock_guard<std::mutex> lock(metadata_perf_mutex_);
+        last_metadata_commit_perf_ = perf;
+    }
+}
+
+MetadataCommitPerfStats FdpStore::last_metadata_commit_perf() const {
+    std::lock_guard<std::mutex> lock(metadata_perf_mutex_);
+    return last_metadata_commit_perf_;
+}
+
+UcmdRingRuntimeStats FdpStore::nefc_ring_runtime_stats() const {
+    return nefc_data_ring_.runtime_stats();
+}
+
+UcmdRingRuntimeStats FdpStore::expert_ring_runtime_stats() const {
+    return expert_data_ring_.runtime_stats();
 }
 
 void FdpStore::flush_metadata(uint64_t iter) {

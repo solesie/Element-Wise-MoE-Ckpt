@@ -48,6 +48,7 @@ import os
 import pickle
 import struct
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,7 +66,6 @@ from .proposal_io import (
     close_fd,
     fdp_begin_expert_batch,
     fdp_end_expert_batch_stats,
-    fdp_mark_writer_done,
     fdp_metadata_mmap_enabled,
     fsync_fd,
     open_lossy_log_for_append,
@@ -82,6 +82,7 @@ from ..telemetry.io_backlog import (
     io_backlog_enabled,
     record_write_batch,
 )
+from ..telemetry import fdp_perf as _fdp_perf
 
 
 ExpertId = Tuple[int, int]  # (layer, expert_idx)
@@ -786,9 +787,9 @@ class ExpertState:
                 int(self._fdp_pending_writes_by_step.get(step_i, 0)) + 1
             )
 
-    def _fdp_note_expert_write_done(self, step: int) -> None:
+    def _fdp_note_expert_write_done(self, step: int) -> bool:
         if not fdp_metadata_mmap_enabled():
-            return
+            return False
         mark = False
         step_i = int(step)
         with self._fdp_pending_lock:
@@ -801,7 +802,15 @@ class ExpertState:
                     self._fdp_done_marked_steps.add(step_i)
                     mark = True
         if mark:
-            fdp_mark_writer_done(step_i, "expert")
+            from .proposal_io import fdp_mark_writer_done
+
+            return _fdp_perf.measured_mark_writer_done(
+                step=step_i,
+                writer_kind="expert",
+                site="expert_persist_finally",
+                fn=lambda: fdp_mark_writer_done(step_i, "expert"),
+            )
+        return False
 
     def fdp_has_pending_writes(self, step: int) -> bool:
         if not fdp_metadata_mmap_enabled():
@@ -809,9 +818,16 @@ class ExpertState:
         with self._fdp_pending_lock:
             return int(self._fdp_pending_writes_by_step.get(int(step), 0)) > 0
 
-    def _acquire_pinned_aos(self) -> Tuple[torch.Tensor, threading.Event]:
+    def _acquire_pinned_aos(
+        self, step: int = -1,
+    ) -> Tuple[torch.Tensor, threading.Event]:
         ready = self._pinned_aos_ready
-        ready.wait()
+        if _fdp_perf.enabled():
+            _fdp_perf.measured_call(
+                "pinned_aos_lease_wait", int(step), ready.wait,
+            )
+        else:
+            ready.wait()
         ready.clear()
         return self._pinned_aos, ready
 
@@ -1540,7 +1556,7 @@ class ExpertState:
         the final D2H event because the single reusable pinned slab cannot be
         overwritten until that copy has completed.
         """
-        pinned_aos, pinned_aos_ready = self._acquire_pinned_aos()
+        pinned_aos, pinned_aos_ready = self._acquire_pinned_aos(int(step))
         try:
             self._sync_dirty_lossy_log_counters_to_device()
             if lossy_state is not None and getattr(
@@ -1567,6 +1583,13 @@ class ExpertState:
                 pinned_aos=pinned_aos,
                 layout_mirror=self._pinned_aos_layout_mirror,
                 copy_to_host=not self.test_skip_d2h,
+            )
+            _segment_d2h = getattr(self._record_pipeline, "_segment_d2h", None)
+            gpu_timing_events = (
+                _segment_d2h.last_perf_timing_events()
+                if _segment_d2h is not None
+                and callable(getattr(_segment_d2h, "last_perf_timing_events", None))
+                else None
             )
             ready_for_optimizer = self._record_direct_emission_feedback(
                 step=int(step),
@@ -1599,7 +1622,7 @@ class ExpertState:
             self._persist_lossy_aos_from_pinned,
             int(step), expert_specs, prepared, pinned_aos,
             self._pinned_aos_layout_mirror, pinned_aos_ready,
-            d2h_done_event,
+            d2h_done_event, gpu_timing_events,
             tag=f"lossy_persist_iter{int(step)}",
         )
 
@@ -1805,6 +1828,9 @@ class ExpertState:
         layout_mirror: PinnedAosLayoutMirror,
         pinned_aos_ready: threading.Event,
         d2h_done_event: Optional["torch.cuda.Event"] = None,
+        gpu_timing_events: Optional[
+            Tuple["torch.cuda.Event", "torch.cuda.Event", "torch.cuda.Event"]
+        ] = None,
     ) -> None:
         """CPU-only expert_writer task: append pinned AOS blobs to LFSY."""
 
@@ -1812,12 +1838,23 @@ class ExpertState:
         _profile = _os_persist.environ.get("PROPOSAL_PERSIST_PROFILE", "") in (
             "1", "true", "TRUE",
         )
+        _profile_every = max(
+            1, int(_os_persist.environ.get("PROPOSAL_PERSIST_PROFILE_EVERY", "1")),
+        )
+        _profile = bool(_profile and int(step) % _profile_every == 0)
         if _profile:
             import time as _time_profile
             _t0 = _time_profile.perf_counter()
         else:
             _time_profile = None
             _t0 = 0.0
+        _perf_diag = _fdp_perf.enabled()
+        _perf_wall0 = _fdp_perf.monotonic_raw_ns() if _perf_diag else 0
+        _perf_cpu0 = time.thread_time_ns() if _perf_diag else 0
+        _fdp_batch_stats: Dict[str, Any] = {}
+        _gpu_timing_ms: Dict[str, float] = {}
+        _data_bytes = 0
+        _data_done_perf = 0.0
         _t_ready = (
             _time_profile.perf_counter() if _profile and _time_profile is not None else 0.0
         )
@@ -1848,7 +1885,27 @@ class ExpertState:
                     )
                 return
             if d2h_done_event is not None:
-                d2h_done_event.synchronize()
+                if _perf_diag:
+                    _fdp_perf.measured_call(
+                        "expert_writer_d2h_host_wait",
+                        int(step),
+                        d2h_done_event.synchronize,
+                    )
+                else:
+                    d2h_done_event.synchronize()
+            if _perf_diag and gpu_timing_events is not None:
+                _gpu_start, _gpu_producer, _gpu_d2h = gpu_timing_events
+                _gpu_timing_ms = {
+                    "emission_to_producer_done_ms": float(
+                        _gpu_start.elapsed_time(_gpu_producer)
+                    ),
+                    "emission_to_d2h_done_ms": float(
+                        _gpu_start.elapsed_time(_gpu_d2h)
+                    ),
+                    "producer_done_to_d2h_done_ms": float(
+                        _gpu_producer.elapsed_time(_gpu_d2h)
+                    ),
+                }
             trace_timestamp = (
                 capture_timestamp() if io_backlog_enabled() else None
             )
@@ -1898,6 +1955,7 @@ class ExpertState:
                 )
                 for row, ent, count in rows:
                     append_nbytes = self._lossy_blob_padded_bytes_for_count(count)
+                    _data_bytes += int(append_nbytes)
                     if (
                         int(row.blob_padded_bytes) > 0
                         and append_nbytes > int(row.blob_padded_bytes)
@@ -1924,7 +1982,7 @@ class ExpertState:
                         int(append_nbytes),
                     )
                 if fdp_batch:
-                    fdp_end_expert_batch_stats()
+                    _fdp_batch_stats = dict(fdp_end_expert_batch_stats())
                     fdp_batch = False
             except BaseException:
                 if fdp_batch:
@@ -1934,19 +1992,46 @@ class ExpertState:
                         pass
                 raise
             if _profile and _time_profile is not None:
-                _t_done = _time_profile.perf_counter()
-                print(
-                    f"[proposal] persist_profile @iter{int(step)}: "
-                    f"scatter=0.0ms "
-                    f"write_fsync={(_t_done - _t_ready) * 1000.0:.1f}ms "
-                    f"target=disk",
-                    flush=True,
-                )
+                _data_done_perf = _time_profile.perf_counter()
             success = True
         finally:
             pinned_aos_ready.set()
+            did_metadata_flush = False
             if success:
-                self._fdp_note_expert_write_done(int(step))
+                did_metadata_flush = self._fdp_note_expert_write_done(int(step))
+            if _perf_diag:
+                _perf_wall1 = _fdp_perf.monotonic_raw_ns()
+                _perf_cpu1 = time.thread_time_ns()
+                _fdp_perf.record_interval(
+                    "expert_persist_total",
+                    int(step),
+                    _perf_wall0,
+                    _perf_wall1,
+                    _perf_cpu0,
+                    _perf_cpu1,
+                    success=bool(success),
+                    did_metadata_flush=bool(did_metadata_flush),
+                    data_bytes=int(_data_bytes),
+                    expert_batch_stats=_fdp_batch_stats,
+                    gpu_timing_ms=_gpu_timing_ms,
+                )
+            if (
+                success
+                and _profile
+                and _time_profile is not None
+                and _data_done_perf > 0.0
+            ):
+                _t_all_done = _time_profile.perf_counter()
+                print(
+                    f"[proposal] persist_profile @iter{int(step)}: "
+                    f"scatter=0.0ms "
+                    f"data_batch={(_data_done_perf - _t_ready) * 1000.0:.1f}ms "
+                    f"post_data={(_t_all_done - _data_done_perf) * 1000.0:.1f}ms "
+                    f"total={(_t_all_done - _t0) * 1000.0:.1f}ms "
+                    f"metadata_flush_owner={int(bool(did_metadata_flush))} "
+                    f"target=disk",
+                    flush=True,
+                )
 
     def _lossy_blob_padded_bytes_for_count(self, count: int) -> int:
         raw = BLOCK_PREFIX_BYTES + max(0, int(count)) * RECORD_BYTES

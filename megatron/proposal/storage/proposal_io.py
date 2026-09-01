@@ -1005,6 +1005,14 @@ def fdp_stats() -> Dict[str, Any]:
     return dict(_get_fdp().stats())
 
 
+def fdp_perf_runtime_stats() -> Dict[str, Any]:
+    """Return read-only FDP timing/thread state for low-rate diagnostics."""
+
+    if backend_kind() != "fdp":
+        return {"backend": "file"}
+    return dict(_get_fdp().perf_runtime_stats())
+
+
 def open_fdp_session() -> None:
     if backend_kind() != "fdp":
         raise RuntimeError("open_fdp_session requires PROPOSAL_IO_BACKEND=fdp")

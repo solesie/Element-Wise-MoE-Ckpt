@@ -564,7 +564,7 @@ def tasks_args(parser):
                        help='Comma-separated subset of the fixed paper tasks.')
     group.add_argument('--results_path', type=str, default = "./results.json", help='Path to where the results will be stored.')
     group.add_argument('--paper-data-dir', type=str,
-                       default='/home/paul/data/lm_eval_paper_6tasks',
+                       default=os.path.expanduser('~/data/lm_eval_paper_6tasks'),
                        help='Prepared paper-task data root containing manifest.json.')
     group.add_argument('--adaptive_seq_len',  default = False, action='store_true',
                        help='Should the sequence length be adapted to the batch during evaluation, if in fp16 the results will be slightly different due to numerical errors but greatly speed up evaluation.')

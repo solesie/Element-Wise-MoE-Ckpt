@@ -103,6 +103,20 @@ struct FdpStatsSnapshot {
     uint64_t last_flush_iter = 0;
 };
 
+struct MetadataCommitPerfStats {
+    bool valid = false;
+    uint64_t iter = 0;
+    uint32_t owner_rank = 0;
+    uint64_t metadata_image_bytes = 0;
+    bool nvme_flush_enabled = false;
+    uint64_t start_mono_raw_ns = 0;
+    uint64_t recalc_done_mono_raw_ns = 0;
+    uint64_t header_done_mono_raw_ns = 0;
+    uint64_t image_write_done_mono_raw_ns = 0;
+    uint64_t flush_done_mono_raw_ns = 0;
+    uint64_t end_mono_raw_ns = 0;
+};
+
 struct MetadataSummary {
     uint64_t magic = 0;
     uint32_t version = 0;
@@ -257,6 +271,9 @@ public:
     UcmdRingBatchStats end_expert_read_batch_stats();
     void begin_checkpoint_iter(uint64_t iter);
     bool mark_writer_done(uint64_t iter, const std::string& writer_kind);
+    MetadataCommitPerfStats last_metadata_commit_perf() const;
+    UcmdRingRuntimeStats nefc_ring_runtime_stats() const;
+    UcmdRingRuntimeStats expert_ring_runtime_stats() const;
     size_t write_nefc(const std::string& object_name,
                       int64_t pinned_addr,
                       const std::string& header,
@@ -453,6 +470,9 @@ private:
     bool local_expert_done_ = false;
     bool local_process_done_reported_ = false;
     mutable std::mutex local_iter_mutex_;
+    MetadataCommitPerfStats last_metadata_commit_perf_;
+    mutable std::mutex metadata_perf_mutex_;
+    bool perf_diag_ = false;
     bool open_ = false;
 };
 

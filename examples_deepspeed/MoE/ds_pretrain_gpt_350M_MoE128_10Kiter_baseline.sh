@@ -3,12 +3,20 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${DIR}/../.." && pwd)
-if [ -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
-    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+if [ ! -x "${REPO_ROOT}/.venv/bin/python" ] || [ ! -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
+    echo "Training environment is missing under ${REPO_ROOT}/.venv" >&2
+    exit 2
 fi
+export CUDA_HOME
+export DS_ACCELERATOR=${DS_ACCELERATOR:-cuda}
+export PATH="${REPO_ROOT}/.venv/bin:${CUDA_HOME}/bin:${PATH}"
+TORCH_LIB=$("${REPO_ROOT}/.venv/bin/python" -c \
+    'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "lib")')
+export LD_LIBRARY_PATH="${TORCH_LIB}:${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 BASE_SCRIPT="${DIR}/ds_pretrain_gpt_350M_MoE128.sh"
 
-DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-/home/paul/data/slimpajama_6b}
+DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-"${HOME}/data/slimpajama_6b"}
 DEFAULT_TRAIN_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document"
 DEFAULT_VALID_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_valid_text_document"
 export VOCAB_PATH=${VOCAB_PATH:-"${DIR}/../rebase/gpt2-vocab.json"}
@@ -66,9 +74,8 @@ if [ "${TRAIN_ITERS}" -eq 10000 ]; then
     DEFAULT_FINAL_BF16_MODEL_PATH="${OUTPUT_BASEPATH}/bf16_model"
 fi
 export FINAL_BF16_MODEL_PATH=${FINAL_BF16_MODEL_PATH-${DEFAULT_FINAL_BF16_MODEL_PATH}}
-export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
-export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
+source "${REPO_ROOT}/tools/cuda_arch_env.sh"
+configure_cuda_arch_env "${REPO_ROOT}" "${REPO_ROOT}/.venv/bin/python"
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
 export EXTRA_MEGATRON_FLAGS="--use-flash-attn-v2 ${BASELINE_EXTRA_MEGATRON_FLAGS:-}"

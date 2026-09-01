@@ -22,6 +22,25 @@ struct UcmdRingBatchStats {
     uint32_t queue_depth = 0;
     uint32_t submit_calls = 0;
     uint32_t registered_file_submits = 0;
+    bool sqpoll = false;
+    bool blocking_completion = false;
+    uint64_t batch_begin_mono_raw_ns = 0;
+    uint64_t first_submit_mono_raw_ns = 0;
+    uint64_t last_submit_mono_raw_ns = 0;
+    uint64_t end_wait_begin_mono_raw_ns = 0;
+    uint64_t first_completion_mono_raw_ns = 0;
+    uint64_t last_completion_mono_raw_ns = 0;
+    uint64_t batch_end_mono_raw_ns = 0;
+};
+
+struct UcmdRingRuntimeStats {
+    std::string name;
+    int32_t ring_fd = -1;
+    int64_t completion_tid = -1;
+    bool sqpoll = false;
+    bool blocking_completion = false;
+    uint64_t completion_waits = 0;
+    uint64_t completed_cqes = 0;
 };
 
 class UcmdRing {
@@ -44,6 +63,7 @@ public:
     void begin_batch();
     uint32_t end_batch();
     UcmdRingBatchStats last_batch_stats() const;
+    UcmdRingRuntimeStats runtime_stats() const;
 
     void submit_nvme(int fd, uint32_t cmd_op, const nvme_uring_cmd& cmd,
                      const char* where);

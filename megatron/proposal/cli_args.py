@@ -125,6 +125,12 @@ def add_proposal_args(parser):
                             "is the V2 default and compacts experts with the "
                             "largest current LFSY files; round_robin is kept "
                             "as a deterministic baseline.")
+    group.add_argument("--proposal-lfcl-fraction-pct", type=float, default=1.0,
+                       help="Global expert-slot percentage compacted into dense "
+                            "LFCL state at each proposal LFCL event. Proposal "
+                            "events round up globally; cumulative-quota MoC "
+                            "policies preserve the exact long-run ratio. "
+                            "Default 1.0.")
     group.add_argument("--proposal-nonexpert-fc-W", type=int, default=1,
                        help="Non-expert lossless FC interval (iters). Default 1 "
                             "(V2 spec: W=1, lossless non-expert FC every iter; DC removed).")
@@ -133,10 +139,46 @@ def add_proposal_args(parser):
                        choices=["proposal", "sequential"],
                        help="Expert checkpoint strategy. "
                             "'proposal' (default): Lossy FC (append-only log, "
-                            "top-K%% elements each iter) + 1%% expert LFCL "
+                            "top-K%% elements each iter) + configured expert LFCL "
                             "compaction every iter. "
                             "'sequential': MoC-System baseline (layer-wise "
                             "round-robin dense expert checkpoint, no element-wise lossy).")
+    group.add_argument(
+        "--proposal-checkpoint-warmup-iters",
+        type=int,
+        default=None,
+        help="Override only the proposal checkpoint cold-start/bootstrap "
+             "iteration. LR warmup and synthetic-fault gating remain "
+             "unchanged. Default None uses the optimizer LR warmup; "
+             "sequential MoC always uses zero checkpoint cold start.",
+    )
+    group.add_argument(
+        "--proposal-moc-sequential-policy",
+        type=str,
+        default="layer_rr",
+        choices=[
+            "layer_rr",
+            "expert_rr_pp_locked",
+            "expert_rr_pp_back_locked",
+        ],
+        help="MoC-only dense checkpoint order. 'layer_rr' preserves the "
+             "canonical whole-layer round robin. 'expert_rr_pp_locked' is "
+             "the 125M-MoE64 PP2/EP4 stress profile: four global experts "
+             "per iteration for 96 iterations, followed by four idle "
+             "iterations in each 100-iteration frame. "
+             "'expert_rr_pp_back_locked' is topology-derived and writes an "
+             "exact cumulative global quota every iteration, ordered from "
+             "the deepest layer to the shallowest layer.",
+    )
+    group.add_argument("--proposal-lfcl-interval-iters", type=int, default=1,
+                       help="Dense expert LFCL event interval. In sequential "
+                            "MoC mode, all local experts in one pipeline-local "
+                            "layer fire every N iterations. Proposal mode is "
+                            "fixed at N=1. Default 1.")
+    group.add_argument("--proposal-age-force-period", type=int, default=128,
+                       help="Phase-sharded force-flush period for elements in "
+                            "the oldest 2-bit age code. This is not an exact "
+                            "maximum element age. Default 128.")
     group.add_argument("--proposal-cp-target", type=str, default="disk",
                        choices=["disk", "test_dram"],
                        help="Where to persist expert checkpoints. "
@@ -162,9 +204,10 @@ def add_proposal_args(parser):
                        help="Path to append JSON-per-line fault records "
                             "(iter, pre_fault_loss, post_fault_loss, recover_time_s).")
     group.add_argument("--proposal-independent-oracle-enable", action="store_true",
-                       help="Telemetry-only: run the sampled-HVP independent "
-                            "ranking oracle at selected iterations. This does "
-                            "not change the production selection/write path.")
+                       help="Telemetry-only: at selected iterations run both "
+                            "the sampled-HVP independent ranking oracle and "
+                            "all-element expert/parameter saliency histograms. "
+                            "This does not change the production selection/write path.")
     group.add_argument("--proposal-independent-oracle-iters", type=str, default="",
                        help="Comma-separated iterations for independent oracle "
                             "measurement. Empty means every iteration.")
@@ -174,4 +217,104 @@ def add_proposal_args(parser):
                        default=1048576,
                        help="Per-rank element sample count for rank/mass oracle "
                             "metrics. Default 1048576.")
+    group.add_argument(
+        "--proposal-oracle-window-measurement-only",
+        action="store_true",
+        help="Special measurement-only mode: at each explicit independent-oracle "
+             "iteration reset expert/non-expert shadow state, observe only "
+             "successful optimizer updates, and disable production checkpoint "
+             "bootstrap/dispatch/finalize and fault injection.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-updates",
+        type=int,
+        default=100,
+        help="Number of successful optimizer updates in each measurement window. "
+             "Default 100.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-snapshot-offsets",
+        type=str,
+        default="10,20,30,40,50,60,70,80,90,100",
+        help="Sorted comma-separated successful-update offsets to snapshot "
+             "before shadow-state reset.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-log-dir",
+        type=str,
+        default=None,
+        help="Rank-sharded oracle-window output directory. Defaults to "
+             "<independent-oracle-log-dir>/oracle_window or "
+             "<proposal-cp-dir>/independent_oracle/oracle_window.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-sample-rounds",
+        type=int,
+        default=4,
+        help="Initial number of distinct block-stratified CDF rounds. Minimum 4.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-max-sample-rounds",
+        type=int,
+        default=8,
+        help="Maximum distinct CDF rounds used when exact K-band validation "
+             "requires cutoff refinement. Default 8.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-sample-blocks",
+        type=int,
+        default=4096,
+        help="Block-stratified samples per domain and round. Default 4096.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-block-elements",
+        type=int,
+        default=256,
+        help="Elements per sampling block. Default 256.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-min-effective-tail-count",
+        type=float,
+        default=8.0,
+        help="Minimum effective tail sample count for percentile validity.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-fd-epsilon",
+        type=float,
+        default=1.0e-2,
+        help="Explicit BF16-representable finite-difference epsilon for the "
+             "router-inclusive non-expert oracle probe. Default 1e-2.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-fd-probes",
+        type=int,
+        default=4,
+        help="Non-expert FD-Hutchinson probes at window T0. Minimum 4.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-fd-data-batches",
+        type=int,
+        default=1,
+        help="Dedicated validation batches used by non-expert FD at T0.",
+    )
+    group.add_argument(
+        "--proposal-oracle-window-fd-min-changed-fraction",
+        type=float,
+        default=0.95,
+        help="Fail-closed minimum +/- BF16 perturb changed fraction.",
+    )
+    group.add_argument(
+        "--proposal-joint-saliency-bins",
+        type=int,
+        default=512,
+        help="Number of log10 score bins for the all-element telemetry that "
+             "runs at every enabled independent-oracle iteration. Default 512.",
+    )
+    group.add_argument(
+        "--proposal-joint-saliency-log-dir",
+        type=str,
+        default=None,
+        help="Rank-sharded NPZ/manifest output directory. Defaults to a "
+             "joint_saliency subdirectory of the independent-oracle log dir.",
+    )
     return parser

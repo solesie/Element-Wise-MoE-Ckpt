@@ -49,6 +49,28 @@ def lr_warmup_iters_from_args(args) -> int:
     return 0
 
 
+def checkpoint_warmup_iters_from_args(args) -> int:
+    """Return checkpoint cold-start length, independent of LR scheduling.
+
+    Proposal mode intentionally establishes its first learned exact recovery
+    baseline at the end of LR warmup.  Sequential/MoC starts round robin from
+    the initial baseline and therefore has no checkpoint cold-start delay,
+    even when the optimizer uses the same LR warmup as other policies.
+    """
+
+    if str(getattr(args, "proposal_cp_mode", "proposal")) == "sequential":
+        return 0
+    override = getattr(args, "proposal_checkpoint_warmup_iters", None)
+    if override is not None:
+        override = int(override)
+        if override < 0:
+            raise ValueError(
+                "proposal_checkpoint_warmup_iters must be >= 0 for proposal mode"
+            )
+        return override
+    return lr_warmup_iters_from_args(args)
+
+
 @dataclass(frozen=True)
 class ProposalConfig:
     """All CLI-derived proposal parameters in one immutable object."""
@@ -80,14 +102,20 @@ class ProposalConfig:
     h_refresh_warmup_iters: int = 0
     n_anchor_batches: Optional[int] = None
 
-    # FC schedule. Expert LFCL is fixed by V2: every iter, 1% of expert slots.
+    # FC schedule. Proposal LFCL runs every iteration; its global expert-slot
+    # fraction is experiment-configurable.
     lfcl_interval_iters: int = DEFAULT_LFCL_INTERVAL_ITERS
     lfcl_fraction_pct: float = DEFAULT_LFCL_FRACTION_PCT
     lfcl_plan_policy: str = DEFAULT_LFCL_PLAN_POLICY
     nonexpert_fc_w: int = 1
 
+    # Oldest-code force flushing. The period is part of the production score
+    # predicate and must be shared by cutoff probing and direct emission.
+    age_force_period: int = 128
+
     # Storage.
     cp_mode: str = "proposal"
+    moc_sequential_policy: str = "layer_rr"
     cp_target: str = "disk"
     cp_dir: Path = Path("./cp")
     pinned_aos_capacity_tolerance: float = 0.75
@@ -101,12 +129,29 @@ class ProposalConfig:
     fault_log: Optional[Path] = None
     test_expert_selection_only: bool = False
 
-    # Telemetry-only independent oracle. This is intentionally outside the
-    # production selection/write path.
+    # Telemetry-only independent oracle. Normal oracle mode also enables the
+    # one-shot joint-saliency capture. The explicit window mode replaces both
+    # with a measurement-only, multi-update shadow collector.
     independent_oracle_enable: bool = False
     independent_oracle_iters: Tuple[int, ...] = ()
     independent_oracle_log_dir: Optional[Path] = None
     independent_oracle_rank_sample: int = 1048576
+    joint_saliency_bins: int = 512
+    joint_saliency_log_dir: Optional[Path] = None
+    oracle_window_measurement_only: bool = False
+    oracle_window_updates: int = 100
+    oracle_window_snapshot_offsets: Tuple[int, ...] = tuple(range(10, 101, 10))
+    oracle_window_log_dir: Optional[Path] = None
+    oracle_window_sample_rounds: int = 4
+    oracle_window_max_sample_rounds: int = 8
+    oracle_window_sample_blocks: int = 4096
+    oracle_window_block_elements: int = 256
+    oracle_window_sampling_seed: int = 0
+    oracle_window_min_effective_tail_count: float = 8.0
+    oracle_window_fd_epsilon: float = 1.0e-2
+    oracle_window_fd_probes: int = 4
+    oracle_window_fd_data_batches: int = 1
+    oracle_window_fd_min_changed_fraction: float = 0.95
 
     @classmethod
     def from_args(cls, args, cp_root: str) -> "ProposalConfig":
@@ -137,6 +182,28 @@ class ProposalConfig:
             raise ValueError(
                 f"proposal_cp_mode must be 'proposal'|'sequential', got {cp_mode!r}"
             )
+        lfcl_interval_iters = int(
+            getattr(
+                args,
+                "proposal_lfcl_interval_iters",
+                DEFAULT_LFCL_INTERVAL_ITERS,
+            )
+            or 0
+        )
+        if lfcl_interval_iters < 1:
+            raise ValueError(
+                "proposal_lfcl_interval_iters must be >= 1, "
+                f"got {lfcl_interval_iters!r}"
+            )
+        if (
+            cp_mode != "sequential"
+            and lfcl_interval_iters != DEFAULT_LFCL_INTERVAL_ITERS
+        ):
+            raise ValueError(
+                "proposal mode fixes proposal_lfcl_interval_iters=1; "
+                "a larger interval is only valid with "
+                "--proposal-cp-mode sequential"
+            )
         cp_target = getattr(args, "proposal_cp_target", "disk")
         if cp_target not in ("disk", "test_dram"):
             raise ValueError(
@@ -152,6 +219,65 @@ class ProposalConfig:
             raise ValueError(
                 "proposal_lfcl_plan_policy must be "
                 f"'round_robin'|'lossy_log_size', got {lfcl_plan_policy!r}"
+            )
+        lfcl_fraction_pct = float(
+            getattr(
+                args,
+                "proposal_lfcl_fraction_pct",
+                DEFAULT_LFCL_FRACTION_PCT,
+            )
+        )
+        if not (0.0 < lfcl_fraction_pct <= 100.0):
+            raise ValueError(
+                "proposal_lfcl_fraction_pct must satisfy 0 < pct <= 100, "
+                f"got {lfcl_fraction_pct!r}"
+            )
+        moc_sequential_policy = str(
+            getattr(args, "proposal_moc_sequential_policy", "layer_rr")
+        )
+        if moc_sequential_policy not in (
+            "layer_rr",
+            "expert_rr_pp_locked",
+            "expert_rr_pp_back_locked",
+        ):
+            raise ValueError(
+                "proposal_moc_sequential_policy must be "
+                "'layer_rr'|'expert_rr_pp_locked'|"
+                "'expert_rr_pp_back_locked', got "
+                f"{moc_sequential_policy!r}"
+            )
+        if moc_sequential_policy != "layer_rr":
+            if cp_mode != "sequential":
+                raise ValueError(
+                    "non-default proposal_moc_sequential_policy is only valid "
+                    "with --proposal-cp-mode sequential"
+                )
+            if lfcl_interval_iters != 1:
+                raise ValueError(
+                    f"{moc_sequential_policy} requires "
+                    "--proposal-lfcl-interval-iters 1"
+                )
+            if (
+                moc_sequential_policy == "expert_rr_pp_locked"
+                and not math.isclose(
+                    lfcl_fraction_pct,
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "expert_rr_pp_locked requires "
+                    "--proposal-lfcl-fraction-pct 1.0"
+                )
+        age_force_period = int(
+            getattr(args, "proposal_age_force_period", 128) or 0
+        )
+        if not (1 <= age_force_period <= 0x7FFFFFFF):
+            raise ValueError(
+                "proposal_age_force_period must satisfy "
+                "1 <= period <= 2^31-1, "
+                f"got {age_force_period!r}"
             )
 
         finite_diff_eps = getattr(args, "proposal_finite_diff_eps", None)
@@ -204,6 +330,191 @@ class ProposalConfig:
             "proposal_independent_oracle_log_dir",
             None,
         )
+        joint_saliency_log_dir_raw = getattr(
+            args,
+            "proposal_joint_saliency_log_dir",
+            None,
+        )
+        oracle_window_log_dir_raw = getattr(
+            args,
+            "proposal_oracle_window_log_dir",
+            None,
+        )
+        joint_saliency_bins = int(
+            getattr(args, "proposal_joint_saliency_bins", 512) or 0
+        )
+        if joint_saliency_bins < 16:
+            raise ValueError("proposal_joint_saliency_bins must be >= 16")
+        independent_oracle_enable = bool(
+            getattr(args, "proposal_independent_oracle_enable", False)
+        )
+        independent_oracle_iters = _parse_int_tuple(
+            getattr(args, "proposal_independent_oracle_iters", "")
+        )
+        oracle_window_measurement_only = bool(
+            getattr(args, "proposal_oracle_window_measurement_only", False)
+        )
+        oracle_window_updates = int(
+            getattr(args, "proposal_oracle_window_updates", 100) or 0
+        )
+        oracle_window_snapshot_offsets = _parse_int_tuple(
+            getattr(
+                args,
+                "proposal_oracle_window_snapshot_offsets",
+                "10,20,30,40,50,60,70,80,90,100",
+            )
+        )
+        oracle_window_sample_rounds = int(
+            getattr(args, "proposal_oracle_window_sample_rounds", 4) or 0
+        )
+        oracle_window_max_sample_rounds = int(
+            getattr(args, "proposal_oracle_window_max_sample_rounds", 8) or 0
+        )
+        oracle_window_sample_blocks = int(
+            getattr(args, "proposal_oracle_window_sample_blocks", 4096) or 0
+        )
+        oracle_window_block_elements = int(
+            getattr(args, "proposal_oracle_window_block_elements", 256) or 0
+        )
+        oracle_window_min_effective_tail_count = float(
+            getattr(
+                args,
+                "proposal_oracle_window_min_effective_tail_count",
+                8.0,
+            )
+        )
+        oracle_window_fd_epsilon = float(
+            getattr(args, "proposal_oracle_window_fd_epsilon", 1.0e-2)
+        )
+        oracle_window_fd_probes = int(
+            getattr(args, "proposal_oracle_window_fd_probes", 4) or 0
+        )
+        oracle_window_fd_data_batches = int(
+            getattr(args, "proposal_oracle_window_fd_data_batches", 1) or 0
+        )
+        oracle_window_fd_min_changed_fraction = float(
+            getattr(
+                args,
+                "proposal_oracle_window_fd_min_changed_fraction",
+                0.95,
+            )
+        )
+        if oracle_window_measurement_only:
+            if not independent_oracle_enable:
+                raise ValueError(
+                    "proposal_oracle_window_measurement_only requires "
+                    "--proposal-independent-oracle-enable"
+                )
+            if selection_mode != "hessian" or cp_mode != "proposal":
+                raise ValueError(
+                    "proposal_oracle_window_measurement_only requires "
+                    "--proposal-selection-mode hessian and "
+                    "--proposal-cp-mode proposal"
+                )
+            if not independent_oracle_iters:
+                raise ValueError(
+                    "proposal_oracle_window_measurement_only requires explicit "
+                    "--proposal-independent-oracle-iters"
+                )
+            if fault_interval_raw != 0:
+                raise ValueError(
+                    "proposal_oracle_window_measurement_only requires "
+                    "--proposal-fault-interval 0"
+                )
+            if oracle_window_updates < 1:
+                raise ValueError("proposal_oracle_window_updates must be >= 1")
+            if int(
+                getattr(
+                    args,
+                    "proposal_independent_oracle_rank_sample",
+                    1048576,
+                ) or 0
+            ) < 1:
+                raise ValueError(
+                    "proposal_oracle_window_measurement_only requires a "
+                    "positive independent-oracle rank sample count"
+                )
+            if oracle_window_sample_rounds < 4:
+                raise ValueError(
+                    "proposal_oracle_window_sample_rounds must be >= 4"
+                )
+            if oracle_window_max_sample_rounds < oracle_window_sample_rounds:
+                raise ValueError(
+                    "proposal_oracle_window_max_sample_rounds must be >= "
+                    "proposal_oracle_window_sample_rounds"
+                )
+            if oracle_window_sample_blocks < 1:
+                raise ValueError(
+                    "proposal_oracle_window_sample_blocks must be >= 1"
+                )
+            if oracle_window_block_elements < 1:
+                raise ValueError(
+                    "proposal_oracle_window_block_elements must be >= 1"
+                )
+            if oracle_window_min_effective_tail_count < 0.0:
+                raise ValueError(
+                    "proposal_oracle_window_min_effective_tail_count must be >= 0"
+                )
+            if not math.isfinite(oracle_window_fd_epsilon) or oracle_window_fd_epsilon <= 0.0:
+                raise ValueError(
+                    "proposal_oracle_window_fd_epsilon must be finite and positive"
+                )
+            if oracle_window_fd_probes < 4:
+                raise ValueError("proposal_oracle_window_fd_probes must be >= 4")
+            if oracle_window_fd_data_batches < 1:
+                raise ValueError(
+                    "proposal_oracle_window_fd_data_batches must be >= 1"
+                )
+            if not 0.0 <= oracle_window_fd_min_changed_fraction <= 1.0:
+                raise ValueError(
+                    "proposal_oracle_window_fd_min_changed_fraction must lie in [0, 1]"
+                )
+            if (
+                not oracle_window_snapshot_offsets
+                or tuple(sorted(set(oracle_window_snapshot_offsets)))
+                != oracle_window_snapshot_offsets
+                or oracle_window_snapshot_offsets[0] < 1
+                or oracle_window_snapshot_offsets[-1] > oracle_window_updates
+            ):
+                raise ValueError(
+                    "proposal_oracle_window_snapshot_offsets must be sorted, "
+                    "unique, and within [1, proposal_oracle_window_updates]"
+                )
+            if tuple(sorted(set(independent_oracle_iters))) != independent_oracle_iters:
+                raise ValueError(
+                    "proposal_independent_oracle_iters must be sorted and unique "
+                    "in oracle-window mode"
+                )
+            first_available_iteration = max(
+                1,
+                int(checkpoint_warmup_iters_from_args(args)),
+            )
+            if independent_oracle_iters[0] < first_available_iteration:
+                raise ValueError(
+                    "oracle-window start precedes proposal activation: "
+                    f"start={independent_oracle_iters[0]} "
+                    f"first_available={first_available_iteration}"
+                )
+            for previous, current in zip(
+                independent_oracle_iters,
+                independent_oracle_iters[1:],
+            ):
+                if current - previous <= oracle_window_updates:
+                    raise ValueError(
+                        "configured oracle measurement windows overlap: "
+                        f"{previous} and {current}"
+                    )
+            train_iters = int(getattr(args, "train_iters", 0) or 0)
+            if (
+                train_iters > 0
+                and independent_oracle_iters[-1] + oracle_window_updates
+                > train_iters
+            ):
+                raise ValueError(
+                    "configured oracle window exceeds train_iters: "
+                    f"start={independent_oracle_iters[-1]} "
+                    f"updates={oracle_window_updates} train_iters={train_iters}"
+                )
 
         return cls(
             topk_ratio=topk_ratio,
@@ -257,11 +568,13 @@ class ProposalConfig:
             h_refresh_warmup_every=max(0, h_refresh_warmup_every),
             h_refresh_warmup_iters=max(0, int(skip_warmup_iters or 0)),
             n_anchor_batches=n_anchor_batches,
-            lfcl_interval_iters=DEFAULT_LFCL_INTERVAL_ITERS,
-            lfcl_fraction_pct=DEFAULT_LFCL_FRACTION_PCT,
+            lfcl_interval_iters=lfcl_interval_iters,
+            lfcl_fraction_pct=lfcl_fraction_pct,
             lfcl_plan_policy=str(lfcl_plan_policy),
             nonexpert_fc_w=int(getattr(args, "proposal_nonexpert_fc_W", 1)),
+            age_force_period=age_force_period,
             cp_mode=str(cp_mode),
+            moc_sequential_policy=moc_sequential_policy,
             cp_target=str(cp_target),
             cp_dir=Path(cp_root),
             pinned_aos_capacity_tolerance=max(
@@ -281,12 +594,8 @@ class ProposalConfig:
             test_expert_selection_only=bool(
                 getattr(args, "proposal_test_expert_selection_only", False)
             ),
-            independent_oracle_enable=bool(
-                getattr(args, "proposal_independent_oracle_enable", False)
-            ),
-            independent_oracle_iters=_parse_int_tuple(
-                getattr(args, "proposal_independent_oracle_iters", "")
-            ),
+            independent_oracle_enable=independent_oracle_enable,
+            independent_oracle_iters=independent_oracle_iters,
             independent_oracle_log_dir=(
                 Path(independent_oracle_log_dir_raw)
                 if independent_oracle_log_dir_raw else None
@@ -300,5 +609,36 @@ class ProposalConfig:
                         1048576,
                     ) or 0
                 ),
+            ),
+            joint_saliency_bins=joint_saliency_bins,
+            joint_saliency_log_dir=(
+                Path(joint_saliency_log_dir_raw)
+                if joint_saliency_log_dir_raw else None
+            ),
+            oracle_window_measurement_only=oracle_window_measurement_only,
+            oracle_window_updates=oracle_window_updates,
+            oracle_window_snapshot_offsets=oracle_window_snapshot_offsets,
+            oracle_window_log_dir=(
+                Path(oracle_window_log_dir_raw)
+                if oracle_window_log_dir_raw
+                else (
+                    Path(independent_oracle_log_dir_raw) / "oracle_window"
+                    if independent_oracle_log_dir_raw
+                    else Path(cp_root) / "independent_oracle" / "oracle_window"
+                )
+            ),
+            oracle_window_sample_rounds=oracle_window_sample_rounds,
+            oracle_window_max_sample_rounds=oracle_window_max_sample_rounds,
+            oracle_window_sample_blocks=oracle_window_sample_blocks,
+            oracle_window_block_elements=oracle_window_block_elements,
+            oracle_window_sampling_seed=int(getattr(args, "seed", 0) or 0),
+            oracle_window_min_effective_tail_count=(
+                oracle_window_min_effective_tail_count
+            ),
+            oracle_window_fd_epsilon=oracle_window_fd_epsilon,
+            oracle_window_fd_probes=oracle_window_fd_probes,
+            oracle_window_fd_data_batches=oracle_window_fd_data_batches,
+            oracle_window_fd_min_changed_fraction=(
+                oracle_window_fd_min_changed_fraction
             ),
         )

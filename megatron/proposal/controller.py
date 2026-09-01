@@ -24,11 +24,15 @@ from .refresh.fp32_state import (
     set_mapper,
 )
 from .refresh.hessian_refresh import HQuantileAnchor
-from .config import ProposalConfig, lr_warmup_iters_from_args
+from .config import ProposalConfig, checkpoint_warmup_iters_from_args
 from .expert_id import build_expert_id_map
 from .storage.fc_manager import FCManager, _detect_expert_layout, DS_EXPERT_IDX_RE
 from .checkpoint.lossy_checkpoint_engine import LossyCheckpointPipeline
 from .storage.recovery import recover
+from .telemetry.oracle_window.session import (
+    OracleWindowCollector,
+    OracleWindowSession,
+)
 
 
 @dataclass
@@ -85,6 +89,7 @@ class ProposalController:
         self._proposal_world_size = 1
         self._warmup_end_iter = 0
         self._active = False
+        self._oracle_window_session: Optional[OracleWindowSession] = None
 
     def init(self, model: Any, optimizer: Any, args: Any, cp_root: str) -> None:
         init_proposal(model, optimizer, args, cp_root)
@@ -112,6 +117,25 @@ class ProposalController:
 
     def prepare_after_optimizer(self) -> None:
         proposal_prepare_after_optimizer()
+
+    def attach_oracle_window_collector(
+        self,
+        collector: OracleWindowCollector,
+    ) -> None:
+        proposal_attach_oracle_window_collector(collector)
+
+    def oracle_window_post_optimizer(
+        self,
+        model: Any,
+        iteration: int,
+        *,
+        applied: bool,
+    ) -> bool:
+        return proposal_oracle_window_post_optimizer(
+            model,
+            iteration,
+            applied=bool(applied),
+        )
 
     def step(
         self,
@@ -142,10 +166,16 @@ class ProposalController:
     def run_independent_oracle(
         self,
         model: Any,
+        forward_step_func: Any,
         data_iterator: Any,
         iteration: int,
     ) -> None:
-        proposal_run_independent_oracle(model, data_iterator, iteration)
+        proposal_run_independent_oracle(
+            model,
+            forward_step_func,
+            data_iterator,
+            iteration,
+        )
 
     def vram_audit_iter_begin(self, step: int) -> None:
         proposal_vram_audit_iter_begin(step)
@@ -278,7 +308,13 @@ def _wait_stage0_emission_boundary(
     ready_event = task.cuda_event
     if not task.defer_stage0_emission:
         return ready_event
-    if not task.stage0_emission_release.wait(timeout=300.0):
+    from .telemetry import fdp_perf as _fdp_perf
+    _released = _fdp_perf.measured_call(
+        "stage0_bubble_release_wait",
+        int(task.iter_T),
+        lambda: task.stage0_emission_release.wait(timeout=300.0),
+    )
+    if not _released:
         raise RuntimeError(
             "timed out waiting for PP stage0 backward-bubble release"
         )
@@ -387,8 +423,27 @@ def init_proposal(
     if not get_controller()._enabled:
         return
     get_controller()._proposal_config = ProposalConfig.from_args(args, cp_root)
+    if get_controller()._proposal_config.oracle_window_measurement_only:
+        get_controller()._oracle_window_session = OracleWindowSession(
+            start_iterations=(
+                get_controller()._proposal_config.independent_oracle_iters
+            ),
+            window_updates=(
+                get_controller()._proposal_config.oracle_window_updates
+            ),
+            snapshot_offsets=(
+                get_controller()._proposal_config.oracle_window_snapshot_offsets
+            ),
+        )
+    else:
+        get_controller()._oracle_window_session = None
+    # LR scheduling and checkpoint-policy cold start are separate concerns.
+    # Proposal mode deliberately delays checkpointing and creates one learned
+    # exact baseline at the LR-warmup boundary.  Canonical MoC/sequential mode
+    # starts its RR checkpoint schedule at iter 1 from the initial baseline;
+    # it must not create an extra full checkpoint when LR warmup ends.
     get_controller()._warmup_end_iter = max(
-        0, int(lr_warmup_iters_from_args(args)),
+        0, int(checkpoint_warmup_iters_from_args(args)),
     )
     get_controller()._active = get_controller()._warmup_end_iter == 0
     get_controller()._h_anchor = HQuantileAnchor(
@@ -576,9 +631,13 @@ def init_proposal(
         "e_hat_proxy": get_controller()._proposal_config.e_hat_proxy,
         "lfcl_interval_iters": get_controller()._proposal_config.lfcl_interval_iters,
         "lfcl_fraction_pct": get_controller()._proposal_config.lfcl_fraction_pct,
+        "age_force_period": get_controller()._proposal_config.age_force_period,
         "nonexpert_fc_W": get_controller()._proposal_config.nonexpert_fc_w,
         "async_queue": get_controller()._proposal_config.async_queue,
         "cp_mode": get_controller()._proposal_config.cp_mode,
+        "moc_sequential_policy": (
+            get_controller()._proposal_config.moc_sequential_policy
+        ),
         "num_experts": num_experts_scalar,
         "num_experts_spec": num_experts_spec,
         "proposal_config": get_controller()._proposal_config,
@@ -623,17 +682,35 @@ def init_proposal(
         get_controller()._config["cp_mode"] != "sequential"
         and bool(topology.writes_expert)
     )
+    _oracle_window_only = bool(
+        get_controller()._proposal_config.oracle_window_measurement_only
+    )
     cp_target = str(get_controller()._proposal_config.cp_target)
     # The backlog tracer is environment-gated but must report the effective
     # CLI/config target, including callers that did not export this variable.
     os.environ["PROPOSAL_CP_TARGET"] = cp_target
     get_controller()._config["expert_lossy_commit_enabled"] = (
-        (not _test_skip_expert_commit) and topology.writes_expert
+        (not _oracle_window_only)
+        and (not _test_skip_expert_commit)
+        and topology.writes_expert
     )
     get_controller()._config["nonexpert_commit_enabled"] = (
-        (not _test_skip_nonexpert_commit)
+        (not _oracle_window_only)
+        and (not _test_skip_nonexpert_commit)
         and (topology.writes_nonexpert or cp_target == "test_dram")
     )
+
+    # Open the shared raw-NVMe session synchronously before any checkpoint
+    # worker can submit the iter-0 bootstrap.  Lazy-open from those worker
+    # threads races rank 0's metadata format with peer-rank waiters when the
+    # checkpoint cold start is zero.
+    from .storage import proposal_io as _proposal_io
+    if _proposal_io.backend_kind() == "fdp":
+        _proposal_io.open_fdp_session()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        from .telemetry import fdp_perf as _fdp_perf
+        _fdp_perf.capture_runtime_init()
 
     get_controller()._checkpoint_workers = CheckpointWorkerPool(
         non_expert_queue_size=get_controller()._config["async_queue"],
@@ -661,6 +738,12 @@ def init_proposal(
         # Required so the warmup-boundary H refresh has valid metadata before
         # the first lossy checkpoint step runs on expert_launcher.
         get_controller()._lossy_cp._init_lossy_flat_layout(inner_opt)
+        if _oracle_window_only:
+            _fd_device = get_controller()._lossy_cp._h_quantile_values.device
+            get_controller()._lossy_cp._oracle_window_fd_changed_counts = (
+                torch.zeros((), dtype=torch.int64, device=_fd_device),
+                torch.zeros((), dtype=torch.int64, device=_fd_device),
+            )
     else:
         get_controller()._lossy_cp = None
 
@@ -721,7 +804,17 @@ def init_proposal(
     topk_ratio = float(
         get_controller()._proposal_config.topk_ratio,
     )
-    pinned_aos_capacity_ratio = float(topk_ratio)
+    # Sequential MoC never emits element-wise lossy AOS records.  Keep only
+    # ExpertState's small fixed header slab instead of reserving the proposal
+    # top-K payload capacity (about 1.8 GB/rank for the 350M MoE128 setup).
+    pinned_aos_capacity_ratio = (
+        0.0
+        if (
+            get_controller()._config["cp_mode"] == "sequential"
+            or _oracle_window_only
+        )
+        else float(topk_ratio)
+    )
     pinned_aos_capacity_tolerance = float(
         get_controller()._proposal_config.pinned_aos_capacity_tolerance,
     )
@@ -736,7 +829,7 @@ def init_proposal(
     get_controller()._config["nonexpert_cp_dir"] = _nonexpert_cp_dir
     get_controller()._config["expert_cp_dir"] = _expert_cp_dir
 
-    # MoC-System baseline uses round_robin single-expert sequential FC.
+    # MoC-System baseline uses layer-wise round-robin sequential FC.
     fc_schedule = (
         "sequential" if get_controller()._config["cp_mode"] == "sequential" else "proposal"
     )
@@ -750,35 +843,46 @@ def init_proposal(
         checkpoint_workers=get_controller()._checkpoint_workers,
         schedule=fc_schedule,
         lfcl_fraction_pct=get_controller()._config["lfcl_fraction_pct"],
-        fresh_expert_state=True,
+        lfcl_interval_iters=get_controller()._config["lfcl_interval_iters"],
+        fresh_expert_state=(not _oracle_window_only),
         # cp_target: 'disk' (default) or 'test_dram'. Both targets use
         # the same proposal GPU path; test_dram is an in-memory
         # correctness/recovery diagnostic target.
         cp_target=cp_target,
         pinned_aos_capacity_ratio=float(pinned_aos_capacity_ratio),
         pinned_aos_capacity_tolerance=float(pinned_aos_capacity_tolerance),
-        enable_expert_state=bool(topology.writes_expert),
+        enable_expert_state=(
+            bool(topology.writes_expert) and not _oracle_window_only
+        ),
         commit_expert_lossy_records=(
             get_controller()._config["expert_lossy_commit_enabled"]
         ),
         commit_nonexpert_fc=(
             get_controller()._config["nonexpert_commit_enabled"]
         ),
-        test_skip_expert_d2h=bool(_test_skip_expert_d2h),
+        test_skip_expert_d2h=bool(
+            _test_skip_expert_d2h or _oracle_window_only
+        ),
         test_skip_nonexpert_d2h=bool(
             _test_skip_nonexpert_d2h
+            or _oracle_window_only
             or (not topology.writes_nonexpert and cp_target != "test_dram")
         ),
         lfcl_capacity_world_size=int(_proposal_world_size),
         expert_id_map=expert_id_map,
         defer_initial_expert_bootstrap=(
             int(get_controller()._warmup_end_iter) > 0
+            or get_controller()._proposal_config.oracle_window_measurement_only
         ),
         nonexpert_shard_rank=(
-            int(topology.nonexpert_shard_rank) if cp_target != "test_dram" else 0
+            int(topology.nonexpert_shard_rank)
+            if (_oracle_window_only or cp_target != "test_dram")
+            else 0
         ),
         nonexpert_shard_count=(
-            int(topology.nonexpert_shard_count) if cp_target != "test_dram" else 1
+            int(topology.nonexpert_shard_count)
+            if (_oracle_window_only or cp_target != "test_dram")
+            else 1
         ),
     )
     # Wire the ExpertState sink into the lossy checkpoint path. Each proposal
@@ -826,7 +930,11 @@ def init_proposal(
     # Expert LFCL compaction materializes plan-target live GPU p/m/v into a
     # pinned LFCL payload; ExpertState owns durable file commit.
     # ``fc_manager.fire_nonexpert_fc_if_due()`` only handles non-expert FC.
-    if _test_skip_expert_d2h or not bool(topology.writes_expert):
+    if (
+        _test_skip_expert_d2h
+        or _oracle_window_only
+        or not bool(topology.writes_expert)
+    ):
         get_controller()._expert_lossless_fc = None
     else:
         from .storage.lossless_compaction import ExpertLosslessFC
@@ -846,6 +954,9 @@ def init_proposal(
             fc_manager=get_controller()._fc,
             interval_iters=get_controller()._proposal_config.lfcl_interval_iters,
             schedule=fc_schedule,
+            moc_sequential_policy=(
+                get_controller()._proposal_config.moc_sequential_policy
+            ),
             lfcl_fraction_pct=get_controller()._config["lfcl_fraction_pct"],
             planner=lfcl_planner,
             commit_payload=get_controller()._config["expert_lossy_commit_enabled"],
@@ -873,6 +984,63 @@ def init_proposal(
     # Diagnostic: per-refresh expert coverage / skipped tensor ratio / eps.
     get_controller()._config["_h_diag_records"] = []
 
+    if _oracle_window_only:
+        from .refresh.fp32_state import get_mapper as _get_oracle_mapper
+        from .telemetry.oracle_window.engine import (
+            LiveOracleWindowCurvatureProvider,
+            OracleWindowTopology,
+            build_rank_owned_oracle_window_engine,
+        )
+
+        _oracle_mapper = _get_oracle_mapper()
+        _oracle_lossy = get_controller()._lossy_cp
+        _oracle_fc = get_controller()._fc
+        _oracle_session = get_controller()._oracle_window_session
+        if any(
+            value is None
+            for value in (
+                _oracle_mapper, _oracle_lossy, _oracle_fc, _oracle_session,
+            )
+        ):
+            raise RuntimeError(
+                "oracle-window live collector dependencies are incomplete"
+            )
+        _oracle_topology = OracleWindowTopology.from_object(topology)
+        _oracle_curvature = LiveOracleWindowCurvatureProvider(
+            lossy_cp=_oracle_lossy,
+            mapper=_oracle_mapper,
+            inner_optimizer=inner_opt,
+            expert_parameter_names=expert_param_names,
+            topology=_oracle_topology,
+            finite_difference_epsilon=float(
+                get_controller()._proposal_config.oracle_window_fd_epsilon
+            ),
+            hutchinson_probes=int(
+                get_controller()._proposal_config.oracle_window_fd_probes
+            ),
+            data_batches=int(
+                get_controller()._proposal_config.oracle_window_fd_data_batches
+            ),
+            rng_seed=int(getattr(args, "seed", 0) or 0),
+            minimum_changed_fraction=float(
+                get_controller()._proposal_config.
+                oracle_window_fd_min_changed_fraction
+            ),
+        )
+        _oracle_collector = build_rank_owned_oracle_window_engine(
+            config=get_controller()._proposal_config,
+            topology=topology,
+            mapper=_oracle_mapper,
+            expert_specs_provider=_oracle_lossy.active_tracked_fragment_specs,
+            nonexpert_parameters_provider=(
+                _oracle_fc.active_nonexpert_named_parameters
+            ),
+            curvature_provider=_oracle_curvature,
+            cpu_process_group=_proposal_cpu_pg,
+            device_process_group=_proposal_pg,
+        )
+        _oracle_session.attach_collector(_oracle_collector)
+
     # POST-INIT VRAM diff vs baseline. Large selection buffers have already
     # been initialized, so this captures the steady V2 allocation footprint.
     if torch.cuda.is_available():
@@ -894,6 +1062,45 @@ def init_proposal(
     )
 
 
+def _oracle_window_measurement_only(ctrl: ProposalController) -> bool:
+    config = ctrl._proposal_config
+    return bool(
+        config is not None
+        and getattr(config, "oracle_window_measurement_only", False)
+    )
+
+
+def proposal_attach_oracle_window_collector(
+    collector: OracleWindowCollector,
+) -> None:
+    """Attach the GPU/math backend to the measurement-only lifecycle."""
+
+    ctrl = get_controller()
+    session = ctrl._oracle_window_session
+    if not ctrl._enabled or session is None:
+        raise RuntimeError("oracle window measurement mode is not initialized")
+    session.attach_collector(collector)
+
+
+def proposal_oracle_window_post_optimizer(
+    model,
+    iteration: int,
+    *,
+    applied: bool,
+) -> bool:
+    """Advance the active window only after an applied optimizer update."""
+
+    ctrl = get_controller()
+    session = ctrl._oracle_window_session
+    if not ctrl._enabled or session is None:
+        return False
+    return session.observe_post_optimizer(
+        model=model,
+        iteration=int(iteration),
+        applied=bool(applied),
+    )
+
+
 def proposal_activate_after_warmup(model, iteration: int) -> bool:
     """Create the first learned recovery baseline at the LR-warmup boundary."""
 
@@ -912,6 +1119,23 @@ def proposal_activate_after_warmup(model, iteration: int) -> bool:
             "proposal activation missed the LR-warmup boundary: "
             f"iteration={iteration} warmup_end={warmup_end}"
         )
+    if bool(
+        getattr(
+            getattr(ctrl, "_proposal_config", None),
+            "oracle_window_measurement_only",
+            False,
+        )
+    ):
+        # The special oracle experiment needs normal H refreshes, but it must
+        # not create a production expert/non-expert recovery baseline.
+        ctrl._active = True
+        if _should_write():
+            print(
+                f"[proposal] oracle-window measurement active @iter{iteration} "
+                "(production checkpoint bootstrap disabled)",
+                flush=True,
+            )
+        return True
     workers = ctrl._checkpoint_workers
     if workers is not None:
         workers.drain()
@@ -971,7 +1195,12 @@ def proposal_record_loss(step: int, loss: Optional[float]) -> None:
         get_controller()._pending_fault_record = None
 
 
-def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> None:
+def proposal_run_independent_oracle(
+    model,
+    forward_step_func,
+    data_iterator,
+    iteration: int,
+) -> None:
     """Run telemetry-only rollback oracle for the current checkpoint image."""
 
     ctrl = get_controller()
@@ -991,6 +1220,21 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
                 flush=True,
             )
         return
+    if _oracle_window_measurement_only(ctrl):
+        session = ctrl._oracle_window_session
+        if session is None:
+            raise RuntimeError("oracle window measurement session is missing")
+        oracle_data_iterator = ctrl._config.get(
+            "_oracle_dedicated_valid_iter",
+            data_iterator,
+        )
+        session.maybe_start(
+            model=model,
+            forward_step_func=forward_step_func,
+            data_iterator=oracle_data_iterator,
+            iteration=int(iteration),
+        )
+        return
     try:
         from .telemetry.independent_oracle import independent_oracle_enabled
         if not independent_oracle_enabled(ctrl._proposal_config, int(iteration)):
@@ -1009,10 +1253,13 @@ def proposal_run_independent_oracle(model, data_iterator, iteration: int) -> Non
     if os.environ.get("PROPOSAL_INDEPENDENT_ORACLE_DEBUG", "0") == "1" and _should_write():
         print(f"[proposal] independent_oracle run: iter={int(iteration)}", flush=True)
 
+    needs_dispatch = int(iteration) > int(
+        getattr(ctrl, "_last_dispatched_iter_T", -1)
+    )
     # Normal V2 dispatches iter T at the beginning of iter T+1.  The oracle
     # measures a fault at iter T, so make the current post-step image visible
     # before evaluating rollback loss.
-    if int(iteration) > int(getattr(ctrl, "_last_dispatched_iter_T", -1)):
+    if needs_dispatch:
         proposal_dispatch_post_iter(
             model,
             iter_T=int(iteration),
@@ -1211,7 +1458,12 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
 
     try:
         task.non_expert_started_at = time.perf_counter()
-        task.dispatch_release_ready.wait()
+        from .telemetry import fdp_perf as _fdp_perf
+        _fdp_perf.measured_call(
+            "nonexpert_dispatch_release_wait",
+            int(task.iter_T),
+            task.dispatch_release_ready.wait,
+        )
         # On PP stage 0 this is the first-RecvGrad boundary event, which is
         # later than the post-optimizer dispatch event.  FCManager wires it
         # into the D2H stream without blocking the training thread.
@@ -1222,8 +1474,9 @@ def _execute_non_expert_post_iter(task: PostStepCheckpointTask) -> None:
                 ready_event=ready_event,
                 d2h_event_callback=_mark_non_expert_read_ready,
             )
-        from .storage import proposal_io as _proposal_io
-        _proposal_io.fdp_mark_writer_done(task.iter_T, "nonexpert")
+        _fdp_mark_writer_done_profiled(
+            task.iter_T, "nonexpert", site="nonexpert_worker",
+        )
     except BaseException as exc:
         task.non_expert_error = exc
         raise
@@ -1251,8 +1504,9 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
         task.expert_started_at = time.perf_counter()
         if not bool(ctrl._config.get("writes_expert", True)):
             task.dispatch_release_ready.set()
-            from .storage import proposal_io as _proposal_io
-            _proposal_io.fdp_mark_writer_done(task.iter_T, "expert")
+            _fdp_mark_writer_done_profiled(
+                task.iter_T, "expert", site="expert_worker_disabled",
+            )
             task.expert_ready_at = time.perf_counter()
             task.expert_read_ready.set()
             return
@@ -1265,8 +1519,8 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
         if ctrl._expert_lossless_fc is not None:
             fired_experts = ctrl._expert_lossless_fc.plan_if_due(
                 task.iter_T,
-                process_group=getattr(ctrl._lossy_cp, "_proposal_cpu_pg", None),
-                world_size=int(getattr(ctrl._lossy_cp, "_proposal_world_size", 1)),
+                process_group=getattr(ctrl, "_proposal_cpu_pg", None),
+                world_size=int(getattr(ctrl, "_proposal_world_size", 1)),
             )
         if ctrl._lossy_cp is not None:
             publish_fired = getattr(ctrl._lossy_cp, "publish_lfcl_fired_experts", None)
@@ -1324,7 +1578,6 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
                 )
             fired_by_step[int(task.iter_T)] = list(fired_experts)
         ctrl._config["_last_fired_experts"] = fired_experts
-        from .storage import proposal_io as _proposal_io
         expert_state = (
             getattr(ctrl._fc, "expert_state", None)
             if ctrl._fc is not None else None
@@ -1334,7 +1587,9 @@ def _execute_expert_post_iter(task: PostStepCheckpointTask) -> None:
             and expert_state.fdp_has_pending_writes(task.iter_T)
         )
         if not has_pending:
-            _proposal_io.fdp_mark_writer_done(task.iter_T, "expert")
+            _fdp_mark_writer_done_profiled(
+                task.iter_T, "expert", site="expert_worker_no_pending_write",
+            )
         task.expert_ready_at = time.perf_counter()
         task.expert_read_ready.set()
     except BaseException as exc:
@@ -1360,8 +1615,17 @@ def proposal_wait_d2h_before_optimizer() -> None:
     task = get_controller()._latest_post_step_checkpoint_task
     if task is not None:
         current = torch.cuda.current_stream()
-        task.non_expert_read_ready.wait()
-        task.expert_read_ready.wait()
+        from .telemetry import fdp_perf as _fdp_perf
+        _fdp_perf.measured_call(
+            "optimizer_fence_nonexpert_host_wait",
+            int(task.iter_T),
+            task.non_expert_read_ready.wait,
+        )
+        _fdp_perf.measured_call(
+            "optimizer_fence_expert_host_wait",
+            int(task.iter_T),
+            task.expert_read_ready.wait,
+        )
         if task.non_expert_error is not None:
             raise RuntimeError(
                 f"proposal non-expert checkpoint task failed at "
@@ -1400,7 +1664,12 @@ def _sync_post_iter_dispatch(iter_T: int) -> None:
             "proposal: synchronized dispatch requires proposal CPU process "
             f"group (iter={int(iter_T)})"
         )
-    torch.distributed.barrier(group=cpu_pg)
+    from .telemetry import fdp_perf as _fdp_perf
+    _fdp_perf.measured_call(
+        "expert_dispatch_gloo_barrier",
+        int(iter_T),
+        lambda: torch.distributed.barrier(group=cpu_pg),
+    )
 
 
 def _proposal_cpu_barrier(where: str) -> None:
@@ -1420,6 +1689,27 @@ def _proposal_cpu_barrier(where: str) -> None:
     if cpu_pg is None:
         raise RuntimeError("proposal multi-rank sync requires CPU/Gloo group")
     torch.distributed.barrier(group=cpu_pg)
+
+
+def _fdp_mark_writer_done_profiled(
+    iter_T: int,
+    writer_kind: str,
+    *,
+    site: str,
+) -> bool:
+    """Call FDP writer completion with absolute wall/CPU diagnostics."""
+
+    from .storage import proposal_io as _proposal_io
+    from .telemetry import fdp_perf as _fdp_perf
+
+    return _fdp_perf.measured_mark_writer_done(
+        step=int(iter_T),
+        writer_kind=str(writer_kind),
+        site=str(site),
+        fn=lambda: _proposal_io.fdp_mark_writer_done(
+            int(iter_T), str(writer_kind),
+        ),
+    )
 
 
 def _proposal_drain_cuda(where: str) -> None:
@@ -1479,29 +1769,78 @@ def proposal_dispatch_post_iter(
 
     if not get_controller()._enabled or not get_controller()._active:
         return
+    ctrl = get_controller()
+    if _oracle_window_measurement_only(ctrl):
+        return
     iter_T = int(iter_T)
     if iter_T <= int(get_controller()._warmup_end_iter):
         return
-    if iter_T <= int(getattr(get_controller(), "_last_dispatched_iter_T", -1)):
+    if iter_T <= int(getattr(ctrl, "_last_dispatched_iter_T", -1)):
         return
+    joint_saliency = getattr(ctrl._lossy_cp, "_joint_saliency_collector", None)
+    if joint_saliency is not None:
+        from .telemetry.independent_oracle import independent_oracle_enabled
+
+        if independent_oracle_enabled(ctrl._proposal_config, iter_T):
+            # This is the only mutation gateway for theta_cp/age state. Capture
+            # the scheduled oracle step here so H-refresh, explicit oracle, and
+            # normal next-loop dispatches cannot reorder the measurement.
+            joint_saliency.capture(lossy_cp=ctrl._lossy_cp, step=iter_T)
     from .storage import proposal_io as _proposal_io
+    from .telemetry import fdp_perf as _fdp_perf
     _prev_iter_T = int(getattr(get_controller(), "_last_dispatched_iter_T", -1))
+    _perf_on = bool(
+        _fdp_perf.enabled() and _proposal_io.backend_kind() == "fdp"
+    )
+    if _perf_on:
+        _fdp_perf.capture_runtime_start()
+    _prologue_wall0 = _fdp_perf.monotonic_raw_ns() if _perf_on else 0
+    _prologue_cpu0 = time.thread_time_ns() if _perf_on else 0
     if (
         _prev_iter_T >= 0
         and _proposal_io.backend_kind() == "fdp"
         and _proposal_io.fdp_metadata_mmap_enabled()
     ):
         if get_controller()._checkpoint_workers is not None:
-            get_controller()._checkpoint_workers.drain_non_expert()
-            get_controller()._checkpoint_workers.drain_expert()
-            get_controller()._checkpoint_workers.drain_expert_write()
-        _proposal_io.fdp_mark_writer_done(_prev_iter_T, "all")
-        _proposal_cpu_barrier("fdp_mark_writer_done")
-    _proposal_io.fdp_begin_checkpoint_iter(iter_T)
+            _workers = get_controller()._checkpoint_workers
+            _fdp_perf.measured_call(
+                "prologue_drain_nonexpert", _prev_iter_T,
+                _workers.drain_non_expert,
+            )
+            _fdp_perf.measured_call(
+                "prologue_drain_expert_compute", _prev_iter_T,
+                _workers.drain_expert,
+            )
+            _fdp_perf.measured_call(
+                "prologue_drain_expert_writer", _prev_iter_T,
+                _workers.drain_expert_write,
+            )
+        _fdp_mark_writer_done_profiled(
+            _prev_iter_T, "all", site="next_iter_prologue",
+        )
+        _fdp_perf.measured_call(
+            "prologue_gloo_barrier", _prev_iter_T,
+            lambda: _proposal_cpu_barrier("fdp_mark_writer_done"),
+        )
+    _fdp_perf.measured_call(
+        "begin_checkpoint_iter", iter_T,
+        lambda: _proposal_io.fdp_begin_checkpoint_iter(iter_T),
+    )
+    if _perf_on:
+        _prologue_wall1 = _fdp_perf.monotonic_raw_ns()
+        _prologue_cpu1 = time.thread_time_ns()
+        _fdp_perf.record_interval(
+            "dispatch_prologue_total",
+            int(iter_T),
+            _prologue_wall0,
+            _prologue_wall1,
+            _prologue_cpu0,
+            _prologue_cpu1,
+            previous_step=int(_prev_iter_T),
+        )
     event = get_controller().acquire_dispatch_ready_event()
     if event is not None:
         event.record()
-    ctrl = get_controller()
     defer_stage0 = bool(
         defer_stage0_emission
         and ctrl._config.get("defer_stage0_emission", False)
@@ -1540,6 +1879,8 @@ def proposal_finalize_post_iter(model, iteration: int) -> None:
     ctrl = get_controller()
     iteration = int(iteration)
     if not ctrl._enabled or not ctrl._active or iteration <= 0:
+        return
+    if _oracle_window_measurement_only(ctrl):
         return
 
     proposal_dispatch_post_iter(
@@ -1941,6 +2282,18 @@ def proposal_shutdown() -> Dict[str, Any]:
     """Drain writers, dump write logs and diagnostic summaries, then cleanup."""
     if not get_controller()._enabled:
         return {}
+    oracle_completion_error: Optional[BaseException] = None
+    if _oracle_window_measurement_only(get_controller()):
+        session = get_controller()._oracle_window_session
+        if session is None:
+            oracle_completion_error = RuntimeError(
+                "oracle-window shutdown has no lifecycle session"
+            )
+        else:
+            try:
+                session.assert_complete()
+            except BaseException as exc:
+                oracle_completion_error = exc
     # An exception may reach shutdown before stage 0 posts its first RecvGrad.
     # Release a pending task before FCManager/worker drains to avoid a teardown
     # deadlock.  Normal completed tasks make this a no-op.
@@ -1994,6 +2347,15 @@ def proposal_shutdown() -> Dict[str, Any]:
         ws = get_controller()._checkpoint_workers.summary()
         summary["async_total_write_ms"] = ws.get("total_write_ms", 0.0)
         get_controller()._checkpoint_workers.shutdown()
+    if dump_dir is not None:
+        try:
+            from .telemetry import fdp_perf as _fdp_perf
+
+            _fdp_perf_path = _fdp_perf.dump(dump_dir, dump_prefix)
+            if _fdp_perf_path is not None:
+                summary["fdp_perf_path"] = str(_fdp_perf_path)
+        except Exception as exc:
+            summary["fdp_perf_error"] = f"{type(exc).__name__}: {exc}"
     try:
         from .telemetry.io_backlog import close_io_backlog_trace
         close_io_backlog_trace()
@@ -2022,4 +2384,6 @@ def proposal_shutdown() -> Dict[str, Any]:
         except Exception:
             pass
     get_controller()._enabled = False
+    if oracle_completion_error is not None:
+        raise oracle_completion_error
     return summary

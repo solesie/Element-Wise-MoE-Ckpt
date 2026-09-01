@@ -1,5 +1,0 @@
-{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 1, "status": "ok", "step": 51, "world": 2}
-{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 1, "status": "ok", "step": 151, "world": 2}
-{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 1, "status": "ok", "step": 201, "world": 2}
-{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 1, "status": "ok", "step": 251, "world": 2}
-{"max_abs_diff_after_restore": 0.0, "mode": "independent_oracle_restore_check", "rank": 1, "status": "ok", "step": 299, "world": 2}

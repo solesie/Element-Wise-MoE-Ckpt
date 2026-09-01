@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 TRAIN_VENV=${TRAIN_VENV:-"${REPO_ROOT}/.venv"}
 DEPS_DIR=${EVAL_DEPS_DIR:-"${HOME}/.cache/element-wise-moe-eval/lm_eval_0_2"}
-DATA_ROOT=${LM_EVAL_PAPER_DATA:-/home/paul/data/lm_eval_paper_6tasks}
+DATA_ROOT=${LM_EVAL_PAPER_DATA:-"${HOME}/data/lm_eval_paper_6tasks"}
 EXPECTED_DEPS_STAMP=lm-eval-0.2.0-paper-overlay-v1
 
 CHECKPOINT_PATH=${1:-${CHECKPOINT_PATH:-}}
@@ -73,7 +73,8 @@ export LM_EVAL_PAPER_DATA="${DATA_ROOT}"
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PATH="${TRAIN_VENV}/bin:${PATH}"
-export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
+source "${REPO_ROOT}/tools/cuda_arch_env.sh"
+configure_cuda_arch_env "${REPO_ROOT}" "${TRAIN_VENV}/bin/python"
 export PYTHONPATH="${DEPS_DIR}:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 "${TRAIN_VENV}/bin/python" -c \
     'from lm_eval import evaluator; from tasks.eval_harness.paper_tasks import PAPER_TASK_REGISTRY, TASK_NAMES; assert set(PAPER_TASK_REGISTRY) == set(TASK_NAMES)'

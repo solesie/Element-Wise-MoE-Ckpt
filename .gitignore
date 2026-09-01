@@ -1,6 +1,7 @@
 __pycache__
 .venv/
 .torch_extensions/
+.cuda_wheels/
 
 # Distribution / packaging
 build/
@@ -23,6 +24,7 @@ logs
 
 # Data folder
 bookcorpus_data/
+dataset/
 
 # Local experiment outputs and checkpoints.
 /results/
@@ -33,3 +35,4 @@ bookcorpus_data/
 
 # Default checkpoint output dir (prevents accidental check-in of CP files)
 proposal_cp/
+MoE_Check_Paper/

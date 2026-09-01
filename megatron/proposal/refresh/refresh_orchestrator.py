@@ -195,6 +195,11 @@ class RefreshOrchestrationMixin:
                 flat, hist, min_bound=h_lo_t, max_bound=h_hi_t,
             )
         self._device_all_reduce_if_needed(hist, torch.distributed.ReduceOp.SUM)
+        self._oracle_window_h_hist_metadata = {
+            "positive": int(hist.sum().item()),
+            "minimum": float(h_lo_t.item()),
+            "maximum": float(h_hi_t.item()),
+        }
         launch_fill_quantiles_from_log_hist(
             hist, self._h_quantile_values, min_bound=h_lo_t, max_bound=h_hi_t,
         )
@@ -319,6 +324,11 @@ class RefreshOrchestrationMixin:
                 max_bound=v_hi_t,
             )
         self._device_all_reduce_if_needed(hist, torch.distributed.ReduceOp.SUM)
+        self._oracle_window_v_hist_metadata = {
+            "positive": int(hist.sum().item()),
+            "minimum": float(v_lo_t.item()),
+            "maximum": float(v_hi_t.item()),
+        }
         launch_fill_quantiles_from_log_hist(
             hist,
             self._v_quantile_values,

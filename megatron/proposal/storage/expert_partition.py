@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 import torch
 
@@ -19,6 +19,101 @@ class ExpertPartitionPlan:
     fragments_by_expert: Dict[ExpertId, List[Dict[str, Any]]]
     field_cache_by_expert: Dict[ExpertId, List[Dict[str, Any]]]
     fragment_to_expert: Dict[str, ExpertId]
+
+
+@dataclass(frozen=True)
+class ActiveTrackedFragmentSpec:
+    """Stable parameter identity for one active rank-owned runtime fragment."""
+
+    runtime_name: str
+    expert_id: ExpertId
+    parameter_name: str
+    parameter_offset: int
+    numel: int
+    parameter_numel: int
+    parameter_shape: Tuple[int, ...]
+    optimizer_group_idx: int | None = None
+    optimizer_local_offset: int | None = None
+
+
+def build_active_tracked_fragment_specs(
+    *,
+    active_names: Iterable[str],
+    name_to_expert: Mapping[str, ExpertId],
+    fragment_meta: Mapping[str, Mapping[str, Any]],
+    name_to_param: Mapping[str, torch.nn.Parameter],
+) -> Tuple[ActiveTrackedFragmentSpec, ...]:
+    """Resolve runtime names without exposing rank-local ``#frag`` parsing.
+
+    The checkpoint layout owns fragment identity.  Telemetry consumes this
+    immutable API and therefore never treats the rank-local runtime suffix as
+    a cross-rank key.
+    """
+
+    names = tuple(str(name) for name in active_names)
+    if len(set(names)) != len(names):
+        raise RuntimeError("active tracked fragment names must be unique")
+    meta_names = {str(name) for name in fragment_meta}
+    if meta_names and set(names) != meta_names:
+        missing = sorted(meta_names - set(names))[:8]
+        extra = sorted(set(names) - meta_names)[:8]
+        raise RuntimeError(
+            "active partition fragment set does not match partition metadata: "
+            f"missing_active={missing} missing_metadata={extra}"
+        )
+
+    out: list[ActiveTrackedFragmentSpec] = []
+    for runtime_name in names:
+        eid_raw = name_to_expert.get(runtime_name)
+        if eid_raw is None:
+            raise RuntimeError(
+                f"active tracked fragment has no expert id: {runtime_name!r}"
+            )
+        meta = fragment_meta.get(runtime_name)
+        if meta is not None:
+            parameter_name = str(meta.get("name", ""))
+            parameter_offset = int(meta.get("param_offset", 0) or 0)
+            numel = int(meta.get("numel", 0) or 0)
+            optimizer_group_idx = int(meta.get("group_idx", 0) or 0)
+            optimizer_local_offset = int(meta.get("local_offset", 0) or 0)
+        else:
+            parameter_name = runtime_name
+            parameter_offset = 0
+            parameter = name_to_param.get(parameter_name)
+            numel = int(parameter.numel()) if parameter is not None else 0
+            optimizer_group_idx = None
+            optimizer_local_offset = None
+        parameter = name_to_param.get(parameter_name)
+        if parameter is None:
+            raise RuntimeError(
+                "active tracked fragment cannot resolve original parameter: "
+                f"runtime={runtime_name!r} parameter={parameter_name!r}"
+            )
+        parameter_numel = int(parameter.numel())
+        if (
+            numel <= 0
+            or parameter_offset < 0
+            or parameter_offset + numel > parameter_numel
+        ):
+            raise RuntimeError(
+                "active tracked fragment interval is invalid: "
+                f"runtime={runtime_name!r} offset={parameter_offset} "
+                f"numel={numel} parameter_numel={parameter_numel}"
+            )
+        out.append(
+            ActiveTrackedFragmentSpec(
+                runtime_name=runtime_name,
+                expert_id=(int(eid_raw[0]), int(eid_raw[1])),
+                parameter_name=parameter_name,
+                parameter_offset=parameter_offset,
+                numel=numel,
+                parameter_numel=parameter_numel,
+                parameter_shape=tuple(int(x) for x in parameter.shape),
+                optimizer_group_idx=optimizer_group_idx,
+                optimizer_local_offset=optimizer_local_offset,
+            )
+        )
+    return tuple(out)
 
 
 def build_expert_partition_plan(

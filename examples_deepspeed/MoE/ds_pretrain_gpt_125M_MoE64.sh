@@ -10,10 +10,10 @@ SEQ_LEN=${SEQ_LEN:-2048}
 ### your desired model size or build your own configs
 
 ## GPT-3 Small 125M
-MODEL_SIZE=0.125
-NUM_LAYERS=12
-HIDDEN_SIZE=768
-NUM_ATTN_HEADS=12
+MODEL_SIZE=${MODEL_SIZE:-0.125}
+NUM_LAYERS=${NUM_LAYERS:-12}
+HIDDEN_SIZE=${HIDDEN_SIZE:-768}
+NUM_ATTN_HEADS=${NUM_ATTN_HEADS:-12}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
 # LR=6.0e-4
 # MIN_LR=6.0e-5
@@ -188,7 +188,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 ## Standard deviation for weight initialization
 ## We used 0.014 for 350M/1.3B dense/MoE models, and used 0.01 for 6.7B
 ## dense model. Usually larger model needs lower std.
-INIT_STD=0.014
+INIT_STD=${INIT_STD:-0.014}
 # INIT_STD=0.01
 
 ## Activation checkpointing saves GPU memory, but reduces training speed

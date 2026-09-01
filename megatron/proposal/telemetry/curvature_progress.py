@@ -9,11 +9,13 @@ sampled elements.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -44,11 +46,29 @@ class CurvatureProgressTelemetry:
         sample_groups: int,
         every: int,
         seed: int,
+        refresh_snapshot_dir: str = "",
+        refresh_only: bool = False,
+        fragment_specs_provider: Optional[Callable[[], Iterable[Any]]] = None,
     ) -> None:
-        self.log_path = Path(log_path).expanduser() if log_path else None
+        rank = int(os.environ.get("RANK", "0") or "0")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+        path_fields = {"rank": rank, "local_rank": local_rank}
+        expanded_log_path = log_path.format(**path_fields) if log_path else ""
+        expanded_snapshot_dir = (
+            refresh_snapshot_dir.format(**path_fields)
+            if refresh_snapshot_dir else ""
+        )
+        self.rank = rank
+        self.log_path = Path(expanded_log_path).expanduser() if expanded_log_path else None
+        self.refresh_snapshot_dir = (
+            Path(expanded_snapshot_dir).expanduser()
+            if expanded_snapshot_dir else None
+        )
         self.sample_groups = max(1, int(sample_groups))
         self.every = max(1, int(every))
         self.seed = int(seed)
+        self.refresh_only = bool(refresh_only)
+        self._fragment_specs_provider = fragment_specs_provider
         self._initialized = False
         self._group_size = 1
         self._sources: List[_SampleSource] = []
@@ -62,12 +82,29 @@ class CurvatureProgressTelemetry:
 
     @classmethod
     def from_env(cls) -> "CurvatureProgressTelemetry":
-        return cls(
+        telemetry = cls(
             log_path=os.environ.get("PROPOSAL_CURVATURE_PROGRESS_LOG", ""),
             sample_groups=int(os.environ.get("PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS", "2048") or "2048"),
             every=int(os.environ.get("PROPOSAL_CURVATURE_PROGRESS_EVERY", "1") or "1"),
             seed=int(os.environ.get("PROPOSAL_CURVATURE_PROGRESS_SEED", "2024") or "2024"),
+            refresh_snapshot_dir=os.environ.get(
+                "PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR", "",
+            ),
+            refresh_only=os.environ.get(
+                "PROPOSAL_CURVATURE_PROGRESS_REFRESH_ONLY", "",
+            ) in ("1", "true", "TRUE", "yes", "YES"),
         )
+        if telemetry.enabled:
+            print(
+                "[proposal] curvature_refresh_telemetry "
+                f"rank={telemetry.rank} every={telemetry.every} "
+                f"sample_groups={telemetry.sample_groups} "
+                f"refresh_only={int(telemetry.refresh_only)} "
+                f"log={telemetry.log_path} "
+                f"snapshots={telemetry.refresh_snapshot_dir}",
+                flush=True,
+            )
+        return telemetry
 
     @property
     def enabled(self) -> bool:
@@ -83,21 +120,30 @@ class CurvatureProgressTelemetry:
         signed_h_views: Iterable[torch.Tensor],
         n_anchor_batches: int,
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or int(step) % self.every != 0:
             return
         groups_list = list(groups)
         if not self._initialized:
             self._initialize(groups_list=groups_list, group_size=int(group_size))
         if not self._sample_by_name or self._sample_element_ids is None:
-            return
+            raise RuntimeError(
+                "curvature refresh telemetry is enabled but no expert "
+                "element sample could be mapped"
+            )
         n = int(self._sample_element_ids.shape[0])
         signed = np.zeros(n, dtype=np.float32)
         filled = np.zeros(n, dtype=bool)
-        view_by_name = {
-            str(name): view.detach().reshape(-1)
-            for name, view in zip(names, signed_h_views)
-            if view is not None and view.numel() > 0
-        }
+        view_by_name: Dict[str, torch.Tensor] = {}
+        for name, view in zip(names, signed_h_views):
+            if view is None or view.numel() <= 0:
+                continue
+            key = str(name)
+            if key in view_by_name:
+                raise RuntimeError(
+                    "curvature refresh telemetry received duplicate Hessian "
+                    f"view name: {key!r}"
+                )
+            view_by_name[key] = view.detach().reshape(-1)
         for name, (sample_idx, local_off) in self._sample_by_name.items():
             view = view_by_name.get(name)
             if view is None or sample_idx.size <= 0:
@@ -106,21 +152,111 @@ class CurvatureProgressTelemetry:
             vals = torch.index_select(view, 0, offsets).detach().float().cpu().numpy()
             signed[sample_idx] = vals.astype(np.float32, copy=False)
             filled[sample_idx] = True
-        if int(filled.sum()) <= 0:
-            return
+        filled_n = int(filled.sum())
+        if filled_n != n:
+            missing_names = sorted(set(self._sample_by_name) - set(view_by_name))
+            raise RuntimeError(
+                "curvature refresh telemetry did not map every sampled "
+                f"element to its original Hessian view: filled={filled_n}/{n} "
+                f"missing_names={missing_names[:4]}"
+            )
         self._prev_signed_h = None if self._signed_h is None else self._signed_h.copy()
         self._signed_h = signed
         self._last_refresh_step = int(step)
         v = self._gather_v(groups_list=groups_list)
+        diagnostics = self._signed_h_diagnostics(signed=signed, filled=filled, v=v)
+        snapshot = self._persist_refresh_snapshot(
+            step=int(step),
+            signed=signed,
+            filled=filled,
+            v=v,
+        )
         record = {
             "mode": "curvature_progress_h_refresh",
+            "schema_version": 2,
+            "rank": int(self.rank),
             "step": int(step),
             "sample_elements": int(n),
             "sample_groups": int(n // max(1, self._group_size)),
             "n_anchor_batches": int(n_anchor_batches),
-            **self._signed_h_diagnostics(signed=signed, filled=filled, v=v),
+            **diagnostics,
         }
+        if snapshot is not None:
+            record.update(snapshot)
         self._append(record)
+
+    def _persist_refresh_snapshot(
+        self,
+        *,
+        step: int,
+        signed: np.ndarray,
+        filled: np.ndarray,
+        v: Optional[np.ndarray],
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically persist the fixed sample used by refresh diagnostics.
+
+        This is experiment-only anchor telemetry.  It never feeds production
+        selection and runs while training is already halted for the Hessian
+        refresh.  Raw samples make CDF/range/rank plots reproducible without
+        re-running the model.
+        """
+
+        if self.refresh_snapshot_dir is None or v is None or v.shape != signed.shape:
+            return None
+        valid = filled & np.isfinite(signed) & np.isfinite(v) & (v >= 0.0)
+        if int(valid.sum()) <= 1:
+            return None
+        abs_h = np.abs(signed[valid]).astype(np.float32, copy=False)
+        v_t = v[valid].astype(np.float32, copy=False)
+        assert self._sample_element_ids is not None
+        assert self._sample_group_ids is not None
+        element_ids = self._sample_element_ids[valid]
+        group_ids = self._sample_group_ids[valid]
+        quantile_prob = np.asarray(
+            [0.0, 0.001, 0.01, 0.1, 0.5, 0.9, 0.99, 0.999, 1.0],
+            dtype=np.float64,
+        )
+        abs_h_quantile = np.quantile(abs_h, quantile_prob).astype(np.float32)
+
+        self.refresh_snapshot_dir.mkdir(parents=True, exist_ok=True)
+        final_path = self.refresh_snapshot_dir / (
+            f"h_rank_step{int(step):07d}_rank{int(self.rank):05d}.npz"
+        )
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{final_path.name}.",
+            suffix=".tmp",
+            dir=str(self.refresh_snapshot_dir),
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                np.savez_compressed(
+                    handle,
+                    schema_version=np.asarray([2], dtype=np.int32),
+                    step=np.asarray([int(step)], dtype=np.int64),
+                    rank=np.asarray([int(self.rank)], dtype=np.int32),
+                    group_size=np.asarray([int(self._group_size)], dtype=np.int32),
+                    element_ids=element_ids,
+                    group_ids=group_ids,
+                    abs_h=abs_h,
+                    v_t=v_t,
+                    quantile_prob=quantile_prob,
+                    abs_h_quantile=abs_h_quantile,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, final_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
+        digest = hashlib.sha256(final_path.read_bytes()).hexdigest()
+        return {
+            "refresh_snapshot": str(final_path),
+            "refresh_snapshot_sha256": digest,
+            "refresh_snapshot_elements": int(abs_h.size),
+        }
 
     def record_iteration(
         self,
@@ -136,8 +272,9 @@ class CurvatureProgressTelemetry:
         sqrt_bc2_inv: float,
         eps: float,
         beta1: float = 0.9,
+        age_force_period: int = 128,
     ) -> None:
-        if not self.enabled or int(step) % self.every != 0:
+        if self.refresh_only or not self.enabled or int(step) % self.every != 0:
             return
         groups_list = list(groups)
         if not self._initialized:
@@ -213,6 +350,7 @@ class CurvatureProgressTelemetry:
                 age_code=state.age_code,
                 step=int(step),
                 element_ids=self._sample_element_ids,
+                age_force_period=int(age_force_period),
             )
             curv_score = h_abs_lut * (e_hat * e_hat)
             curv_age2_score = h_abs_lut * (e_hat_age2 * e_hat_age2)
@@ -318,26 +456,141 @@ class CurvatureProgressTelemetry:
             "sample_groups": int(n // max(1, int(group_size))),
             "sample_k": int(k),
             "topk_ratio": float(topk_ratio),
+            "age_force_period": int(age_force_period),
             **self._h_lut_diagnostics(h_abs_lut=h_abs_lut, v=v),
             **rho_stats,
             "policies": policies,
         })
 
     def _initialize(self, *, groups_list: List[Dict[str, Any]], group_size: int) -> None:
-        ranges: List[Tuple[int, int, int]] = []
+        if int(group_size) <= 0:
+            raise ValueError("curvature refresh telemetry group_size must be positive")
+
+        specs = self._active_fragment_specs()
+        spec_by_runtime = {str(spec.runtime_name): spec for spec in specs}
+        if len(spec_by_runtime) != len(specs):
+            raise RuntimeError(
+                "curvature refresh telemetry fragment runtime names are not unique"
+            )
+
+        # (group index, runtime name, original parameter name, parameter
+        # offset, physical flat offset, logical group start, group count)
+        ranges: List[Tuple[int, str, str, int, int, int, int]] = []
         total_groups = 0
         for idx, grp in enumerate(groups_list):
             if grp.get("p_flat") is None or grp.get("m_flat") is None or grp.get("v_flat") is None:
                 continue
-            group_count = int(grp.get("total_aligned", 0)) // int(group_size)
-            if group_count <= 0:
-                continue
-            start = int(grp["master_off"])
-            ranges.append((idx, start, start + group_count))
-            total_groups = max(total_groups, start + group_count)
+            names = [str(name) for name in (grp.get("names") or [])]
+            sizes = [int(size) for size in (grp.get("sizes") or [])]
+            if len(names) != len(sizes):
+                raise RuntimeError(
+                    "curvature refresh telemetry group names/sizes are misaligned"
+                )
+            physical_starts_raw = grp.get("entry_elem_start_host")
+            if physical_starts_raw is None:
+                physical_starts = np.concatenate((
+                    np.asarray([0], dtype=np.int64),
+                    np.cumsum(np.asarray(sizes[:-1], dtype=np.int64)),
+                )).tolist() if sizes else []
+            else:
+                physical_starts = [int(value) for value in physical_starts_raw]
+            logical_starts_raw = grp.get("entry_age_elem_start_host")
+            if logical_starts_raw is None:
+                logical_elem = int(grp.get("master_off", 0)) * int(group_size)
+                logical_starts = []
+                for size in sizes:
+                    logical_starts.append(logical_elem)
+                    logical_elem += int(size)
+            else:
+                logical_starts = [int(value) for value in logical_starts_raw]
+            if not (
+                len(names) == len(physical_starts) == len(logical_starts)
+            ):
+                raise RuntimeError(
+                    "curvature refresh telemetry entry metadata is misaligned"
+                )
+
+            flat_numel = int(grp["v_flat"].numel())
+            for runtime_name, size, physical_start, logical_elem_start in zip(
+                names, sizes, physical_starts, logical_starts,
+            ):
+                if size <= 0 or size % int(group_size) != 0:
+                    raise RuntimeError(
+                        "curvature refresh telemetry requires group-aligned "
+                        f"fragments: runtime={runtime_name!r} size={size} "
+                        f"group_size={int(group_size)}"
+                    )
+                if physical_start < 0 or physical_start + size > flat_numel:
+                    raise RuntimeError(
+                        "curvature refresh telemetry fragment exceeds its "
+                        f"optimizer flat: runtime={runtime_name!r} "
+                        f"offset={physical_start} size={size} flat={flat_numel}"
+                    )
+                if logical_elem_start % int(group_size) != 0:
+                    raise RuntimeError(
+                        "curvature refresh telemetry logical fragment offset "
+                        f"is not group-aligned: runtime={runtime_name!r}"
+                    )
+                spec = spec_by_runtime.get(runtime_name)
+                if spec is None:
+                    if "#frag" in runtime_name:
+                        raise RuntimeError(
+                            "curvature refresh telemetry cannot resolve "
+                            f"partition fragment metadata: {runtime_name!r}"
+                        )
+                    parameter_name = runtime_name
+                    parameter_offset = 0
+                    parameter_numel = size
+                else:
+                    parameter_name = str(spec.parameter_name)
+                    parameter_offset = int(spec.parameter_offset)
+                    parameter_numel = int(spec.parameter_numel)
+                    if int(spec.numel) != size:
+                        raise RuntimeError(
+                            "curvature refresh telemetry fragment size does "
+                            f"not match active metadata: runtime={runtime_name!r} "
+                            f"group={size} metadata={int(spec.numel)}"
+                        )
+                if (
+                    parameter_offset < 0
+                    or parameter_offset + size > parameter_numel
+                ):
+                    raise RuntimeError(
+                        "curvature refresh telemetry original-parameter "
+                        f"interval is invalid: runtime={runtime_name!r} "
+                        f"offset={parameter_offset} size={size} "
+                        f"parameter_numel={parameter_numel}"
+                    )
+                logical_group_start = logical_elem_start // int(group_size)
+                group_count = size // int(group_size)
+                ranges.append((
+                    int(idx), runtime_name, parameter_name,
+                    int(parameter_offset), int(physical_start),
+                    int(logical_group_start), int(group_count),
+                ))
+                total_groups = max(
+                    total_groups, int(logical_group_start + group_count),
+                )
         if total_groups <= 0:
             self._initialized = True
             return
+
+        ranges.sort(key=lambda item: item[5])
+        expected_start = 0
+        for entry in ranges:
+            logical_start = int(entry[5])
+            if logical_start != expected_start:
+                raise RuntimeError(
+                    "curvature refresh telemetry logical fragment coverage "
+                    f"has a gap/overlap: expected={expected_start} "
+                    f"actual={logical_start} runtime={entry[1]!r}"
+                )
+            expected_start += int(entry[6])
+        if expected_start != total_groups:
+            raise RuntimeError(
+                "curvature refresh telemetry logical coverage is incomplete"
+            )
+
         n_sample_groups = min(int(self.sample_groups), int(total_groups))
         rng = np.random.default_rng(self.seed)
         sampled_groups = np.sort(rng.choice(total_groups, size=n_sample_groups, replace=False).astype(np.int64))
@@ -346,17 +599,23 @@ class CurvatureProgressTelemetry:
         sample_element_ids: List[int] = []
         by_name: Dict[str, Tuple[List[int], List[int]]] = {}
         sample_index_base = 0
-        sample_group_base = 0
-        for group_idx, start, end in ranges:
-            lo = int(np.searchsorted(sampled_groups, start, side="left"))
+        for (
+            group_idx, _runtime_name, parameter_name, parameter_offset,
+            physical_start, logical_start, group_count,
+        ) in ranges:
+            end = int(logical_start + group_count)
+            lo = int(np.searchsorted(sampled_groups, logical_start, side="left"))
             hi = int(np.searchsorted(sampled_groups, end, side="left"))
             if hi <= lo:
                 continue
             grp = groups_list[group_idx]
             global_groups = sampled_groups[lo:hi]
-            local_groups = global_groups - int(start)
+            local_groups = global_groups - int(logical_start)
             lane = np.arange(int(group_size), dtype=np.int64)
-            local_offsets_np = (local_groups[:, None] * int(group_size) + lane[None, :]).reshape(-1)
+            local_entry_offsets_np = (
+                local_groups[:, None] * int(group_size) + lane[None, :]
+            ).reshape(-1)
+            local_offsets_np = local_entry_offsets_np + int(physical_start)
             global_element_ids_np = (global_groups[:, None] * int(group_size) + lane[None, :]).reshape(-1)
             sample_indices = np.arange(sample_index_base, sample_index_base + local_offsets_np.size, dtype=np.int64)
             sample_index_base += int(local_offsets_np.size)
@@ -365,16 +624,19 @@ class CurvatureProgressTelemetry:
                 local_offsets=torch.as_tensor(local_offsets_np, dtype=torch.long, device=grp["p_flat"].device),
                 sample_indices=sample_indices,
             ))
-            self._append_name_mapping(
-                grp=grp,
-                local_offsets=local_offsets_np,
-                sample_indices=sample_indices,
-                by_name=by_name,
+            idx_list, off_list = by_name.setdefault(
+                str(parameter_name), ([], []),
             )
-            for local_sample_group_id in range(sample_group_base, sample_group_base + len(global_groups)):
-                sample_group_ids.extend([int(local_sample_group_id)] * int(group_size))
+            idx_list.extend(int(value) for value in sample_indices.tolist())
+            off_list.extend(
+                int(value)
+                for value in (
+                    local_entry_offsets_np + int(parameter_offset)
+                ).tolist()
+            )
+            for global_group in global_groups.tolist():
+                sample_group_ids.extend([int(global_group)] * int(group_size))
             sample_element_ids.extend(int(x) for x in global_element_ids_np.tolist())
-            sample_group_base += int(len(global_groups))
         self._group_size = int(group_size)
         self._sources = sources
         self._sample_group_ids = np.asarray(sample_group_ids, dtype=np.int64)
@@ -384,6 +646,35 @@ class CurvatureProgressTelemetry:
             for name, (idx, off) in by_name.items()
         }
         self._initialized = True
+
+    def _active_fragment_specs(self) -> List[Any]:
+        provider = self._fragment_specs_provider
+        if provider is None:
+            try:
+                from ..controller import get_controller
+
+                lossy_cp = getattr(get_controller(), "_lossy_cp", None)
+                provider = (
+                    getattr(lossy_cp, "active_tracked_fragment_specs", None)
+                    if lossy_cp is not None else None
+                )
+            except (ImportError, RuntimeError, AttributeError):
+                provider = None
+        if provider is None:
+            return []
+        specs = list(provider())
+        required = (
+            "runtime_name", "parameter_name", "parameter_offset",
+            "numel", "parameter_numel",
+        )
+        for spec in specs:
+            missing = [name for name in required if not hasattr(spec, name)]
+            if missing:
+                raise RuntimeError(
+                    "curvature refresh telemetry fragment metadata is "
+                    f"incomplete: missing={missing}"
+                )
+        return specs
 
     @staticmethod
     def _append_name_mapping(
@@ -620,6 +911,7 @@ class CurvatureProgressTelemetry:
         age_code: np.ndarray,
         step: int,
         element_ids: Optional[np.ndarray],
+        age_force_period: int = 128,
     ) -> np.ndarray:
         age_sq = np.choose(age_code, (1.0, 16.0, 256.0, 4096.0)).astype(np.float32)
         score = h_abs * age_sq * delta_sq
@@ -628,7 +920,7 @@ class CurvatureProgressTelemetry:
         forced = (age_code == 3) & CurvatureProgressTelemetry._age2_phase_hit_np(
             element_ids=element_ids,
             step=int(step),
-            period=128,
+            period=max(1, int(age_force_period)),
             salt=0x51ED270B,
         )
         if forced.any():
@@ -666,18 +958,46 @@ class CurvatureProgressTelemetry:
         if int(valid.sum()) <= 0:
             return out
         s = signed[valid]
+        abs_s = np.abs(s)
         out.update({
             "signed_h_mean": float(s.mean()),
-            "signed_h_abs_mean": float(np.abs(s).mean()),
+            "signed_h_abs_mean": float(abs_s.mean()),
             "signed_h_pos_ratio": float((s > 0.0).mean()),
             "signed_h_neg_ratio": float((s < 0.0).mean()),
             "signed_h_zero_ratio": float((s == 0.0).mean()),
+            "observed_abs_h_ratio": float((abs_s > 0.0).mean()),
         })
+        for label, percentile in (
+            ("min", 0.0),
+            ("p001", 0.1),
+            ("p01", 1.0),
+            ("p10", 10.0),
+            ("p50", 50.0),
+            ("p90", 90.0),
+            ("p99", 99.0),
+            ("p999", 99.9),
+            ("max", 100.0),
+        ):
+            out[f"abs_h_{label}"] = float(np.percentile(abs_s, percentile))
         if self._prev_signed_h is not None and self._prev_signed_h.shape == signed.shape:
             prev = self._prev_signed_h[valid]
+            abs_prev = np.abs(prev)
             out["signed_h_sign_flip_vs_prev"] = float((np.sign(prev) != np.sign(s)).mean())
             out["signed_h_abs_log_corr_prev"] = self._pearson(np.log(np.abs(prev) + 1.0e-30), np.log(np.abs(s) + 1.0e-30))
             out["signed_h_spearman_prev"] = self._spearman(prev, s)
+            out["abs_h_spearman_prev"] = self._spearman(abs_prev, abs_s)
+            observed_both = (abs_prev > 0.0) & (abs_s > 0.0)
+            out["abs_h_observed_both_ratio_prev"] = float(observed_both.mean())
+            if int(observed_both.sum()) > 1:
+                out["abs_h_observed_spearman_prev"] = self._spearman(
+                    abs_prev[observed_both], abs_s[observed_both],
+                )
+            for pct in (0.01, 0.05, 0.10):
+                out[f"abs_h_top{int(pct * 100)}pct_overlap_prev"] = self._top_fraction_overlap(
+                    abs_prev,
+                    abs_s,
+                    pct,
+                )
             out.update(self._conditional_sign_stability(
                 current=signed,
                 previous=self._prev_signed_h,
@@ -695,7 +1015,26 @@ class CurvatureProgressTelemetry:
         if v is not None and v.shape == signed.shape:
             vv = v[valid]
             out["raw_signed_h_vs_logv_spearman"] = self._spearman(s, np.log(vv + 1.0e-30))
-            out["raw_abs_signed_h_vs_logv_spearman"] = self._spearman(np.abs(s), np.log(vv + 1.0e-30))
+            h_v_spearman = self._spearman(abs_s, vv)
+            out["raw_abs_signed_h_vs_logv_spearman"] = h_v_spearman
+            out["abs_h_vs_v_spearman"] = h_v_spearman
+            observed = (abs_s > 0.0) & np.isfinite(vv)
+            if int(observed.sum()) > 1:
+                out["abs_h_observed_vs_v_spearman"] = self._spearman(
+                    abs_s[observed], vv[observed],
+                )
+                for pct in (0.01, 0.05, 0.10):
+                    out[
+                        f"abs_h_observed_vs_v_top{int(pct * 100)}pct_overlap"
+                    ] = self._top_fraction_overlap(
+                        abs_s[observed], vv[observed], pct,
+                    )
+            for pct in (0.01, 0.05, 0.10):
+                out[f"abs_h_vs_v_top{int(pct * 100)}pct_overlap"] = self._top_fraction_overlap(
+                    abs_s,
+                    vv,
+                    pct,
+                )
             out.update({
                 f"raw_abs_signed_h_group_{k}": val
                 for k, val in self._group_mean_spearman(
@@ -1163,10 +1502,29 @@ class CurvatureProgressTelemetry:
         )
 
     @staticmethod
+    def _top_fraction_overlap(a: np.ndarray, b: np.ndarray, fraction: float) -> float:
+        if a.size <= 0 or b.size != a.size:
+            return 0.0
+        k = max(1, min(int(a.size), int(math.ceil(float(fraction) * float(a.size)))))
+        a_finite = np.where(np.isfinite(a), a, -np.inf)
+        b_finite = np.where(np.isfinite(b), b, -np.inf)
+        a_idx = np.argpartition(a_finite, -k)[-k:]
+        b_idx = np.argpartition(b_finite, -k)[-k:]
+        return float(np.intersect1d(a_idx, b_idx, assume_unique=False).size) / float(k)
+
+    @staticmethod
     def _rank(x: np.ndarray) -> np.ndarray:
         order = np.argsort(x, kind="mergesort")
+        sorted_x = np.asarray(x)[order]
+        starts = np.concatenate((
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(sorted_x[1:] != sorted_x[:-1]).astype(np.int64) + 1,
+        ))
+        ends = np.concatenate((starts[1:], np.asarray([order.size], dtype=np.int64)))
+        average = (starts.astype(np.float64) + ends.astype(np.float64) - 1.0) * 0.5
+        sorted_ranks = np.repeat(average, ends - starts)
         ranks = np.empty(order.shape[0], dtype=np.float64)
-        ranks[order] = np.arange(order.shape[0], dtype=np.float64)
+        ranks[order] = sorted_ranks
         return ranks
 
     @staticmethod

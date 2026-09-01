@@ -107,6 +107,7 @@ if _HAS_TRITON:
         GROUPS_PER_BLOCK: tl.constexpr,
         H_LUT_BINS: tl.constexpr,
         SCORE_POLICY: tl.constexpr,
+        AGE_FORCE_PERIOD: tl.constexpr,
         MAX_CANDIDATES: tl.constexpr,
         STRATUM_STRIDE: tl.constexpr,
         MAX_SAMPLES_PER_GROUP: tl.constexpr,
@@ -226,7 +227,7 @@ if _HAS_TRITON:
                 SCORE_POLICY,
             )
         force = (age_code == 3) & _age2_phase_hit(
-            global_elem_idx, step_value, 128, 0x51ED270B,
+            global_elem_idx, step_value, AGE_FORCE_PERIOD, 0x51ED270B,
         ) & selectable_mask
         if RANDOM_MODE:
             elem_score = _random_unit_from_index(global_elem_idx, RANDOM_SALT)
@@ -875,6 +876,7 @@ def launch_generated_block_probe_for_group(
     eps: float,
     step: int,
     score_policy_id: int,
+    age_force_period: int = 128,
     use_e_hat_proxy: bool = True,
     random_mode: bool = False,
     random_salt: int = 0,
@@ -941,6 +943,7 @@ def launch_generated_block_probe_for_group(
         GROUPS_PER_BLOCK=gpb,
         H_LUT_BINS=int(h_lut_values.numel()),
         SCORE_POLICY=int(score_policy_id),
+        AGE_FORCE_PERIOD=max(1, int(age_force_period)),
         MAX_CANDIDATES=int(candidate_capacity),
         STRATUM_STRIDE=int(sum_q.shape[1]),
         MAX_SAMPLES_PER_GROUP=max_samples,

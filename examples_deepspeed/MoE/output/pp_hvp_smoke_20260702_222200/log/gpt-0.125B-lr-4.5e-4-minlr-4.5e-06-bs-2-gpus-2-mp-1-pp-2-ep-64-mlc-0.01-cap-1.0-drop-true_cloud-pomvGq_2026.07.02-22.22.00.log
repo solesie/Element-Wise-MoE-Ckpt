@@ -1,0 +1,991 @@
+[2026-07-02 22:22:06,850] [WARNING] [runner.py:232:fetch_hostfile] Unable to find hostfile, will proceed with training with local resources only.
+Detected VISIBLE_DEVICES=0,1 but ignoring it because one or several of --include/--exclude/--num_gpus/--num_nodes cl args were used. If you want to use CUDA_VISIBLE_DEVICES don't pass any of these arguments to deepspeed.
+[2026-07-02 22:22:06,851] [INFO] [runner.py:630:main] cmd = /usr/bin/python3 -u -m deepspeed.launcher.launch --world_info=eyJsb2NhbGhvc3QiOiBbMCwgMV19 --master_addr=127.0.0.1 --master_port=29541 --enable_each_rank_log=None --log_level=info /home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/MoE/../../pretrain_gpt.py --override-opt_param-scheduler --adam-beta1 0.9 --adam-beta2 0.95 --tensor-model-parallel-size 1 --moe-expert-parallel-size 1 --num-experts 64 --moe-loss-coeff 0.01 --moe-train-capacity-factor 1.0 --moe-eval-capacity-factor 1.0 --moe-min-capacity 4 --init-method-std 0.014 --lr-decay-tokens 100000000 --lr-warmup-tokens 1024 --micro-batch-size 1 --exit-duration-in-mins 30000000 --global-batch-size 2 --num-layers 12 --hidden-size 768 --num-attention-heads 12 --seq-length 256 --max-position-embeddings 256 --train-tokens 999999999 --train-iters 2 --lr 4.5e-4 --min-lr 4.5e-06 --lr-decay-style cosine --split 98,2,0 --log-interval 1 --eval-interval 1000000 --eval-iters 1 --save-interval 1000000 --weight-decay 0.1 --clip-grad 1.0 --hysteresis 2 --num-workers 0 --fp16 --tensorboard-queue-size 1 --log-timers-to-tensorboard --log-batch-size-to-tensorboard --log-validation-ppl-to-tensorboard --tensorboard-dir examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/tensorboard/gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true_cloud-pomvGq_2026.07.02-22.22.00 --proposal-enable --proposal-cp-target test_dram --proposal-cp-dir examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/proposal_cp --proposal-topk-ratio 0.04 --proposal-selection-mode hessian --proposal-hessian-refresh-every 100000 --proposal-hessian-refresh-warmup-every 20 --proposal-independent-oracle-enable --proposal-independent-oracle-iters 2 --proposal-independent-oracle-log-dir examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/oracle --proposal-independent-oracle-rank-sample 2048 --proposal-independent-oracle-actual-batches 1 --proposal-independent-oracle-hvp-batches 1 --checkpoint-activations --create-moe-param-group --vocab-file /home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-vocab.json --merge-file /home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-merges.txt --data-path /home/elice/data/slimpajama_6b/slimpajama_6b_train_text_document --valid-data-path /home/elice/data/slimpajama_6b/slimpajama_6b_valid_text_document --data-impl mmap --deepspeed --deepspeed_config examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/ds_config_gpt_gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true.json --pipeline-model-parallel-size 2 --deepspeed-activation-checkpointing
+[2026-07-02 22:22:14,056] [INFO] [launch.py:162:main] WORLD INFO DICT: {'localhost': [0, 1]}
+[2026-07-02 22:22:14,056] [INFO] [launch.py:168:main] nnodes=1, num_local_procs=2, node_rank=0
+[2026-07-02 22:22:14,056] [INFO] [launch.py:179:main] global_rank_mapping=defaultdict(<class 'list'>, {'localhost': [0, 1]})
+[2026-07-02 22:22:14,056] [INFO] [launch.py:180:main] dist_world_size=2
+[2026-07-02 22:22:14,056] [INFO] [launch.py:184:main] Setting CUDA_VISIBLE_DEVICES=0,1
+[2026-07-02 22:22:14,057] [INFO] [launch.py:272:main] process 95330 spawned with command: ['/usr/bin/python3', '-u', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=0', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '64', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--lr-decay-tokens', '100000000', '--lr-warmup-tokens', '1024', '--micro-batch-size', '1', '--exit-duration-in-mins', '30000000', '--global-batch-size', '2', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '256', '--max-position-embeddings', '256', '--train-tokens', '999999999', '--train-iters', '2', '--lr', '4.5e-4', '--min-lr', '4.5e-06', '--lr-decay-style', 'cosine', '--split', '98,2,0', '--log-interval', '1', '--eval-interval', '1000000', '--eval-iters', '1', '--save-interval', '1000000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '0', '--fp16', '--tensorboard-queue-size', '1', '--log-timers-to-tensorboard', '--log-batch-size-to-tensorboard', '--log-validation-ppl-to-tensorboard', '--tensorboard-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/tensorboard/gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true_cloud-pomvGq_2026.07.02-22.22.00', '--proposal-enable', '--proposal-cp-target', 'test_dram', '--proposal-cp-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/proposal_cp', '--proposal-topk-ratio', '0.04', '--proposal-selection-mode', 'hessian', '--proposal-hessian-refresh-every', '100000', '--proposal-hessian-refresh-warmup-every', '20', '--proposal-independent-oracle-enable', '--proposal-independent-oracle-iters', '2', '--proposal-independent-oracle-log-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/oracle', '--proposal-independent-oracle-rank-sample', '2048', '--proposal-independent-oracle-actual-batches', '1', '--proposal-independent-oracle-hvp-batches', '1', '--checkpoint-activations', '--create-moe-param-group', '--vocab-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-vocab.json', '--merge-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-merges.txt', '--data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_train_text_document', '--valid-data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/ds_config_gpt_gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true.json', '--pipeline-model-parallel-size', '2', '--deepspeed-activation-checkpointing']
+[2026-07-02 22:22:14,058] [INFO] [launch.py:272:main] process 95331 spawned with command: ['/usr/bin/python3', '-u', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=1', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '64', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--lr-decay-tokens', '100000000', '--lr-warmup-tokens', '1024', '--micro-batch-size', '1', '--exit-duration-in-mins', '30000000', '--global-batch-size', '2', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '256', '--max-position-embeddings', '256', '--train-tokens', '999999999', '--train-iters', '2', '--lr', '4.5e-4', '--min-lr', '4.5e-06', '--lr-decay-style', 'cosine', '--split', '98,2,0', '--log-interval', '1', '--eval-interval', '1000000', '--eval-iters', '1', '--save-interval', '1000000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '0', '--fp16', '--tensorboard-queue-size', '1', '--log-timers-to-tensorboard', '--log-batch-size-to-tensorboard', '--log-validation-ppl-to-tensorboard', '--tensorboard-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/tensorboard/gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true_cloud-pomvGq_2026.07.02-22.22.00', '--proposal-enable', '--proposal-cp-target', 'test_dram', '--proposal-cp-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/proposal_cp', '--proposal-topk-ratio', '0.04', '--proposal-selection-mode', 'hessian', '--proposal-hessian-refresh-every', '100000', '--proposal-hessian-refresh-warmup-every', '20', '--proposal-independent-oracle-enable', '--proposal-independent-oracle-iters', '2', '--proposal-independent-oracle-log-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/oracle', '--proposal-independent-oracle-rank-sample', '2048', '--proposal-independent-oracle-actual-batches', '1', '--proposal-independent-oracle-hvp-batches', '1', '--checkpoint-activations', '--create-moe-param-group', '--vocab-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-vocab.json', '--merge-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-merges.txt', '--data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_train_text_document', '--valid-data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/ds_config_gpt_gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true.json', '--pipeline-model-parallel-size', '2', '--deepspeed-activation-checkpointing']
+/home/elice/Element-Wise-MoE-Ckpt/megatron/core/tensor_parallel/layers.py:249: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @custom_fwd
+/home/elice/Element-Wise-MoE-Ckpt/megatron/core/tensor_parallel/layers.py:287: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @custom_bwd
+--------------------------------------------------
+DeepSpeed C++/CUDA extension op report
+--------------------------------------------------
+NOTE: Ops not installed will be just-in-time (JIT) compiled at
+      runtime if needed. Op compatibility means that your system
+      meet the required dependencies to JIT install the op.
+--------------------------------------------------
+JIT compiled ops requires ninja
+ninja .................. [92m[OKAY][0m
+--------------------------------------------------
+op name ................ installed .. compatible
+--------------------------------------------------
+[93m [WARNING] [0m async_io requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m async_io: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+async_io ............... [93m[NO][0m ....... [93m[NO][0m
+fused_adam ............. [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adam ............... [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adagrad ............ [93m[NO][0m ....... [92m[OKAY][0m
+cpu_lion ............... [93m[NO][0m ....... [92m[OKAY][0m
+dc ..................... [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m Please specify CUTLASS location directory as environment variable CUTLASS_PATH
+[93m [WARNING] [0m Possible values are: a path, DS_IGNORE_CUTLASS_DETECTION and DS_USE_CUTLASS_PYTHON_BINDINGS
+evoformer_attn ......... [93m[NO][0m ....... [93m[NO][0m
+[93m [WARNING] [0m FP Quantizer is using an untested triton version (3.4.0), only 2.3.(0, 1) and 3.0.0 are known to be compatible with these kernels
+fp_quantizer ........... [93m[NO][0m ....... [93m[NO][0m
+fused_lamb ............. [93m[NO][0m ....... [92m[OKAY][0m
+fused_lion ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m gds requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m gds: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+gds .................... [93m[NO][0m ....... [93m[NO][0m
+transformer_inference .. [93m[NO][0m ....... [92m[OKAY][0m
+inference_core_ops ..... [93m[NO][0m ....... [92m[OKAY][0m
+cutlass_ops ............ [93m[NO][0m ....... [92m[OKAY][0m
+quantizer .............. [93m[NO][0m ....... [92m[OKAY][0m
+ragged_device_ops ...... [93m[NO][0m ....... [92m[OKAY][0m
+ragged_ops ............. [93m[NO][0m ....... [92m[OKAY][0m
+random_ltd ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m sparse_attn requires a torch version >= 1.5 and < 2.0 but detected 2.8
+[93m [WARNING] [0m using untested triton version (3.4.0), only 1.0.0 is known to be compatible
+sparse_attn ............ [93m[NO][0m ....... [93m[NO][0m
+spatial_inference ...... [93m[NO][0m ....... [92m[OKAY][0m
+transformer ............ [93m[NO][0m ....... [92m[OKAY][0m
+stochastic_transformer . [93m[NO][0m ....... [92m[OKAY][0m
+utils .................. [93m[NO][0m ....... [92m[OKAY][0m
+--------------------------------------------------
+DeepSpeed general environment info:
+torch install path ............... ['/home/elice/.local/lib/python3.12/site-packages/torch']
+torch version .................... 2.8.0+cu128
+deepspeed install path ........... ['/home/elice/.local/lib/python3.12/site-packages/deepspeed']
+deepspeed info ................... 0.18.9, unknown, unknown
+torch cuda version ............... 12.8
+torch hip version ................ None
+nvcc version ..................... 12.8
+deepspeed wheel compiled w. ...... torch 2.8, cuda 12.8
+shared memory (/dev/shm) size .... 139.62 GB
+**** Git info for Megatron: git_hash=04e2a973 git_branch=main ****
+using world size: 2, data-parallel-size: 1, sequence-parallel size: 1, tensor-model-parallel size: 1, pipeline-model-parallel size: 2 
+using torch.float16 for parameters ...
+------------------------ arguments ------------------------
+  accumulate_allreduce_grads_in_fp32 .............. False
+  adam_beta1 ...................................... 0.9
+  adam_beta2 ...................................... 0.95
+  adam_eps ........................................ 1e-08
+  add_bias_linear ................................. True
+  add_position_embedding .......................... True
+  adlr_autoresume ................................. False
+  adlr_autoresume_interval ........................ 1000
+  aml_data_download_path .......................... None
+  apply_layernorm_1p .............................. False
+  apply_query_key_layer_scaling ................... True
+  apply_residual_connection_post_layernorm ........ False
+  async_tensor_model_parallel_allreduce ........... False
+  attention_dropout ............................... 0.1
+  attention_softmax_in_fp32 ....................... False
+  barrier_with_L1_time ............................ True
+  bert_binary_head ................................ True
+  bert_embedder_type .............................. megatron
+  bert_load ....................................... None
+  bf16 ............................................ False
+  bias_dropout_fusion ............................. True
+  bias_gelu_fusion ................................ True
+  biencoder_projection_dim ........................ 0
+  biencoder_shared_query_context_model ............ False
+  block_data_path ................................. None
+  checkpoint_activations .......................... True
+  checkpoint_in_cpu ............................... False
+  checkpoint_num_layers ........................... 1
+  classes_fraction ................................ 1.0
+  clip_grad ....................................... 1.0
+  compression_training ............................ False
+  consumed_train_samples .......................... 0
+  consumed_train_tokens ........................... 0
+  consumed_valid_samples .......................... 0
+  contigious_checkpointing ........................ False
+  cpu_optimizer ................................... False
+  cpu_torch_adam .................................. False
+  create_moe_param_group .......................... True
+  curriculum_learning_legacy ...................... False
+  data_cache_path ................................. None
+  data_efficiency_curriculum_learning ............. False
+  data_impl ....................................... mmap
+  data_parallel_random_init ....................... False
+  data_parallel_size .............................. 1
+  data_path ....................................... ['/home/elice/data/slimpajama_6b/slimpajama_6b_train_text_document']
+  data_per_class_fraction ......................... 1.0
+  data_sharding ................................... True
+  dataloader_type ................................. single
+  DDP_impl ........................................ local
+  decoder_num_layers .............................. None
+  decoder_seq_length .............................. None
+  deepscale ....................................... False
+  deepscale_config ................................ None
+  deepspeed ....................................... True
+  deepspeed_activation_checkpointing .............. True
+  deepspeed_config ................................ examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/ds_config_gpt_gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true.json
+  dino_bottleneck_size ............................ 256
+  dino_freeze_last_layer .......................... 1
+  dino_head_hidden_size ........................... 2048
+  dino_local_crops_number ......................... 10
+  dino_local_img_size ............................. 96
+  dino_norm_last_layer ............................ False
+  dino_teacher_temp ............................... 0.07
+  dino_warmup_teacher_temp ........................ 0.04
+  dino_warmup_teacher_temp_epochs ................. 30
+  distribute_checkpointed_activations ............. False
+  distribute_saved_activations .................... False
+  distributed_backend ............................. nccl
+  distributed_timeout_minutes ..................... 10
+  ds_fused_adam ................................... False
+  ds_inference .................................... False
+  ds_pipeline_enabled ............................. True
+  ds_sequence_parallel_fpdt ....................... False
+  ds_sequence_parallel_fpdt_chunk_size ............ 65536
+  ds_sequence_parallel_fpdt_offloading ............ False
+  ds_sequence_parallel_size ....................... 1
+  embedding_path .................................. None
+  embedding_weights_in_fp32 ....................... False
+  empty_unused_memory_level ....................... 0
+  enable_expert_tensor_parallelism ................ False
+  enable_zbh1_exact_semantics ..................... False
+  enable_zbh1_pipeline ............................ False
+  encoder_num_layers .............................. 12
+  encoder_seq_length .............................. 256
+  end_weight_decay ................................ 0.1
+  eod_mask_loss ................................... False
+  eval_interval ................................... 1000000
+  eval_iters ...................................... 1
+  evidence_data_path .............................. None
+  exit_duration_in_mins ........................... 30000000
+  exit_interval ................................... None
+  exit_on_missing_checkpoint ...................... False
+  exit_signal_handler ............................. False
+  expert_interval ................................. 2
+  ffn_hidden_size ................................. 3072
+  finetune ........................................ False
+  force_ds_sequence_parallel ...................... False
+  fp16 ............................................ True
+  fp16_lm_cross_entropy ........................... False
+  fp32_residual_connection ........................ False
+  fp8_amax_compute_algo ........................... most_recent
+  fp8_amax_history_len ............................ 1
+  fp8_e4m3 ........................................ False
+  fp8_hybrid ...................................... False
+  fp8_interval .................................... 1
+  fp8_margin ...................................... 0
+  fp8_wgrad ....................................... True
+  global_batch_size ............................... 2
+  gradient_accumulation_fusion .................... True
+  head_lr_mult .................................... 1.0
+  hidden_dropout .................................. 0.1
+  hidden_size ..................................... 768
+  hidden_size_teacher ............................. None
+  hysteresis ...................................... 2
+  ict_head_size ................................... None
+  ict_load ........................................ None
+  img_h ........................................... 224
+  img_w ........................................... 224
+  indexer_batch_size .............................. 128
+  indexer_log_interval ............................ 1000
+  inference ....................................... False
+  inference_batch_times_seqlen_threshold .......... 512
+  init_method_std ................................. 0.014
+  init_method_xavier_uniform ...................... False
+  initial_loss_scale .............................. 4294967296
+  iter_per_epoch .................................. 1250
+  kd .............................................. False
+  kd_alpha_ce ..................................... 1
+  kd_beta_ce ...................................... 1
+  kd_temp ......................................... 1.0
+  kill_switch_file ................................ None
+  kv_channels ..................................... 64
+  layernorm_epsilon ............................... 1e-05
+  lazy_mpu_init ................................... None
+  load ............................................ None
+  load_tag ........................................ None
+  load_teacher .................................... None
+  local_rank ...................................... 0
+  log_batch_size_to_tensorboard ................... True
+  log_interval .................................... 1
+  log_learning_rate_to_tensorboard ................ True
+  log_loss_scale_to_tensorboard ................... True
+  log_memory_to_tensorboard ....................... False
+  log_num_zeros_in_grad ........................... False
+  log_optimizer_states_to_tensorboard ............. False
+  log_params_norm ................................. False
+  log_timers_to_tensorboard ....................... True
+  log_validation_ppl_to_tensorboard ............... True
+  log_world_size_to_tensorboard ................... False
+  loss_scale ...................................... None
+  loss_scale_window ............................... 1000
+  lr .............................................. 0.00045
+  lr_decay_iters .................................. None
+  lr_decay_samples ................................ None
+  lr_decay_style .................................. cosine
+  lr_decay_tokens ................................. 100000000
+  lr_warmup_fraction .............................. None
+  lr_warmup_iters ................................. 0
+  lr_warmup_samples ............................... 0
+  lr_warmup_tokens ................................ 1024
+  make_vocab_size_divisible_by .................... 128
+  mask_factor ..................................... 1.0
+  mask_prob ....................................... 0.15
+  mask_type ....................................... random
+  masked_softmax_fusion ........................... True
+  max_position_embeddings ......................... 256
+  max_tokens_to_oom ............................... 12000
+  mem_efficient_ln ................................ True
+  memory_centric_tiled_linear ..................... False
+  merge_file ...................................... /home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-merges.txt
+  micro_batch_size ................................ 1
+  min_loss_scale .................................. 1.0
+  min_lr .......................................... 4.5e-06
+  mlp_type ........................................ standard
+  mmap_warmup ..................................... False
+  moe_eval_capacity_factor ........................ 1.0
+  moe_expert_parallel_size ........................ 1
+  moe_loss_coeff .................................. 0.01
+  moe_min_capacity ................................ 4
+  moe_token_dropping .............................. True
+  moe_top2_2nd_expert_sampling .................... True
+  moe_train_capacity_factor ....................... 1.0
+  mos ............................................. False
+  no_load_lr_state ................................ False
+  no_load_optim ................................... None
+  no_load_rng ..................................... None
+  no_persist_layer_norm ........................... False
+  no_pipeline_parallel ............................ False
+  no_save_optim ................................... None
+  no_save_rng ..................................... None
+  normalization ................................... layernorm
+  num_attention_heads ............................. 12
+  num_attention_heads_teacher ..................... None
+  num_channels .................................... 3
+  num_classes ..................................... 1000
+  num_experts ..................................... [64]
+  num_experts_switch .............................. None
+  num_experts_teacher ............................. [1]
+  num_key_value_heads ............................. 12
+  num_layers ...................................... 12
+  num_layers_per_virtual_pipeline_stage ........... None
+  num_layers_teacher .............................. None
+  num_workers ..................................... 0
+  onnx_safe ....................................... None
+  openai_gelu ..................................... False
+  optimizer ....................................... adam
+  output_bert_embeddings .......................... False
+  overlap_p2p_comm ................................ False
+  override_opt_param_scheduler .................... True
+  params_dtype .................................... torch.float16
+  partition_activations ........................... False
+  patch_dim ....................................... 16
+  perform_initialization .......................... True
+  pipeline_model_parallel_size .................... 2
+  pipeline_model_parallel_split_rank .............. None
+  profile ......................................... None
+  profile_backward ................................ False
+  profile_ranks ................................... None
+  profile_steps ................................... 2,3
+  proposal_adaptive_cutoff_min_observations ....... 8
+  proposal_adaptive_cutoff_retry_tolerance ........ 0.04
+  proposal_adaptive_cutoff_warmup_iters ........... 0
+  proposal_adaptive_cutoff_window ................. 16
+  proposal_async_queue ............................ 5
+  proposal_block_quant_g .......................... 8
+  proposal_cp_dir ................................. examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/proposal_cp
+  proposal_cp_mode ................................ proposal
+  proposal_cp_target .............................. test_dram
+  proposal_cutoff_k_tolerance ..................... 0.04
+  proposal_e_hat_proxy_off ........................ False
+  proposal_enable ................................. True
+  proposal_fault_interval ......................... 0
+  proposal_fault_log .............................. None
+  proposal_fault_warmup ........................... 0
+  proposal_finite_diff_eps ........................ None
+  proposal_h_lookup_lut_bins ...................... 8192
+  proposal_hessian_refresh_every .................. 100000
+  proposal_hessian_refresh_warmup_every ........... 20
+  proposal_independent_oracle_actual_batches ...... 1
+  proposal_independent_oracle_batch_seed .......... 20240625
+  proposal_independent_oracle_enable .............. True
+  proposal_independent_oracle_hvp_batches ......... 1
+  proposal_independent_oracle_iters ............... 2
+  proposal_independent_oracle_log_dir ............. examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/oracle
+  proposal_independent_oracle_rank_sample ......... 2048
+  proposal_independent_oracle_rank_sample_seed .... 20240625
+  proposal_lfcl_plan_policy ....................... lossy_log_size
+  proposal_n_bins_cutoff .......................... 4096
+  proposal_n_q .................................... 4096
+  proposal_nonexpert_fc_W ......................... 1
+  proposal_pinned_aos_capacity_tolerance .......... 0.75
+  proposal_score_linear_source .................... grad
+  proposal_score_policy ........................... abs_h_taylor_first_and_second_order
+  proposal_selection_mode ......................... hessian
+  proposal_test_expert_selection_only ............. False
+  proposal_test_skip_expert_commit ................ False
+  proposal_test_skip_expert_d2h ................... False
+  proposal_test_skip_nonexpert_commit ............. False
+  proposal_test_skip_nonexpert_d2h ................ False
+  proposal_topk_ratio ............................. 0.04
+  query_in_block_prob ............................. 0.1
+  rampup_batch_size ............................... None
+  random_ltd ...................................... False
+  rank ............................................ 0
+  recompute_granularity ........................... None
+  recompute_method ................................ None
+  recompute_num_layers ............................ 1
+  remote_device ................................... none
+  repeated_dataloader ............................. False
+  reset_attention_mask ............................ False
+  reset_iteration ................................. False
+  reset_position_ids .............................. False
+  retriever_report_topk_accuracies ................ []
+  retriever_score_scaling ......................... False
+  retriever_seq_length ............................ 256
+  retro_add_retriever ............................. False
+  retro_cyclic_train_iters ........................ None
+  retro_encoder_attention_dropout ................. 0.1
+  retro_encoder_hidden_dropout .................... 0.1
+  retro_encoder_layers ............................ 2
+  retro_num_neighbors ............................. 2
+  retro_num_retrieved_chunks ...................... 2
+  retro_return_doc_ids ............................ False
+  retro_workdir ................................... None
+  return_data_index ............................... False
+  rope_theta ...................................... 10000
+  rotary_percent .................................. 1.0
+  sample_rate ..................................... 1.0
+  save ............................................ None
+  save_interval ................................... 1000000
+  scatter_gather_tensors_in_pipeline .............. True
+  scattered_embeddings ............................ False
+  seed ............................................ 1234
+  seq_length ...................................... 256
+  sequence_parallel ............................... False
+  sgd_momentum .................................... 0.9
+  short_seq_prob .................................. 0.1
+  skip_train ...................................... False
+  split ........................................... 98,2,0
+  split_transformers .............................. False
+  squared_relu .................................... False
+  standalone_embedding_stage ...................... False
+  start_weight_decay .............................. 0.1
+  swiglu .......................................... False
+  swin_backbone_type .............................. tiny
+  synchronize_each_layer .......................... False
+  tensor_model_parallel_size ...................... 1
+  tensorboard_dir ................................. examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/tensorboard/gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true_cloud-pomvGq_2026.07.02-22.22.00
+  tensorboard_log_interval ........................ 1
+  tensorboard_queue_size .......................... 1
+  test_data_path .................................. None
+  tile_factor ..................................... 1
+  timing_log_level ................................ 0
+  timing_log_option ............................... minmax
+  titles_data_path ................................ None
+  tokenizer_model ................................. None
+  tokenizer_type .................................. GPT2BPETokenizer
+  topk ............................................ 1
+  train_data_exact_num_epochs ..................... None
+  train_data_path ................................. None
+  train_desc_path ................................. None
+  train_doc_idx_path .............................. None
+  train_idx_path .................................. None
+  train_iters ..................................... 2
+  train_sample_idx_path ........................... None
+  train_samples ................................... None
+  train_shuffle_idx_path .......................... None
+  train_tokens .................................... 999999999
+  transformer_impl ................................ local
+  transformer_pipeline_model_parallel_size ........ 2
+  trust_remote_code ............................... False
+  universal_checkpoint ............................ False
+  untie_embeddings_and_output_weights ............. False
+  use_checkpoint_args ............................. False
+  use_checkpoint_opt_param_scheduler .............. False
+  use_contiguous_buffers_in_local_ddp ............. True
+  use_cpu_initialization .......................... None
+  use_dataset_only ................................ False
+  use_distributed_optimizer ....................... False
+  use_flash_attn .................................. False
+  use_flash_attn_builder .......................... False
+  use_flash_attn_triton ........................... False
+  use_flash_attn_v1 ............................... False
+  use_flash_attn_v2 ............................... False
+  use_one_sent_docs ............................... False
+  use_pin_memory .................................. False
+  use_ring_exchange_p2p ........................... False
+  use_rotary_position_embeddings .................. False
+  use_tutel ....................................... False
+  valid_data_path ................................. ['/home/elice/data/slimpajama_6b/slimpajama_6b_valid_text_document']
+  variable_seq_lengths ............................ False
+  virtual_pipeline_model_parallel_size ............ None
+  vision_backbone_type ............................ vit
+  vision_pretraining .............................. False
+  vision_pretraining_type ......................... classify
+  vocab_extra_ids ................................. 0
+  vocab_file ...................................... /home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-vocab.json
+  vocab_size ...................................... None
+  wandb_exp_name .................................. 
+  wandb_project ................................... 
+  wandb_save_dir .................................. 
+  weight_decay .................................... 0.1
+  weight_decay_incr_style ......................... constant
+  world_size ...................................... 2
+  zero_allgather_bucket_size ...................... 0.0
+  zero_contigious_gradients ....................... False
+  zero_reduce_bucket_size ......................... 0.0
+  zero_reduce_scatter ............................. False
+  zero_stage ...................................... 1.0
+-------------------- end of arguments ---------------------
+setting number of micro-batches to constant 2
+> building GPT2BPETokenizer tokenizer ...
+ > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+> initializing torch distributed ...
+/home/elice/Element-Wise-MoE-Ckpt/megatron/core/tensor_parallel/layers.py:249: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @custom_fwd
+/home/elice/Element-Wise-MoE-Ckpt/megatron/core/tensor_parallel/layers.py:287: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @custom_bwd
+--------------------------------------------------
+DeepSpeed C++/CUDA extension op report
+--------------------------------------------------
+NOTE: Ops not installed will be just-in-time (JIT) compiled at
+      runtime if needed. Op compatibility means that your system
+      meet the required dependencies to JIT install the op.
+--------------------------------------------------
+JIT compiled ops requires ninja
+ninja .................. [92m[OKAY][0m
+--------------------------------------------------
+op name ................ installed .. compatible
+--------------------------------------------------
+[93m [WARNING] [0m async_io requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m async_io: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+async_io ............... [93m[NO][0m ....... [93m[NO][0m
+fused_adam ............. [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adam ............... [93m[NO][0m ....... [92m[OKAY][0m
+cpu_adagrad ............ [93m[NO][0m ....... [92m[OKAY][0m
+cpu_lion ............... [93m[NO][0m ....... [92m[OKAY][0m
+dc ..................... [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m Please specify CUTLASS location directory as environment variable CUTLASS_PATH
+[93m [WARNING] [0m Possible values are: a path, DS_IGNORE_CUTLASS_DETECTION and DS_USE_CUTLASS_PYTHON_BINDINGS
+evoformer_attn ......... [93m[NO][0m ....... [93m[NO][0m
+[93m [WARNING] [0m FP Quantizer is using an untested triton version (3.4.0), only 2.3.(0, 1) and 3.0.0 are known to be compatible with these kernels
+fp_quantizer ........... [93m[NO][0m ....... [93m[NO][0m
+fused_lamb ............. [93m[NO][0m ....... [92m[OKAY][0m
+fused_lion ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m gds requires the dev libaio .so object and headers but these were not found.
+[93m [WARNING] [0m gds: please install the libaio-dev package with apt
+[93m [WARNING] [0m If libaio is already installed (perhaps from source), try setting the CFLAGS and LDFLAGS environment variables to where it can be found.
+gds .................... [93m[NO][0m ....... [93m[NO][0m
+transformer_inference .. [93m[NO][0m ....... [92m[OKAY][0m
+inference_core_ops ..... [93m[NO][0m ....... [92m[OKAY][0m
+cutlass_ops ............ [93m[NO][0m ....... [92m[OKAY][0m
+quantizer .............. [93m[NO][0m ....... [92m[OKAY][0m
+ragged_device_ops ...... [93m[NO][0m ....... [92m[OKAY][0m
+ragged_ops ............. [93m[NO][0m ....... [92m[OKAY][0m
+random_ltd ............. [93m[NO][0m ....... [92m[OKAY][0m
+[93m [WARNING] [0m sparse_attn requires a torch version >= 1.5 and < 2.0 but detected 2.8
+[93m [WARNING] [0m using untested triton version (3.4.0), only 1.0.0 is known to be compatible
+sparse_attn ............ [93m[NO][0m ....... [93m[NO][0m
+spatial_inference ...... [93m[NO][0m ....... [92m[OKAY][0m
+transformer ............ [93m[NO][0m ....... [92m[OKAY][0m
+stochastic_transformer . [93m[NO][0m ....... [92m[OKAY][0m
+utils .................. [93m[NO][0m ....... [92m[OKAY][0m
+--------------------------------------------------
+DeepSpeed general environment info:
+torch install path ............... ['/home/elice/.local/lib/python3.12/site-packages/torch']
+torch version .................... 2.8.0+cu128
+deepspeed install path ........... ['/home/elice/.local/lib/python3.12/site-packages/deepspeed']
+deepspeed info ................... 0.18.9, unknown, unknown
+torch cuda version ............... 12.8
+torch hip version ................ None
+nvcc version ..................... 12.8
+deepspeed wheel compiled w. ...... torch 2.8, cuda 12.8
+shared memory (/dev/shm) size .... 139.62 GB
+**** Git info for Megatron: git_hash=04e2a973 git_branch=main ****
+> setting tensorboard ...
+WARNING: WANDB writing requested but no legit wandb project or experiment name provided, therefore no WANDB logs will be written according to random generated project or experiment name.
+> initialized tensor model parallel with size 1
+> initialized pipeline model parallel with size 2
+> setting random seeds to 1234 ...
+> compiling dataset index builder ...
+make: Entering directory '/home/elice/Element-Wise-MoE-Ckpt/megatron/data'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/home/elice/Element-Wise-MoE-Ckpt/megatron/data'
+>>> done with dataset index builder. Compilation time: 0.076 seconds
+> compiling and loading fused kernels ...
+[rank0]:W0702 22:22:24.079000 95330 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0702 22:22:24.079000 95330 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0702 22:22:24.128000 95330 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0702 22:22:24.128000 95330 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank0]:W0702 22:22:24.177000 95330 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank0]:W0702 22:22:24.177000 95330 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+ninja: no work to do.
+[rank1]:W0702 22:22:24.269000 95331 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank1]:W0702 22:22:24.269000 95331 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+[rank1]:W0702 22:22:24.294000 95331 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank1]:W0702 22:22:24.294000 95331 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+[rank1]:W0702 22:22:24.339000 95331 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[rank1]:W0702 22:22:24.339000 95331 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+>>> done with compiling and loading fused kernels. Compilation time: 0.338 seconds
+[rank0]:[W702 22:22:24.736981445 init.cpp:772] Warning: nvfuser is no longer supported in torch script, use _jit_set_nvfuser_enabled is deprecated and a no-op (function operator())
+[rank1]:[W702 22:22:24.737078089 init.cpp:772] Warning: nvfuser is no longer supported in torch script, use _jit_set_nvfuser_enabled is deprecated and a no-op (function operator())
+time to initialize megatron (seconds): 3.658
+[after megatron is initialized] datetime: 2026-07-02 22:22:24 
+building GPT model ...
+Before Building Model
+MA 0.0 GB         Max_MA 0.03 GB         CA 0.0 GB         Max_CA 0 GB 
+CPU Virtual Memory:  used = 14.65 GB, percent = 5.2%
+SEED_LAYERS=False BASE_SEED=1234 SEED_FN=None
+Using topology: {ProcessCoord(pipe=0, data=0, model=0): 0, ProcessCoord(pipe=1, data=0, model=0): 1}
+stage=0 layers=8
+     0: _to_float16
+     1: EmbeddingPipe
+     2: ParallelTransformerLayerPipe
+     3: ParallelTransformerLayerPipe
+     4: ParallelTransformerLayerPipe
+     5: ParallelTransformerLayerPipe
+     6: ParallelTransformerLayerPipe
+     7: ParallelTransformerLayerPipe
+stage=1 layers=10
+     8: ParallelTransformerLayerPipe
+     9: ParallelTransformerLayerPipe
+    10: ParallelTransformerLayerPipe
+    11: ParallelTransformerLayerPipe
+    12: ParallelTransformerLayerPipe
+    13: ParallelTransformerLayerPipe
+    14: _calculate_moe_loss
+    15: MixedFusedLayerNorm
+    16: EmbeddingPipe
+    17: float16_to_fp32
+  loss: loss_func
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 1): 974045952
+No existing process group found, creating a new group named: ep_size_1
+After Building Model
+MA 1.82 GB         Max_MA 1.82 GB         CA 2.03 GB         Max_CA 2 GB 
+CPU Virtual Memory:  used = 14.84 GB, percent = 5.3%
+ > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 974044416
+> learning rate decay style: cosine
+DeepSpeed is enabled.
+No existing process group found, creating a new group named: ep_size_1
+[after model, optimizer, and learning rate scheduler are built] datetime: 2026-07-02 22:22:25 
+[proposal] BASELINE VRAM (before proposal init): alloc=13642.7 MB, reserved=21554.5 MB
+[proposal] score first-order source: grad requested, but no DeepSpeed grad lease point was found; falling back to momentum
+[proposal] Fp32StateMapper mode=unfused_fp16  masters=833 adam_state_keys=833
+[proposal] PipelineEngine optimizer fence installed
+[proposal] lossy CP state init: ZERO-COPY all groups, optimizer_groups=768, total=906706944 elements, groups=113338368, n_tracked=768
+[proposal] lossy CP mem persistent: age2bit=226.7MB score_lut=0.131MB theta_cp=0.0MB hist_i64=0.033MB -> total=226.8MB
+[proposal] bf16_group detail truncated: showing 12/768 groups (756 omitted)
+[proposal] bf16_group g_idx=0: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=1: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=2: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=3: n_tensors=1, total=768, zero_copy=True
+[proposal] bf16_group g_idx=4: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=5: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=6: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=7: n_tensors=1, total=768, zero_copy=True
+[proposal] bf16_group g_idx=764: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=765: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=766: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=767: n_tensors=1, total=768, zero_copy=True
+[proposal] lossy CP state init: ZERO-COPY all groups, optimizer_groups=768, total=906706944 elements, groups=113338368, n_tracked=768
+[proposal] lossy CP mem persistent: age2bit=226.7MB score_lut=0.131MB theta_cp=0.0MB hist_i64=0.033MB -> total=226.8MB
+[proposal] bf16_group detail truncated: showing 12/768 groups (756 omitted)
+[proposal] bf16_group g_idx=0: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=1: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=2: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=3: n_tensors=1, total=768, zero_copy=True
+[proposal] bf16_group g_idx=4: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=5: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=6: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=7: n_tensors=1, total=768, zero_copy=True
+[proposal] bf16_group g_idx=764: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=765: n_tensors=1, total=3072, zero_copy=True
+[proposal] bf16_group g_idx=766: n_tensors=1, total=2359296, zero_copy=True
+[proposal] bf16_group g_idx=767: n_tensors=1, total=768, zero_copy=True
+[Gloo] Rank 1 is connected to [Gloo] Rank 10 peer ranks.  is connected to Expected number of connected peer ranks is : 11 peer ranks. 
+Expected number of connected peer ranks is : 1
+[proposal] proposal process groups created (world_size=2)
+[proposal] multi-rank selection domain local=906706944 global=1813413888 aos_capacity_ratio=0.040000 tolerance=0.750000
+[proposal] ExpertState pinned_aos pre-alloc: 1.02 GB (configured capacity (63469487 records); local_total=0.91G elements)
+[proposal] ExpertState pinned_aos pre-alloc: 1.02 GB (configured capacity (63469487 records); local_total=0.91G elements)
+[proposal] ExpertState dense recovery image: 10.88 GB (cp_target=test_dram, pinned=True)
+[proposal] ExpertState dense recovery image: 10.88 GB (cp_target=test_dram, pinned=True)
+[proposal] POST-INIT VRAM: alloc=14161.2 MB (Δ from baseline = +518.6 MB; lazy buffers add at iter 1)
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      4
+    validation: 2
+    test:       2
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000289 seconds
+    number of documents: 5489000
+ > dataset split:
+    train:
+     document indices in [0, 5379220) total of 5379220 documents
+    validation:
+     document indices in [5379220, 5489000) total of 109780 documents
+    test:
+     document indices in [5489000, 5489000) total of 0 documents
+ > WARNING: could not find index map files, building the indices on rank 0 ...
+ > only one epoch required, setting separate_last_epoch to False
+ > elasped time to build and save doc-idx mapping (seconds): 0.332564
+    using:
+     number of documents:       5379220
+     number of epochs:          1
+     sequence length:           256
+     total number of samples:   22279544
+ > elasped time to build and save sample-idx mapping (seconds): 0.827127
+ > building shuffle index with split [0, 22279544) and [22279544, 22279544) ...
+ > elasped time to build and save shuffle-idx mapping (seconds): 0.991122
+ > loading doc-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_doc_idx.npy
+ > loading sample-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_sample_idx.npy
+ > loading shuffle-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_shuffle_idx.npy
+    loaded indexed file in 0.043 seconds
+    total number of samples: 22279545
+    total number of epochs: 1
+ > WARNING: could not find index map files, building the indices on rank 0 ...
+ > only one epoch required, setting separate_last_epoch to False
+ > elasped time to build and save doc-idx mapping (seconds): 0.006186
+    using:
+     number of documents:       109780
+     number of epochs:          1
+     sequence length:           256
+     total number of samples:   464377
+ > elasped time to build and save sample-idx mapping (seconds): 0.009237
+ > building shuffle index with split [0, 464377) and [464377, 464377) ...
+ > elasped time to build and save shuffle-idx mapping (seconds): 0.015652
+ > loading doc-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_doc_idx.npy
+ > loading sample-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_sample_idx.npy
+ > loading shuffle-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_shuffle_idx.npy
+    loaded indexed file in 0.001 seconds
+    total number of samples: 464378
+    total number of epochs: 1
+> finished creating GPT datasets ...
+[after dataloaders are built] datetime: 2026-07-02 22:22:38 
+done with setup ...
+training ...
+> building train, validation, and test datasets ...
+ > datasets target sizes (minimum size):
+    train:      4
+    validation: 2
+    test:       2
+> building train, validation, and test datasets for GPT ...
+Single data path provided for train, valid & test
+ > building dataset index ...
+    reading sizes...
+    reading pointers...
+    reading document index...
+    creating numpy buffer of mmap...
+    creating memory view of numpy buffer...
+ > finished creating indexed dataset in 0.000299 seconds
+    number of documents: 5489000
+ > dataset split:
+    train:
+     document indices in [0, 5379220) total of 5379220 documents
+    validation:
+     document indices in [5379220, 5489000) total of 109780 documents
+    test:
+     document indices in [5489000, 5489000) total of 0 documents
+(min, max) time across ranks (ms):
+    model-and-optimizer-setup ......................: (1478.14, 1478.39)
+    train/valid/test-data-iterators-setup ..........: (2311.28, 2311.65)
+ > loading doc-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_doc_idx.npy
+ > loading sample-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_sample_idx.npy
+ > loading shuffle-idx mapping from /home/elice/data/slimpajama_6b/index-cache/5c58ceced7326f3f142e544f1fb10ffd_shuffle_idx.npy
+    loaded indexed file in 0.001 seconds
+    total number of samples: 22279545
+    total number of epochs: 1
+ > loading doc-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_doc_idx.npy
+ > loading sample-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_sample_idx.npy
+ > loading shuffle-idx mapping from /home/elice/data/slimpajama_6b/index-cache/935ef04a5d1befdf799c891cee8eb7c4_shuffle_idx.npy
+    loaded indexed file in 0.000 seconds
+    total number of samples: 464378
+    total number of epochs: 1
+> finished creating GPT datasets ...
+[before the start of training step] datetime: 2026-07-02 22:22:38 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] Backend compiler exception
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[256, 64][64, 1]"):
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 64][64, 1]" = topk[1];  topk = None
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     . Adding a graph break.
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]   Developer debug context: Backend: inductor
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[256, 64][64, 1]"):
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 64][64, 1]" = topk[1];  topk = None
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]     Traceback:
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.741000 95330 torch/_dynamo/exc.py:525] [2/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] Backend compiler exception
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[256][1]"):
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[256, 4][4, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[256, 4][4, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     . Adding a graph break.
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]   Hint: Report an issue to the backend compiler repo.
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]   Developer debug context: Backend: inductor
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     Exception:aten._local_scalar_dense.default
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[256][1]"):
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[256, 4][4, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[256, 4][4, 1]" = one_hot.float();  one_hot = None
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]     Traceback:
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank0]:W0702 22:22:44.822000 95330 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] Backend compiler exception
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[256, 64][64, 1]"):
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 64][64, 1]" = topk[1];  topk = None
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     . Adding a graph break.
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]   Hint: Report an issue to the backend compiler repo.
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]   Developer debug context: Backend: inductor
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     Exception:aten._local_scalar_dense.default
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     While executing %topk : [num_users=1] = call_function[target=torch.topk](args = (%l_source_,), kwargs = {k: %l_k_, dim: 0})
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         def forward(self, L_k_: "i64[][]", L_source_: "f32[256, 64][64, 1]"):
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             l_k_ = L_k_
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             l_source_ = L_source_
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:176 in _top_idx, code: return torch.topk(source, k=k, dim=0)[1]
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             topk = torch.topk(l_source_, k = l_k_, dim = 0);  l_source_ = l_k_ = None
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             getitem_1: "i64[s94, 64][64, 1]" = topk[1];  topk = None
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]             return (getitem_1,)
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     Original traceback:
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]     Traceback:
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 176, in _top_idx
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0]         return torch.topk(source, k=k, dim=0)[1]
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.148000 95331 torch/_dynamo/exc.py:525] [2/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] Backend compiler exception
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]   Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[256][1]"):
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[256, 4][4, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[256, 4][4, 1]" = one_hot.float();  one_hot = None
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     . Adding a graph break.
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]   Hint: Report an issue to the backend compiler repo.
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]   Developer debug context: Backend: inductor
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     Exception:aten._local_scalar_dense.default
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     While executing %one_hot : [num_users=1] = call_function[target=torch._C._nn.one_hot](args = (%l_x_,), kwargs = {num_classes: %l_num_classes_})
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     GraphModule: class GraphModule(torch.nn.Module):
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         def forward(self, L_num_classes_: "i64[][]", L_x_: "i64[256][1]"):
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             l_num_classes_ = L_num_classes_
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             l_x_ = L_x_
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]              # File: /home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py:181 in _one_hot_to_float, code: return F.one_hot(x, num_classes=num_classes).float()
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             one_hot: "i64[256, 4][4, 1]" = torch._C._nn.one_hot(l_x_, num_classes = l_num_classes_);  l_x_ = l_num_classes_ = None
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             float_1: "f32[256, 4][4, 1]" = one_hot.float();  one_hot = None
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]             return (float_1,)
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     Original traceback:
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]     Traceback:
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]       File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/moe/sharded_moe.py", line 181, in _one_hot_to_float
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0]         return F.one_hot(x, num_classes=num_classes).float()
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+[rank1]:W0702 22:22:50.234000 95331 torch/_dynamo/exc.py:525] [3/0] 
+/home/elice/.local/lib/python3.12/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/home/elice/.local/lib/python3.12/site-packages/torch/autograd/graph.py:829: UserWarning: c10d::broadcast_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:62.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/MoE/../../pretrain_gpt.py", line 361, in <module>
+[rank0]:     pretrain(train_valid_test_datasets_provider,
+[rank0]:   File "/home/elice/Element-Wise-MoE-Ckpt/megatron/training.py", line 277, in pretrain
+[rank0]:     iteration = train(forward_step_func,
+[rank0]:                 ^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/elice/Element-Wise-MoE-Ckpt/megatron/training.py", line 1339, in train
+[rank0]:     train_step(forward_step_func,
+[rank0]:   File "/home/elice/Element-Wise-MoE-Ckpt/megatron/training.py", line 723, in train_step
+[rank0]:     loss = model[0].train_batch(data_iter=data_iterator)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/runtime/pipe/engine.py", line 388, in train_batch
+[rank0]:     self._exec_schedule(sched)
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/runtime/pipe/engine.py", line 1378, in _exec_schedule
+[rank0]:     self._exec_instr(**cmd.kwargs)
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/runtime/pipe/engine.py", line 866, in _exec_backward_pass
+[rank0]:     out.backward(gradient=grad, retain_graph=(i < len(out_tensors) - 1))
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/torch/_tensor.py", line 647, in backward
+[rank0]:     torch.autograd.backward(
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+[rank0]:     _engine_run_backward(
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/torch/autograd/function.py", line 311, in apply
+[rank0]:     return user_fn(self, *args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/elice/.local/lib/python3.12/site-packages/deepspeed/runtime/activation_checkpointing/checkpointing.py", line 615, in backward
+[rank0]:     for t in ctx.deepspeed_saved_tensors:
+[rank0]: TypeError: 'NoneType' object is not iterable
+[rank0]:[W702 22:22:52.859887138 ProcessGroupNCCL.cpp:1538] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[rank1]:[W702 22:22:58.730848644 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=60, addr=[localhost]:56150, remote=[localhost]:29541): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7c402fd7eeb0 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5d694d1 (0x7c401a5694d1 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5d6a8cd (0x7c401a56a8cd in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5d6b47a (0x7c401a56b47a in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7c401a56619e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7c3fd9a3db18 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xecdb4 (0x7c3fbceecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x9caa4 (0x7c403769caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x129c6c (0x7c4037729c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank1]:[W702 22:22:58.749198643 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[rank1]:[W702 22:22:59.749524374 TCPStore.cpp:106] [c10d] sendBytes failed on SocketImpl(fd=60, addr=[localhost]:56150, remote=[localhost]:29541): Broken pipe
+Exception raised from sendBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:653 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7c402fd7eeb0 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5d694d1 (0x7c401a5694d1 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5d69d62 (0x7c401a569d62 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5d6b86e (0x7c401a56b86e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x30e (0x7c401a56618e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7c3fd9a3db18 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xecdb4 (0x7c3fbceecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x9caa4 (0x7c403769caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x129c6c (0x7c4037729c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank1]:[W702 22:22:59.763614664 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Broken pipe
+[rank1]:[W702 22:23:00.763843915 TCPStore.cpp:106] [c10d] sendBytes failed on SocketImpl(fd=60, addr=[localhost]:56150, remote=[localhost]:29541): Broken pipe
+Exception raised from sendBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:653 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7c402fd7eeb0 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5d694d1 (0x7c401a5694d1 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5d69d62 (0x7c401a569d62 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5d6b86e (0x7c401a56b86e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x30e (0x7c401a56618e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7c3fd9a3db18 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xecdb4 (0x7c3fbceecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x9caa4 (0x7c403769caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x129c6c (0x7c4037729c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank1]:[W702 22:23:00.777768432 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Broken pipe
+[rank1]:[W702 22:23:01.778072319 TCPStore.cpp:106] [c10d] sendBytes failed on SocketImpl(fd=60, addr=[localhost]:56150, remote=[localhost]:29541): Broken pipe
+Exception raised from sendBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:653 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7c402fd7eeb0 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5d694d1 (0x7c401a5694d1 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5d69d62 (0x7c401a569d62 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5d6b86e (0x7c401a56b86e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x30e (0x7c401a56618e in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x398 (0x7c3fd9a3db18 in /home/elice/.local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xecdb4 (0x7c3fbceecdb4 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x9caa4 (0x7c403769caa4 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x129c6c (0x7c4037729c6c in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank1]:[W702 22:23:01.792031639 ProcessGroupNCCL.cpp:1783] [PG ID 0 PG GUID 0(default_pg) Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Broken pipe
+[2026-07-02 22:23:02,066] [INFO] [launch.py:335:sigkill_handler] Killing subprocess 95330
+[2026-07-02 22:23:02,066] [INFO] [launch.py:335:sigkill_handler] Killing subprocess 95331
+[2026-07-02 22:23:05,733] [ERROR] [launch.py:341:sigkill_handler] ['/usr/bin/python3', '-u', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/MoE/../../pretrain_gpt.py', '--local_rank=1', '--override-opt_param-scheduler', '--adam-beta1', '0.9', '--adam-beta2', '0.95', '--tensor-model-parallel-size', '1', '--moe-expert-parallel-size', '1', '--num-experts', '64', '--moe-loss-coeff', '0.01', '--moe-train-capacity-factor', '1.0', '--moe-eval-capacity-factor', '1.0', '--moe-min-capacity', '4', '--init-method-std', '0.014', '--lr-decay-tokens', '100000000', '--lr-warmup-tokens', '1024', '--micro-batch-size', '1', '--exit-duration-in-mins', '30000000', '--global-batch-size', '2', '--num-layers', '12', '--hidden-size', '768', '--num-attention-heads', '12', '--seq-length', '256', '--max-position-embeddings', '256', '--train-tokens', '999999999', '--train-iters', '2', '--lr', '4.5e-4', '--min-lr', '4.5e-06', '--lr-decay-style', 'cosine', '--split', '98,2,0', '--log-interval', '1', '--eval-interval', '1000000', '--eval-iters', '1', '--save-interval', '1000000', '--weight-decay', '0.1', '--clip-grad', '1.0', '--hysteresis', '2', '--num-workers', '0', '--fp16', '--tensorboard-queue-size', '1', '--log-timers-to-tensorboard', '--log-batch-size-to-tensorboard', '--log-validation-ppl-to-tensorboard', '--tensorboard-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/tensorboard/gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true_cloud-pomvGq_2026.07.02-22.22.00', '--proposal-enable', '--proposal-cp-target', 'test_dram', '--proposal-cp-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/proposal_cp', '--proposal-topk-ratio', '0.04', '--proposal-selection-mode', 'hessian', '--proposal-hessian-refresh-every', '100000', '--proposal-hessian-refresh-warmup-every', '20', '--proposal-independent-oracle-enable', '--proposal-independent-oracle-iters', '2', '--proposal-independent-oracle-log-dir', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/oracle', '--proposal-independent-oracle-rank-sample', '2048', '--proposal-independent-oracle-actual-batches', '1', '--proposal-independent-oracle-hvp-batches', '1', '--checkpoint-activations', '--create-moe-param-group', '--vocab-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-vocab.json', '--merge-file', '/home/elice/Element-Wise-MoE-Ckpt/examples_deepspeed/rebase/gpt2-merges.txt', '--data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_train_text_document', '--valid-data-path', '/home/elice/data/slimpajama_6b/slimpajama_6b_valid_text_document', '--data-impl', 'mmap', '--deepspeed', '--deepspeed_config', 'examples_deepspeed/MoE/output/pp_hvp_smoke_20260702_222200/ds_config_gpt_gpt-0.125B-lr-4.5e-4-minlr-4.5e-06-bs-2-gpus-2-mp-1-pp-2-ep-64-mlc-0.01-cap-1.0-drop-true.json', '--pipeline-model-parallel-size', '2', '--deepspeed-activation-checkpointing'] exits with return code = 1

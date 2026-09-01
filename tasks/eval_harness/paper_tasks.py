@@ -20,7 +20,7 @@ TASK_NAMES = (
     "arc_challenge",
     "winogrande",
 )
-DEFAULT_DATA_ROOT = Path("/home/paul/data/lm_eval_paper_6tasks")
+DEFAULT_DATA_ROOT = Path.home() / "data" / "lm_eval_paper_6tasks"
 
 
 def _data_root() -> Path:

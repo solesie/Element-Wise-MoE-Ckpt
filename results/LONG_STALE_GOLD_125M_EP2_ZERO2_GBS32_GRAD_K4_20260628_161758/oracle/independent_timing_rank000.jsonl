@@ -1,5 +1,0 @@
-{"actual_batches": 8, "elapsed_ms": 16889.110629999777, "hvp_batches": 0, "mode": "independent_oracle_timing", "rank": 0, "sample_elements": 262144, "step": 51}
-{"actual_batches": 8, "elapsed_ms": 11089.218457000243, "hvp_batches": 0, "mode": "independent_oracle_timing", "rank": 0, "sample_elements": 262144, "step": 151}
-{"actual_batches": 8, "elapsed_ms": 15105.490147998353, "hvp_batches": 0, "mode": "independent_oracle_timing", "rank": 0, "sample_elements": 262144, "step": 201}
-{"actual_batches": 8, "elapsed_ms": 11342.746014999648, "hvp_batches": 0, "mode": "independent_oracle_timing", "rank": 0, "sample_elements": 262144, "step": 251}
-{"actual_batches": 8, "elapsed_ms": 14592.644311000186, "hvp_batches": 0, "mode": "independent_oracle_timing", "rank": 0, "sample_elements": 262144, "step": 299}

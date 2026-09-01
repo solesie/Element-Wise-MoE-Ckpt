@@ -106,6 +106,7 @@ class LossyRecordWriteInputs:
     ehat_geom_lut: Optional[torch.Tensor] = None
     use_e_hat_proxy: bool = True
     score_policy_id: int = 0
+    age_force_period: int = 128
     lfcl_fired_epoch: Optional[torch.Tensor] = None
 
 
@@ -272,6 +273,7 @@ if _HAS_TRITON:
         USE_ADAM_SCALAR_PTR: tl.constexpr,
         USE_E_HAT_PROXY: tl.constexpr,
         HAS_LFCL_FIRED_MASK: tl.constexpr,
+        AGE_FORCE_PERIOD: tl.constexpr,
         WORKER_COUNT: tl.constexpr,
     ):
         BLOCK_SIZE: tl.constexpr = G * GROUPS_PER_BLOCK
@@ -395,7 +397,10 @@ if _HAS_TRITON:
 
             th = tl.load(total_th_ptr)
             force = (age_code == 3) & _age2_phase_hit(
-                global_elem_idx_for_score, step_value, 128, 0x51ED270B,
+                global_elem_idx_for_score,
+                step_value,
+                AGE_FORCE_PERIOD,
+                0x51ED270B,
             ) & selectable_mask
             if RANDOM_MODE:
                 force = tl.full((BLOCK_SIZE,), False, tl.int1)
@@ -600,6 +605,7 @@ def launch_direct_records_for_segment_entry_workqueue(
     theta_cp_view: Optional[torch.Tensor] = None,
     use_e_hat_proxy: bool = True,
     score_policy_id: int = 0,
+    age_force_period: int = 128,
     lfcl_fired_epoch: Optional[torch.Tensor] = None,
     step_device: Optional[torch.Tensor] = None,
 ) -> None:
@@ -685,6 +691,7 @@ def launch_direct_records_for_segment_entry_workqueue(
         USE_ADAM_SCALAR_PTR=bool(use_adam_scalar_ptr),
         USE_E_HAT_PROXY=bool(use_e_hat_proxy),
         HAS_LFCL_FIRED_MASK=bool(has_lfcl_mask),
+        AGE_FORCE_PERIOD=max(1, int(age_force_period)),
         WORKER_COUNT=int(workers),
     )
 

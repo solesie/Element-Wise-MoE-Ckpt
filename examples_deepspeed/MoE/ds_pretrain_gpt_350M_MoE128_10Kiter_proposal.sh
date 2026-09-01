@@ -3,12 +3,20 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${DIR}/../.." && pwd)
-if [ -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
-    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+if [ ! -x "${REPO_ROOT}/.venv/bin/python" ] || [ ! -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
+    echo "Training environment is missing under ${REPO_ROOT}/.venv" >&2
+    exit 2
 fi
+export CUDA_HOME
+export DS_ACCELERATOR=${DS_ACCELERATOR:-cuda}
+export PATH="${REPO_ROOT}/.venv/bin:${CUDA_HOME}/bin:${PATH}"
+TORCH_LIB=$("${REPO_ROOT}/.venv/bin/python" -c \
+    'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "lib")')
+export LD_LIBRARY_PATH="${TORCH_LIB}:${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 BASE_SCRIPT="${DIR}/ds_pretrain_gpt_350M_MoE128.sh"
 
-DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-/home/paul/data/slimpajama_6b}
+DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-"${HOME}/data/slimpajama_6b"}
 DEFAULT_TRAIN_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document"
 DEFAULT_VALID_PREFIX="${DEFAULT_DATA_ROOT}/slimpajama_6b_valid_text_document"
 export VOCAB_PATH=${VOCAB_PATH:-"${DIR}/../rebase/gpt2-vocab.json"}
@@ -66,9 +74,8 @@ if [ "${TRAIN_ITERS}" -eq 10000 ]; then
     DEFAULT_FINAL_BF16_MODEL_PATH="${OUTPUT_BASEPATH}/bf16_model"
 fi
 export FINAL_BF16_MODEL_PATH=${FINAL_BF16_MODEL_PATH-${DEFAULT_FINAL_BF16_MODEL_PATH}}
-export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
-export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
+source "${REPO_ROOT}/tools/cuda_arch_env.sh"
+configure_cuda_arch_env "${REPO_ROOT}" "${REPO_ROOT}/.venv/bin/python"
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
 export PROPOSAL_IO_BACKEND=${PROPOSAL_IO_BACKEND:-file}
@@ -77,6 +84,8 @@ export PROPOSAL_CP_DIR=${PROPOSAL_CP_DIR:-"${OUTPUT_BASEPATH}/proposal_cp"}
 # Logical write-only trace for offline SSD WAF replay. Empty disables it.
 export PROPOSAL_IO_BACKLOG_TRACE_DIR=${PROPOSAL_IO_BACKLOG_TRACE_DIR-"${OUTPUT_BASEPATH}/waf_trace"}
 export PROPOSAL_TOPK=${PROPOSAL_TOPK:-0.04}
+export PROPOSAL_LFCL_FRACTION_PCT=${PROPOSAL_LFCL_FRACTION_PCT:-1.0}
+export PROPOSAL_AGE_FORCE_PERIOD=${PROPOSAL_AGE_FORCE_PERIOD:-128}
 export LFCL_PLAN_POLICY=${LFCL_PLAN_POLICY:-lossy_log_size}
 export HESSIAN_REFRESH_EVERY=${HESSIAN_REFRESH_EVERY:-100}
 export FAULT_INTERVAL=${FAULT_INTERVAL:-100}
@@ -90,8 +99,12 @@ case "${PROPOSAL_ORACLE_ENABLE}" in
 esac
 export PROPOSAL_ORACLE_ENABLE
 export ORACLE_INTERVAL=${ORACLE_INTERVAL:-1000}
-ORACLE_ITERS=${ORACLE_ITERS:-}
-if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ] && [ "${ORACLE_INTERVAL}" -gt 0 ] && [ -z "${ORACLE_ITERS}" ]; then
+ORACLE_ITERS_WAS_SET=${ORACLE_ITERS+x}
+ORACLE_ITERS=${ORACLE_ITERS-}
+if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ] && \
+   [ "${ORACLE_INTERVAL}" -gt 0 ] && \
+   [ -z "${ORACLE_ITERS_WAS_SET}" ] && \
+   [ -z "${ORACLE_ITERS}" ]; then
     for ((iter = ORACLE_INTERVAL; iter <= TRAIN_ITERS; iter += ORACLE_INTERVAL)); do
         ORACLE_ITERS="${ORACLE_ITERS:+${ORACLE_ITERS},}${iter}"
     done
@@ -103,6 +116,8 @@ EXTRA_PROPOSAL_FLAGS=" \
     --proposal-cp-target ${PROPOSAL_CP_TARGET} \
     --proposal-cp-dir ${PROPOSAL_CP_DIR} \
     --proposal-topk-ratio ${PROPOSAL_TOPK} \
+    --proposal-lfcl-fraction-pct ${PROPOSAL_LFCL_FRACTION_PCT} \
+    --proposal-age-force-period ${PROPOSAL_AGE_FORCE_PERIOD} \
     --proposal-e-hat-proxy-off \
     --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
     --proposal-lfcl-plan-policy ${LFCL_PLAN_POLICY} \
@@ -116,7 +131,9 @@ if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ] && [ -n "${ORACLE_ITERS}" ]; then
         --proposal-independent-oracle-enable \
         --proposal-independent-oracle-iters ${ORACLE_ITERS} \
         --proposal-independent-oracle-log-dir ${ORACLE_LOG_DIR:-${OUTPUT_BASEPATH}/oracle} \
-        --proposal-independent-oracle-rank-sample ${ORACLE_RANK_SAMPLE:-262144}"
+        --proposal-independent-oracle-rank-sample ${ORACLE_RANK_SAMPLE:-262144} \
+        --proposal-joint-saliency-bins ${JOINT_SALIENCY_BINS:-512} \
+        --proposal-joint-saliency-log-dir ${JOINT_SALIENCY_LOG_DIR:-${OUTPUT_BASEPATH}/oracle/joint_saliency}"
 fi
 
 export EXTRA_MEGATRON_FLAGS="--use-flash-attn-v2 ${EXTRA_MEGATRON_FLAGS:-} ${EXTRA_PROPOSAL_FLAGS}"
@@ -126,7 +143,10 @@ echo "[350M-10K-proposal] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_S
 echo "[350M-10K-proposal] iters=${TRAIN_ITERS} tokens=${TRAIN_TOKENS} warmup=${WARMUP_TOKENS} decay=${LR_DECAY_TOKENS}"
 echo "[350M-10K-proposal] micro_batch=${BATCH_SIZE} zero=${ZERO_STAGE} activation_checkpoint=${ACTIVATION_CHECKPOINT} precision=${TRAIN_PRECISION}"
 echo "[350M-10K-proposal] eval=${EVAL_INTERVAL}x${EVAL_ITERS} cp_target=${PROPOSAL_CP_TARGET} h_refresh=${HESSIAN_REFRESH_EVERY} fault=${FAULT_INTERVAL} oracle=${ORACLE_INTERVAL}:${ORACLE_ITERS}"
+echo "[350M-10K-proposal] lfsy=${PROPOSAL_TOPK} lfcl=${PROPOSAL_LFCL_FRACTION_PCT}% age_force_period=${PROPOSAL_AGE_FORCE_PERIOD}"
+echo "[350M-10K-proposal] joint_saliency=oracle-coupled bins=${JOINT_SALIENCY_BINS:-512}"
 echo "[350M-10K-proposal] waf_trace=${PROPOSAL_IO_BACKLOG_TRACE_DIR:-disabled}"
+echo "[350M-10K-proposal] cutoff_trace=${PROPOSAL_APPROX_PROBE_TELEMETRY_LOG:-disabled} lfcl_fire_log=${PROPOSAL_LFCL_FIRE_LOG:-disabled}"
 echo "[350M-10K-proposal] final_bf16_model=${FINAL_BF16_MODEL_PATH:-disabled}"
 
 exec bash "${BASE_SCRIPT}"

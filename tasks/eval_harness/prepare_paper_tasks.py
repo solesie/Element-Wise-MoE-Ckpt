@@ -23,7 +23,7 @@ from urllib.request import urlopen
 
 
 TASK_DEFINITION_COMMIT = "f4d4b3de3ee6741a7151a9fe74945ee515262f4c"
-DEFAULT_DATA_ROOT = Path("/home/paul/data/lm_eval_paper_6tasks")
+DEFAULT_DATA_ROOT = Path.home() / "data" / "lm_eval_paper_6tasks"
 PAPER_TASKS = (
     "piqa",
     "hellaswag",

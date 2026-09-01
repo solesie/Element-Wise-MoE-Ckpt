@@ -23,6 +23,23 @@ def proposal_prepare_after_optimizer() -> None:
     get_controller().prepare_after_optimizer()
 
 
+def proposal_attach_oracle_window_collector(collector: Any) -> None:
+    get_controller().attach_oracle_window_collector(collector)
+
+
+def proposal_oracle_window_post_optimizer(
+    model: Any,
+    iteration: int,
+    *,
+    applied: bool,
+) -> bool:
+    return get_controller().oracle_window_post_optimizer(
+        model,
+        int(iteration),
+        applied=bool(applied),
+    )
+
+
 def proposal_dispatch_post_iter(
     model: Any,
     iter_T: int,
@@ -50,8 +67,18 @@ def proposal_record_loss(step: int, loss: Optional[float]) -> None:
     get_controller().record_loss(step, loss)
 
 
-def proposal_run_independent_oracle(model: Any, data_iterator: Any, iteration: int) -> None:
-    get_controller().run_independent_oracle(model, data_iterator, iteration)
+def proposal_run_independent_oracle(
+    model: Any,
+    forward_step_func: Any,
+    data_iterator: Any,
+    iteration: int,
+) -> None:
+    get_controller().run_independent_oracle(
+        model,
+        forward_step_func,
+        data_iterator,
+        iteration,
+    )
 
 
 def proposal_vram_audit_iter_begin(step: int) -> None:
@@ -94,6 +121,8 @@ __all__ = [
     "init_proposal",
     "proposal_activate_after_warmup",
     "proposal_prepare_after_optimizer",
+    "proposal_attach_oracle_window_collector",
+    "proposal_oracle_window_post_optimizer",
     "proposal_dispatch_post_iter",
     "proposal_finalize_post_iter",
     "proposal_wait_d2h_before_optimizer",

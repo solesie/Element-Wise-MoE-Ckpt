@@ -1,0 +1,9 @@
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 1000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 2000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 3000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 4000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 5000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 6000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 7000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 8000 --cmap magma
+python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py --step 9000 --cmap magma

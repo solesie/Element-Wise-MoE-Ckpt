@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import time
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
@@ -71,6 +72,15 @@ class LossyCheckpointPipeline(
         if not (0.0 < self.topk_ratio <= 1.0):
             raise ValueError(
                 f"topk_ratio must satisfy 0 < topk_ratio <= 1, got {self.topk_ratio!r}"
+            )
+        self.age_force_period = int(
+            getattr(proposal_config, "age_force_period", 128)
+            if proposal_config is not None else 128
+        )
+        if self.age_force_period < 1:
+            raise ValueError(
+                "age_force_period must be >= 1, "
+                f"got {self.age_force_period!r}"
             )
         self.group_size = max(1, int(group_size))
         self.n_bins_cutoff = max(2, int(
@@ -135,6 +145,7 @@ class LossyCheckpointPipeline(
         self._policy_shadow_telemetry = PolicyShadowTelemetry.from_env()
         from ..telemetry.curvature_progress import CurvatureProgressTelemetry
         self._curvature_progress_telemetry = CurvatureProgressTelemetry.from_env()
+        self._joint_saliency_collector = None
         from ..cutoff.adaptive_controller import ApproxProbeRejectWarning
         self._approx_probe_reject_warning = ApproxProbeRejectWarning()
         self._checkpoint_workers = checkpoint_workers
@@ -359,6 +370,18 @@ class LossyCheckpointPipeline(
             for name in self._tname_list
             if name in self._tname_to_eid
         }))
+
+    def active_tracked_fragment_specs(self):
+        """Return immutable stable identities in active layout-name order."""
+
+        from ..storage.expert_partition import build_active_tracked_fragment_specs
+
+        return build_active_tracked_fragment_specs(
+            active_names=self._tname_list,
+            name_to_expert=self._tname_to_eid,
+            fragment_meta=getattr(self, "_expert_partition_fragment_meta", {}) or {},
+            name_to_param=self._name_to_param,
+        )
 
     def _build_approx_probe_metadata(self, *, device: torch.device) -> None:
         """Build static metadata for GPU-generated block-stratified probe.
@@ -585,6 +608,10 @@ class LossyCheckpointPipeline(
         theta_cp_state = getattr(self, "_theta_cp_score_state", None)
         if theta_cp_state is not None:
             add_owned_tensor("theta_cp.values", getattr(theta_cp_state, "values", None))
+        joint_saliency = getattr(self, "_joint_saliency_collector", None)
+        if joint_saliency is not None:
+            for name, tensor in joint_saliency.owned_cuda_tensors().items():
+                add_owned_tensor(f"joint_saliency.{name}", tensor)
         # Current dispatch carries no cross-iteration pending stash; current
         # lossy write inputs are local to ``step()``.
         # _v_mapping_v_flats and m/v/p group entries are flat views into
@@ -1122,6 +1149,66 @@ class LossyCheckpointPipeline(
             self._theta_cp_score_state = None
             for grp in self._groups:
                 grp["theta_cp_flat"] = None
+
+        # Joint saliency is part of the independent-oracle measurement. Normal
+        # one-shot oracle mode has no second switch. The explicit multi-update
+        # oracle-window mode owns separate storage and must not allocate or
+        # write this production-dispatch collector.
+        if bool(
+            getattr(self.proposal_config, "independent_oracle_enable", False)
+            and not getattr(
+                self.proposal_config,
+                "oracle_window_measurement_only",
+                False,
+            )
+        ):
+            from ..telemetry.joint_saliency import (
+                JointSaliencyCollector,
+                JointSaliencySettings,
+            )
+
+            oracle_dir = getattr(
+                self.proposal_config,
+                "independent_oracle_log_dir",
+                None,
+            )
+            if oracle_dir is None:
+                oracle_dir = Path(self.proposal_config.cp_dir) / "independent_oracle"
+            output_dir = getattr(
+                self.proposal_config,
+                "joint_saliency_log_dir",
+                None,
+            )
+            if output_dir is None:
+                output_dir = Path(oracle_dir) / "joint_saliency"
+            self._joint_saliency_collector = JointSaliencyCollector.initialize(
+                self,
+                JointSaliencySettings(
+                    enabled=True,
+                    n_bins=int(
+                        getattr(
+                            self.proposal_config,
+                            "joint_saliency_bins",
+                            512,
+                        )
+                    ),
+                    output_dir=Path(output_dir),
+                    global_expert_base=int(
+                        os.environ.get("PROPOSAL_FDP_EXPERT_ID_BASE", "0") or 0
+                    ),
+                    ep_rank=int(
+                        os.environ.get("PROPOSAL_FDP_EP_RANK", "0") or 0
+                    ),
+                    ep_size=int(
+                        os.environ.get("PROPOSAL_FDP_EP_SIZE", "1") or 1
+                    ),
+                    experts_per_layer=int(
+                        os.environ.get(
+                            "PROPOSAL_FDP_EXPERTS_PER_LAYER", "0"
+                        ) or 0
+                    ),
+                ),
+            )
 
         try:
             # Persistent memory accounting (only items truly retained

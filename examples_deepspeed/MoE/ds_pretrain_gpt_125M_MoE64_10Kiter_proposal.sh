@@ -3,9 +3,17 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${DIR}/../.." && pwd)
-if [ -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
-    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+if [ ! -x "${REPO_ROOT}/.venv/bin/python" ] || [ ! -x "${REPO_ROOT}/.venv/bin/deepspeed" ]; then
+    echo "Training environment is missing under ${REPO_ROOT}/.venv" >&2
+    exit 2
 fi
+export CUDA_HOME
+export DS_ACCELERATOR=${DS_ACCELERATOR:-cuda}
+export PATH="${REPO_ROOT}/.venv/bin:${CUDA_HOME}/bin:${PATH}"
+TORCH_LIB=$("${REPO_ROOT}/.venv/bin/python" -c \
+    'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "lib")')
+export LD_LIBRARY_PATH="${TORCH_LIB}:${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 BASE_SCRIPT="${DIR}/ds_pretrain_gpt_125M_MoE64.sh"
 
 export PROPOSAL_IO_BACKEND=${PROPOSAL_IO_BACKEND:-file}
@@ -47,9 +55,17 @@ if [ "${PROPOSAL_IO_BACKEND}" = "fdp" ] && [ "${EUID}" -ne 0 ]; then
         PROPOSAL_CP_TARGET="${PROPOSAL_CP_TARGET:-}" \
         PROPOSAL_CP_DIR="${PROPOSAL_CP_DIR:-}" \
         PROPOSAL_TOPK="${PROPOSAL_TOPK:-}" \
+        PROPOSAL_LFCL_FRACTION_PCT="${PROPOSAL_LFCL_FRACTION_PCT:-}" \
+        PROPOSAL_AGE_FORCE_PERIOD="${PROPOSAL_AGE_FORCE_PERIOD:-}" \
         LFCL_PLAN_POLICY="${LFCL_PLAN_POLICY:-}" \
         HESSIAN_REFRESH_EVERY="${HESSIAN_REFRESH_EVERY:-}" \
         HESSIAN_REFRESH_WARMUP_EVERY="${HESSIAN_REFRESH_WARMUP_EVERY:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_LOG="${PROPOSAL_CURVATURE_PROGRESS_LOG:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR="${PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS="${PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_EVERY="${PROPOSAL_CURVATURE_PROGRESS_EVERY:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_SEED="${PROPOSAL_CURVATURE_PROGRESS_SEED:-}" \
+        PROPOSAL_CURVATURE_PROGRESS_REFRESH_ONLY="${PROPOSAL_CURVATURE_PROGRESS_REFRESH_ONLY:-}" \
         PROPOSAL_ORACLE_ENABLE="${PROPOSAL_ORACLE_ENABLE:-}" \
         ORACLE_INTERVAL="${ORACLE_INTERVAL:-}" \
         ORACLE_ITERS="${ORACLE_ITERS:-}" \
@@ -59,16 +75,13 @@ if [ "${PROPOSAL_IO_BACKEND}" = "fdp" ] && [ "${EUID}" -ne 0 ]; then
         FAULT_LOG="${FAULT_LOG:-}" \
         PROPOSAL_FDP_FORCE_FORMAT="${PROPOSAL_FDP_FORCE_FORMAT:-}" \
         PROPOSAL_FDP_ALLOW_FORMAT="${PROPOSAL_FDP_ALLOW_FORMAT:-}" \
+        PROPOSAL_FDP_PERF_DIAG="${PROPOSAL_FDP_PERF_DIAG:-}" \
+        PROPOSAL_FDP_SQPOLL="${PROPOSAL_FDP_SQPOLL:-}" \
+        PROPOSAL_FDP_BLOCKING_COMPLETION="${PROPOSAL_FDP_BLOCKING_COMPLETION:-}" \
         bash "$0" "$@"
 fi
 
-DEFAULT_DATA_ROOT="/home/paul/data/slimpajama_6b"
-if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
-    DEFAULT_DATA_ROOT="/home/elice/data/slimpajama_6b"
-fi
-if [ ! -e "${DEFAULT_DATA_ROOT}/slimpajama_6b_train_text_document.idx" ]; then
-    DEFAULT_DATA_ROOT="/home/asdf1234/data/slimpajama_6b"
-fi
+DEFAULT_DATA_ROOT=${SLIMPAJAMA_DATA_ROOT:-"${HOME}/data/slimpajama_6b"}
 
 export VOCAB_PATH=${VOCAB_PATH:-"${DIR}/../rebase/gpt2-vocab.json"}
 export MERGE_PATH=${MERGE_PATH:-"${DIR}/../rebase/gpt2-merges.txt"}
@@ -89,13 +102,14 @@ export NUM_GPUS_PERNODE=${NUM_GPUS_PERNODE:-8}
 export MP_SIZE=${MP_SIZE:-1}
 export PP_SIZE=${PP_SIZE:-2}
 export EP_SIZE=${EP_SIZE:-64}
-export MOE_EXPERT_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE:-2}
+export MOE_EXPERT_PARALLEL_SIZE=${MOE_EXPERT_PARALLEL_SIZE:-4}
 export ZERO_STAGE=${ZERO_STAGE:-0}
 export BATCH_SIZE=${BATCH_SIZE:-8}
 export ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-false}
 export TRAIN_PRECISION=${TRAIN_PRECISION:-bf16}
 export LR=${LR:-4.5e-4}
 export MIN_LR=${MIN_LR:-4.5e-06}
+export EXPERT_INTERVAL=${EXPERT_INTERVAL:-2}
 
 DENOM=$((MP_SIZE * PP_SIZE * MOE_EXPERT_PARALLEL_SIZE))
 if [ "${DENOM}" -le 0 ] || [ $((NUM_GPUS % DENOM)) -ne 0 ]; then
@@ -103,8 +117,12 @@ if [ "${DENOM}" -le 0 ] || [ $((NUM_GPUS % DENOM)) -ne 0 ]; then
     exit 2
 fi
 DP_SIZE=$((NUM_GPUS / DENOM))
-if [ "${DP_SIZE}" -ne 2 ]; then
-    echo "Expected DP=2, got DP=${DP_SIZE}" >&2
+if [ "${DP_SIZE}" -ne 1 ]; then
+    echo "Expected expert DP=1 for the (DP,EP,PP)=(1,4,2) proposal profile, got DP=${DP_SIZE}" >&2
+    exit 2
+fi
+if [ $((EP_SIZE % MOE_EXPERT_PARALLEL_SIZE)) -ne 0 ]; then
+    echo "Experts must divide evenly across EP ranks: experts=${EP_SIZE}, EP=${MOE_EXPERT_PARALLEL_SIZE}" >&2
     exit 2
 fi
 
@@ -120,9 +138,8 @@ if [ "${TRAIN_ITERS}" -eq 10000 ]; then
     DEFAULT_FINAL_BF16_MODEL_PATH="${OUTPUT_BASEPATH}/bf16_model"
 fi
 export FINAL_BF16_MODEL_PATH=${FINAL_BF16_MODEL_PATH-${DEFAULT_FINAL_BF16_MODEL_PATH}}
-export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-"${REPO_ROOT}/.torch_extensions"}
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
-export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
+source "${REPO_ROOT}/tools/cuda_arch_env.sh"
+configure_cuda_arch_env "${REPO_ROOT}" "${REPO_ROOT}/.venv/bin/python"
 export DEEPSPEED_LAUNCH_ARGS=${DEEPSPEED_LAUNCH_ARGS:-"--num_gpus ${NUM_GPUS}"}
 
 cleanup_output_owner() {
@@ -133,6 +150,9 @@ cleanup_output_owner() {
 trap cleanup_output_owner EXIT
 
 if [ "${PROPOSAL_IO_BACKEND}" = "fdp" ]; then
+    export PROPOSAL_FDP_PERF_DIAG=${PROPOSAL_FDP_PERF_DIAG:-0}
+    export PROPOSAL_FDP_SQPOLL=${PROPOSAL_FDP_SQPOLL:-1}
+    export PROPOSAL_FDP_BLOCKING_COMPLETION=${PROPOSAL_FDP_BLOCKING_COMPLETION:-0}
     FDP_BLOCK_NAME=$(basename "${PROPOSAL_FDP_BLOCK_DEVICE}")
     FDP_SYSFS="/sys/block/${FDP_BLOCK_NAME}"
     if [ ! -e "${FDP_SYSFS}/queue/logical_block_size" ] || [ ! -e "${FDP_SYSFS}/size" ]; then
@@ -162,6 +182,16 @@ fi
 
 export PROPOSAL_CP_TARGET=${PROPOSAL_CP_TARGET:-test_dram}
 export PROPOSAL_IO_BACKLOG_TRACE_DIR=${PROPOSAL_IO_BACKLOG_TRACE_DIR-"${OUTPUT_BASEPATH}/waf_trace"}
+export PROPOSAL_TOPK=${PROPOSAL_TOPK:-0.04}
+export PROPOSAL_LFCL_FRACTION_PCT=${PROPOSAL_LFCL_FRACTION_PCT:-1.0}
+export PROPOSAL_AGE_FORCE_PERIOD=${PROPOSAL_AGE_FORCE_PERIOD:-128}
+export PROPOSAL_CHECKPOINT_WARMUP_ITERS=${PROPOSAL_CHECKPOINT_WARMUP_ITERS:-${WARMUP_ITERS}}
+export PROPOSAL_CURVATURE_PROGRESS_LOG=${PROPOSAL_CURVATURE_PROGRESS_LOG:-"${OUTPUT_BASEPATH}/oracle/h_rank/h_rank_rank{rank}.jsonl"}
+export PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR=${PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR:-"${OUTPUT_BASEPATH}/oracle/h_rank"}
+export PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS=${PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS:-2048}
+export PROPOSAL_CURVATURE_PROGRESS_EVERY=${PROPOSAL_CURVATURE_PROGRESS_EVERY:-1000}
+export PROPOSAL_CURVATURE_PROGRESS_SEED=${PROPOSAL_CURVATURE_PROGRESS_SEED:-2024}
+export PROPOSAL_CURVATURE_PROGRESS_REFRESH_ONLY=${PROPOSAL_CURVATURE_PROGRESS_REFRESH_ONLY:-1}
 
 PROPOSAL_ORACLE_ENABLE=${PROPOSAL_ORACLE_ENABLE:-1}
 case "${PROPOSAL_ORACLE_ENABLE}" in
@@ -196,16 +226,20 @@ FAULT_LOG=${FAULT_LOG:-"${OUTPUT_BASEPATH}/log/proposal_faults.jsonl"}
 EXTRA_PROPOSAL_FLAGS=" \
     --proposal-enable \
     --proposal-cp-mode proposal \
+    --proposal-checkpoint-warmup-iters ${PROPOSAL_CHECKPOINT_WARMUP_ITERS} \
     --proposal-cp-target ${PROPOSAL_CP_TARGET} \
     --proposal-cp-dir ${PROPOSAL_CP_DIR} \
-    --proposal-topk-ratio ${PROPOSAL_TOPK:-0.04} \
+    --proposal-topk-ratio ${PROPOSAL_TOPK} \
+    --proposal-lfcl-fraction-pct ${PROPOSAL_LFCL_FRACTION_PCT} \
+    --proposal-age-force-period ${PROPOSAL_AGE_FORCE_PERIOD} \
     --proposal-e-hat-proxy-off \
     --proposal-nonexpert-fc-W ${NONEXPERT_FC_W:-1} \
     --proposal-lfcl-plan-policy ${LFCL_PLAN_POLICY:-lossy_log_size} \
     --proposal-hessian-refresh-every ${HESSIAN_REFRESH_EVERY:-100} \
     --proposal-fault-interval ${FAULT_INTERVAL:-100} \
     --proposal-fault-warmup ${FAULT_WARMUP:-0} \
-    --proposal-fault-log ${FAULT_LOG}"
+    --proposal-fault-log ${FAULT_LOG} \
+    --expert-interval ${EXPERT_INTERVAL}"
 
 if [ "${PROPOSAL_ORACLE_ENABLE}" = "1" ]; then
 EXTRA_PROPOSAL_FLAGS="${EXTRA_PROPOSAL_FLAGS} \
@@ -219,13 +253,15 @@ export EXTRA_MEGATRON_FLAGS="--use-flash-attn-v2 ${EXTRA_MEGATRON_FLAGS:-} ${EXT
 
 echo "[10K-proposal] dataset=${DATA_PATH}"
 echo "[10K-proposal] dp=${DP_SIZE} pp=${PP_SIZE} ep=${MOE_EXPERT_PARALLEL_SIZE} experts=${EP_SIZE} gpus=${NUM_GPUS}"
-echo "[10K-proposal] train_iters=${TRAIN_ITERS} warmup_iters=${WARMUP_ITERS} warmup_tokens=${WARMUP_TOKENS} decay_tokens=${LR_DECAY_TOKENS}"
+echo "[10K-proposal] train_iters=${TRAIN_ITERS} lr_warmup_iters=${WARMUP_ITERS} checkpoint_warmup_iters=${PROPOSAL_CHECKPOINT_WARMUP_ITERS} warmup_tokens=${WARMUP_TOKENS} decay_tokens=${LR_DECAY_TOKENS}"
 echo "[10K-proposal] validation_interval=${EVAL_INTERVAL} validation_iters=${EVAL_ITERS}"
-echo "[10K-proposal] micro_batch=${BATCH_SIZE} zero=${ZERO_STAGE} precision=${TRAIN_PRECISION} proposal=4% cp_target=${PROPOSAL_CP_TARGET} theta_cp=2byte W=1 LFCL=${LFCL_PLAN_POLICY:-lossy_log_size}_1pct fault_interval=${FAULT_INTERVAL:-100} oracle_enable=${PROPOSAL_ORACLE_ENABLE} oracle_interval=${ORACLE_INTERVAL} oracle_iters=${ORACLE_ITERS}"
+echo "[10K-proposal] micro_batch=${BATCH_SIZE} zero=${ZERO_STAGE} precision=${TRAIN_PRECISION} proposal_topk=${PROPOSAL_TOPK} cp_target=${PROPOSAL_CP_TARGET} theta_cp=2byte W=1 LFCL=${LFCL_PLAN_POLICY:-lossy_log_size}_${PROPOSAL_LFCL_FRACTION_PCT}pct age_force=${PROPOSAL_AGE_FORCE_PERIOD} fault_interval=${FAULT_INTERVAL:-100} oracle_enable=${PROPOSAL_ORACLE_ENABLE} oracle_interval=${ORACLE_INTERVAL} oracle_iters=${ORACLE_ITERS}"
 echo "[10K-proposal] waf_trace=${PROPOSAL_IO_BACKLOG_TRACE_DIR:-disabled}"
+echo "[10K-proposal] h_rank_telemetry=every_${PROPOSAL_CURVATURE_PROGRESS_EVERY} sample_groups_per_rank_${PROPOSAL_CURVATURE_PROGRESS_SAMPLE_GROUPS} log=${PROPOSAL_CURVATURE_PROGRESS_LOG} snapshots=${PROPOSAL_CURVATURE_PROGRESS_REFRESH_SNAPSHOT_DIR}"
 echo "[10K-proposal] final_bf16_model=${FINAL_BF16_MODEL_PATH:-disabled}"
 if [ "${PROPOSAL_IO_BACKEND}" = "fdp" ]; then
     echo "[10K-proposal] fdp_backend=on block=${PROPOSAL_FDP_BLOCK_DEVICE} device=${PROPOSAL_FDP_DEVICE} readback=${PROPOSAL_FDP_VALIDATE_READBACK:-0}"
+    echo "[10K-proposal] fdp_perf_diag=${PROPOSAL_FDP_PERF_DIAG} sqpoll=${PROPOSAL_FDP_SQPOLL} blocking_completion=${PROPOSAL_FDP_BLOCKING_COMPLETION}"
 fi
 
 exec bash "${BASE_SCRIPT}"

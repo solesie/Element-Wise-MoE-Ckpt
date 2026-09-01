@@ -98,6 +98,8 @@ class Fp32StateMapper:
         self._fp32_flat: Optional[List[torch.Tensor]] = None
         self._fp32_grad_flat: Optional[List[torch.Tensor]] = None
         self._direct_master: Dict[int, torch.Tensor] = {}
+        self._direct_group_idx: Dict[int, int] = {}
+        self._direct_groups: List[torch.Tensor] = []
         self._zero_params_in_partition: List[List[torch.nn.Parameter]] = []
         self._zero_first_offset: List[int] = []
         self._zero_partition_size: List[int] = []
@@ -208,6 +210,8 @@ class Fp32StateMapper:
         for f16_group, fp32_group in zip(candidate.fp16_groups, candidate.fp32_groups):
             for f16_param, fp32_param in zip(f16_group, fp32_group):
                 self._direct_master[id(f16_param)] = fp32_param
+                self._direct_group_idx[id(f16_param)] = len(self._direct_groups)
+                self._direct_groups.append(fp32_param)
         return True
 
     def _try_zero12(self, candidate: object) -> bool:
@@ -399,6 +403,14 @@ class Fp32StateMapper:
             return []
 
         fragments: List[LocalPartitionFragment] = []
+        if self._mode == "unfused_fp16":
+            for name, p in wanted.values():
+                group_idx = self._direct_group_idx.get(id(p))
+                if group_idx is not None:
+                    fragments.append((
+                        str(name), p, int(group_idx), 0, 0, int(p.numel()),
+                    ))
+            return fragments
         if self._mode != "zero12":
             for name, p in wanted.values():
                 hp_mapping = getattr(p, "_hp_mapping", None)
@@ -468,6 +480,18 @@ class Fp32StateMapper:
         *,
         state_key: Optional[str] = None,
     ) -> Optional[torch.Tensor]:
+        if self._mode == "unfused_fp16":
+            group_idx = int(group_idx)
+            if group_idx < 0 or group_idx >= len(self._direct_groups):
+                return None
+            master = self._direct_groups[group_idx]
+            source = (
+                master if state_key is None
+                else self._inner_opt.state.get(master, {}).get(state_key)
+            )
+            if source is None or local_offset < 0 or local_offset + numel > int(source.numel()):
+                return None
+            return source.reshape(-1).narrow(0, int(local_offset), int(numel))
         if self._mode != "zero12" or self._fp32_flat is None:
             if self._fp32_flat is None:
                 return None

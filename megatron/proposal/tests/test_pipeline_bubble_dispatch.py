@@ -264,8 +264,8 @@ def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
     class _FakeLosslessFC:
         last_d2h_event = None
 
-        def plan_if_due(self, step, **_kwargs):
-            calls.append(("plan", step))
+        def plan_if_due(self, step, *, process_group, world_size):
+            calls.append(("plan", step, process_group, world_size))
             return [(0, 0)]
 
         def fire_planned(self, step, fired, *, ready_event):
@@ -277,6 +277,9 @@ def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
     old_fc = ctrl._fc
     old_lossy_cp = ctrl._lossy_cp
     old_lossless_fc = ctrl._expert_lossless_fc
+    old_cpu_pg = ctrl._proposal_cpu_pg
+    old_world_size = ctrl._proposal_world_size
+    cpu_pg = object()
     ctrl._config = {
         "writes_expert": True,
         "expert_lossy_enabled": False,
@@ -284,6 +287,8 @@ def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
     ctrl._fc = None
     ctrl._lossy_cp = None
     ctrl._expert_lossless_fc = _FakeLosslessFC()
+    ctrl._proposal_cpu_pg = cpu_pg
+    ctrl._proposal_world_size = 8
     task = PostStepCheckpointTask(
         cuda_event=dispatch_event,
         iter_T=9,
@@ -301,12 +306,12 @@ def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
     try:
         worker.start()
         assert release.entered.wait(timeout=1.0)
-        assert calls == [("plan", 9), "wait"]
+        assert calls == [("plan", 9, cpu_pg, 8), "wait"]
         release.set()
         worker.join(timeout=1.0)
         assert not worker.is_alive()
         assert calls == [
-            ("plan", 9),
+            ("plan", 9, cpu_pg, 8),
             "wait",
             "release",
             ("fire", 9, ((0, 0),), boundary_event),
@@ -319,6 +324,8 @@ def test_stage0_lfcl_d2h_uses_same_bubble_event(monkeypatch):
         ctrl._fc = old_fc
         ctrl._lossy_cp = old_lossy_cp
         ctrl._expert_lossless_fc = old_lossless_fc
+        ctrl._proposal_cpu_pg = old_cpu_pg
+        ctrl._proposal_world_size = old_world_size
 
 
 def test_inline_worker_fallback_cannot_wait_for_future_bubble(monkeypatch):

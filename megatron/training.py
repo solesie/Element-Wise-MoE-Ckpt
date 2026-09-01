@@ -55,11 +55,16 @@ from megatron.core.pipeline_parallel.deepspeed_compat import (
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
-from megatron.proposal.config import lr_warmup_iters_from_args
+from megatron.proposal.config import (
+    checkpoint_warmup_iters_from_args,
+    lr_warmup_iters_from_args,
+)
+from megatron.proposal.telemetry import fdp_perf as proposal_fdp_perf
 from megatron.proposal.hooks import (
     init_proposal,
     proposal_activate_after_warmup,
     proposal_prepare_after_optimizer,
+    proposal_oracle_window_post_optimizer,
     proposal_dispatch_post_iter,
     proposal_finalize_post_iter,
     proposal_wait_d2h_before_optimizer,
@@ -88,11 +93,21 @@ def print_datetime(string):
 
 
 def _proposal_h_refresh_due(args, iteration):
+    if bool(
+        getattr(args, "proposal_oracle_window_measurement_only", False)
+    ):
+        # The oracle-window provider performs one common all-parameter FD at
+        # explicit T0.  Running the production expert-only refresh here would
+        # duplicate the expert forward/backward work and use a different K/eps.
+        return False
     h_refresh_every = int(getattr(args, 'proposal_hessian_refresh_every', 0) or 0)
     if h_refresh_every <= 0:
         return False
     iteration = int(iteration)
-    warmup_end = int(lr_warmup_iters_from_args(args))
+    # H must exist at the checkpoint activation boundary.  A checkpoint-only
+    # cold-start override must not leave the active selector without its
+    # initial H cache while the optimizer's LR warmup continues independently.
+    warmup_end = int(checkpoint_warmup_iters_from_args(args))
     if warmup_end > 0:
         return (
             iteration == warmup_end
@@ -1345,6 +1360,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        _fdp_iter_perf_on = bool(
+            getattr(args, 'proposal_enable', False)
+            and proposal_fdp_perf.enabled()
+        )
+        _iter_wall0 = (
+            proposal_fdp_perf.monotonic_raw_ns() if _fdp_iter_perf_on else 0
+        )
+        _iter_cpu0 = time.thread_time_ns() if _fdp_iter_perf_on else 0
         if (
             getattr(args, 'proposal_enable', False)
             or os.environ.get('PROPOSAL_VRAM_AUDIT', '') in ('1', 'true', 'True')
@@ -1367,10 +1390,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        proposal_warmup_end = int(lr_warmup_iters_from_args(args))
+        lr_warmup_end = int(lr_warmup_iters_from_args(args))
+        checkpoint_warmup_end = int(checkpoint_warmup_iters_from_args(args))
         if (
             getattr(args, 'proposal_enable', False)
-            and iteration > proposal_warmup_end
+            and iteration > checkpoint_warmup_end
         ):
             _audit_dispatched = proposal_vram_audit_dispatch_post_iter(
                 model,
@@ -1385,18 +1409,42 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     # below remain immediate to avoid drain deadlocks.
                     defer_stage0_emission=True,
                 )
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler,
-                       config)
+        _fdp_perf_on = bool(
+            getattr(args, 'proposal_enable', False)
+            and proposal_fdp_perf.enabled()
+        )
+        _train_wall0 = proposal_fdp_perf.monotonic_raw_ns() if _fdp_perf_on else 0
+        _train_cpu0 = time.thread_time_ns() if _fdp_perf_on else 0
+        try:
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                           train_data_iterator,
+                           model,
+                           optimizer,
+                           opt_param_scheduler,
+                           config)
+        finally:
+            if _fdp_perf_on:
+                _train_wall1 = proposal_fdp_perf.monotonic_raw_ns()
+                _train_cpu1 = time.thread_time_ns()
+                proposal_fdp_perf.record_interval(
+                    "train_step",
+                    int(iteration + 1),
+                    _train_wall0,
+                    _train_wall1,
+                    _train_cpu0,
+                    _train_cpu1,
+                )
         iteration += 1
         args.iteration = iteration
 
         if getattr(args, 'proposal_enable', False):
             proposal_prepare_after_optimizer()
+            proposal_oracle_window_post_optimizer(
+                model,
+                iteration,
+                applied=(skipped_iter == 0),
+            )
 
         # Resolve current iter's loss (flushes post-fault loss + cpu mem samples).
         cur_loss_value = None
@@ -1411,8 +1459,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         activated_now = False
         if (
             getattr(args, 'proposal_enable', False)
-            and proposal_warmup_end > 0
-            and iteration == proposal_warmup_end
+            and checkpoint_warmup_end > 0
+            and iteration == checkpoint_warmup_end
         ):
             activated_now = proposal_activate_after_warmup(model, iteration)
 
@@ -1435,7 +1483,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 model, forward_step_func, valid_data_iterator, iteration,
             )
         if getattr(args, 'proposal_enable', False):
-            proposal_run_independent_oracle(model, valid_data_iterator, iteration)
+            proposal_run_independent_oracle(
+                model,
+                forward_step_func,
+                valid_data_iterator,
+                iteration,
+            )
         if (
             getattr(args, 'proposal_enable', False)
             or os.environ.get('PROPOSAL_VRAM_AUDIT', '') in ('1', 'true', 'True')
@@ -1448,7 +1501,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if (
             getattr(args, 'proposal_enable', False)
             and fault_interval > 0
-            and iteration > proposal_warmup_end
+            and iteration > lr_warmup_end
             and iteration >= fault_warmup
             and iteration % fault_interval == 0
             and iteration < args.train_iters
@@ -1556,6 +1609,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
+            if _fdp_iter_perf_on:
+                _iter_wall1 = proposal_fdp_perf.monotonic_raw_ns()
+                _iter_cpu1 = time.thread_time_ns()
+                proposal_fdp_perf.record_interval(
+                    "training_loop_iteration",
+                    int(iteration),
+                    _iter_wall0,
+                    _iter_wall1,
+                    _iter_cpu0,
+                    _iter_cpu1,
+                    exit_boundary=True,
+                )
             proposal_finalize_post_iter(model, iteration)
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
@@ -1566,6 +1631,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 proposal_shutdown()
             sys.exit()
         trigger(on_step_end)
+        if _fdp_iter_perf_on:
+            _iter_wall1 = proposal_fdp_perf.monotonic_raw_ns()
+            _iter_cpu1 = time.thread_time_ns()
+            proposal_fdp_perf.record_interval(
+                "training_loop_iteration",
+                int(iteration),
+                _iter_wall0,
+                _iter_wall1,
+                _iter_cpu0,
+                _iter_cpu1,
+                exit_boundary=False,
+            )
 
         # Exiting based on kill switch file
         if found_kill_switch():

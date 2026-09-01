@@ -404,6 +404,7 @@ def emit_segment_direct_from_plan(
                     getattr(lossy_state, "use_e_hat_proxy", True)
                 ),
                 score_policy_id=int(lossy_state.score_policy_id),
+                age_force_period=int(getattr(lossy_state, "age_force_period", 128)),
                 lfcl_fired_epoch=getattr(lossy_state, "lfcl_fired_epoch", None),
                 step_device=lossy_state.step_device,
             )

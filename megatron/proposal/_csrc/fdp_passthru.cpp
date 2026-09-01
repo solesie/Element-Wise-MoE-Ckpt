@@ -13,8 +13,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
+#include <sys/syscall.h>
 
 namespace proposal { namespace fdp {
 namespace {
@@ -92,6 +94,15 @@ bool env_bool_default(const char* name, bool fallback) {
     throw std::runtime_error(std::string("invalid boolean env ") + name);
 }
 
+uint64_t monotonic_raw_ns() {
+    timespec ts{};
+    if (::clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+        throw std::runtime_error("clock_gettime(CLOCK_MONOTONIC_RAW) failed");
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+}
+
 void prepare_uring_cmd_sqe(io_uring_sqe* sqe, int fd, bool fixed_file,
                            uint32_t cmd_op, const nvme_uring_cmd& cmd,
                            uint64_t user_data) {
@@ -112,8 +123,14 @@ struct UcmdRing::Impl {
     bool batching = false;
     bool file_registered = false;
     bool use_completion_thread = false;
+    bool use_sqpoll = false;
+    bool blocking_completion = false;
+    bool profile_runtime = false;
     std::atomic<bool> stop_completion{false};
     std::atomic<uint32_t> in_flight{0};
+    std::atomic<int64_t> completion_tid{-1};
+    std::atomic<uint64_t> completion_waits{0};
+    std::atomic<uint64_t> completed_cqes{0};
     std::thread completion_thread;
     mutable std::mutex state_mutex;
     std::condition_variable state_cv;
@@ -155,7 +172,9 @@ void UcmdRing::init(uint32_t queue_depth, const std::string& name,
 #ifdef IORING_SETUP_NO_SQARRAY
     params.flags |= IORING_SETUP_NO_SQARRAY;
 #endif
-    if (completion_thread) {
+    const bool use_sqpoll = completion_thread && env_bool_default(
+        "PROPOSAL_FDP_SQPOLL", true);
+    if (use_sqpoll) {
 #ifdef IORING_SETUP_SQPOLL
         params.flags |= IORING_SETUP_SQPOLL;
         params.sq_thread_idle = static_cast<uint32_t>(env_u64_default(
@@ -204,6 +223,11 @@ void UcmdRing::init(uint32_t queue_depth, const std::string& name,
 
     if (completion_thread) {
         impl_->use_completion_thread = true;
+        impl_->use_sqpoll = use_sqpoll;
+        impl_->blocking_completion = env_bool_default(
+            "PROPOSAL_FDP_BLOCKING_COMPLETION", false);
+        impl_->profile_runtime = env_bool_default(
+            "PROPOSAL_FDP_PERF_DIAG", false);
         impl_->stop_completion.store(false, std::memory_order_release);
         impl_->completion_thread = std::thread(&UcmdRing::completion_loop, this);
     }
@@ -213,6 +237,7 @@ void UcmdRing::close() {
     if (impl_ == nullptr) return;
     if (impl_->use_completion_thread) {
         impl_->stop_completion.store(true, std::memory_order_release);
+        impl_->state_cv.notify_all();
         if (impl_->completion_thread.joinable()) {
             impl_->completion_thread.join();
         }
@@ -228,8 +253,14 @@ void UcmdRing::close() {
     impl_->batching = false;
     impl_->file_registered = false;
     impl_->use_completion_thread = false;
+    impl_->use_sqpoll = false;
+    impl_->blocking_completion = false;
+    impl_->profile_runtime = false;
     impl_->stop_completion.store(false, std::memory_order_release);
     impl_->in_flight.store(0, std::memory_order_release);
+    impl_->completion_tid.store(-1, std::memory_order_release);
+    impl_->completion_waits.store(0, std::memory_order_release);
+    impl_->completed_cqes.store(0, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(impl_->state_mutex);
         impl_->active_stats = UcmdRingBatchStats{};
@@ -267,6 +298,11 @@ void UcmdRing::begin_batch() {
     std::lock_guard<std::mutex> lock(impl_->state_mutex);
     impl_->active_stats = UcmdRingBatchStats{};
     impl_->active_stats.queue_depth = queue_depth_;
+    impl_->active_stats.sqpoll = impl_->use_sqpoll;
+    impl_->active_stats.blocking_completion = impl_->blocking_completion;
+    if (impl_->profile_runtime) {
+        impl_->active_stats.batch_begin_mono_raw_ns = monotonic_raw_ns();
+    }
     impl_->first_error.clear();
     impl_->batching = true;
 }
@@ -276,11 +312,19 @@ uint32_t UcmdRing::end_batch() {
         throw std::runtime_error("UcmdRing::end_batch: batch is not open");
     }
     std::unique_lock<std::mutex> lock(impl_->state_mutex);
+    if (impl_->profile_runtime) {
+        impl_->active_stats.end_wait_begin_mono_raw_ns = monotonic_raw_ns();
+        impl_->active_stats.last_submit_mono_raw_ns =
+            impl_->active_stats.end_wait_begin_mono_raw_ns;
+    }
     impl_->state_cv.wait(lock, [&] {
         return impl_->active_stats.commands == impl_->active_stats.submitted &&
                impl_->in_flight.load(std::memory_order_acquire) == 0;
     });
     UcmdRingBatchStats& stats = impl_->active_stats;
+    if (impl_->profile_runtime) {
+        stats.batch_end_mono_raw_ns = monotonic_raw_ns();
+    }
     impl_->last_stats = stats;
     const uint32_t completed = stats.commands;
     const std::string error = impl_->first_error;
@@ -296,6 +340,19 @@ UcmdRingBatchStats UcmdRing::last_batch_stats() const {
     if (impl_ == nullptr) return UcmdRingBatchStats{};
     std::lock_guard<std::mutex> lock(impl_->state_mutex);
     return impl_->last_stats;
+}
+
+UcmdRingRuntimeStats UcmdRing::runtime_stats() const {
+    UcmdRingRuntimeStats out;
+    if (impl_ == nullptr) return out;
+    out.name = name_;
+    out.ring_fd = impl_->initialized ? impl_->ring.ring_fd : -1;
+    out.completion_tid = impl_->completion_tid.load(std::memory_order_acquire);
+    out.sqpoll = impl_->use_sqpoll;
+    out.blocking_completion = impl_->blocking_completion;
+    out.completion_waits = impl_->completion_waits.load(std::memory_order_relaxed);
+    out.completed_cqes = impl_->completed_cqes.load(std::memory_order_relaxed);
+    return out;
 }
 
 void UcmdRing::wait_for_sq_space() {
@@ -337,9 +394,15 @@ void UcmdRing::submit_async(int fd, uint32_t cmd_op,
         if (ret == 0) std::this_thread::yield();
     } while (ret == 0);
 
+    if (impl_->profile_runtime && impl_->active_stats.submitted == 0) {
+        impl_->active_stats.first_submit_mono_raw_ns = monotonic_raw_ns();
+    }
     ++impl_->active_stats.submitted;
     if (impl_->file_registered) ++impl_->active_stats.registered_file_submits;
     impl_->in_flight.fetch_add(1, std::memory_order_release);
+    if (impl_->blocking_completion) {
+        impl_->state_cv.notify_all();
+    }
 }
 
 void UcmdRing::submit_sync(int fd, uint32_t cmd_op,
@@ -397,9 +460,40 @@ void UcmdRing::submit_nvme(int fd, uint32_t cmd_op,
 }
 
 void UcmdRing::completion_loop() {
+    impl_->completion_tid.store(
+        static_cast<int64_t>(::syscall(SYS_gettid)),
+        std::memory_order_release);
     std::vector<io_uring_cqe*> cqes(queue_depth_ * 4);
     while (!impl_->stop_completion.load(std::memory_order_acquire) ||
            impl_->in_flight.load(std::memory_order_acquire) != 0) {
+        if (impl_->blocking_completion &&
+            impl_->in_flight.load(std::memory_order_acquire) == 0) {
+            std::unique_lock<std::mutex> idle_lock(impl_->state_mutex);
+            impl_->state_cv.wait(idle_lock, [&] {
+                return impl_->stop_completion.load(std::memory_order_acquire) ||
+                       impl_->in_flight.load(std::memory_order_acquire) != 0;
+            });
+            continue;
+        }
+        if (impl_->blocking_completion) {
+            io_uring_cqe* first = nullptr;
+            if (impl_->profile_runtime) {
+                impl_->completion_waits.fetch_add(1, std::memory_order_relaxed);
+            }
+            const int wait_ret = io_uring_wait_cqe(&impl_->ring, &first);
+            if (wait_ret < 0) {
+                std::lock_guard<std::mutex> lock(impl_->state_mutex);
+                if (impl_->first_error.empty()) {
+                    impl_->first_error = name_ +
+                        ": io_uring_wait_cqe failed: " +
+                        neg_errno_string(wait_ret);
+                }
+                impl_->active_stats.commands = impl_->active_stats.submitted;
+                impl_->in_flight.store(0, std::memory_order_release);
+                impl_->state_cv.notify_all();
+                break;
+            }
+        }
         const uint32_t got = io_uring_peek_batch_cqe(
             &impl_->ring, cqes.data(), static_cast<unsigned>(cqes.size()));
         if (got == 0) {
@@ -407,6 +501,7 @@ void UcmdRing::completion_loop() {
             continue;
         }
         std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        const bool first_completion = impl_->active_stats.commands == 0;
         for (uint32_t i = 0; i < got; ++i) {
             io_uring_cqe* cqe = cqes[i];
             if (cqe == nullptr || cqe->user_data == 0) continue;
@@ -419,6 +514,20 @@ void UcmdRing::completion_loop() {
                 impl_->first_error = name_ + ": NVMe completion status " +
                                      std::to_string(cqe->res);
             }
+        }
+        if (impl_->profile_runtime) {
+            if (first_completion) {
+                impl_->active_stats.first_completion_mono_raw_ns =
+                    monotonic_raw_ns();
+            }
+            if (
+                impl_->active_stats.commands == impl_->active_stats.submitted &&
+                impl_->in_flight.load(std::memory_order_acquire) == 0
+            ) {
+                impl_->active_stats.last_completion_mono_raw_ns =
+                    monotonic_raw_ns();
+            }
+            impl_->completed_cqes.fetch_add(got, std::memory_order_relaxed);
         }
         io_uring_cq_advance(&impl_->ring, got);
         impl_->state_cv.notify_all();

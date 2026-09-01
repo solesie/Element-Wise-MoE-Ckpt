@@ -229,6 +229,7 @@ class FCManager:
         lfcl_capacity_world_size: int = 1,
         expert_id_map: Optional[Mapping[str, ExpertId]] = None,
         defer_initial_expert_bootstrap: bool = False,
+        lfcl_interval_iters: int = 1,
     ) -> None:
         if nonexpert_fc_W < 1:
             raise ValueError(f"nonexpert_fc_W must be ≥1, got {nonexpert_fc_W}")
@@ -285,7 +286,11 @@ class FCManager:
             max(self._num_experts_by_layer.values()) if self._num_experts_by_layer else 0
         )
         self._num_expert_slots = len(self._all_expert_ids)
-        self.lfcl_interval_iters = 1
+        if int(lfcl_interval_iters) < 1:
+            raise ValueError(
+                f"lfcl_interval_iters must be >=1, got {lfcl_interval_iters}"
+            )
+        self.lfcl_interval_iters = int(lfcl_interval_iters)
 
         if schedule not in ("proposal", "sequential"):
             raise ValueError(
@@ -293,7 +298,8 @@ class FCManager:
             )
         self._schedule = schedule
 
-        # Proposal LFCL is fixed by V2: every iter, 1% expert slots by planner.
+        # Proposal LFCL runs every iteration and uses the configured global
+        # expert-slot fraction. Sequential mode ignores this quota.
         self._rr_cursor = 0
         self.lfcl_fraction_pct = float(lfcl_fraction_pct)
         self._lfcl_capacity_world_size = max(1, int(lfcl_capacity_world_size))
@@ -341,6 +347,9 @@ class FCManager:
         self._last_lfcl_batch_cuda_event: Optional["torch.cuda.Event"] = None
         self._last_lfcl_batch_info: Optional[Dict[str, Any]] = None
         self._last_lfcl_batch_sub_ms: Dict[str, float] = {}
+        self._fdp_perf_enabled = os.environ.get(
+            "PROPOSAL_FDP_PERF_DIAG", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
 
         # Generic collect is now non-expert only. The lock serialises rare
         # cache-miss writes; cache hits are stable dict reads.
@@ -349,7 +358,11 @@ class FCManager:
             self._collect_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._collect_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._collect_nonexpert_d2h_event: Optional["torch.cuda.Event"] = (
-                torch.cuda.Event()
+                torch.cuda.Event(enable_timing=self._fdp_perf_enabled)
+            )
+            self._collect_nonexpert_perf_start: Optional["torch.cuda.Event"] = (
+                torch.cuda.Event(enable_timing=True)
+                if self._fdp_perf_enabled else None
             )
             self._lfcl_batch_main_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
             self._lfcl_batch_d2h_event: Optional["torch.cuda.Event"] = torch.cuda.Event()
@@ -357,6 +370,7 @@ class FCManager:
             self._collect_main_event = None
             self._collect_d2h_event = None
             self._collect_nonexpert_d2h_event = None
+            self._collect_nonexpert_perf_start = None
             self._lfcl_batch_main_event = None
             self._lfcl_batch_d2h_event = None
 
@@ -666,6 +680,52 @@ class FCManager:
         if state is None:
             return 0
         return int(state.pinned_aos_total_bytes)
+
+    def active_nonexpert_named_parameters(
+        self,
+    ) -> Tuple[Tuple[str, torch.nn.Parameter], ...]:
+        """Return the canonical rank-owned non-expert optimizer population.
+
+        Replicated ZeRO-0 tensors have already been name-sharded across
+        DP x EP; partitioned layouts retain all names and let the FP32 mapper
+        resolve only the locally owned element intervals.  This read-only API
+        is for measurement ownership, not for deciding which model replicas a
+        distributed finite-difference forward must perturb.
+        """
+
+        named = self._named_params_cache
+        if named is None:
+            named = dict(self.model.named_parameters())
+            self._named_params_cache = named
+        missing = [name for name in self._non_expert_names if name not in named]
+        if missing:
+            raise RuntimeError(
+                "FCManager non-expert ownership references missing parameters: "
+                f"{missing[:8]}"
+            )
+        return tuple((name, named[name]) for name in self._non_expert_names)
+
+    def all_local_nonexpert_named_parameters(
+        self,
+    ) -> Tuple[Tuple[str, torch.nn.Parameter], ...]:
+        """Return every local non-expert replica participating in forward.
+
+        Unlike :meth:`active_nonexpert_named_parameters`, this list is not
+        storage-sharded.  A telemetry-only FD pass uses it to perturb every
+        local replica consistently while counting only canonical owned FP32
+        fragments in the reported distribution.
+        """
+
+        expert_names = {
+            name
+            for names in self._separated_tensors_by_slot.values()
+            for name in names
+        }
+        return tuple(
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad and name not in expert_names
+        )
 
     def _init_lfcl_batch_pinned(
         self,
@@ -1448,6 +1508,8 @@ class FCManager:
             if producer_ready_event is None:
                 main_event.record()
             with torch.cuda.stream(d2h_stream):
+                if self._collect_nonexpert_perf_start is not None:
+                    self._collect_nonexpert_perf_start.record(d2h_stream)
                 if producer_ready_event is not None:
                     d2h_stream.wait_event(producer_ready_event)
                 else:
@@ -1480,6 +1542,10 @@ class FCManager:
             "payload_bytes": int(payload_bytes),
             "total_pinned_bytes": int(padded_bytes),
             "plan": list(plan),
+            "gpu_timing_events": (
+                self._collect_nonexpert_perf_start,
+                read_event,
+            ) if self._collect_nonexpert_perf_start is not None else None,
         }
         if ready_event_for_writer is not None:
             self._collect_tls.pinned_info["ready_event"] = ready_event_for_writer
@@ -1680,15 +1746,32 @@ class FCManager:
             pinned_info["plan"],
             scalars=header_scalars,
         )
+        from ..telemetry import fdp_perf as _fdp_perf
+        _diag_nefc_stats: Dict[str, Any] = {}
+        _diag_ne_gpu_timing: Dict[str, float] = {}
 
         def _do_save(
             _path=path, _pinned_info=pinned_info, _header=header_bytes,
             _cuda_event=read_event, _on_complete=_unlink, _rec=rec,
             _stats=stats, _step=int(step), _payload=payload,
         ) -> None:
+            nonlocal _diag_nefc_stats, _diag_ne_gpu_timing
             t0 = time.perf_counter()
             _rec.queue_delay_ms = (t0 - _rec.submit_time) * 1000.0
             _ready_event = _pinned_info.get("ready_event")
+
+            def _capture_ne_gpu_timing() -> None:
+                nonlocal _diag_ne_gpu_timing
+                events = _pinned_info.get("gpu_timing_events")
+                if not _fdp_perf.enabled() or not events:
+                    return
+                start_event, done_event = events
+                if start_event is not None and done_event is not None:
+                    _diag_ne_gpu_timing = {
+                        "queued_dependency_plus_d2h_ms": float(
+                            start_event.elapsed_time(done_event)
+                        )
+                    }
 
             def _release_ready_event() -> None:
                 if _ready_event is not None:
@@ -1717,6 +1800,7 @@ class FCManager:
                 _release_ready_event()
 
             def _write_from_leased_slot() -> None:
+                nonlocal _diag_nefc_stats
                 write_start = time.perf_counter()
                 _rec.queue_delay_ms = (write_start - _rec.submit_time) * 1000.0
                 fdp_batch = bool(binary_io.fdp_metadata_mmap_enabled())
@@ -1724,7 +1808,15 @@ class FCManager:
                     binary_io.fdp_begin_nefc_batch()
                 try:
                     if _cuda_event is not None:
-                        _cuda_event.synchronize()
+                        if _fdp_perf.enabled():
+                            _fdp_perf.measured_call(
+                                "nonexpert_writer_d2h_host_wait",
+                                int(_step),
+                                _cuda_event.synchronize,
+                            )
+                        else:
+                            _cuda_event.synchronize()
+                        _capture_ne_gpu_timing()
                     pinned_tensor = _pinned_info["pinned"]
                     payload_bytes_local = _pinned_info["payload_bytes"]
                     self._record_nonexpert_write(
@@ -1736,7 +1828,9 @@ class FCManager:
                         step=_step, fsync=True,
                     ))
                     if fdp_batch:
-                        binary_io.fdp_end_nefc_batch_stats()
+                        _diag_nefc_stats = dict(
+                            binary_io.fdp_end_nefc_batch_stats()
+                        )
                         fdp_batch = False
                 except Exception as exc:
                     if fdp_batch:
@@ -1759,7 +1853,15 @@ class FCManager:
                     _write_from_leased_slot()
                     return
                 if _cuda_event is not None:
-                    _cuda_event.synchronize()
+                    if _fdp_perf.enabled():
+                        _fdp_perf.measured_call(
+                            "nonexpert_writer_d2h_host_wait",
+                            int(_step),
+                            _cuda_event.synchronize,
+                        )
+                    else:
+                        _cuda_event.synchronize()
+                    _capture_ne_gpu_timing()
                 pinned_tensor = _pinned_info["pinned"]
                 payload_bytes_local = _pinned_info["payload_bytes"]
                 self._record_nonexpert_write(
@@ -1776,7 +1878,9 @@ class FCManager:
                             step=_step,
                         )
                         if fdp_batch:
-                            binary_io.fdp_end_nefc_batch_stats()
+                            _diag_nefc_stats = dict(
+                                binary_io.fdp_end_nefc_batch_stats()
+                            )
                             fdp_batch = False
                     except Exception:
                         if fdp_batch:
@@ -1814,7 +1918,27 @@ class FCManager:
         # (no-writer fallback). The non-expert worker owns both the D2H
         # launch and the durable commit so there is no second commit queue
         # or self-submit path.
-        _do_save()
+        if _fdp_perf.enabled():
+            _ne_wall0 = _fdp_perf.monotonic_raw_ns()
+            _ne_cpu0 = time.thread_time_ns()
+            try:
+                _do_save()
+            finally:
+                _ne_wall1 = _fdp_perf.monotonic_raw_ns()
+                _ne_cpu1 = time.thread_time_ns()
+                _fdp_perf.record_interval(
+                    "nonexpert_persist_total",
+                    int(step),
+                    _ne_wall0,
+                    _ne_wall1,
+                    _ne_cpu0,
+                    _ne_cpu1,
+                    nefc_batch_stats=_diag_nefc_stats,
+                    gpu_timing_ms=_diag_ne_gpu_timing,
+                    data_bytes=int(rec.file_bytes),
+                )
+        else:
+            _do_save()
         self._nonexpert_fc_files[-1] = (path, rec)
         self.write_log.append(stats)
         self._write_records.append(rec)

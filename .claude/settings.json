@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(/usr/bin/env python3 -c \"import ast;ast.parse\\(open\\('MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py'\\).read\\(\\)\\)\")",
+      "Bash(/usr/bin/env python3 MoE_Check_Paper/scripts/plot_motivation_joint_saliency.py)",
+      "Bash(/usr/bin/env python3 -)",
+      "Bash(/usr/bin/env python3 -c ' *)",
+      "Bash(/usr/bin/env python3 /tmp/claude-1000/-home-elice-Element-Wise-MoE-Ckpt/e2bc0a6f-761d-4515-b157-1ac1b615dbee/scratchpad/overflow.py)",
+      "Bash(/usr/bin/env python3 /tmp/claude-1000/-home-elice-Element-Wise-MoE-Ckpt/e2bc0a6f-761d-4515-b157-1ac1b615dbee/scratchpad/sweep.py)",
+      "Bash(/usr/bin/env python3 /tmp/claude-1000/-home-elice-Element-Wise-MoE-Ckpt/e2bc0a6f-761d-4515-b157-1ac1b615dbee/scratchpad/ylab.py)",
+      "Bash(/usr/bin/env python3 /tmp/claude-1000/-home-elice-Element-Wise-MoE-Ckpt/e2bc0a6f-761d-4515-b157-1ac1b615dbee/scratchpad/verify.py)"
+    ]
+  }
+}

@@ -41,6 +41,69 @@ def _should_write() -> bool:
     return torch.distributed.get_rank() == 0
 
 
+def _finalize_curvature_views_and_record_telemetry(
+    *,
+    lossy_cp: Any,
+    iteration: int,
+    group_size: int,
+    names: List[str],
+    views: List[torch.Tensor],
+    successful_anchor_batches: int,
+) -> bool:
+    """Average signed FD views, persist due telemetry, then take ``abs``.
+
+    The helper is the single integration seam between the production anchor
+    and experiment-only H-rank telemetry.  With telemetry disabled it is
+    exactly the original in-place ``mul(inv).abs_()`` path.  An explicitly
+    requested telemetry path is fail-closed so a run cannot silently produce
+    zero measurement files.
+    """
+
+    if successful_anchor_batches <= 0:
+        raise ValueError("successful_anchor_batches must be positive")
+    telemetry = (
+        getattr(lossy_cp, "_curvature_progress_telemetry", None)
+        if lossy_cp is not None else None
+    )
+    requested = bool(os.environ.get("PROPOSAL_CURVATURE_PROGRESS_LOG", ""))
+    if requested and telemetry is None:
+        raise RuntimeError(
+            "curvature refresh telemetry was requested but is not attached "
+            "to the lossy checkpoint pipeline"
+        )
+    inv_success = 1.0 / float(successful_anchor_batches)
+    if telemetry is None or not getattr(telemetry, "enabled", False):
+        for view in views:
+            view.mul_(inv_success).abs_()
+        return False
+
+    due = int(iteration) % int(telemetry.every) == 0
+    if due:
+        print(
+            "[proposal] curvature_refresh_telemetry_dispatch "
+            f"rank={int(telemetry.rank)} step={int(iteration)}",
+            flush=True,
+        )
+    for view in views:
+        view.mul_(inv_success)
+    telemetry.record_signed_h_refresh(
+        step=int(iteration),
+        groups=getattr(lossy_cp, "_groups", ()),
+        group_size=int(group_size),
+        names=names,
+        signed_h_views=views,
+        n_anchor_batches=int(successful_anchor_batches),
+    )
+    if due and not telemetry.log_path.is_file():
+        raise RuntimeError(
+            "curvature refresh telemetry did not persist its due rank log: "
+            f"{telemetry.log_path}"
+        )
+    for view in views:
+        view.abs_()
+    return due
+
+
 def _zero12_expert_h_views_from_table(
     ds_opt: Any,
     table_name: str,
@@ -191,6 +254,32 @@ def _collect_anchor_h_named_views(
             out_names.append(name)
             views.append(view)
     return out_names, views
+
+
+def collect_parameter_fd_curvature_views(
+    *,
+    mapper: Any,
+    engine_optimizer: Any,
+    named_parameters: List[Tuple[str, torch.nn.Parameter]],
+    allow_create: bool,
+) -> Tuple[List[str], List[torch.Tensor]]:
+    """Public measurement adapter for finalized local FD accumulation views."""
+
+    names = [str(name) for name, _param in named_parameters]
+    params = [param for _name, param in named_parameters]
+    if str(getattr(mapper, "mode", getattr(mapper, "_mode", ""))) == "zero12":
+        return _zero12_expert_h_views_from_table(
+            engine_optimizer,
+            "averaged_gradients",
+            names,
+            params,
+        )
+    return _collect_anchor_h_named_views(
+        mapper,
+        names,
+        params,
+        allow_create=bool(allow_create),
+    )
 
 
 def _register_fd_grad_transform_hook(
@@ -588,6 +677,13 @@ def _refresh_h_quantile_from_finite_diff(
                 _p.grad = None
                 if hasattr(_p, "grad_accum"):
                     _p.grad_accum = None
+        elif getattr(_mapper, "_mode", "") == "unfused_fp16":
+            # DeepSpeed's non-pipeline FP16_UnfusedOptimizer deliberately
+            # drops LP ``param.grad`` after every optimizer step.  The first
+            # anchor backward recreates that normal training-owned buffer;
+            # keep it across the paired FD passes and collect it afterwards.
+            _h_view_names = []
+            _grad_accum_views = []
         else:
             _h_view_names, _grad_accum_views = _collect_anchor_h_named_views(
                 _mapper,
@@ -609,6 +705,12 @@ def _refresh_h_quantile_from_finite_diff(
             pinned_snapshot(_p.data.detach(), key=("anchor_theta", _i))
             for _i, _p in enumerate(_expert_ps_sorted)
         ]
+        _oracle_fd_changed = getattr(
+            _lossy_cp, "_oracle_window_fd_changed_counts", None,
+        )
+        if _oracle_fd_changed is not None:
+            _oracle_fd_changed[0].zero_()
+            _oracle_fd_changed[1].zero_()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         try:
@@ -630,6 +732,7 @@ def _refresh_h_quantile_from_finite_diff(
                     ds_pass_base=_bi * _fd_passes_per_anchor_batch,
                     ds_total_backward_passes=_fd_total_backward_passes,
                     final_grad_accum_boundary=True,
+                    perturb_changed_counts=_oracle_fd_changed,
                 )
                 if _mb_timing_on and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -650,6 +753,23 @@ def _refresh_h_quantile_from_finite_diff(
                     "H-quantile anchor did not complete every requested batch: "
                     f"{_n_succ}/{_n_anchor_batches}"
                 )
+            if _oracle_fd_changed is not None:
+                _lossy_cp._oracle_window_expert_fd_audit = {
+                    "parameter_dtype": str(_expert_ps_sorted[0].dtype).replace(
+                        "torch.", ""
+                    ),
+                    "epsilon": float(1.0e-3 if eps is None else eps),
+                    "compared_elements": int(
+                        sum(int(p.numel()) for p in _expert_ps_sorted)
+                        * int(fd_k_used)
+                        * int(_n_anchor_batches)
+                    ),
+                    "plus_changed_elements": int(_oracle_fd_changed[0].item()),
+                    "minus_changed_elements": int(_oracle_fd_changed[1].item()),
+                    "hutchinson_probes": int(fd_k_used),
+                    "data_batches": int(_n_anchor_batches),
+                    "iteration": int(iteration),
+                }
             if _zero12_mode:
                 _final_names, _final_views = _zero12_expert_h_views_from_table(
                     _ds_engine_opt,
@@ -694,27 +814,14 @@ def _refresh_h_quantile_from_finite_diff(
                         "H-quantile anchor produced NaN/Inf in resident "
                         "curvature views"
                     )
-                _inv_succ = 1.0 / float(_n_succ)
-                _curvature_telemetry = (
-                    getattr(_lossy_cp, "_curvature_progress_telemetry", None)
-                    if _lossy_cp is not None else None
+                _finalize_curvature_views_and_record_telemetry(
+                    lossy_cp=_lossy_cp,
+                    iteration=int(iteration),
+                    group_size=int(_group_size_for_fd),
+                    names=_h_view_names,
+                    views=_grad_accum_views,
+                    successful_anchor_batches=int(_n_succ),
                 )
-                if _curvature_telemetry is not None and getattr(_curvature_telemetry, "enabled", False):
-                    for _view in _grad_accum_views:
-                        _view.mul_(_inv_succ)
-                    _curvature_telemetry.record_signed_h_refresh(
-                        step=int(iteration),
-                        groups=getattr(_lossy_cp, "_groups", ()),
-                        group_size=int(_group_size_for_fd),
-                        names=_h_view_names,
-                        signed_h_views=_grad_accum_views,
-                        n_anchor_batches=int(_n_succ),
-                    )
-                    for _view in _grad_accum_views:
-                        _view.abs_()
-                else:
-                    for _view in _grad_accum_views:
-                        _view.mul_(_inv_succ).abs_()
                 if _lossy_cp is not None:
                     _lossy_cp.update_h_anchor_quantiles(
                         _grad_accum_views,
@@ -1064,6 +1171,43 @@ if _HAS_TRITON_HESSIAN:
                  (lp + eps_signed * z).to(tl.bfloat16), mask=mask)
 
 
+    @triton.jit
+    def _flat_z_perturb_audited_kernel(
+        lp_ptr,
+        n_elem,
+        eps_signed,
+        global_offset,
+        rng_seed_lo,
+        rng_seed_hi,
+        k_lo,
+        k_hi,
+        changed_count_ptr,
+        BLOCK: tl.constexpr,
+    ):
+        """The normal BF16 perturb plus an actual changed-element count."""
+
+        pid = tl.program_id(0)
+        local_offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = local_offs < n_elem
+        global_offs = local_offs + global_offset
+        lp = tl.load(lp_ptr + local_offs, mask=mask, other=0.0).to(tl.float32)
+        x = global_offs.to(tl.uint32) * tl.full((), 0x9E3779B9, tl.uint32)
+        x = x ^ tl.full((), rng_seed_lo, tl.uint32)
+        x = x ^ (global_offs.to(tl.uint32) >> 16) * tl.full((), 0x85EBCA6B, tl.uint32)
+        x = x ^ tl.full((), k_lo, tl.uint32) * tl.full((), 0xC2B2AE35, tl.uint32)
+        x = x ^ (x >> 13)
+        x = x * tl.full((), 0x27D4EB2D, tl.uint32)
+        x = x ^ (x >> 16)
+        z = tl.where((x & tl.full((), 1, tl.uint32)) == 0, 1.0, -1.0)
+        quantized = (lp + eps_signed * z).to(tl.bfloat16)
+        changed = mask & (quantized.to(tl.float32) != lp)
+        tl.atomic_add(
+            changed_count_ptr,
+            tl.sum(changed, axis=0).to(tl.int64),
+        )
+        tl.store(lp_ptr + local_offs, quantized, mask=mask)
+
+
 def _resident_views_are_finite(
     views: List[torch.Tensor],
     nonfinite_flag: torch.Tensor,
@@ -1135,6 +1279,34 @@ def _resident_views_are_finite(
     return int(nonfinite_flag.item()) == 0, flags
 
 
+def validate_parameter_fd_curvature_views(
+    views: List[torch.Tensor],
+) -> List[bool]:
+    """Public allocation-bounded finiteness/signal adapter for measurements."""
+
+    if not views:
+        raise ValueError("FD curvature validation requires non-empty views")
+    device = views[0].device
+    if device.type != "cuda":
+        raise ValueError("FD curvature validation requires CUDA views")
+    nonfinite_flag = torch.zeros((), dtype=torch.int32, device=device)
+    coverage = torch.zeros(len(views), dtype=torch.int32, device=device)
+    coverage_host = torch.empty(
+        len(views), dtype=torch.int32, device="cpu", pin_memory=True,
+    )
+    finite, flags = _resident_views_are_finite(
+        views,
+        nonfinite_flag,
+        coverage,
+        coverage_host,
+    )
+    if not finite:
+        raise RuntimeError("FD curvature contains NaN/Inf")
+    if not any(flags):
+        raise RuntimeError("FD curvature contains no nonzero signal")
+    return flags
+
+
 def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
                     global_offset: int,
                     rng_seed: int, k: int) -> None:
@@ -1157,6 +1329,45 @@ def _flat_z_perturb(lp_tensor: torch.Tensor, eps_signed: float,
         seed64 & 0xFFFFFFFF, (seed64 >> 32) & 0xFFFFFFFF,
         k64 & 0xFFFFFFFF, (k64 >> 32) & 0xFFFFFFFF,
         BLOCK=BLOCK,
+    )
+
+
+def _flat_z_perturb_audited(
+    lp_tensor: torch.Tensor,
+    eps_signed: float,
+    global_offset: int,
+    rng_seed: int,
+    k: int,
+    changed_count: torch.Tensor,
+) -> None:
+    """Use the normal perturb formula and count representable LP changes."""
+
+    n = int(lp_tensor.numel())
+    if n == 0:
+        return
+    if not _HAS_TRITON_HESSIAN:
+        raise RuntimeError("audited H-quantile perturb requires Triton")
+    if (
+        changed_count.dtype != torch.int64
+        or changed_count.numel() != 1
+        or changed_count.device != lp_tensor.device
+    ):
+        raise ValueError("changed_count must be a same-device scalar int64 tensor")
+    block = 8192
+    n_progs = (n + block - 1) // block
+    seed64 = int(rng_seed) & ((1 << 64) - 1)
+    k64 = int(k) & ((1 << 64) - 1)
+    _flat_z_perturb_audited_kernel[(n_progs,)](
+        lp_tensor,
+        n,
+        float(eps_signed),
+        int(global_offset),
+        seed64 & 0xFFFFFFFF,
+        (seed64 >> 32) & 0xFFFFFFFF,
+        k64 & 0xFFFFFFFF,
+        (k64 >> 32) & 0xFFFFFFFF,
+        changed_count,
+        BLOCK=block,
     )
 
 
@@ -1310,6 +1521,8 @@ def _compute_fd_fast_flat(
     schedule_backward_fn: Optional[Callable[[], bool]] = None,
     final_grad_accum_boundary: bool = True,
     phase_rng_state: Optional[Dict[str, Any]] = None,
+    transform_untracked_params: bool = True,
+    perturb_changed_counts: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[List[torch.Tensor]]:
     """Finite-difference anchor over the normal training backward path.
 
@@ -1325,10 +1538,21 @@ def _compute_fd_fast_flat(
 
     if grad_accum_views is None:
         raise RuntimeError("H-quantile anchor requires resident FP32 grad views")
+    ds_engine = _unwrap_engine(model_for_full_zero)
+    use_engine_backward = (
+        pipeline_engine is None
+        and ds_engine is not None
+        and callable(getattr(ds_engine, "backward", None))
+        and getattr(ds_engine, "optimizer", None) is not None
+    )
+    ds_opt = getattr(ds_engine, "optimizer", None) if use_engine_backward else None
+    lazy_unfused_grad = type(ds_opt).__name__ == "FP16_UnfusedOptimizer"
     # Pipeline ZeRO-1 skips ReduceGrads for every non-final +/- pass, so its
     # BF16 param.grad is the only cross-pass accumulator.  Keep it resident
     # until the final ReduceGrads copies the result to averaged_gradients.
-    preserve_param_grad_storage = pipeline_engine is not None or any(
+    # Non-pipeline FP16_UnfusedOptimizer likewise creates LP param.grad lazily
+    # in the first backward and has no resident FP32 grad table outside step().
+    preserve_param_grad_storage = pipeline_engine is not None or lazy_unfused_grad or any(
         isinstance(view, torch.Tensor) and view.dtype != torch.float32
         for view in grad_accum_views
     )
@@ -1364,19 +1588,17 @@ def _compute_fd_fast_flat(
                 _p.grad = None
 
     _tsum = {"perturb": 0.0, "hook": 0.0, "bwd": 0.0}
-    ds_engine = _unwrap_engine(model_for_full_zero)
-    use_engine_backward = (
-        pipeline_engine is None
-        and ds_engine is not None
-        and callable(getattr(ds_engine, "backward", None))
-        and getattr(ds_engine, "optimizer", None) is not None
-    )
-    ds_opt = getattr(ds_engine, "optimizer", None) if use_engine_backward else None
     expert_param_ids = {id(p) for p in expert_ps}
-    nonexpert_params = [
-        p for p in _trainable_params(ds_engine if use_engine_backward else model_for_full_zero)
-        if id(p) not in expert_param_ids
-    ]
+    nonexpert_params = (
+        [
+            p for p in _trainable_params(
+                ds_engine if use_engine_backward else model_for_full_zero
+            )
+            if id(p) not in expert_param_ids
+        ]
+        if bool(transform_untracked_params)
+        else []
+    )
     next_nonexpert_offset = sum(int(p.numel()) for p in expert_ps)
     nonexpert_offsets: Dict[int, int] = {}
     for p in nonexpert_params:
@@ -1444,11 +1666,26 @@ def _compute_fd_fast_flat(
                         with torch.no_grad():
                             for i, p in enumerate(expert_ps):
                                 p.data.copy_(restore_src_list[i], non_blocking=True)
-                                _flat_z_perturb(
-                                    p.data, sign * float(eps),
-                                    global_offset=int(grad_offsets[i]),
-                                    rng_seed=int(rng_seed), k=int(k),
-                                )
+                                if perturb_changed_counts is None:
+                                    _flat_z_perturb(
+                                        p.data, sign * float(eps),
+                                        global_offset=int(grad_offsets[i]),
+                                        rng_seed=int(rng_seed), k=int(k),
+                                    )
+                                else:
+                                    changed_count = (
+                                        perturb_changed_counts[0]
+                                        if sign > 0.0
+                                        else perturb_changed_counts[1]
+                                    )
+                                    _flat_z_perturb_audited(
+                                        p.data,
+                                        sign * float(eps),
+                                        global_offset=int(grad_offsets[i]),
+                                        rng_seed=int(rng_seed),
+                                        k=int(k),
+                                        changed_count=changed_count,
+                                    )
                         _sync(); _t1 = _time.perf_counter()
                         handles = []
                         loss_scale = (
@@ -1570,6 +1807,8 @@ def compute_hessian_finite_diff_core(
     schedule_backward_fn: Optional[Callable[[], bool]] = None,
     final_grad_accum_boundary: bool = True,
     phase_rng_state: Optional[Dict[str, Any]] = None,
+    transform_untracked_params: bool = True,
+    perturb_changed_counts: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[List[torch.Tensor]]:
     """Accumulate one finite-difference batch through the normal backward path.
 
@@ -1605,6 +1844,8 @@ def compute_hessian_finite_diff_core(
             schedule_backward_fn=schedule_backward_fn,
             final_grad_accum_boundary=final_grad_accum_boundary,
             phase_rng_state=phase_rng_state,
+            transform_untracked_params=transform_untracked_params,
+            perturb_changed_counts=perturb_changed_counts,
         )
 
     raise RuntimeError(
@@ -1631,6 +1872,8 @@ def compute_hessian_finite_diff(
     ds_total_backward_passes: Optional[int] = None,
     final_grad_accum_boundary: bool = True,
     phase_rng_state: Optional[Dict[str, Any]] = None,
+    transform_untracked_params: bool = True,
+    perturb_changed_counts: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[Any]:
     """Run one central finite-difference batch into training grad storage.
 
@@ -1745,4 +1988,54 @@ def compute_hessian_finite_diff(
         schedule_backward_fn=_schedule_backward,
         final_grad_accum_boundary=final_grad_accum_boundary,
         phase_rng_state=phase_rng_state,
+        transform_untracked_params=transform_untracked_params,
+        perturb_changed_counts=perturb_changed_counts,
+    )
+
+
+def compute_parameter_hessian_finite_diff(
+    model: Any,
+    forward_step_func: Callable,
+    data_iterator: Any,
+    parameters: List[torch.nn.Parameter],
+    k_samples: int,
+    *,
+    eps: float,
+    rng_seed: int,
+    theta_snap_ref: List[torch.Tensor],
+    grad_offsets: List[int],
+    grad_accum_views: List[torch.Tensor],
+    perturb_changed_counts: Tuple[torch.Tensor, torch.Tensor],
+    ds_pass_base: int = 0,
+    ds_total_backward_passes: Optional[int] = None,
+    final_grad_accum_boundary: bool = True,
+    phase_rng_state: Optional[Dict[str, Any]] = None,
+) -> Optional[Any]:
+    """Measurement adapter for an explicit parameter domain.
+
+    Unlike the production expert anchor, this adapter transforms only the
+    supplied parameter gradients.  Routing freeze is intentionally disabled:
+    a non-expert domain includes router parameters, whose curvature would be
+    undefined if their routing decisions were replayed from an unperturbed
+    capture.  The caller owns snapshot/restore and enforces ``k_samples >= 4``.
+    """
+
+    return compute_hessian_finite_diff(
+        model,
+        forward_step_func,
+        data_iterator,
+        parameters,
+        int(k_samples),
+        eps=float(eps),
+        use_routing_freeze=False,
+        rng_seed=int(rng_seed),
+        theta_snap_ref=theta_snap_ref,
+        grad_offsets=grad_offsets,
+        grad_accum_views=grad_accum_views,
+        ds_pass_base=int(ds_pass_base),
+        ds_total_backward_passes=ds_total_backward_passes,
+        final_grad_accum_boundary=bool(final_grad_accum_boundary),
+        phase_rng_state=phase_rng_state,
+        transform_untracked_params=False,
+        perturb_changed_counts=perturb_changed_counts,
     )

@@ -910,6 +910,11 @@ def _recover_from_fdp(
         gpu_replay_bytes = 0
         gpu_replay_experts = 0
         expert_apply_ms = 0.0
+        # Recovery-only timing: retain one event pair per LFSY replay call so
+        # the intrinsic pinned-H2D + scatter work can be separated from NVMe
+        # reads and the dense LFCL restore.  Events are allocated only during
+        # a fault recovery, never on the per-iteration checkpoint hot path.
+        gpu_replay_events = [[], []]
 
         def _apply_decoded_batch(
             decoded_batch: Dict[ExpertId, _DecodedExpertState],
@@ -943,11 +948,18 @@ def _recover_from_fdp(
                                 stream=stream,
                             )
                             if decoded.replay_plan is not None:
+                                replay_start = torch.cuda.Event(enable_timing=True)
+                                replay_end = torch.cuda.Event(enable_timing=True)
+                                replay_start.record(stream)
                                 replay_stats = replay_lfsy_in_place(
                                     decoded.replay_plan,
                                     replay_targets,
                                     staging,
                                     stream=stream,
+                                )
+                                replay_end.record(stream)
+                                gpu_replay_events[lane_index].append(
+                                    (replay_start, replay_end)
                                 )
                                 log_step = max(
                                     log_step,
@@ -1010,6 +1022,10 @@ def _recover_from_fdp(
                 expert_apply_ms += (
                     _time.perf_counter() - drain_t0
                 ) * 1000.0
+        gpu_replay_lane_ms = [
+            sum(float(start.elapsed_time(end)) for start, end in events)
+            for events in gpu_replay_events
+        ]
         expert_pipeline_ms = (_time.perf_counter() - _t_read0) * 1000.0
         _phase["expert_read_ms"] = float(
             read_batch_stats.get("fdp_expert_read_io_ms", 0.0)
@@ -1030,6 +1046,10 @@ def _recover_from_fdp(
         _phase["gpu_replay_records"] = float(gpu_replay_records)
         _phase["gpu_replay_bytes"] = float(gpu_replay_bytes)
         _phase["gpu_replay_lanes"] = float(2 if lane_pool is not None else 0)
+        _phase["gpu_replay_lane0_ms"] = float(gpu_replay_lane_ms[0])
+        _phase["gpu_replay_lane1_ms"] = float(gpu_replay_lane_ms[1])
+        _phase["gpu_replay_sum_ms"] = float(sum(gpu_replay_lane_ms))
+        _phase["gpu_replay_critical_ms"] = float(max(gpu_replay_lane_ms))
 
         diag.rolling_experts_loaded = len(log_loaded)
         diag.expert_fc_count = len(log_loaded)
@@ -1325,6 +1345,10 @@ def _print_recovery_phases(phase: Dict[str, float], diag: RecoveryDiagnostics) -
             f"gpu_replay={phase['gpu_replay_experts']:.0f}e/"
             f"{phase.get('gpu_replay_records', 0.0):.0f}r/"
             f"{phase.get('gpu_replay_bytes', 0.0) / (1024.0 ** 3):.2f}GiB "
+            f"pure={phase.get('gpu_replay_critical_ms', 0.0):.3f}ms"
+            f"(sum={phase.get('gpu_replay_sum_ms', 0.0):.3f},"
+            f"lanes={phase.get('gpu_replay_lane0_ms', 0.0):.3f}/"
+            f"{phase.get('gpu_replay_lane1_ms', 0.0):.3f}) "
         )
     print(
         f"[recovery] total={phase.get('total_ms', 0.0):.1f}ms  "

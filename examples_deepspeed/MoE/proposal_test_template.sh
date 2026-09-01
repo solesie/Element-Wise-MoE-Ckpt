@@ -18,8 +18,8 @@ export LD_LIBRARY_PATH=$(python3 -c 'import os,torch;print(os.path.join(os.path.
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=${CUDA_HOME}/bin:${PATH}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
-export MEGATRON_FUSED_KERNEL_ARCH_LIST=${MEGATRON_FUSED_KERNEL_ARCH_LIST:-90}
+source "${REPO_ROOT}/tools/cuda_arch_env.sh"
+configure_cuda_arch_env "${REPO_ROOT}" "$(command -v python3)"
 
 SEQ_LEN=${SEQ_LEN:-2048}
 NUM_LAYERS=${NUM_LAYERS:-12}

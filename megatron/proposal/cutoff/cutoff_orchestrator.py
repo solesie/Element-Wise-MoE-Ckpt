@@ -640,6 +640,7 @@ class CutoffOrchestrationMixin:
                 eps=float(hparams.eps),
                 step=int(global_step),
                 score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                age_force_period=int(getattr(self, "age_force_period", 128)),
                 use_e_hat_proxy=use_e_hat_proxy,
                 random_mode=bool(random_mode),
                 random_salt=int(random_salt),
@@ -894,6 +895,7 @@ class CutoffOrchestrationMixin:
                     eps=float(hparams.eps),
                     step=int(global_step),
                     score_policy_id=int(getattr(self, "score_policy_id", 0)),
+                    age_force_period=int(getattr(self, "age_force_period", 128)),
                     use_e_hat_proxy=use_e_hat_proxy,
                     random_mode=bool(random_mode),
                     random_salt=int(random_salt),
@@ -1235,6 +1237,7 @@ class CutoffOrchestrationMixin:
                 sqrt_bc2_inv=float(hparams.sqrt_bc2_inv),
                 eps=float(hparams.eps),
                 beta1=float(hparams.beta1),
+                age_force_period=int(getattr(self, "age_force_period", 128)),
             )
         t_after_telemetry = time.perf_counter() if profile else 0.0
         self._selection_total_th_host = float(tau_center)

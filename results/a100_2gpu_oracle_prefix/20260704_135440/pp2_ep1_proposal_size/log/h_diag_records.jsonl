@@ -1,3 +1,0 @@
-{"iter": 1, "estimator": "finite_diff", "expert_coverage": 1.0, "skip_ratio": 0.0, "eps": 0.001, "routing_freeze": false, "pipeline_fd_anchor": true, "vq_refresh_ms": 17.15273400031947}
-{"iter": 5, "estimator": "finite_diff", "expert_coverage": 0.375, "skip_ratio": 0.625, "eps": 0.001, "routing_freeze": false, "pipeline_fd_anchor": true, "vq_refresh_ms": 15.430929000103788}
-{"iter": 20, "estimator": "finite_diff", "expert_coverage": 0.5, "skip_ratio": 0.5, "eps": 0.001, "routing_freeze": false, "pipeline_fd_anchor": true, "vq_refresh_ms": 18.60334100001637}

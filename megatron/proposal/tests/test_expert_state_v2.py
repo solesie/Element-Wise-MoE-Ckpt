@@ -608,6 +608,101 @@ def test_theta_cp_mode_selects_by_residual_and_updates_written(tmp_path: Path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_theta_cp_default_taylor_score_is_elementwise(tmp_path: Path):
+    """Check the production first+second-order predicate lane by lane."""
+
+    expert_map = {(0, 0): [("mlp.w", torch.Size([16]), 16)]}
+    state = ExpertState(
+        expert_map,
+        output_dir=tmp_path,
+        fresh=True,
+        cp_target="test_dram",
+    )
+    device = torch.device("cuda")
+    state.warmup_record_pipeline(device)
+    group_size = 4
+    p = torch.full((16,), 32.0, dtype=torch.float32, device=device)
+    m = torch.zeros(16, dtype=torch.float32, device=device)
+    residual = torch.zeros(16, dtype=torch.float32, device=device)
+    # score=max(0, -m*e + 0.5*|H|*e^2), with |H|=1 below.
+    # The selected lanes cross group boundaries, proving G is a launch/layout
+    # unit and not a group-wise selection unit.
+    m[:5] = torch.tensor([-1.0, 1.0, 1.0, -1.0, 0.0], device=device)
+    residual[:5] = torch.tensor([2.0, -2.0, 1.0, -1.0, 4.0], device=device)
+    expected_idx = torch.tensor([0, 1, 4], dtype=torch.long, device=device)
+    theta_cp = (p - residual).to(torch.bfloat16)
+    theta_before = theta_cp.clone()
+    v = torch.ones(16, dtype=torch.float32, device=device)
+    h_lut_values = torch.ones(8, dtype=torch.float32, device=device)
+    h_lut_log_v_min = torch.zeros((), dtype=torch.float32, device=device)
+    h_lut_inv_log_v_width = torch.ones((), dtype=torch.float32, device=device)
+    total_th = torch.tensor(3.9, dtype=torch.float32, device=device)
+    hp = AdamHParams(lr_over_bc1=1.0, sqrt_bc2_inv=1.0, eps=1.0e-8)
+
+    lossy_state = LossyRecordWriteInputs(
+        bf16_groups_mvph=[(m, v, p, 0)],
+        name_list=["mlp.w"],
+        group_size=group_size,
+        theta_cp_groups=[theta_cp],
+        within_off_per_name=[0],
+        group_count_per_name=[4],
+        h_lut_values=h_lut_values,
+        h_lut_log_v_min=h_lut_log_v_min,
+        h_lut_inv_log_v_width=h_lut_inv_log_v_width,
+        total_th=total_th,
+        adam_hparams=hp,
+        direct_emission_enabled=True,
+        use_e_hat_proxy=False,
+        score_policy_id=0,
+    )
+    age = _attach_age2bit(lossy_state, 16, device)
+    lossy_state.step_device.fill_(10)
+    try:
+        state.write_for_iter(
+            step=10,
+            per_expert_updates={(0, 0): [("mlp.w", 0, 0, 16)]},
+            compute_event=None,
+            gpu_refs=[
+                m, v, p, theta_cp, h_lut_values, total_th,
+                age.age_words, age.ehat_geom_lut, lossy_state.step_device,
+            ],
+            lossy_state=lossy_state,
+        )
+        torch.cuda.synchronize()
+        assert state._direct_record_cursor_device is not None
+        assert state._direct_overflow_count_device is not None
+        assert int(state._direct_record_cursor_device[0].item()) == 3
+        assert int(state._direct_overflow_count_device[0].item()) == 0
+
+        prefix_off = _first_aos_prefix_offset(state._pinned_aos)
+        prefix_count, _ = struct.unpack_from(
+            "<II", state._pinned_aos.numpy(), prefix_off,
+        )
+        record_indices = {
+            struct.unpack_from(
+                "<I",
+                state._pinned_aos.numpy(),
+                prefix_off + BLOCK_PREFIX_BYTES + i * RECORD_BYTES,
+            )[0]
+            for i in range(int(prefix_count))
+        }
+        assert record_indices == set(expected_idx.cpu().tolist())
+
+        selected = expected_idx.cpu()
+        rest_mask = torch.ones(16, dtype=torch.bool)
+        rest_mask[selected] = False
+        theta_after = theta_cp.float().cpu()
+        assert torch.equal(
+            theta_after[selected], p.to(torch.bfloat16).float().cpu()[selected],
+        )
+        assert torch.equal(
+            theta_after[rest_mask], theta_before.float().cpu()[rest_mask],
+        )
+    finally:
+        state.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_direct_emission_resets_age_only_for_actual_written(tmp_path: Path):
     expert_map = {(0, 0): [("mlp.w", torch.Size([16]), 16)]}
     state = ExpertState(

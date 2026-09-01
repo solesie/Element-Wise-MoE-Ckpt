@@ -91,7 +91,44 @@ py::dict batch_stats_to_dict(const proposal::fdp::UcmdRingBatchStats& s) {
     d["registered_file_submits"] = s.registered_file_submits;
     d["submission_policy"] = "sq_space";
     d["completion_thread"] = true;
-    d["sqpoll"] = true;
+    d["sqpoll"] = s.sqpoll;
+    d["blocking_completion"] = s.blocking_completion;
+    d["batch_begin_mono_raw_ns"] = s.batch_begin_mono_raw_ns;
+    d["first_submit_mono_raw_ns"] = s.first_submit_mono_raw_ns;
+    d["last_submit_mono_raw_ns"] = s.last_submit_mono_raw_ns;
+    d["end_wait_begin_mono_raw_ns"] = s.end_wait_begin_mono_raw_ns;
+    d["first_completion_mono_raw_ns"] = s.first_completion_mono_raw_ns;
+    d["last_completion_mono_raw_ns"] = s.last_completion_mono_raw_ns;
+    d["batch_end_mono_raw_ns"] = s.batch_end_mono_raw_ns;
+    return d;
+}
+
+py::dict ring_runtime_to_dict(const proposal::fdp::UcmdRingRuntimeStats& s) {
+    py::dict d;
+    d["name"] = s.name;
+    d["ring_fd"] = s.ring_fd;
+    d["completion_tid"] = s.completion_tid;
+    d["sqpoll"] = s.sqpoll;
+    d["blocking_completion"] = s.blocking_completion;
+    d["completion_waits"] = s.completion_waits;
+    d["completed_cqes"] = s.completed_cqes;
+    return d;
+}
+
+py::dict metadata_perf_to_dict(
+    const proposal::fdp::MetadataCommitPerfStats& s) {
+    py::dict d;
+    d["valid"] = s.valid;
+    d["iter"] = s.iter;
+    d["owner_rank"] = s.owner_rank;
+    d["metadata_image_bytes"] = s.metadata_image_bytes;
+    d["nvme_flush_enabled"] = s.nvme_flush_enabled;
+    d["start_mono_raw_ns"] = s.start_mono_raw_ns;
+    d["recalc_done_mono_raw_ns"] = s.recalc_done_mono_raw_ns;
+    d["header_done_mono_raw_ns"] = s.header_done_mono_raw_ns;
+    d["image_write_done_mono_raw_ns"] = s.image_write_done_mono_raw_ns;
+    d["flush_done_mono_raw_ns"] = s.flush_done_mono_raw_ns;
+    d["end_mono_raw_ns"] = s.end_mono_raw_ns;
     return d;
 }
 
@@ -334,6 +371,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     }, py::arg("handle"));
     m.def("stats", []() {
         return stats_to_dict(fdp::global_store().stats());
+    });
+    m.def("perf_runtime_stats", []() {
+        py::dict d;
+        d["nefc_ring"] = ring_runtime_to_dict(
+            fdp::global_store().nefc_ring_runtime_stats());
+        d["expert_ring"] = ring_runtime_to_dict(
+            fdp::global_store().expert_ring_runtime_stats());
+        d["last_metadata_commit"] = metadata_perf_to_dict(
+            fdp::global_store().last_metadata_commit_perf());
+        return d;
     });
     m.def("debug_read_metadata_summary", []() {
         fdp::MetadataSummary s;

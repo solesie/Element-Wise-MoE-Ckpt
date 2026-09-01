@@ -4,8 +4,9 @@ Separated from fc_manager to keep checkpoint responsibilities split:
 
   - **lossy expert FC**: per-iter top-K element snapshot handled by
     lossy checkpoint engine.
-  - **expert LFCL compaction** (this module): every iter, 1% of expert slots
-    by the selected planner materialize live GPU p/m/v into an LFCL payload.
+  - **expert LFCL compaction** (this module): every iter, the configured global
+    expert-slot fraction selected by the planner materializes live GPU p/m/v
+    into an LFCL payload.
   - **non-expert FC** (still in fc_manager): every W iter, full non-expert
     weight + m + v snapshot.
 
@@ -21,6 +22,7 @@ import heapq
 import math
 import os
 import time
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -53,6 +55,7 @@ class ExpertLosslessFC:
         fc_manager: Optional[Any] = None,
         interval_iters: int = 1,
         schedule: str = "proposal",
+        moc_sequential_policy: str = "layer_rr",
         lfcl_fraction_pct: float = 1.0,
         planner: Optional[LFCLPlanner] = None,
         commit_payload: bool = True,
@@ -68,6 +71,22 @@ class ExpertLosslessFC:
         self._num_expert_slots = len(self._all_expert_ids)
         self.interval_iters = max(1, int(interval_iters))
         self._schedule = schedule
+        if moc_sequential_policy not in (
+            "layer_rr",
+            "expert_rr_pp_locked",
+            "expert_rr_pp_back_locked",
+        ):
+            raise ValueError(
+                "moc_sequential_policy must be "
+                "'layer_rr'|'expert_rr_pp_locked'|"
+                "'expert_rr_pp_back_locked', got "
+                f"{moc_sequential_policy!r}"
+            )
+        if schedule != "sequential" and moc_sequential_policy != "layer_rr":
+            raise ValueError(
+                "non-default moc_sequential_policy requires schedule='sequential'"
+            )
+        self._moc_sequential_policy = moc_sequential_policy
         self.lfcl_fraction_pct = float(lfcl_fraction_pct)
         if self._num_expert_slots > 0 and self.lfcl_fraction_pct > 0:
             self._experts_per_lfcl_event = max(
@@ -78,6 +97,10 @@ class ExpertLosslessFC:
             self._experts_per_lfcl_event = 0
         self._planner = planner if planner is not None else RoundRobinPlan()
         self._layer_rr_tick = 0  # sequential mode
+        self._global_rr_cursor = 0  # proposal-mode distributed round robin
+        self._moc_back_locked_layout: Optional[
+            List[Tuple[int, int, int, int]]
+        ] = None
 
         self._expert_state = expert_state
         self._fc_manager = fc_manager
@@ -174,6 +197,152 @@ class ExpertLosslessFC:
             if int(winner_rank) == rank
         ]
 
+    def _select_global_round_robin_plan(
+        self,
+        *,
+        process_group: Any,
+    ) -> List[ExpertId]:
+        """Apply one deterministic quota after global, not per-rank, rounding."""
+
+        rank = int(torch.distributed.get_rank())
+        local_records = [
+            (rank, idx, int(eid[0]), int(eid[1]))
+            for idx, eid in enumerate(self._all_expert_ids)
+        ]
+        gathered: List[List[Tuple[int, int, int, int]]] = [
+            [] for _ in range(
+                int(torch.distributed.get_world_size(group=process_group))
+            )
+        ]
+        torch.distributed.all_gather_object(
+            gathered,
+            local_records,
+            group=process_group,
+        )
+        flat = sorted(
+            (record for records in gathered for record in records),
+            key=lambda item: (int(item[2]), int(item[3]), int(item[0]), int(item[1])),
+        )
+        if not flat or self.lfcl_fraction_pct <= 0.0:
+            return []
+        n_to_fire = min(
+            len(flat),
+            max(
+                1,
+                math.ceil(
+                    len(flat) * float(self.lfcl_fraction_pct) / 100.0
+                ),
+            ),
+        )
+        start = int(self._global_rr_cursor) % len(flat)
+        winners = [flat[(start + offset) % len(flat)] for offset in range(n_to_fire)]
+        self._global_rr_cursor = (start + n_to_fire) % len(flat)
+        return [
+            (int(layer), int(expert))
+            for winner_rank, _idx, layer, expert in winners
+            if int(winner_rank) == rank
+        ]
+
+    def _get_moc_back_locked_layout(
+        self,
+        *,
+        process_group: Any = None,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Gather the static physical expert layout once for MoC stress RR."""
+
+        if self._moc_back_locked_layout is not None:
+            return self._moc_back_locked_layout
+
+        distributed_ready = bool(
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        rank = int(torch.distributed.get_rank()) if distributed_ready else 0
+        local_records = [
+            (rank, idx, int(eid[0]), int(eid[1]))
+            for idx, eid in enumerate(self._all_expert_ids)
+        ]
+        distributed_world_size = (
+            int(torch.distributed.get_world_size(group=process_group))
+            if distributed_ready else 1
+        )
+        if distributed_world_size > 1:
+            if process_group is None:
+                raise RuntimeError(
+                    "expert_rr_pp_back_locked requires the proposal CPU "
+                    "process group when world_size > 1"
+                )
+            gathered: List[List[Tuple[int, int, int, int]]] = [
+                [] for _ in range(distributed_world_size)
+            ]
+            torch.distributed.all_gather_object(
+                gathered,
+                local_records,
+                group=process_group,
+            )
+        else:
+            gathered = [local_records]
+        # Deepest layers are written first.  With faults at a fixed 100-step
+        # phase, they are therefore the stalest layers at recovery time.  Rank
+        # and local index only make duplicate EP/DP records deterministic.
+        self._moc_back_locked_layout = sorted(
+            (record for records in gathered for record in records),
+            key=lambda item: (
+                -int(item[2]),
+                int(item[3]),
+                int(item[0]),
+                int(item[1]),
+            ),
+        )
+        if not self._moc_back_locked_layout:
+            raise RuntimeError(
+                "expert_rr_pp_back_locked found no distributed expert slots"
+            )
+        return self._moc_back_locked_layout
+
+    def _select_moc_back_locked_plan(
+        self,
+        *,
+        step: int,
+        process_group: Any,
+    ) -> List[ExpertId]:
+        """Select an exact cumulative global quota in reverse-layer RR order."""
+
+        layout = self._get_moc_back_locked_layout(process_group=process_group)
+        ratio = Fraction(str(self.lfcl_fraction_pct)) / 100
+        total_slots = len(layout)
+        cumulative_before = (
+            (int(step) - 1) * total_slots * ratio.numerator
+        ) // ratio.denominator
+        cumulative_after = (
+            int(step) * total_slots * ratio.numerator
+        ) // ratio.denominator
+        n_to_fire = int(cumulative_after - cumulative_before)
+        if n_to_fire <= 0:
+            return []
+        if n_to_fire > total_slots:
+            raise RuntimeError(
+                "expert_rr_pp_back_locked per-step quota exceeds the global "
+                f"layout: quota={n_to_fire} slots={total_slots}"
+            )
+
+        start = int(cumulative_before) % total_slots
+        winners = [
+            layout[(start + offset) % total_slots]
+            for offset in range(n_to_fire)
+        ]
+        rank = (
+            int(torch.distributed.get_rank())
+            if torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            else 0
+        )
+        return [
+            (int(layer), int(expert))
+            for winner_rank, _idx, layer, expert in winners
+            if int(winner_rank) == rank
+        ]
+
     def _select_fired_experts(
         self,
         step: int,
@@ -186,7 +355,47 @@ class ExpertLosslessFC:
         if step <= 0:
             return fired
         if self._schedule == "sequential":
-            # MoC paper baseline: fire all experts of one layer in round-robin order.
+            if self._moc_sequential_policy == "expert_rr_pp_back_locked":
+                if process_group is None and int(world_size) > 1:
+                    raise RuntimeError(
+                        "expert_rr_pp_back_locked requires the proposal CPU "
+                        "process group when world_size > 1"
+                    )
+                return self._select_moc_back_locked_plan(
+                    step=int(step),
+                    process_group=process_group,
+                )
+
+            if self._moc_sequential_policy == "expert_rr_pp_locked":
+                # 125M-MoE64 PP2/EP4 stress profile. Each rank owns
+                # 3 layers x 16 local experts; all eight ranks therefore own
+                # 384 physical expert slots. A global 1% event selects four
+                # slots. One complete 384-slot sweep occupies 96 iterations,
+                # then four idle iterations make the 100-iteration average
+                # exactly 1%. Global layer-major ordering intentionally keeps
+                # PP0's three layers ahead of PP1's three layers.
+                if int(world_size) != 8 or self._num_expert_slots != 48:
+                    raise RuntimeError(
+                        "expert_rr_pp_locked requires the 125M-MoE64 "
+                        "(DP,EP,PP)=(1,4,2) layout: expected world_size=8 "
+                        "and 48 local expert slots per rank, got "
+                        f"world_size={int(world_size)} "
+                        f"local_slots={self._num_expert_slots}"
+                    )
+                if process_group is None:
+                    raise RuntimeError(
+                        "expert_rr_pp_locked requires the proposal CPU "
+                        "process group"
+                    )
+                phase = (int(step) - 1) % 100
+                if phase >= 96:
+                    return []
+                return self._select_global_round_robin_plan(
+                    process_group=process_group,
+                )
+
+            # Canonical MoC baseline: fire all experts of one layer in
+            # round-robin order.
             if (
                 self._num_layers > 0
                 and (step - 1) % max(self.interval_iters, 1) == 0
@@ -216,6 +425,15 @@ class ExpertLosslessFC:
                 ):
                     return self._select_global_lossy_log_size_plan(
                         step=int(step),
+                        process_group=process_group,
+                    )
+                if (
+                    not needs_log_bytes
+                    and isinstance(self._planner, RoundRobinPlan)
+                    and int(world_size) > 1
+                    and process_group is not None
+                ):
+                    return self._select_global_round_robin_plan(
                         process_group=process_group,
                     )
                 lossy_log_bytes = (

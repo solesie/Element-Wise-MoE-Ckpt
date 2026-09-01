@@ -6,6 +6,8 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+from megatron.proposal.config import checkpoint_warmup_iters_from_args
+
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,7 +40,7 @@ def test_refresh_cadence_starts_at_warmup_then_keeps_absolute_period() -> None:
     module = ast.Module(body=[fn], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {
-        "lr_warmup_iters_from_args": lambda args: int(args.warmup),
+        "checkpoint_warmup_iters_from_args": lambda args: int(args.warmup),
     }
     exec(compile(module, "training.py", "exec"), namespace)
     due = namespace["_proposal_h_refresh_due"]
@@ -64,8 +66,58 @@ def test_activation_uses_existing_exact_baseline_paths() -> None:
     assert "iter_T <= int(get_controller()._warmup_end_iter)" in dispatch
 
     train = _source("training.py", "train")
-    assert "iteration > proposal_warmup_end" in train
-    assert "iteration == proposal_warmup_end" in train
+    assert "iteration > checkpoint_warmup_end" in train
+    assert "iteration == checkpoint_warmup_end" in train
+    assert "iteration > lr_warmup_end" in train
+
+
+def test_sequential_moc_decouples_lr_warmup_from_checkpoint_cold_start() -> None:
+    common = {
+        "lr_warmup_tokens": None,
+        "lr_warmup_iters": 80,
+        "lr_warmup_samples": 0,
+        "lr_warmup_fraction": None,
+    }
+    assert checkpoint_warmup_iters_from_args(
+        SimpleNamespace(proposal_cp_mode="sequential", **common),
+    ) == 0
+    assert checkpoint_warmup_iters_from_args(
+        SimpleNamespace(proposal_cp_mode="proposal", **common),
+    ) == 80
+    assert checkpoint_warmup_iters_from_args(
+        SimpleNamespace(
+            proposal_cp_mode="proposal",
+            proposal_checkpoint_warmup_iters=10,
+            **common,
+        ),
+    ) == 10
+
+    init = _source("proposal/controller.py", "init_proposal")
+    assert "checkpoint_warmup_iters_from_args(args)" in init
+
+    train = _source("training.py", "train")
+    assert "checkpoint_warmup_end =" in train
+    assert "checkpoint_warmup_iters_from_args(args)" in train
+    # Sequential dispatch is gated by checkpoint policy (zero warmup), while
+    # fault injection remains gated by the optimizer's real LR warmup.
+    assert "iteration > checkpoint_warmup_end" in train
+    assert "iteration > lr_warmup_end" in train
+
+
+def test_h_refresh_uses_checkpoint_bootstrap_boundary() -> None:
+    fn = _function("training.py", "_proposal_h_refresh_due")
+    module = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "checkpoint_warmup_iters_from_args": lambda args: int(args.cp_warmup),
+    }
+    exec(compile(module, "training.py", "exec"), namespace)
+    due = namespace["_proposal_h_refresh_due"]
+    args = SimpleNamespace(
+        proposal_hessian_refresh_every=100,
+        cp_warmup=10,
+    )
+    assert [step for step in range(1, 301) if due(args, step)] == [10, 100, 200, 300]
 
 
 def test_activation_runs_baselines_once_at_exact_boundary() -> None:

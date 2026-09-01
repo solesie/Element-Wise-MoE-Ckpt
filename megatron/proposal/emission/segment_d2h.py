@@ -65,6 +65,15 @@ class SegmentD2H:
         # caller has set the final CUDA device.
         self._prod_done: List[Optional[torch.cuda.Event]] = [None] * num_buffers
         self._d2h_done: List[Optional[torch.cuda.Event]] = [None] * num_buffers
+        self._perf_enabled = os.environ.get(
+            "PROPOSAL_FDP_PERF_DIAG", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._perf_start: Optional[torch.cuda.Event] = (
+            torch.cuda.Event(enable_timing=True) if self._perf_enabled else None
+        )
+        self._perf_last_events: Optional[
+            Tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]
+        ] = None
 
     @property
     def segment_bytes(self) -> int:
@@ -191,6 +200,11 @@ class SegmentD2H:
         segment_list = self._validate_run_inputs(
             segments, dst, copy_to_host=bool(copy_to_host),
         )
+        if segment_list:
+            self._ensure_events()
+        self._perf_last_events = None
+        if segment_list and self._perf_start is not None:
+            self._perf_start.record(self._compute_stream)
         seg = self._segment_bytes
         d2h_chunk = max(1 * 1024 * 1024, int(seg))
         nb = len(self._gpu_bufs)
@@ -213,7 +227,9 @@ class SegmentD2H:
                 if profile and time is not None:
                     producer_ms += (time.perf_counter() - t0) * 1000.0
             if self._prod_done[buf] is None:
-                self._prod_done[buf] = torch.cuda.Event()
+                self._prod_done[buf] = torch.cuda.Event(
+                    enable_timing=self._perf_enabled,
+                )
             self._prod_done[buf].record(self._compute_stream)
             producer_event_for_wait = self._prod_done[buf]
             last_producer_event = producer_event_for_wait
@@ -237,10 +253,22 @@ class SegmentD2H:
                 if profile and time is not None:
                     d2h_enqueue_ms += (time.perf_counter() - t0) * 1000.0
             if self._d2h_done[buf] is None:
-                self._d2h_done[buf] = torch.cuda.Event()
+                self._d2h_done[buf] = torch.cuda.Event(
+                    enable_timing=self._perf_enabled,
+                )
             self._d2h_done[buf].record(self._d2h_stream)
             last_event = self._d2h_done[buf]
             buf = (buf + 1) % nb
+        if (
+            self._perf_start is not None
+            and last_producer_event is not None
+            and last_event is not None
+        ):
+            self._perf_last_events = (
+                self._perf_start,
+                last_producer_event,
+                last_event,
+            )
         if profile and time is not None:
             total_ms = (time.perf_counter() - t_run0) * 1000.0
             total_bytes = sum(int(n) for _o, n in segment_list)
@@ -260,6 +288,17 @@ class SegmentD2H:
     def _ensure_events(self, *, replace: bool = False) -> None:
         for i in range(len(self._gpu_bufs)):
             if replace or self._prod_done[i] is None:
-                self._prod_done[i] = torch.cuda.Event()
+                self._prod_done[i] = torch.cuda.Event(
+                    enable_timing=self._perf_enabled,
+                )
             if replace or self._d2h_done[i] is None:
-                self._d2h_done[i] = torch.cuda.Event()
+                self._d2h_done[i] = torch.cuda.Event(
+                    enable_timing=self._perf_enabled,
+                )
+
+    def last_perf_timing_events(
+        self,
+    ) -> Optional[Tuple["torch.cuda.Event", "torch.cuda.Event", "torch.cuda.Event"]]:
+        """Return the reusable emission start/producer/D2H timing events."""
+
+        return self._perf_last_events

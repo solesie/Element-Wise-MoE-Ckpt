@@ -1,0 +1,141 @@
+/* Aggregate-only shadow trace.  The two waf-control writes bracket timed I/O. */
+
+BEGIN
+{
+  printf("TRACE_READY\n");
+}
+
+tracepoint:syscalls:sys_enter_write
+/strncmp(comm, "waf-control", 11) == 0 && args.fd == 2/
+{
+  @active = @active == 0 ? 1 : 0;
+  @markers = count();
+}
+
+tracepoint:raw_syscalls:sys_enter
+/@active && (strncmp(comm, "waf-proc1", 9) == 0 || strncmp(comm, "waf-rank-", 9) == 0)/
+{
+  @sys_start[tid] = nsecs;
+  @sys_id[tid] = args.id;
+}
+
+tracepoint:raw_syscalls:sys_exit
+/@sys_start[tid]/
+{
+  @sys_count[@sys_id[tid]] = count();
+  @sys_ns[@sys_id[tid]] = sum(nsecs - @sys_start[tid]);
+  delete(@sys_start[tid]);
+  delete(@sys_id[tid]);
+}
+
+tracepoint:sched:sched_switch
+/@active && (strncmp(args.prev_comm, "waf-proc1", 9) == 0 || strncmp(args.prev_comm, "waf-rank-", 9) == 0)/
+{
+  @off_start[args.prev_pid] = nsecs;
+  @off_state[args.prev_pid] = args.prev_state;
+  @off_kstack[args.prev_pid] = kstack(24);
+}
+
+tracepoint:sched:sched_switch
+/@off_start[args.next_pid] && (strncmp(args.next_comm, "waf-proc1", 9) == 0 || strncmp(args.next_comm, "waf-rank-", 9) == 0)/
+{
+  if (@off_state[args.next_pid] == 0) {
+    @runnable_ns[args.next_comm] = sum(nsecs - @off_start[args.next_pid]);
+    @runnable_count[args.next_comm] = count();
+  } else {
+    @blocked_ns[args.next_comm] = sum(nsecs - @off_start[args.next_pid]);
+    @blocked_count[args.next_comm] = count();
+    @blocked_stack_ns[@off_kstack[args.next_pid]] = sum(nsecs - @off_start[args.next_pid]);
+  }
+  delete(@off_start[args.next_pid]);
+  delete(@off_state[args.next_pid]);
+  delete(@off_kstack[args.next_pid]);
+}
+
+tracepoint:lock:contention_begin
+/@active && (strncmp(comm, "waf-proc1", 9) == 0 || strncmp(comm, "waf-rank-", 9) == 0)/
+{
+  @lock_start[tid] = nsecs;
+  @lock_flags[tid] = args.flags;
+  @lock_kstack[tid] = kstack(24);
+}
+
+tracepoint:lock:contention_end
+/@lock_start[tid]/
+{
+  @lock_ns[@lock_flags[tid]] = sum(nsecs - @lock_start[tid]);
+  @lock_count[@lock_flags[tid]] = count();
+  @lock_stack_ns[@lock_kstack[tid]] = sum(nsecs - @lock_start[tid]);
+  delete(@lock_start[tid]);
+  delete(@lock_flags[tid]);
+  delete(@lock_kstack[tid]);
+}
+
+tracepoint:ext4:ext4_sync_file_enter
+/@active && (strncmp(comm, "waf-proc1", 9) == 0 || strncmp(comm, "waf-rank-", 9) == 0)/
+{
+  @ext4_sync_start[tid] = nsecs;
+}
+
+tracepoint:ext4:ext4_sync_file_exit
+/@ext4_sync_start[tid]/
+{
+  @ext4_sync_ns = sum(nsecs - @ext4_sync_start[tid]);
+  @ext4_sync_count = count();
+  delete(@ext4_sync_start[tid]);
+}
+
+tracepoint:jbd2:jbd2_start_commit
+/@active/
+{
+  @jbd2_start[args.dev, args.transaction] = nsecs;
+  @jbd2_sync[args.dev, args.transaction] = args.sync_commit;
+}
+
+tracepoint:jbd2:jbd2_end_commit
+/@jbd2_start[args.dev, args.transaction]/
+{
+  @jbd2_ns[@jbd2_sync[args.dev, args.transaction]] =
+    sum(nsecs - @jbd2_start[args.dev, args.transaction]);
+  @jbd2_count[@jbd2_sync[args.dev, args.transaction]] = count();
+  delete(@jbd2_start[args.dev, args.transaction]);
+  delete(@jbd2_sync[args.dev, args.transaction]);
+}
+
+tracepoint:writeback:writeback_start
+/@active/
+{
+  @writeback_start_count = count();
+  @writeback_requested_pages = sum(args.nr_pages);
+}
+
+tracepoint:writeback:writeback_written
+/@active/
+{
+  @writeback_written_count = count();
+  @writeback_remaining_pages = sum(args.nr_pages);
+}
+
+tracepoint:writeback:balance_dirty_pages
+/@active && (strncmp(comm, "waf-proc1", 9) == 0 || strncmp(comm, "waf-rank-", 9) == 0)/
+{
+  @dirty_balance_count = count();
+  @dirty_pause = sum(args.pause);
+}
+
+tracepoint:block:block_rq_issue
+/@active/
+{
+  @block_issue_count = count();
+  @block_issue_bytes = sum(args.bytes);
+  @block_start[args.dev, args.sector, args.nr_sector] = nsecs;
+}
+
+tracepoint:block:block_rq_complete
+/@block_start[args.dev, args.sector, args.nr_sector]/
+{
+  @block_complete_count = count();
+  @block_latency_ns = sum(nsecs - @block_start[args.dev, args.sector, args.nr_sector]);
+  @block_latency_us = hist((nsecs - @block_start[args.dev, args.sector, args.nr_sector]) / 1000);
+  delete(@block_start[args.dev, args.sector, args.nr_sector]);
+}
