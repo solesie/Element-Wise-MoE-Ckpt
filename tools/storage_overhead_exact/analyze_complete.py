@@ -64,7 +64,7 @@ def parse_pyspy(path):
                                   "buffer_flush": 0, "other_python": 0}}
     if not path or not Path(path).exists():
         return out
-    timed = re.compile(r"worker \(exact_waf_replay[.]py:1(?:3[4-9]|4[0-9]|5[0-9]|6[0-9]|7[0-9])\)")
+    timed = re.compile(r"worker \(exact_waf_replay[.]py:\d+\)")
     for line in Path(path).read_text(errors="replace").splitlines():
         m = re.search(r" (\d+)$", line)
         if not m:
@@ -140,7 +140,7 @@ def main():
     p.add_argument("--perf-stat")
     p.add_argument("--perf-dso")
     p.add_argument("--pyspy")
-    p.add_argument("--ssd-gbps", type=float, default=4.1)
+    p.add_argument("--ssd-gbps", type=float, default=6.8)
     p.add_argument("--output", required=True)
     a = p.parse_args()
 
@@ -150,7 +150,7 @@ def main():
     media = payload / (a.ssd_gbps * 1e9)
 
     points = [
-        ("device_ideal_4.1GBps", media),
+        ("device_ideal", media),
         ("raw_kernel_filesystem", t("raw_preopen_proc1") - media),
         ("eight_rank_net", t("raw_preopen_proc8") - t("raw_preopen_proc1")),
         ("open_close", t("raw_actual_proc8") - t("raw_preopen_proc8")),
@@ -218,14 +218,42 @@ def main():
         "gil_holding_samples": parse_pyspy(a.pyspy),
     }
 
+    full_case = cases["full_fsync_proc8"]
+    source_bytes = int(full_case.get("source_bytes", payload))
+    projection = None
+    if full_case.get("workload") == "full_checkpoint_10pct":
+        factor = source_bytes / payload
+        fixed = cases.get("fixed_fsync_proc8")
+        fixed_aware = None
+        if fixed is not None:
+            fixed_bytes = int(fixed["payload_bytes"])
+            fixed_seconds = float(fixed["seconds"])
+            byte_factor = (source_bytes - fixed_bytes) / (payload - fixed_bytes)
+            fixed_aware = fixed_seconds + (headline - fixed_seconds) * byte_factor
+        projection = {
+            "target_full_checkpoint_bytes": source_bytes,
+            "measured_scaled_bytes": payload,
+            "byte_scale_factor": factor,
+            "full_device_ideal_seconds": source_bytes / (a.ssd_gbps * 1e9),
+            "naive_all_time_linear_seconds": headline * factor,
+            "fixed_control_bytes": int(fixed["payload_bytes"]) if fixed else None,
+            "fixed_control_seconds": float(fixed["seconds"]) if fixed else None,
+            "fixed_aware_linear_model_seconds": fixed_aware,
+            "model": "T(B)=T_fixed+(T_10pct-T_fixed)*(B-B_fixed)/(B_10pct-B_fixed)",
+            "warning": "This is an extrapolation under a fixed-plus-linear-byte-cost model; validate with the full checkpoint before using it as a paper result.",
+        }
+
     result = {
-        "scope": {"steps": cases["full_fsync_proc8"]["steps"], "payload_bytes": payload,
+        "scope": {"workload": full_case.get("workload", "log"),
+                  "steps": full_case["steps"], "payload_bytes": payload,
+                  "source_bytes": source_bytes,
                   "physical_ops": cases["full_fsync_proc8"]["physical_ops"],
                   "topology": cases["full_fsync_proc8"]["topology"]},
         "headline": {"seconds": headline, "GBps": payload / headline / 1e9,
-                     "device_ideal_seconds_at_4.1GBps": media,
+                     "device_ideal_seconds": media, "device_ideal_GBps": a.ssd_gbps,
                      "software_overhead_seconds": overhead,
                      "software_overhead_percent": 100.0 * overhead / headline},
+        "full_checkpoint_projection": projection,
         "additive_waterfall_seconds": waterfall,
         "software_overhead_share_percent": shares,
         "waterfall_sum_seconds": sum(waterfall.values()),
@@ -234,7 +262,7 @@ def main():
         "interpretation": [
             "Waterfall deltas are ordered counterfactuals and therefore add exactly to headline wall time.",
             "Shadow syscall/off-CPU/device durations are concurrent rank sums; they explain causes but are not added to wall time.",
-            "The 4.1 GB/s passthru result is supplied, not remeasured on this VM.",
+            f"The {a.ssd_gbps} GB/s ideal result is supplied, not remeasured by this suite.",
         ],
     }
     Path(a.output).write_text(json.dumps(result, indent=2) + "\n")

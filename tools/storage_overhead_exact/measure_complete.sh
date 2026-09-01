@@ -4,15 +4,18 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TRACE=${TRACE:-$ROOT/results/ds_pretrain_gpt_350M_MoE128_10Kiter_proposal/waf_trace}
 WORK=${WORK:-/tmp}
-BUDGET=${BUDGET:-900000000}
+# The real measurement always replays the original WAF io_bytes.  Set an
+# integer only for an explicitly bounded validation run.
+BUDGET=${BUDGET:-full}
 STEPS=${STEPS:-1001,1002,1003}
-SSD_GBPS=${SSD_GBPS:-4.1}
-OUT=${OUT:-$ROOT/results/storage_overhead_complete_$(date +%Y%m%d_%H%M%S)}
+WORKLOAD=${WORKLOAD:-log}
+SSD_GBPS=${SSD_GBPS:-6.8}
+OUT=${OUT:-$ROOT/results/storage_overhead_${WORKLOAD}_$(date +%Y%m%d_%H%M%S)}
 PY=${PYTHON:-python3}
 R=$ROOT/tools/storage_overhead_exact/exact_waf_replay.py
 ANALYZE=$ROOT/tools/storage_overhead_exact/analyze_complete.py
 BPF=$ROOT/tools/storage_overhead_exact/storage_trace.bt
-CACHE=$OUT/plan.pkl
+CACHE=$OUT/plan_${WORKLOAD}.pkl
 ORIG_PARANOID=$(sysctl -n kernel.perf_event_paranoid)
 ORIG_KPTR=$(sysctl -n kernel.kptr_restrict)
 BPF_SUDO_PID=
@@ -37,10 +40,11 @@ sudo -n sysctl -q -w kernel.perf_event_paranoid=1 >/dev/null
 sudo -n sysctl -q -w kernel.kptr_restrict=0 >/dev/null
 
 case1() {
-  local name=$1 writer=$2 executor=$3 opened=$4 sync_mode=$5
+  local name=$1 writer=$2 executor=$3 opened=$4 sync_mode=$5 workload=${6:-$WORKLOAD}
+  local cache=$OUT/plan_${workload}.pkl
   sync
-  "$PY" "$R" --trace "$TRACE" --plan-cache "$CACHE" --work "$WORK" --steps "$STEPS" \
-    --budget "$BUDGET" --writer "$writer" --executor "$executor" --open-mode "$opened" \
+  "$PY" "$R" --trace "$TRACE" --plan-cache "$cache" --work "$WORK" --steps "$STEPS" \
+    --budget "$BUDGET" --workload "$workload" --writer "$writer" --executor "$executor" --open-mode "$opened" \
     --sync "$sync_mode" --sink disk \
     | jq -c --arg case "$name" '. + {case:$case}' | tee -a "$OUT/cases.jsonl"
 }
@@ -54,6 +58,9 @@ if [[ "$SKIP_CONTROLS" != 1 ]]; then
   case1 raw_actual_proc8       raw   proc8 persistent     flush
   case1 raw_preopen_proc8      raw   proc8 all-persistent flush
   case1 raw_preopen_proc1      raw   proc1 all-persistent flush
+  if [[ "$WORKLOAD" == full_checkpoint_10pct ]]; then
+    case1 fixed_fsync_proc8 torch proc8 persistent fsync full_checkpoint_fixed
+  fi
 else
   test -s "$OUT/cases.jsonl"
 fi
@@ -76,7 +83,7 @@ if [[ "$SKIP_BPF" != 1 ]]; then
     -o "$OUT/shadow/perf_stat.csv" \
     -e task-clock,cycles,instructions,context-switches,cpu-migrations,page-faults -- \
     "$PY" "$R" --trace "$TRACE" --plan-cache "$CACHE" --work "$WORK" --steps "$STEPS" \
-    --budget "$BUDGET" --writer torch --executor proc8 --open-mode persistent --sync fsync \
+    --budget "$BUDGET" --workload "$WORKLOAD" --writer torch --executor proc8 --open-mode persistent --sync fsync \
     --perf-ctl "$OUT/shadow/perf.ctl" --perf-ack "$OUT/shadow/perf.ack" --markers \
     > "$OUT/shadow/bpf_perf_workload.json"
   unlink "$OUT/shadow/perf.ctl"
@@ -97,7 +104,7 @@ if [[ "$SKIP_PERF_RECORD" != 1 ]]; then
   perf record -D -1 --control "fifo:$OUT/shadow/record.ctl,$OUT/shadow/record.ack" \
     -F 199 -e cycles -g --call-graph dwarf,8192 -o "$OUT/shadow/perf.data" -- \
     env PYTHONPERFSUPPORT=1 "$PY" "$R" --trace "$TRACE" --plan-cache "$CACHE" \
-    --work "$WORK" --steps "$STEPS" --budget "$BUDGET" --writer torch --executor proc8 \
+    --work "$WORK" --steps "$STEPS" --budget "$BUDGET" --workload "$WORKLOAD" --writer torch --executor proc8 \
     --open-mode persistent --sync fsync --perf-ctl "$OUT/shadow/record.ctl" \
     --perf-ack "$OUT/shadow/record.ack" > "$OUT/shadow/perf_workload.json"
   unlink "$OUT/shadow/record.ctl"
@@ -112,7 +119,7 @@ sudo -n perf report -f --stdio --no-children --sort dso -g none --percent-limit 
 py-spy record --subprocesses --gil --native --rate 49 --format raw \
   --output "$OUT/shadow/pyspy_gil.raw" -- \
   "$PY" "$R" --trace "$TRACE" --plan-cache "$CACHE" --work "$WORK" --steps "$STEPS" \
-  --budget "$BUDGET" --writer torch --executor proc8 --open-mode persistent --sync fsync \
+  --budget "$BUDGET" --workload "$WORKLOAD" --writer torch --executor proc8 --open-mode persistent --sync fsync \
   > "$OUT/shadow/pyspy_workload.json" || true
 
 "$PY" "$ANALYZE" --cases "$OUT/cases.jsonl" --bpf "$OUT/shadow/bpftrace.jsonl" \

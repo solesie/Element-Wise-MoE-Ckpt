@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """CPU-only WAF replay with DeepSpeed MoE files plus one persistent log/expert."""
 
-import argparse, glob, json, multiprocessing as mp, os, pickle, shutil, tempfile, threading, time
+import argparse, glob, io, json, multiprocessing as mp, os, pickle, shutil, tempfile, threading, time
 from pathlib import Path
 
 A = 4096
 
 
-def load(trace, steps, budget):
+def tenth_aligned(n):
+    return max(A, ((int(n) + 5 * A) // (10 * A)) * A)
+
+
+def load(trace, steps, budget, workload="log"):
     plans, meta, raw = {}, {}, []
     for name in sorted(glob.glob(str(Path(trace) / "waf_rank*.jsonl"))):
         rank, rows = None, {s: [] for s in steps}
@@ -27,38 +31,83 @@ def load(trace, steps, budget):
     for r in plans:
         for s in steps:
             raw += [(r, s, *x) for x in plans[r][s]]
-    floor = A * len(raw)
-    if budget < floor:
-        raise RuntimeError(f"budget must be >= {floor}")
-    source, extra = sum(int(x[6]) for x in raw), budget - floor
-    sizes = [A + (extra * int(x[6]) // source // A) * A for x in raw]
-
-    out = {r: {s: [] for s in steps} for r in plans}
     layers = {p: sorted({int(x[4]) for x in raw if x[2] == "y" and meta[x[0]]["pp_rank"] == p})
               for p in {meta[r]["pp_rank"] for r in meta}}
-    nonexpert = {}
+
+    if workload in ("full_checkpoint_10pct", "full_checkpoint_fixed"):
+        if budget is not None:
+            raise RuntimeError(f"{workload} does not accept a validation budget")
+        active_step = steps[0]
+        lfcl_sizes = {int(x[6]) for x in raw if x[2] == "c"}
+        if len(lfcl_sizes) != 1:
+            raise RuntimeError(f"expected one LFCL size, got {sorted(lfcl_sizes)}")
+        lfcl_bytes = lfcl_sizes.pop()
+        experts = {}
+        for x in raw:
+            r, _s, kind, _op, layer, expert, _bytes, _off = x
+            if kind != "y":
+                continue
+            pp = int(meta[r]["pp_rank"])
+            key = (r, pp, layers[pp].index(int(layer)), int(expert))
+            experts[key] = None
+        nonexpert = [x for x in raw if x[1] == active_step and x[2] == "n"]
+        if len(experts) != 1536 or len(nonexpert) != 8:
+            raise RuntimeError(f"full checkpoint requires 1536 experts + 8 non-expert calls, got {len(experts)} + {len(nonexpert)}")
+        out = {r: {active_step: []} for r in plans}
+        scale = (lambda _n: A) if workload == "full_checkpoint_fixed" else tenth_aligned
+        for r, pp, layer, expert in sorted(experts):
+            out[r][active_step].append(("c", "r", pp, layer, expert, scale(lfcl_bytes)))
+        for x in nonexpert:
+            r, _s, _kind, op, _layer, _expert, n, _off = x
+            pp = int(meta[r]["pp_rank"])
+            out[r][active_step].append(("n", op, pp, -1, -1, scale(n)))
+        source = len(experts) * lfcl_bytes + sum(int(x[6]) for x in nonexpert)
+        payload = sum(op[5] for r in out for op in out[r][active_step])
+        info = dict(source_bytes=source, payload_bytes=payload,
+                    trace_ops=len(experts) + len(nonexpert), physical_ops=len(experts) + len(nonexpert),
+                    scale_mode="fixed_4KiB_per_call" if workload == "full_checkpoint_fixed" else "one_tenth",
+                    workload=workload,
+                    active_steps=[active_step], extrapolation_factor=source / payload,
+                    operation_counts={"lfcl": len(experts), "nonexpert": len(nonexpert), "lfsy": 0})
+        return out, meta, info
+
+    source = sum(int(x[6]) for x in raw)
+    if budget is None:
+        sizes = [int(x[6]) for x in raw]
+        if any(n <= 0 or n % A for n in sizes):
+            raise RuntimeError("full replay requires positive 4 KiB-aligned io_bytes")
+    else:
+        floor = A * len(raw)
+        if budget < floor:
+            raise RuntimeError(f"budget must be >= {floor}")
+        extra = budget - floor
+        sizes = [A + (extra * int(x[6]) // source // A) * A for x in raw]
+
+    out = {r: {s: [] for s in steps} for r in plans}
     for x, n in zip(raw, sizes):
         r, s, kind, op, layer, expert, _bytes, _off = x
         pp = int(meta[r]["pp_rank"])
         if kind == "n":
-            nonexpert[pp, s] = nonexpert.get((pp, s), 0) + n
+            # Keep every rank's call.  DeepSpeed names the replicated
+            # non-expert files by model-parallel rank, so multiple EP ranks
+            # intentionally target the same PP file.
+            out[r][s].append((kind, op, pp, -1, -1, n))
         else:
             local_layer = layers[pp].index(int(layer))
             out[r][s].append((kind, op, pp, local_layer, int(expert), n))
-    for (pp, s), n in nonexpert.items():
-        owner = min(r for r in meta if int(meta[r]["pp_rank"]) == pp)
-        out[owner][s].append(("n", "r", pp, -1, -1, n))
     info = dict(source_bytes=source, payload_bytes=sum(sizes), trace_ops=len(raw),
-                physical_ops=sum(len(out[r][s]) for r in out for s in steps))
+                physical_ops=sum(len(out[r][s]) for r in out for s in steps),
+                scale_mode="full" if budget is None else "bounded_validation",
+                workload=workload, active_steps=list(steps))
     return out, meta, info
 
 
-def load_cached(trace, steps, budget, cache):
-    key = (str(Path(trace).resolve()), tuple(steps), int(budget))
+def load_cached(trace, steps, budget, workload, cache):
+    key = (str(Path(trace).resolve()), tuple(steps), budget, workload)
     if cache and Path(cache).exists():
         x = pickle.load(open(cache, "rb"))
         if x[0] == key: return x[1]
-    value = load(trace, steps, budget)
+    value = load(trace, steps, budget, workload)
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         tmp = f"{cache}.{os.getpid()}.tmp"
@@ -81,6 +130,7 @@ def seed(root, plans, meta, steps):
     targets = {paths(root, op) for r in plans for s in steps for op in plans[r][s]}
     logs = {p for p in targets if p.endswith(".lfsy.log")}
     bases = {p.replace(".lfsy.log", "_model_states.pt") for p in logs}
+    bases |= {paths(root, op) for r in plans for s in steps for op in plans[r][s] if op[0] == "c"}
     nonexpert = {p for p in targets if Path(p).name.startswith("mp_rank_")}
     optimizer = {str(Path(root) / f"expp_rank_{int(meta[r]['ep_rank'])}_mp_rank_{int(meta[r]['pp_rank']):02d}_optim_states.pt")
                  for r in meta}
@@ -118,7 +168,9 @@ def worker(groups, root, steps, writer, open_mode, sync, sink, start, done, rele
                 import torch
                 torch.set_num_threads(1)
                 states = {n: {"payload": torch.frombuffer(views[n], dtype=torch.uint8)} for n in views}
-                torch.save(states[min(states)], "/dev/null", _use_new_zipfile_serialization=False)
+                # Warm imports and the real ZIP serializer before the timed
+                # interval.  ZIP serialization needs a seekable destination.
+                torch.save(states[min(states)], io.BytesIO(), _use_new_zipfile_serialization=True)
             if open_mode in ("persistent", "all-persistent"):
                 for op in ops:
                     if op[0] == "y" or open_mode == "all-persistent":
@@ -151,7 +203,7 @@ def worker(groups, root, steps, writer, open_mode, sync, sink, start, done, rele
                             mode = "wb" if action == "c" else "ab"
                             f = open(p, mode, buffering=0); fd, close = f.fileno(), True
                         if writer == "torch":
-                            torch.save(states[n], f, _use_new_zipfile_serialization=False)
+                            torch.save(states[n], f, _use_new_zipfile_serialization=True)
                             if sync in ("flush", "fsync"): f.flush()
                         else:
                             write_all(fd, views[n])
@@ -161,14 +213,14 @@ def worker(groups, root, steps, writer, open_mode, sync, sink, start, done, rele
                         fd, f = handles[p], files.get(p)
                         if f:
                             f.flush(); f.seek(0); f.truncate(0)
-                            torch.save(states[n], f, _use_new_zipfile_serialization=False)
+                            torch.save(states[n], f, _use_new_zipfile_serialization=True)
                             if sync in ("flush", "fsync"): f.flush()
                         else:
                             os.ftruncate(fd, 0); os.lseek(fd, 0, os.SEEK_SET)
                             write_all(fd, views[n])
                         if sync == "fsync": os.fsync(fd)
                     elif writer == "torch":
-                        torch.save(states[n], p, _use_new_zipfile_serialization=False)
+                        torch.save(states[n], p, _use_new_zipfile_serialization=True)
                         if sync == "fsync":
                             fd = os.open(p, os.O_RDONLY); os.fsync(fd); os.close(fd)
                     else:
@@ -267,7 +319,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--trace", required=True); p.add_argument("--work", required=True)
     p.add_argument("--steps", default="1001,1002,1003")
-    p.add_argument("--budget", type=int, default=900_000_000)
+    p.add_argument("--workload", choices=("log", "full_checkpoint_10pct", "full_checkpoint_fixed"),
+                   default="log")
+    p.add_argument("--budget", default="full",
+                   help="full uses trace io_bytes verbatim; an integer enables bounded validation")
     p.add_argument("--writer", choices=("noop", "raw", "torch"), required=True)
     p.add_argument("--executor", choices=("proc1", "proc8", "thread8"), required=True)
     p.add_argument("--open-mode", choices=("persistent", "all-persistent", "per-write"), default="persistent")
@@ -276,9 +331,13 @@ def main():
     p.add_argument("--plan-cache")
     p.add_argument("--perf-ctl"); p.add_argument("--perf-ack"); p.add_argument("--markers", action="store_true")
     a = p.parse_args(); a.steps = tuple(map(int, a.steps.split(",")))
-    if a.budget > 1_000_000_000: raise SystemExit("--budget must be <= 1,000,000,000")
+    budget_text = str(a.budget).strip().lower()
+    a.budget = None if budget_text == "full" else int(budget_text)
+    if a.budget is not None and a.budget > 1_000_000_000:
+        raise SystemExit("bounded validation --budget must be <= 1,000,000,000")
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-    plans, meta, info = load_cached(a.trace, a.steps, a.budget, a.plan_cache)
+    plans, meta, info = load_cached(a.trace, a.steps, a.budget, a.workload, a.plan_cache)
+    a.steps = tuple(info["active_steps"])
     Path(a.work).mkdir(parents=True, exist_ok=True)
     root = tempfile.mkdtemp(prefix="exact-waf-", dir=a.work)
     try:
